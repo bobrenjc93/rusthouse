@@ -1,8 +1,13 @@
-use rusthouse::batch::engine::{Database, QueryResult, ResultColumn, StatementResult};
+use rusthouse::batch::engine::{
+    Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
+};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{BatchSqlLimits, SelectItem, Statement, parse, parse_with_limits};
 use rusthouse::batch::value::{DataType, Value};
-use rusthouse::batch::{run_csv_batch, run_json_batch};
+use rusthouse::batch::{
+    run_csv_batch, run_json_batch, run_json_compact_each_row_batch, run_json_each_row_batch,
+    run_table_batch, run_tsv_batch,
+};
 
 fn query(database: &mut Database, sql: &str) -> QueryResult {
     let results = database.execute(sql).expect("query succeeds");
@@ -52,6 +57,20 @@ fn parses_cast_as_a_bounded_select_item_with_an_optional_alias() {
             name: "ratio".to_owned(),
             target_type: DataType::Int64,
             alias: Some("whole".to_owned()),
+        }]
+    );
+
+    let statements =
+        parse("SELECT CAST(reading AS Bool) AS present FROM samples").expect("valid Bool CAST");
+    let Statement::Select(select) = &statements[0] else {
+        panic!("expected SELECT");
+    };
+    assert_eq!(
+        select.items,
+        [SelectItem::Cast {
+            name: "reading".to_owned(),
+            target_type: DataType::Bool,
+            alias: Some("present".to_owned()),
         }]
     );
 
@@ -318,6 +337,64 @@ fn projects_negative_values_and_integer_extremes_with_filters_aliases_and_limits
 }
 
 #[test]
+fn int64_to_bool_maps_zero_and_nonzero_extrema_after_row_selection() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, reading Int64); \
+             INSERT INTO samples VALUES \
+             (1, -9223372036854775808), (2, -1), (3, 0), (4, 1), \
+             (5, 9223372036854775807);",
+        )
+        .expect("setup");
+
+    let all = query(&mut database, "SELECT CAST(reading AS Bool) FROM samples");
+    assert_eq!(
+        all.columns,
+        [ResultColumn {
+            name: "CAST(reading AS Bool)".to_owned(),
+            data_type: DataType::Bool,
+        }]
+    );
+    assert_eq!(
+        all.rows,
+        [
+            vec![Value::Bool(true)],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(false)],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(true)],
+        ]
+    );
+
+    let selected = query(
+        &mut database,
+        "SELECT id, CAST(reading AS Bool) AS truthy FROM samples \
+         WHERE reading >= 0 ORDER BY truthy, id DESC LIMIT 2",
+    );
+    assert_eq!(
+        selected.columns,
+        [
+            ResultColumn {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "truthy".to_owned(),
+                data_type: DataType::Bool,
+            },
+        ]
+    );
+    assert_eq!(
+        selected.rows,
+        [
+            vec![Value::Int64(3), Value::Bool(false)],
+            vec![Value::Int64(5), Value::Bool(true)],
+        ]
+    );
+}
+
+#[test]
 fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
     let mut database = Database::new();
     database
@@ -370,6 +447,29 @@ fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
             "column {name}"
         );
     }
+
+    assert_eq!(
+        database.execute("SELECT CAST(missing AS Bool) FROM samples"),
+        Err(Error::ColumnNotFound {
+            table: "samples".to_owned(),
+            column: "missing".to_owned(),
+        })
+    );
+    for (name, actual) in [
+        ("f", DataType::Float64),
+        ("b", DataType::Bool),
+        ("s", DataType::String),
+    ] {
+        assert_eq!(
+            database.execute(&format!("SELECT CAST({name} AS Bool) FROM samples")),
+            Err(Error::TypeMismatch {
+                context: format!("CAST argument '{name}'"),
+                expected: "Int64".to_owned(),
+                actual: actual.to_string(),
+            }),
+            "column {name}"
+        );
+    }
 }
 
 #[test]
@@ -380,7 +480,6 @@ fn rejects_malformed_or_unsupported_cast_syntax() {
         "SELECT CAST(reading Float64) FROM samples",
         "SELECT CAST(reading AS) FROM samples",
         "SELECT CAST(reading AS Missing) FROM samples",
-        "SELECT CAST(reading AS Bool) FROM samples",
         "SELECT CAST(reading AS String) FROM samples",
         "SELECT CAST(reading AS Float64 FROM samples",
         "SELECT CAST(reading AS Float64) converted FROM samples",
@@ -388,6 +487,78 @@ fn rejects_malformed_or_unsupported_cast_syntax() {
     ] {
         assert!(parse(sql).is_err(), "{sql:?} must be rejected");
     }
+}
+
+#[test]
+fn int64_to_bool_cast_obeys_result_caps() {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 2,
+        max_values: 2,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE samples (reading Int64); \
+             INSERT INTO samples VALUES (0), (1), (-1);",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Bool) FROM samples LIMIT 2",
+        )
+        .rows,
+        [vec![Value::Bool(false)], vec![Value::Bool(true)]]
+    );
+    assert_eq!(
+        database.execute("SELECT CAST(reading AS Bool) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+
+    let mut value_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 3,
+        max_values: 5,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    value_limited
+        .execute(
+            "CREATE TABLE samples (reading Int64); \
+             INSERT INTO samples VALUES (0), (1), (-1);",
+        )
+        .expect("setup");
+    assert_eq!(
+        value_limited.execute("SELECT CAST(reading AS Bool), CAST(reading AS Bool) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result values",
+            actual: 6,
+            max: 5,
+        })
+    );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    byte_limited
+        .execute("CREATE TABLE samples (reading Int64); INSERT INTO samples VALUES (0);")
+        .expect("setup");
+    assert!(matches!(
+        byte_limited.execute("SELECT CAST(reading AS Bool) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            max: 0,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -399,6 +570,12 @@ fn cast_remains_an_ordinary_projection() {
 
     assert_eq!(
         database.execute("SELECT CAST(reading AS Float64), COUNT(*) FROM samples GROUP BY reading"),
+        Err(Error::InvalidQuery(
+            "CAST projections are only supported in ungrouped SELECT queries".to_owned()
+        ))
+    );
+    assert_eq!(
+        database.execute("SELECT CAST(reading AS Bool), COUNT(*) FROM samples GROUP BY reading"),
         Err(Error::InvalidQuery(
             "CAST projections are only supported in ungrouped SELECT queries".to_owned()
         ))
@@ -421,5 +598,63 @@ fn emits_float64_to_int64_as_typed_csv_and_json() {
     assert_eq!(
         String::from_utf8(json).unwrap(),
         "{\"columns\":[{\"name\":\"converted\",\"type\":\"Int64\"}],\"rows\":[[-7],[0],[12]]}\n"
+    );
+}
+
+#[test]
+fn emits_int64_to_bool_in_all_cli_formats() {
+    let sql = "CREATE TABLE samples (reading Int64); \
+               INSERT INTO samples VALUES (-7), (0), (12); \
+               SELECT CAST(reading AS Bool) AS enabled \
+               FROM samples ORDER BY enabled;";
+
+    let mut table = Vec::new();
+    run_table_batch(sql.as_bytes(), &mut table).expect("table batch succeeds");
+    assert_eq!(
+        String::from_utf8(table).unwrap(),
+        "+---------+\n\
+         | enabled |\n\
+         +---------+\n\
+         | false   |\n\
+         | true    |\n\
+         | true    |\n\
+         +---------+\n"
+    );
+
+    let mut csv = Vec::new();
+    run_csv_batch(sql.as_bytes(), &mut csv).expect("CSV batch succeeds");
+    assert_eq!(
+        String::from_utf8(csv).unwrap(),
+        "enabled\nfalse\ntrue\ntrue\n"
+    );
+
+    let mut tsv = Vec::new();
+    run_tsv_batch(sql.as_bytes(), &mut tsv).expect("TSV batch succeeds");
+    assert_eq!(
+        String::from_utf8(tsv).unwrap(),
+        "enabled\nfalse\ntrue\ntrue\n"
+    );
+
+    let mut json = Vec::new();
+    run_json_batch(sql.as_bytes(), &mut json).expect("JSON batch succeeds");
+    assert_eq!(
+        String::from_utf8(json).unwrap(),
+        "{\"columns\":[{\"name\":\"enabled\",\"type\":\"Bool\"}],\"rows\":[[false],[true],[true]]}\n"
+    );
+
+    let mut json_each_row = Vec::new();
+    run_json_each_row_batch(sql.as_bytes(), &mut json_each_row)
+        .expect("JSONEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_each_row).unwrap(),
+        "{\"enabled\":false}\n{\"enabled\":true}\n{\"enabled\":true}\n"
+    );
+
+    let mut json_compact_each_row = Vec::new();
+    run_json_compact_each_row_batch(sql.as_bytes(), &mut json_compact_each_row)
+        .expect("JSONCompactEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_compact_each_row).unwrap(),
+        "[false]\n[true]\n[true]\n"
     );
 }
