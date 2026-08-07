@@ -1,5 +1,6 @@
 use rusthouse::batch::engine::{Database, StatementResult};
 use rusthouse::batch::error::Error;
+use rusthouse::batch::sql::Statement;
 use rusthouse::batch::value::Value;
 
 fn query_rows(database: &mut Database, sql: &str) -> Vec<Vec<Value>> {
@@ -8,6 +9,29 @@ fn query_rows(database: &mut Database, sql: &str) -> Vec<Vec<Value>> {
         panic!("expected query result");
     };
     result.rows
+}
+
+#[test]
+fn original_public_positional_insert_ast_shape_remains_executable() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .expect("create target");
+
+    assert_eq!(
+        database.execute_statement(Statement::Insert {
+            table: "events".to_owned(),
+            rows: vec![vec![Value::Int64(7), Value::String("seven".to_owned()),]],
+        }),
+        Ok(StatementResult::Command {
+            tag: "INSERT",
+            affected_rows: 1,
+        })
+    );
+    assert_eq!(
+        query_rows(&mut database, "SELECT id, label FROM events;"),
+        [vec![Value::Int64(7), Value::String("seven".to_owned()),]]
+    );
 }
 
 #[test]

@@ -68,8 +68,12 @@ pub enum Statement {
     },
     Insert {
         table: String,
-        /// Explicit input-column order. `None` preserves positional INSERT.
-        columns: Option<Vec<String>>,
+        rows: Vec<Vec<Value>>,
+    },
+    /// `INSERT` with a complete explicit input-column order.
+    InsertWithColumns {
+        table: String,
+        columns: Vec<String>,
         rows: Vec<Vec<Value>>,
     },
     /// Exactly one typed literal with no `FROM` or other clauses.
@@ -1074,11 +1078,14 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(Statement::Insert {
-            table,
-            columns,
-            rows,
-        })
+        match columns {
+            Some(columns) => Ok(Statement::InsertWithColumns {
+                table,
+                columns,
+                rows,
+            }),
+            None => Ok(Statement::Insert { table, rows }),
+        }
     }
 
     fn parse_select(&mut self) -> Result<Select> {
@@ -2084,10 +2091,9 @@ mod tests {
     fn parses_escaped_strings_and_multiple_rows() {
         let statements =
             parse("INSERT INTO notes VALUES (1, 'it''s good'), (2, 'ok')").expect("valid insert");
-        let Statement::Insert { columns, rows, .. } = &statements[0] else {
+        let Statement::Insert { rows, .. } = &statements[0] else {
             panic!("expected insert");
         };
-        assert_eq!(columns, &None);
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
     }
@@ -2099,7 +2105,7 @@ mod tests {
              VALUES ('first', true, 2.5, 7), ('second', false, 4.0, 8)",
         )
         .expect("valid INSERT column list");
-        let Statement::Insert {
+        let Statement::InsertWithColumns {
             table,
             columns,
             rows,
@@ -2110,12 +2116,12 @@ mod tests {
         assert_eq!(table, "metrics");
         assert_eq!(
             columns,
-            &Some(vec![
+            &vec![
                 "LABEL".to_owned(),
                 "active".to_owned(),
                 "score".to_owned(),
                 "id".to_owned(),
-            ])
+            ]
         );
         assert_eq!(
             rows[0],
