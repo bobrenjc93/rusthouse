@@ -257,6 +257,12 @@ pub enum Predicate {
         column: String,
         prefix: String,
     },
+    /// A case-sensitive String containment match parsed from
+    /// `column LIKE '%substring%'`.
+    LikeContains {
+        column: String,
+        substring: String,
+    },
     Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
@@ -1718,28 +1724,41 @@ impl<'a> Parser<'a> {
             let TokenKind::String(mut pattern) = self.take_kind() else {
                 return Err(Error::Sql {
                     position: pattern_position,
-                    message: "LIKE pattern must be a String literal with exactly one terminal '%'"
+                    message: "LIKE pattern must be a String literal of the form 'prefix%' or '%substring%'"
                         .to_owned(),
                 });
             };
             if !pattern.ends_with('%') {
                 return Err(Error::Sql {
                     position: pattern_position,
-                    message: "LIKE pattern must contain exactly one terminal '%'".to_owned(),
+                    message: "LIKE pattern must have the exact form 'prefix%' or '%substring%'"
+                        .to_owned(),
                 });
             }
             pattern.pop();
+            let contains = pattern.starts_with('%');
+            if contains {
+                pattern.remove(0);
+            }
             if pattern.contains('%') {
                 return Err(Error::Sql {
                     position: pattern_position,
-                    message: "LIKE pattern must contain exactly one terminal '%'".to_owned(),
+                    message: "LIKE pattern must have the exact form 'prefix%' or '%substring%'"
+                        .to_owned(),
                 });
             }
             self.record_predicate_node()?;
-            return Ok(Predicate::LikePrefix {
-                column,
-                prefix: pattern,
-            });
+            return if contains {
+                Ok(Predicate::LikeContains {
+                    column,
+                    substring: pattern,
+                })
+            } else {
+                Ok(Predicate::LikePrefix {
+                    column,
+                    prefix: pattern,
+                })
+            };
         }
         let operator = self.parse_comparison_operator()?;
         let right = self.parse_operand()?;
