@@ -896,7 +896,11 @@ impl<'a> Parser<'a> {
     }
 
     fn at_literal_start(&self) -> bool {
-        match self.peek() {
+        Self::token_can_start_literal(self.peek())
+    }
+
+    fn token_can_start_literal(token: &TokenKind) -> bool {
+        match token {
             TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Plus | TokenKind::Minus => {
                 true
             }
@@ -1775,7 +1779,10 @@ impl<'a> Parser<'a> {
             TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("LIKE") => {
                 matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::String(_))
             }
-            TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("BETWEEN") => true,
+            TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("BETWEEN") => {
+                let lower_bound = Self::next_or_invalid(&mut lexer);
+                Self::token_can_start_literal(&lower_bound.kind)
+            }
             _ => false,
         }
     }

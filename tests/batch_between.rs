@@ -77,6 +77,49 @@ fn lowers_between_as_one_atom_in_regular_and_distinct_queries() {
 }
 
 #[test]
+fn unary_not_preserves_between_as_a_column_in_regular_and_distinct_queries() {
+    let expected = Predicate::Not(Box::new(comparison(
+        "between",
+        ComparisonOperator::Equal,
+        Value::Int64(1),
+    )));
+    for projection in ["between", "DISTINCT between"] {
+        assert_eq!(
+            predicate(&format!(
+                "SELECT {projection} FROM samples WHERE NOT between = 1"
+            )),
+            expected,
+            "{projection}",
+        );
+    }
+
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (between Int64); \
+             INSERT INTO samples VALUES (1), (2), (1), (3);",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT between FROM samples WHERE NOT between = 1"
+        )
+        .rows,
+        [vec![Value::Int64(2)], vec![Value::Int64(3)]],
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT between FROM samples WHERE NOT between = 1"
+        )
+        .rows,
+        [vec![Value::Int64(2)], vec![Value::Int64(3)]],
+    );
+}
+
+#[test]
 fn executes_inclusive_between_for_every_physical_type() {
     let mut database = Database::new();
     database
