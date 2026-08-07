@@ -97,6 +97,10 @@ the query; a selected `i64::MIN` reports a typed numeric-overflow error.
 integers are rounded away from zero. It supports an optional `AS alias`,
 ordering by the unaliased expression or alias, `WHERE`, and `LIMIT`; non-
 `Float64` arguments are rejected with a typed error.
+`FLOOR(float64_column)` has the same ungrouped projection shape and returns the
+greatest integral `Float64` less than or equal to each finite input. It supports
+an optional `AS alias`, ordering by the unaliased expression or alias, `WHERE`,
+and `LIMIT`; non-`Float64` arguments are rejected with a typed error.
 
 `ROW_NUMBER() OVER ()` adds a one-based `Int64` sequence to an ungrouped,
 non-`DISTINCT` projection and accepts an optional `AS alias`. The ordered form
