@@ -74,10 +74,10 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// Checked `Int64` column-minus-literal expressions, `CAST`, `LENGTH`, `ABS`,
-/// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window forms
-/// provide bounded projections in ungrouped queries. An optional `AS` alias
-/// controls each result column name.
+/// Checked `Int64` column-minus-literal expressions, `CAST`, `LENGTH`, `LOWER`,
+/// `ABS`, `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER`
+/// window forms provide bounded projections in ungrouped queries. An optional
+/// `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
 ///
@@ -216,10 +216,11 @@ impl Database {
     ///
     /// The header must exactly match the target table's column names in schema
     /// order. Data fields are parsed using their `Int64`, finite `Float64`,
-    /// `Bool`, or `String` schema types. A `String` data field may be
-    /// double-quoted, allowing commas, LF or CRLF line endings, and doubled
-    /// (`""`) quote escapes. Headers and non-`String` fields must remain
-    /// unquoted. Only LF and CRLF line endings are accepted.
+    /// `Bool`, or `String` schema types. Data fields may be double-quoted,
+    /// allowing commas, LF or CRLF line endings, and doubled (`""`) quote
+    /// escapes; decoded contents are parsed using the same schema-type rules.
+    /// Headers must remain unquoted. Only LF and CRLF line endings are
+    /// accepted.
     ///
     /// The complete input, header, every row and value, configured limits, and
     /// remaining table capacity are validated before any physical column is
@@ -1286,6 +1287,9 @@ enum ResolvedItem {
     StringLength {
         source: usize,
     },
+    StringLower {
+        source: usize,
+    },
     Int64Abs {
         source: usize,
     },
@@ -1521,6 +1525,30 @@ fn resolve_select_items(
                         .clone()
                         .unwrap_or_else(|| format!("LENGTH({})", table.schema()[source].name)),
                     data_type: DataType::Int64,
+                });
+            }
+            SelectItem::Lower { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::String {
+                    return Err(Error::TypeMismatch {
+                        context: format!("LOWER argument '{name}'"),
+                        expected: DataType::String.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "LOWER projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::StringLower { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("LOWER({})", table.schema()[source].name)),
+                    data_type: DataType::String,
                 });
             }
             SelectItem::Abs { name, alias } => {
@@ -1804,6 +1832,9 @@ fn execute_projection(
                         ResolvedItem::StringLength { source } => Value::Int64(
                             string_length_to_i64(string_at(table, *source, *row).len())?,
                         ),
+                        ResolvedItem::StringLower { source } => {
+                            Value::String(string_at(table, *source, *row).to_ascii_lowercase())
+                        }
                         ResolvedItem::Int64Abs { source } => {
                             Value::Int64(checked_int64_abs(int64_at(table, *source, *row))?)
                         }
@@ -1933,7 +1964,9 @@ fn validate_projection_result_limits(
     for row in rows {
         for item in items {
             let source = match item {
-                ResolvedItem::Column { source, .. } => Some(*source),
+                ResolvedItem::Column { source, .. } | ResolvedItem::StringLower { source } => {
+                    Some(*source)
+                }
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
@@ -1993,6 +2026,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringLower { .. } => {
+                    unreachable!("LOWER projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Int64Abs { .. } => {
                     unreachable!("ABS projections are restricted to ungrouped queries")
@@ -2442,6 +2478,9 @@ impl GroupedData<'_> {
                         ResolvedItem::StringLength { .. } => {
                             unreachable!("LENGTH projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::StringLower { .. } => {
+                            unreachable!("LOWER projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::Int64Abs { .. } => {
                             unreachable!("ABS projections are restricted to ungrouped queries")
                         }
@@ -2776,6 +2815,10 @@ fn order_source_rows(
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
                     .cmp(&string_at(table, source, right).len()),
+                ResolvedItem::StringLower { source } => ascii_lower_cmp(
+                    string_at(table, source, left),
+                    string_at(table, source, right),
+                ),
                 ResolvedItem::Int64Abs { source } => int64_at(table, source, left)
                     .unsigned_abs()
                     .cmp(&int64_at(table, source, right).unsigned_abs()),
@@ -2845,6 +2888,9 @@ fn order_grouped_rows(
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
                 }
+                ResolvedItem::StringLower { .. } => {
+                    unreachable!("LOWER projections are restricted to ungrouped queries")
+                }
                 ResolvedItem::Int64Abs { .. } => {
                     unreachable!("ABS projections are restricted to ungrouped queries")
                 }
@@ -2901,9 +2947,15 @@ fn checked_float64_to_int64(value: f64) -> Result<i64> {
 
 fn string_at(table: &Table, source: usize, row: usize) -> &str {
     let Column::String(values) = &table.columns()[source] else {
-        unreachable!("LENGTH input type is resolved")
+        unreachable!("String scalar input type is resolved")
     };
     &values[row]
+}
+
+fn ascii_lower_cmp(left: &str, right: &str) -> Ordering {
+    left.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
 fn string_length_to_i64(length: usize) -> Result<i64> {
