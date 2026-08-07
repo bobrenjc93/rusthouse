@@ -10,7 +10,7 @@ The accepted reference is the supplied ClickHouse Local build:
 - SHA-256: 6611c5aadcfac188031fa0fdf2676ec311771f96654a62b918b146b60dd11075
 - Binary size used for validation: 853,099,511 bytes
 
-The harness executes the local version command, calculates SHA-256 with shasum, and fails before benchmarking if either the 26.7.1 version or pinned checksum differs. The ClickHouse executable is an external validation tool and must not be committed.
+The harness executes the local version command, calculates SHA-256 with shasum, and fails before benchmarking if either the 26.7.1 version or pinned checksum differs. It also records the RustHouse binary SHA-256, source commit, inferred build profile, RUSTFLAGS, harness SHA-256, OS, CPU, and Rust toolchain. The ClickHouse executable is an external validation tool and must not be committed.
 
 Verify it independently:
 
@@ -66,7 +66,7 @@ The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 1
 
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. In quick mode, --seed is the one runtime seed. In default mode it is the root of a three-value panel formed by wrapping additions of the SplitMix64 golden-ratio increment. Changing the root deterministically changes every panel value, profile, and row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the profiles, aggregation contract, fixed work budget, per-case amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, derived dataset seeds, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, incomplete score-matrix, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. Timed stdout is streamed through SHA-256 without being retained; every engine execution must match the exact byte count and digest produced by repeating that engine's correctness-gated single-query output. The --details option writes schema-versioned JSON containing the profiles, aggregation contract, fixed work budget, per-case amplification, correctness and timed-output check counts, output digests, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, derived dataset seeds, and complete run provenance. Setup, execution, version, checksum, parse, correctness, output-digest, timing-stability, incomplete score-matrix, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
 
 ## Dataset and workloads
 

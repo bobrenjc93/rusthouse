@@ -1,6 +1,9 @@
-use std::io::Write as _;
+use sha2::{Digest as _, Sha256};
+use std::env;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub const CLICKHOUSE_VERSION: &str = "26.7.1";
@@ -14,9 +17,22 @@ pub struct EnginePaths {
 }
 
 #[derive(Debug, Clone)]
-pub struct ClickHouseIdentity {
-    pub version_output: String,
-    pub sha256: String,
+pub struct BenchmarkIdentity {
+    pub clickhouse_version_output: String,
+    pub clickhouse_sha256: String,
+    pub rusthouse_sha256: String,
+    pub rusthouse_source_commit: String,
+    pub rusthouse_build_profile: String,
+    pub rustflags: String,
+    pub harness_sha256: String,
+    pub os: String,
+    pub cpu: String,
+    pub rust_toolchain: String,
+}
+
+struct ClickHouseIdentity {
+    version_output: String,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -28,18 +44,69 @@ pub enum Engine {
 #[derive(Debug)]
 pub struct TimedOutput {
     pub stdout: String,
+    pub digest: OutputDigest,
 }
 
 #[derive(Debug)]
 pub struct TimedBatch {
     pub elapsed: Duration,
     pub query_repetitions: usize,
+    pub output_digest: OutputDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputDigest {
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl OutputDigest {
+    pub fn repeated(bytes: &[u8], repetitions: usize) -> Result<Self, String> {
+        if repetitions == 0 {
+            return Err("output digest repetition count must be positive".to_owned());
+        }
+        let byte_count = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|length| length.checked_mul(repetitions as u64))
+            .ok_or_else(|| "repeated output byte count overflowed".to_owned())?;
+        let mut hasher = Sha256::new();
+        for _ in 0..repetitions {
+            hasher.update(bytes);
+        }
+        Ok(Self {
+            bytes: byte_count,
+            sha256: format!("{:x}", hasher.finalize()),
+        })
+    }
 }
 
 impl EnginePaths {
-    pub fn validate(&self) -> Result<ClickHouseIdentity, String> {
+    pub fn validate(&self) -> Result<BenchmarkIdentity, String> {
         validate_rusthouse(&self.rusthouse)?;
-        validate_clickhouse(&self.clickhouse)
+        let clickhouse = validate_clickhouse(&self.clickhouse)?;
+        let executable = env::current_exe()
+            .map_err(|error| format!("could not locate benchmark executable: {error}"))?;
+        Ok(BenchmarkIdentity {
+            clickhouse_version_output: clickhouse.version_output,
+            clickhouse_sha256: clickhouse.sha256,
+            rusthouse_sha256: sha256_file(&self.rusthouse, "RustHouse")?,
+            rusthouse_source_commit: command_text(
+                "git",
+                &["rev-parse", "HEAD"],
+                "RustHouse source commit",
+            )?,
+            rusthouse_build_profile: infer_build_profile(&self.rusthouse)?,
+            rustflags: env::var("RUSTFLAGS").unwrap_or_else(|_| "<unset>".to_owned()),
+            harness_sha256: sha256_file(&executable, "benchmark harness")?,
+            os: command_text("uname", &["-a"], "operating system identity")?,
+            cpu: command_text(
+                "sysctl",
+                &["-n", "machdep.cpu.brand_string"],
+                "CPU identity",
+            )
+            .unwrap_or_else(|_| env::consts::ARCH.to_owned()),
+            rust_toolchain: command_text("rustc", &["--version", "--verbose"], "Rust toolchain")?,
+        })
     }
 
     pub fn execute_correctness(
@@ -49,9 +116,10 @@ impl EnginePaths {
         query_sql: &str,
     ) -> Result<TimedOutput, String> {
         let batch = sql_batch(setup_sql, query_sql, 1)?;
-        let (_, stdout) = self.execute_batch(engine, &batch, true)?;
+        let (_, stdout, digest) = self.execute_batch(engine, &batch, true)?;
         Ok(TimedOutput {
             stdout: stdout.expect("captured execution returns stdout"),
+            digest,
         })
     }
 
@@ -63,11 +131,12 @@ impl EnginePaths {
         query_repetitions: usize,
     ) -> Result<TimedBatch, String> {
         let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
-        let (elapsed, stdout) = self.execute_batch(engine, &batch, false)?;
+        let (elapsed, stdout, output_digest) = self.execute_batch(engine, &batch, false)?;
         debug_assert!(stdout.is_none());
         Ok(TimedBatch {
             elapsed,
             query_repetitions,
+            output_digest,
         })
     }
 
@@ -76,7 +145,7 @@ impl EnginePaths {
         engine: Engine,
         batch: &str,
         capture_stdout: bool,
-    ) -> Result<(Duration, Option<String>), String> {
+    ) -> Result<(Duration, Option<String>, OutputDigest), String> {
         let mut command = match engine {
             Engine::RustHouse => {
                 let mut command = Command::new(&self.rusthouse);
@@ -91,11 +160,7 @@ impl EnginePaths {
         };
         command
             .stdin(Stdio::piped())
-            .stdout(if capture_stdout {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         let started = Instant::now();
@@ -106,16 +171,27 @@ impl EnginePaths {
                 engine.path(self).display()
             )
         })?;
-        child
-            .stdin
+        let stdout = child
+            .stdout
             .take()
-            .ok_or_else(|| format!("{} stdin was not piped", engine.name()))?
-            .write_all(batch.as_bytes())
-            .map_err(|error| format!("could not write SQL to {}: {error}", engine.name()))?;
+            .ok_or_else(|| format!("{} stdout was not piped", engine.name()))?;
+        let output_reader = thread::spawn(move || digest_output(stdout, capture_stdout));
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| format!("{} stdin was not piped", engine.name()))?;
+            stdin
+                .write_all(batch.as_bytes())
+                .map_err(|error| format!("could not write SQL to {}: {error}", engine.name()))?;
+        }
         let output = child
             .wait_with_output()
             .map_err(|error| format!("could not wait for {}: {error}", engine.name()))?;
         let elapsed = started.elapsed();
+        let captured = output_reader
+            .join()
+            .map_err(|_| format!("{} output digest worker panicked", engine.name()))??;
 
         if !output.status.success() {
             return Err(format!(
@@ -125,16 +201,49 @@ impl EnginePaths {
                 summarize_stderr(&output.stderr)
             ));
         }
-        let stdout =
-            if capture_stdout {
-                Some(String::from_utf8(output.stdout).map_err(|error| {
-                    format!("{} emitted non-UTF-8 output: {error}", engine.name())
-                })?)
-            } else {
-                None
-            };
-        Ok((elapsed, stdout))
+        let stdout = captured
+            .bytes
+            .map(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|error| format!("{} emitted non-UTF-8 output: {error}", engine.name()))
+            })
+            .transpose()?;
+        Ok((elapsed, stdout, captured.digest))
     }
+}
+
+struct CapturedOutput {
+    digest: OutputDigest,
+    bytes: Option<Vec<u8>>,
+}
+
+fn digest_output(mut reader: impl Read, capture: bool) -> Result<CapturedOutput, String> {
+    let mut hasher = Sha256::new();
+    let mut byte_count = 0_u64;
+    let mut captured = capture.then(Vec::new);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read engine output: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        byte_count = byte_count
+            .checked_add(read as u64)
+            .ok_or_else(|| "engine output byte count overflowed".to_owned())?;
+        hasher.update(&buffer[..read]);
+        if let Some(bytes) = &mut captured {
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+    }
+    Ok(CapturedOutput {
+        digest: OutputDigest {
+            bytes: byte_count,
+            sha256: format!("{:x}", hasher.finalize()),
+        },
+        bytes: captured,
+    })
 }
 
 fn sql_batch(setup_sql: &str, query_sql: &str, query_repetitions: usize) -> Result<String, String> {
@@ -190,6 +299,66 @@ fn validate_rusthouse(path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn infer_build_profile(path: &Path) -> Result<String, String> {
+    for component in path.components().rev() {
+        let component = component.as_os_str().to_string_lossy();
+        if component == "release" || component == "debug" {
+            return Ok(component.into_owned());
+        }
+    }
+    Err(format!(
+        "could not infer RustHouse build profile from '{}'",
+        path.display()
+    ))
+}
+
+fn command_text(program: &str, arguments: &[&str], label: &str) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("could not collect {label}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{label} command failed with {}: {}",
+            output.status,
+            summarize_stderr(&output.stderr)
+        ));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|error| format!("{label} was not UTF-8: {error}"))?
+        .trim()
+        .to_owned();
+    if value.is_empty() {
+        return Err(format!("{label} was empty"));
+    }
+    Ok(value)
+}
+
+fn sha256_file(path: &Path, label: &str) -> Result<String, String> {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("could not calculate {label} SHA-256: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{label} checksum failed with {}: {}",
+            output.status,
+            summarize_stderr(&output.stderr)
+        ));
+    }
+    let checksum_output = String::from_utf8(output.stdout)
+        .map_err(|error| format!("{label} checksum output was not UTF-8: {error}"))?;
+    checksum_output
+        .split_whitespace()
+        .next()
+        .filter(|value| {
+            value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| format!("unexpected {label} shasum output: {checksum_output:?}"))
 }
 
 fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {

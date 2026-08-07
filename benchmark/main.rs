@@ -16,7 +16,7 @@ use std::time::Duration;
 use config::{Config, ParseResult};
 use dataset::{Dataset, SchemaProfile};
 use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use process::{BenchmarkIdentity, Engine, EnginePaths, OutputDigest, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, WorkloadDimension, median, parity_score};
 use workload::workloads;
 
@@ -66,15 +66,21 @@ struct CaseResult {
     rusthouse_primary_median_ms: f64,
     clickhouse_primary_median_ms: f64,
     primary_ratio: f64,
+    rusthouse_primary_output_digest: OutputDigest,
+    clickhouse_primary_output_digest: OutputDigest,
     end_to_end: TimingSeries,
     rusthouse_end_to_end_median_ms: f64,
     clickhouse_end_to_end_median_ms: f64,
     end_to_end_ratio: f64,
+    rusthouse_end_to_end_output_digest: OutputDigest,
+    clickhouse_end_to_end_output_digest: OutputDigest,
 }
 
 #[derive(Debug, Default)]
 struct CorrectnessGate {
     passed: bool,
+    rusthouse_stdout: Option<Vec<u8>>,
+    clickhouse_stdout: Option<Vec<u8>>,
 }
 
 impl CorrectnessGate {
@@ -85,8 +91,49 @@ impl CorrectnessGate {
         clickhouse: &TimedOutput,
     ) -> Result<(), String> {
         compare_outputs(&rusthouse.stdout, &clickhouse.stdout, columns)?;
+        let rusthouse_digest = OutputDigest::repeated(rusthouse.stdout.as_bytes(), 1)?;
+        let clickhouse_digest = OutputDigest::repeated(clickhouse.stdout.as_bytes(), 1)?;
+        if rusthouse.digest != rusthouse_digest || clickhouse.digest != clickhouse_digest {
+            return Err(
+                "captured correctness output did not match its streamed SHA-256 digest".to_owned(),
+            );
+        }
         self.passed = true;
+        self.rusthouse_stdout = Some(rusthouse.stdout.as_bytes().to_vec());
+        self.clickhouse_stdout = Some(clickhouse.stdout.as_bytes().to_vec());
         Ok(())
+    }
+
+    fn expected_digest(&self, engine: Engine, repetitions: usize) -> Result<OutputDigest, String> {
+        if !self.passed {
+            return Err("timed batch was not preceded by a passing correctness run".to_owned());
+        }
+        let bytes = match engine {
+            Engine::RustHouse => self.rusthouse_stdout.as_deref(),
+            Engine::ClickHouse => self.clickhouse_stdout.as_deref(),
+        }
+        .ok_or_else(|| "correctness output was not retained for digest validation".to_owned())?;
+        OutputDigest::repeated(bytes, repetitions)
+    }
+
+    fn verify_timed_output(
+        &self,
+        engine: Engine,
+        observed: &OutputDigest,
+        repetitions: usize,
+    ) -> Result<(), String> {
+        let expected = self.expected_digest(engine, repetitions)?;
+        if observed == &expected {
+            return Ok(());
+        }
+        let engine = match engine {
+            Engine::RustHouse => "RustHouse",
+            Engine::ClickHouse => "ClickHouse Local",
+        };
+        Err(format!(
+            "{engine} amplified output digest mismatch for {repetitions} repetitions: expected {} bytes / {}, got {} bytes / {}",
+            expected.bytes, expected.sha256, observed.bytes, observed.sha256
+        ))
     }
 }
 
@@ -173,6 +220,7 @@ fn run(config: Config) -> Result<Report, String> {
     let identity = paths.validate()?;
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
+    let mut timed_output_digest_checks = 0_usize;
 
     for (seed_index, seed) in seeds.iter().copied().enumerate() {
         for (profile_index, profile) in profiles.into_iter().enumerate() {
@@ -249,6 +297,7 @@ fn run(config: Config) -> Result<Report, String> {
                             iteration >= settings.warmups,
                             &mut primary,
                         )?;
+                        timed_output_digest_checks += 2;
                     }
 
                     let mut end_to_end = TimingSeries::default();
@@ -275,6 +324,7 @@ fn run(config: Config) -> Result<Report, String> {
                             true,
                             &mut end_to_end,
                         )?;
+                        timed_output_digest_checks += 2;
                     }
 
                     let rusthouse_primary_batch_median = stable_median(
@@ -328,6 +378,14 @@ fn run(config: Config) -> Result<Report, String> {
                     let primary_ratio = clickhouse_primary_median / rusthouse_primary_median;
                     let end_to_end_ratio =
                         clickhouse_end_to_end_median / rusthouse_end_to_end_median;
+                    let rusthouse_primary_output_digest =
+                        correctness_gate.expected_digest(Engine::RustHouse, query_amplification)?;
+                    let clickhouse_primary_output_digest = correctness_gate
+                        .expected_digest(Engine::ClickHouse, query_amplification)?;
+                    let rusthouse_end_to_end_output_digest =
+                        correctness_gate.expected_digest(Engine::RustHouse, 1)?;
+                    let clickhouse_end_to_end_output_digest =
+                        correctness_gate.expected_digest(Engine::ClickHouse, 1)?;
                     eprintln!(
                         "  primary/query: RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end ratio {:.3}",
                         rusthouse_primary_median,
@@ -349,10 +407,14 @@ fn run(config: Config) -> Result<Report, String> {
                         rusthouse_primary_median_ms: rusthouse_primary_median,
                         clickhouse_primary_median_ms: clickhouse_primary_median,
                         primary_ratio,
+                        rusthouse_primary_output_digest,
+                        clickhouse_primary_output_digest,
                         end_to_end,
                         rusthouse_end_to_end_median_ms: rusthouse_end_to_end_median,
                         clickhouse_end_to_end_median_ms: clickhouse_end_to_end_median,
                         end_to_end_ratio,
+                        rusthouse_end_to_end_output_digest,
+                        clickhouse_end_to_end_output_digest,
                     });
                 }
             }
@@ -394,6 +456,7 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score,
             end_to_end_score,
             correctness_checks,
+            timed_output_digest_checks,
         );
         fs::write(path, details)
             .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
@@ -413,7 +476,7 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score.score, end_to_end_score.score
         ),
         format!(
-            "primary timing holds a fixed {}-query budget per workload/scale/sample across all profile/seed cells; each symmetric engine batch uses {} or {} identical queries, divides positive batch wall time by its exact repetition count, discards stdout, and performs no startup subtraction",
+            "primary timing holds a fixed {}-query budget per workload/scale/sample across all profile/seed cells; each symmetric engine batch uses {} or {} identical queries, divides positive batch wall time by its exact repetition count, streams stdout through exact-byte and SHA-256 validation without retaining it, and performs no startup subtraction",
             settings.sustained_query_budget,
             minimum_amplification,
             maximum_amplification
@@ -434,9 +497,26 @@ fn run(config: Config) -> Result<Report, String> {
             settings.warmups,
             settings.samples,
             settings.end_to_end_samples,
-            identity.sha256
+            identity.clickhouse_sha256
         ),
-        format!("ClickHouse identity: {}", identity.version_output),
+        format!("ClickHouse identity: {}", identity.clickhouse_version_output),
+        format!(
+            "RustHouse provenance: SHA-256={}, source_commit={}, build_profile={}, RUSTFLAGS={}",
+            identity.rusthouse_sha256,
+            identity.rusthouse_source_commit,
+            identity.rusthouse_build_profile,
+            identity.rustflags
+        ),
+        format!(
+            "harness SHA-256={}; host OS={}; CPU={}; Rust toolchain={}",
+            identity.harness_sha256,
+            identity.os,
+            identity.cpu,
+            identity.rust_toolchain.replace('\n', " | ")
+        ),
+        format!(
+            "{timed_output_digest_checks} timed engine outputs matched exact byte counts and streamed SHA-256 digests derived from their correctness-gated single-query outputs"
+        ),
         "limitation: amplification measures repeated warm in-process work, retains a profile-batch-dependent fraction of startup/setup, and does not model concurrency, durable storage, or network access".to_owned(),
         "aggregation is fail-closed and equally weights workload within profile/seed/family/scale, then scale, family, seed, and schema profile".to_owned(),
     ];
@@ -599,6 +679,16 @@ fn accept_timed_pair(
             rusthouse.query_repetitions, clickhouse.query_repetitions
         ));
     }
+    gate.verify_timed_output(
+        Engine::RustHouse,
+        &rusthouse.output_digest,
+        expected_repetitions,
+    )?;
+    gate.verify_timed_output(
+        Engine::ClickHouse,
+        &clickhouse.output_digest,
+        expected_repetitions,
+    )?;
 
     let rusthouse_batch_ms = rusthouse.elapsed.as_secs_f64() * 1_000.0;
     let clickhouse_batch_ms = clickhouse.elapsed.as_secs_f64() * 1_000.0;
@@ -680,11 +770,12 @@ fn stable_sample_count(samples: &[f64], maximum_spread: f64) -> usize {
 
 fn details_json(
     config: &Config,
-    identity: &ClickHouseIdentity,
+    identity: &BenchmarkIdentity,
     cases: &[CaseResult],
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
+    timed_output_digest_checks: usize,
 ) -> String {
     let settings = config.mode.settings();
     let seeds = config.mode.seeds(config.seed);
@@ -701,7 +792,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":6,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":7,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -736,14 +827,22 @@ fn details_json(
     }
     write!(
         output,
-        "],\"aggregation\":{{\"space\":\"log\",\"ratio_floor\":0.01,\"ratio_cap\":1.0,\"hierarchy\":[\"workload\",\"scale\",\"family\",\"seed\",\"profile\"],\"complete_matrix_required\":true}},\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_total_profile_seed_budget\",\"sustained_query_budget\":{},\"case_query_amplification_min\":{},\"case_query_amplification_max\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"stability_gate\":\"strict_majority_window\",\"max_majority_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"aggregation\":{{\"space\":\"log\",\"ratio_floor\":0.01,\"ratio_cap\":1.0,\"hierarchy\":[\"workload\",\"scale\",\"family\",\"seed\",\"profile\"],\"complete_matrix_required\":true}},\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_total_profile_seed_budget\",\"sustained_query_budget\":{},\"case_query_amplification_min\":{},\"case_query_amplification_max\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"timed_output_validation\":\"exact_bytes_and_streamed_sha256_of_repeated_correctness_output\",\"stability_gate\":\"strict_majority_window\",\"max_majority_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"timed_output_digest_checks\":{timed_output_digest_checks},\"provenance\":{{\"rusthouse_path\":{},\"rusthouse_sha256\":{},\"rusthouse_source_commit\":{},\"rusthouse_build_profile\":{},\"rustflags\":{},\"harness_sha256\":{},\"os\":{},\"cpu\":{},\"rust_toolchain\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{}}},\"limitations\":[{},{}],\"cases\":[",
         settings.sustained_query_budget,
         minimum_amplification,
         maximum_amplification,
         json_string(&config.rusthouse.display().to_string()),
+        json_string(&identity.rusthouse_sha256),
+        json_string(&identity.rusthouse_source_commit),
+        json_string(&identity.rusthouse_build_profile),
+        json_string(&identity.rustflags),
+        json_string(&identity.harness_sha256),
+        json_string(&identity.os),
+        json_string(&identity.cpu),
+        json_string(&identity.rust_toolchain),
         json_string(&config.clickhouse.display().to_string()),
-        json_string(&identity.version_output),
-        json_string(&identity.sha256),
+        json_string(&identity.clickhouse_version_output),
+        json_string(&identity.clickhouse_sha256),
         json_string("amplification measures repeated warm in-process work and retains a case-dependent fraction of startup and setup"),
         json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
     )
@@ -755,7 +854,7 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"profile\":{},\"seed\":{},\"dataset_seed\":{},\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"profile\":{},\"seed\":{},\"dataset_seed\":{},\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_output_bytes\":{},\"rusthouse_output_sha256\":{},\"clickhouse_output_bytes\":{},\"clickhouse_output_sha256\":{},\"rusthouse_batch_samples_ms\":",
             json_string(case.profile),
             case.seed,
             case.dataset_seed,
@@ -767,7 +866,11 @@ fn details_json(
             case.clickhouse_primary_batch_median_ms,
             case.rusthouse_primary_median_ms,
             case.clickhouse_primary_median_ms,
-            case.primary_ratio
+            case.primary_ratio,
+            case.rusthouse_primary_output_digest.bytes,
+            json_string(&case.rusthouse_primary_output_digest.sha256),
+            case.clickhouse_primary_output_digest.bytes,
+            json_string(&case.clickhouse_primary_output_digest.sha256)
         )
         .expect("writing to String cannot fail");
         write_number_array(&mut output, &case.primary.rusthouse_batch_ms);
@@ -779,10 +882,14 @@ fn details_json(
         write_number_array(&mut output, &case.primary.clickhouse_per_query_ms);
         write!(
             output,
-            "}},\"end_to_end\":{{\"rusthouse_median_ms\":{:.6},\"clickhouse_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_samples_ms\":",
+            "}},\"end_to_end\":{{\"rusthouse_median_ms\":{:.6},\"clickhouse_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_output_bytes\":{},\"rusthouse_output_sha256\":{},\"clickhouse_output_bytes\":{},\"clickhouse_output_sha256\":{},\"rusthouse_samples_ms\":",
             case.rusthouse_end_to_end_median_ms,
             case.clickhouse_end_to_end_median_ms,
-            case.end_to_end_ratio
+            case.end_to_end_ratio,
+            case.rusthouse_end_to_end_output_digest.bytes,
+            json_string(&case.rusthouse_end_to_end_output_digest.sha256),
+            case.clickhouse_end_to_end_output_digest.bytes,
+            json_string(&case.clickhouse_end_to_end_output_digest.sha256)
         )
         .expect("writing to String cannot fail");
         write_number_array(&mut output, &case.end_to_end.rusthouse_batch_ms);
@@ -853,15 +960,29 @@ mod tests {
     use super::*;
 
     fn batch(milliseconds: f64, repetitions: usize) -> TimedBatch {
+        batch_with_output(milliseconds, repetitions, b"n\n1\n")
+    }
+
+    fn batch_with_output(milliseconds: f64, repetitions: usize, output: &[u8]) -> TimedBatch {
         TimedBatch {
             elapsed: Duration::from_secs_f64(milliseconds / 1_000.0),
             query_repetitions: repetitions,
+            output_digest: OutputDigest::repeated(output, repetitions).expect("test output digest"),
         }
     }
 
     fn output(csv: &str) -> TimedOutput {
         TimedOutput {
             stdout: csv.to_owned(),
+            digest: OutputDigest::repeated(csv.as_bytes(), 1).expect("test output digest"),
+        }
+    }
+
+    fn passed_gate() -> CorrectnessGate {
+        CorrectnessGate {
+            passed: true,
+            rusthouse_stdout: Some(b"n\n1\n".to_vec()),
+            clickhouse_stdout: Some(b"n\n1\n".to_vec()),
         }
     }
 
@@ -902,7 +1023,7 @@ mod tests {
     fn amplification_must_match_for_both_engines() {
         let mut samples = TimingSeries::default();
         let error = accept_timed_pair(
-            &CorrectnessGate { passed: true },
+            &passed_gate(),
             &batch(10.0, 64),
             &batch(10.0, 63),
             64,
@@ -1003,8 +1124,8 @@ mod tests {
         let mut samples = TimingSeries::default();
         accept_timed_pair(
             &gate,
-            &batch(64.0, 64),
-            &batch(32.0, 64),
+            &batch_with_output(64.0, 64, b"enabled\ntrue\n"),
+            &batch_with_output(32.0, 64, b"enabled\n1\n"),
             64,
             true,
             &mut samples,
