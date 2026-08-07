@@ -7,7 +7,7 @@ use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having,
-    LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
+    HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -1290,23 +1290,38 @@ struct AggregateSpec {
 #[derive(Debug, Clone)]
 struct ResolvedHaving {
     state: usize,
-    operator: ComparisonOperator,
-    value: Value,
+    predicate: ResolvedHavingPredicate,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedHavingPredicate {
+    Comparison {
+        operator: ComparisonOperator,
+        value: Value,
+    },
+    IsNull,
+    IsNotNull,
 }
 
 impl ResolvedHaving {
     fn evaluate(&self, data: &GroupedData<'_>, group: usize) -> bool {
-        let aggregate = data.aggregates[self.state][group].as_ref();
-        let Some(comparison) = aggregate.sql_cmp(self.value.as_ref()) else {
-            return false;
-        };
-        match self.operator {
-            ComparisonOperator::Equal => comparison == Ordering::Equal,
-            ComparisonOperator::NotEqual => comparison != Ordering::Equal,
-            ComparisonOperator::Less => comparison == Ordering::Less,
-            ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
-            ComparisonOperator::Greater => comparison == Ordering::Greater,
-            ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
+        let aggregate = &data.aggregates[self.state][group];
+        match &self.predicate {
+            ResolvedHavingPredicate::Comparison { operator, value } => {
+                let Some(comparison) = aggregate.as_ref().sql_cmp(value.as_ref()) else {
+                    return false;
+                };
+                match operator {
+                    ComparisonOperator::Equal => comparison == Ordering::Equal,
+                    ComparisonOperator::NotEqual => comparison != Ordering::Equal,
+                    ComparisonOperator::Less => comparison == Ordering::Less,
+                    ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
+                    ComparisonOperator::Greater => comparison == Ordering::Greater,
+                    ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
+                }
+            }
+            ResolvedHavingPredicate::IsNull => matches!(aggregate, Value::Null(_)),
+            ResolvedHavingPredicate::IsNotNull => !matches!(aggregate, Value::Null(_)),
         }
     }
 }
@@ -1659,50 +1674,60 @@ fn resolve_having(
         }
     };
 
+    let aggregate_requirement = match &requested.predicate {
+        HavingPredicate::Comparison { .. } => "a projected numeric aggregate",
+        HavingPredicate::IsNull | HavingPredicate::IsNotNull => "a projected aggregate",
+    };
     let ResolvedItem::Aggregate { state } = items[output] else {
         return Err(Error::InvalidQuery(format!(
-            "HAVING alias '{}' must reference a projected numeric aggregate",
-            requested.alias
+            "HAVING alias '{}' must reference {aggregate_requirement}",
+            requested.alias,
         )));
     };
     let spec = &aggregate_specs[state];
-    let supported = matches!(
-        aggregate_output_type(spec.function, spec.input_type),
-        DataType::Int64 | DataType::Float64
-    );
-    if !supported {
-        return Err(Error::InvalidQuery(format!(
-            "HAVING alias '{}' must reference a projected numeric aggregate",
-            requested.alias
-        )));
-    }
-    match &requested.value {
-        Value::Int64(_) => {}
-        Value::Float64(value) if value.is_finite() => {}
-        Value::Float64(_) => {
-            return Err(Error::InvalidQuery(
-                "HAVING comparison Float64 thresholds must be finite".to_owned(),
-            ));
+    let predicate = match &requested.predicate {
+        HavingPredicate::Comparison { operator, value } => {
+            let supported = matches!(
+                aggregate_output_type(spec.function, spec.input_type),
+                DataType::Int64 | DataType::Float64
+            );
+            if !supported {
+                return Err(Error::InvalidQuery(format!(
+                    "HAVING alias '{}' must reference a projected numeric aggregate",
+                    requested.alias
+                )));
+            }
+            match value {
+                Value::Int64(_) => {}
+                Value::Float64(value) if value.is_finite() => {}
+                Value::Float64(_) => {
+                    return Err(Error::InvalidQuery(
+                        "HAVING comparison Float64 thresholds must be finite".to_owned(),
+                    ));
+                }
+                Value::Null(_) => {
+                    return Err(Error::InvalidQuery(
+                        "HAVING comparisons do not support NULL thresholds".to_owned(),
+                    ));
+                }
+                value => {
+                    return Err(Error::TypeMismatch {
+                        context: "HAVING comparison threshold".to_owned(),
+                        expected: "Int64 or Float64".to_owned(),
+                        actual: value.data_type().to_string(),
+                    });
+                }
+            }
+            ResolvedHavingPredicate::Comparison {
+                operator: *operator,
+                value: value.clone(),
+            }
         }
-        Value::Null(_) => {
-            return Err(Error::InvalidQuery(
-                "HAVING comparisons do not support NULL thresholds".to_owned(),
-            ));
-        }
-        value => {
-            return Err(Error::TypeMismatch {
-                context: "HAVING comparison threshold".to_owned(),
-                expected: "Int64 or Float64".to_owned(),
-                actual: value.data_type().to_string(),
-            });
-        }
-    }
+        HavingPredicate::IsNull => ResolvedHavingPredicate::IsNull,
+        HavingPredicate::IsNotNull => ResolvedHavingPredicate::IsNotNull,
+    };
 
-    Ok(ResolvedHaving {
-        state,
-        operator: requested.operator,
-        value: requested.value.clone(),
-    })
+    Ok(ResolvedHaving { state, predicate })
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
@@ -3578,6 +3603,98 @@ mod tests {
     }
 
     #[test]
+    fn having_nullness_filters_finalized_empty_and_populated_aggregates_before_order_and_limit() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (amount Int64, score Float64, active Bool, label String);",
+            )
+            .expect("setup");
+
+        let cases = [
+            ("SUM(amount)", Value::Int64(3)),
+            ("MIN(label)", Value::String("present".to_owned())),
+            ("MAX(active)", Value::Bool(true)),
+            ("AVG(score)", Value::Float64(2.5)),
+        ];
+        for (aggregate, populated_value) in &cases {
+            let null_result = query(
+                &mut database,
+                &format!(
+                    "SELECT {aggregate} AS value FROM events \
+                     HAVING value IS NULL ORDER BY value DESC LIMIT 1"
+                ),
+            );
+            assert_eq!(null_result.rows.len(), 1, "empty {aggregate}");
+            assert!(
+                matches!(null_result.rows[0][0], Value::Null(_)),
+                "empty {aggregate} is a finalized typed NULL"
+            );
+            assert!(
+                query(
+                    &mut database,
+                    &format!(
+                        "SELECT {aggregate} AS value FROM events \
+                         HAVING value IS NOT NULL ORDER BY value DESC LIMIT 1"
+                    ),
+                )
+                .rows
+                .is_empty(),
+                "empty {aggregate} must not satisfy IS NOT NULL"
+            );
+
+            database
+                .execute("INSERT INTO events VALUES (3, 2.5, true, 'present')")
+                .expect("populate aggregate input");
+            assert!(
+                query(
+                    &mut database,
+                    &format!(
+                        "SELECT {aggregate} AS value FROM events \
+                         HAVING value IS NULL ORDER BY value DESC LIMIT 1"
+                    ),
+                )
+                .rows
+                .is_empty(),
+                "populated {aggregate} must not satisfy IS NULL"
+            );
+            assert_eq!(
+                query(
+                    &mut database,
+                    &format!(
+                        "SELECT {aggregate} AS value FROM events \
+                         HAVING value IS NOT NULL ORDER BY value DESC LIMIT 1"
+                    ),
+                )
+                .rows,
+                vec![vec![populated_value.clone()]],
+                "populated {aggregate}"
+            );
+
+            database
+                .execute("TRUNCATE TABLE events")
+                .expect("restore empty input for the next aggregate");
+        }
+
+        assert!(
+            query(
+                &mut database,
+                "SELECT COUNT(*) AS rows FROM events HAVING rows IS NULL"
+            )
+            .rows
+            .is_empty()
+        );
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(*) AS rows FROM events HAVING rows IS NOT NULL"
+            )
+            .rows,
+            vec![vec![Value::Int64(0)]]
+        );
+    }
+
+    #[test]
     fn having_rejects_unknown_ambiguous_and_unsupported_aliases() {
         let mut database = Database::new();
         database
@@ -3608,6 +3725,30 @@ mod tests {
         ];
 
         for (sql, expected) in cases {
+            assert_eq!(
+                database.execute(sql).expect_err("invalid HAVING alias"),
+                Error::InvalidQuery(expected.to_owned()),
+                "{sql}"
+            );
+        }
+
+        let nullness_cases = [
+            (
+                "SELECT kind, COUNT(*) AS n FROM events GROUP BY kind HAVING missing IS NULL",
+                "HAVING alias 'missing' is not in the SELECT output",
+            ),
+            (
+                "SELECT kind, MIN(amount) AS Total, MAX(amount) AS total FROM events \
+                 GROUP BY kind HAVING total IS NOT NULL",
+                "HAVING alias 'total' is ambiguous",
+            ),
+            (
+                "SELECT kind AS total, COUNT(*) AS n FROM events \
+                 GROUP BY kind HAVING total IS NULL",
+                "HAVING alias 'total' must reference a projected aggregate",
+            ),
+        ];
+        for (sql, expected) in nullness_cases {
             assert_eq!(
                 database.execute(sql).expect_err("invalid HAVING alias"),
                 Error::InvalidQuery(expected.to_owned()),
@@ -3652,7 +3793,14 @@ mod tests {
         ];
         for (value, expected) in cases {
             let mut invalid = select.clone();
-            invalid.having.as_mut().expect("HAVING exists").value = value;
+            let HavingPredicate::Comparison {
+                value: invalid_value,
+                ..
+            } = &mut invalid.having.as_mut().expect("HAVING exists").predicate
+            else {
+                panic!("baseline HAVING is a comparison");
+            };
+            *invalid_value = value;
             assert_eq!(
                 database
                     .execute_statement(Statement::Select(invalid))
