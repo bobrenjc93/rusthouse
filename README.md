@@ -466,10 +466,14 @@ The typed engine's `Database::ingest_csv_with_names` API atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table.
 `SharedDatabase::ingest_csv_with_names` is the synchronized equivalent and
 retains one write lock through table lookup, bounded parsing, capacity
-validation, and the atomic append. The header must exactly match every schema
-column in order and case. Data fields parse according to the table's `Int64`,
-finite `Float64`, `Bool`, and `String` types, and callers provide complete-input
-byte, row, and total-value limits.
+validation, and the atomic append. Its `try_ingest_csv_with_names` counterpart
+makes exactly one immediate write-lock attempt before table lookup or input
+access. It returns the typed `DatabaseBusy` error instead of waiting for an
+active reader or writer; poisoning and typed CSV, limit, and table-capacity
+failures remain distinct, and every failure leaves existing rows unchanged.
+The header must exactly match every schema column in order and case. Data fields
+parse according to the table's `Int64`, finite `Float64`, `Bool`, and `String`
+types, and callers provide complete-input byte, row, and total-value limits.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. Any data field may be double-quoted so it can contain
 commas and LF or CRLF line endings, and doubled quotes inside it decode to one

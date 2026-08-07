@@ -19,7 +19,7 @@ fn metrics_database(row_cap: usize) -> SharedDatabase {
 }
 
 #[test]
-fn writer_output_round_trips_through_shared_database_at_exact_limits() {
+fn try_ingest_writer_output_succeeds_at_exact_limits() {
     let expected = QueryResult {
         columns: vec![
             ResultColumn {
@@ -60,7 +60,7 @@ fn writer_output_round_trips_through_shared_database_at_exact_limits() {
 
     assert_eq!(
         database
-            .ingest_csv_with_names("metrics", &csv, CsvIngestLimits::new(csv.len(), 2, 8),)
+            .try_ingest_csv_with_names("metrics", &csv, CsvIngestLimits::new(csv.len(), 2, 8),)
             .expect("ingest writer output at exact byte, row, value, and table limits"),
         2
     );
@@ -73,7 +73,7 @@ fn writer_output_round_trips_through_shared_database_at_exact_limits() {
 }
 
 #[test]
-fn late_csv_error_is_typed_and_rolls_back_every_parsed_row() {
+fn try_ingest_late_csv_error_is_typed_and_rolls_back_every_parsed_row() {
     let database = metrics_database(3);
     database
         .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
@@ -81,7 +81,11 @@ fn late_csv_error_is_typed_and_rolls_back_every_parsed_row() {
     let input = b"id,score,active,label\n1,1.5,true,valid\n2,NaN,false,late\n";
 
     assert_eq!(
-        database.ingest_csv_with_names("metrics", input, CsvIngestLimits::new(input.len(), 2, 8),),
+        database.try_ingest_csv_with_names(
+            "metrics",
+            input,
+            CsvIngestLimits::new(input.len(), 2, 8),
+        ),
         Err(SharedDatabaseError::CsvIngest(
             CsvIngestError::InvalidValue {
                 line: 3,
@@ -113,8 +117,106 @@ impl AsRef<[u8]> for BlockingInput {
     }
 }
 
+struct InaccessibleInput;
+
+impl AsRef<[u8]> for InaccessibleInput {
+    fn as_ref(&self) -> &[u8] {
+        panic!("contended or poisoned ingestion must not access its input")
+    }
+}
+
 #[test]
-fn csv_ingestion_holds_one_write_lock_through_input_access_and_atomic_append() {
+fn try_ingest_returns_busy_without_lookup_or_input_access_for_reader_and_writer() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+
+    let reader = inner.read().unwrap();
+    let (reader_sender, reader_receiver) = mpsc::channel();
+    let reader_database = database.clone();
+    let reader_worker = thread::spawn(move || {
+        reader_sender
+            .send(reader_database.try_ingest_csv_with_names(
+                "missing",
+                InaccessibleInput,
+                CsvIngestLimits::new(0, 0, 0),
+            ))
+            .unwrap();
+    });
+    let reader_result = reader_receiver.recv_timeout(Duration::from_secs(2));
+    drop(reader);
+    reader_worker.join().unwrap();
+    assert_eq!(
+        reader_result,
+        Ok(Err(SharedDatabaseError::DatabaseBusy)),
+        "reader contention must return without waiting"
+    );
+
+    let writer = inner.write().unwrap();
+    let (writer_sender, writer_receiver) = mpsc::channel();
+    let writer_database = database.clone();
+    let writer_worker = thread::spawn(move || {
+        writer_sender
+            .send(writer_database.try_ingest_csv_with_names(
+                "missing",
+                InaccessibleInput,
+                CsvIngestLimits::new(0, 0, 0),
+            ))
+            .unwrap();
+    });
+    let writer_result = writer_receiver.recv_timeout(Duration::from_secs(2));
+    drop(writer);
+    writer_worker.join().unwrap();
+    assert_eq!(
+        writer_result,
+        Ok(Err(SharedDatabaseError::DatabaseBusy)),
+        "writer contention must return without waiting"
+    );
+}
+
+#[test]
+fn try_ingest_preserves_csv_limits_and_table_capacity_without_partial_rows() {
+    let database = metrics_database(2);
+    database
+        .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
+        .unwrap();
+    let input = b"id,score,active,label\n1,1.5,true,one\n2,2.5,false,two\n";
+
+    assert_eq!(
+        database.try_ingest_csv_with_names(
+            "metrics",
+            input,
+            CsvIngestLimits::new(input.len(), 1, 8),
+        ),
+        Err(SharedDatabaseError::CsvIngest(
+            CsvIngestError::RowLimitExceeded {
+                line: 3,
+                rows: 2,
+                max_rows: 1,
+            }
+        ))
+    );
+    assert_eq!(
+        database.try_ingest_csv_with_names(
+            "metrics",
+            input,
+            CsvIngestLimits::new(input.len(), 2, 8),
+        ),
+        Err(SharedDatabaseError::CsvIngest(CsvIngestError::Database(
+            Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 3,
+                max: 2,
+            }
+        )))
+    );
+    assert_eq!(
+        database.query("SELECT id FROM metrics;").unwrap().rows,
+        [vec![Value::Int64(9)]]
+    );
+}
+
+#[test]
+fn try_ingestion_holds_one_write_lock_through_input_access_and_atomic_append() {
     let mut initial = Database::with_max_rows_per_table(1);
     initial.execute("CREATE TABLE metrics (id Int64);").unwrap();
     let inner = Arc::new(RwLock::new(initial));
@@ -128,7 +230,7 @@ fn csv_ingestion_holds_one_write_lock_through_input_access_and_atomic_append() {
     };
     let ingest_database = database.clone();
     let ingest = thread::spawn(move || {
-        ingest_database.ingest_csv_with_names("metrics", input, CsvIngestLimits::new(5, 1, 1))
+        ingest_database.try_ingest_csv_with_names("metrics", input, CsvIngestLimits::new(5, 1, 1))
     });
 
     entered.wait();
@@ -165,7 +267,7 @@ fn csv_ingestion_holds_one_write_lock_through_input_access_and_atomic_append() {
 }
 
 #[test]
-fn csv_ingestion_reports_lock_poisoning_before_accessing_input() {
+fn try_ingestion_reports_lock_poisoning_before_lookup_or_input_access() {
     let inner = Arc::new(RwLock::new(Database::new()));
     let database = SharedDatabase::from_arc(Arc::clone(&inner));
     let poisoner = thread::spawn(move || {
@@ -174,9 +276,12 @@ fn csv_ingestion_reports_lock_poisoning_before_accessing_input() {
     });
     assert!(poisoner.join().is_err());
 
-    let input = b"id\n1\n";
     assert_eq!(
-        database.ingest_csv_with_names("metrics", input, CsvIngestLimits::new(input.len(), 1, 1),),
+        database.try_ingest_csv_with_names(
+            "missing",
+            InaccessibleInput,
+            CsvIngestLimits::new(0, 0, 0),
+        ),
         Err(SharedDatabaseError::LockPoisoned)
     );
 }
