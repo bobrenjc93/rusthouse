@@ -17,7 +17,7 @@ Limits:
   legacy: 65536 input bytes, 1024 statements, 64 tables, 1024 rows per table
   SQL batch: 67108864 input bytes, 4096 statements
   batch INSERT ASTs: 100000 rows, 1000000 values
-  batch schema/query AST lists: 100000 items
+  batch schema/query/INSERT-column AST lists: 100000 items
   batch SELECT: 10000 rows, 250000 values, 16777216 estimated result bytes
   batch table output: 16777216 formatted bytes per result
   batch JSONEachRow output: 16777216 formatted bytes per result

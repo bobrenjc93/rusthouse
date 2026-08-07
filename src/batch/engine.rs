@@ -382,7 +382,10 @@ impl Database {
         statements: Vec<Statement>,
     ) -> Result<Vec<StatementResult>> {
         for statement in &statements {
-            if !matches!(statement, Statement::Insert { .. }) {
+            if !matches!(
+                statement,
+                Statement::Insert { .. } | Statement::InsertWithColumns { .. }
+            ) {
                 return Err(Error::InsertOnlyStatementRequired {
                     statement: statement_name(statement),
                 });
@@ -390,26 +393,32 @@ impl Database {
         }
 
         let mut incoming_rows_by_table = HashMap::<String, usize>::new();
-        for statement in &statements {
-            let Statement::Insert { table, rows } = statement else {
-                unreachable!("non-INSERT statements were rejected")
+        let mut prepared = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let (table, columns, rows) = match statement {
+                Statement::Insert { table, rows } => (table, None, rows),
+                Statement::InsertWithColumns {
+                    table,
+                    columns,
+                    rows,
+                } => (table, Some(columns), rows),
+                _ => unreachable!("non-INSERT statements were rejected"),
             };
-            let target = self.catalog.table(table)?;
+            let target = self.catalog.table(&table)?;
+            let rows = target.prepare_insert_rows(columns.as_deref(), rows)?;
             let cumulative_rows = incoming_rows_by_table
                 .entry(table.to_ascii_lowercase())
                 .or_default();
             *cumulative_rows = cumulative_rows.saturating_add(rows.len());
             target.validate_row_capacity(*cumulative_rows)?;
-            for row in rows {
+            for row in &rows {
                 target.validate_row(row)?;
             }
+            prepared.push((table, rows));
         }
 
-        let mut results = Vec::with_capacity(statements.len());
-        for statement in statements {
-            let Statement::Insert { table, rows } = statement else {
-                unreachable!("non-INSERT statements were rejected")
-            };
+        let mut results = Vec::with_capacity(prepared.len());
+        for (table, rows) in prepared {
             let affected_rows = rows.len();
             self.catalog
                 .table_mut(&table)
@@ -544,15 +553,12 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Insert { table, rows } => {
-                let affected_rows = rows.len();
-                let target = self.catalog.table_mut(&table)?;
-                target.insert_rows(rows)?;
-                Ok(StatementResult::Command {
-                    tag: "INSERT",
-                    affected_rows,
-                })
-            }
+            Statement::Insert { table, rows } => self.execute_insert_statement(table, None, rows),
+            Statement::InsertWithColumns {
+                table,
+                columns,
+                rows,
+            } => self.execute_insert_statement(table, Some(columns), rows),
             statement @ (Statement::LiteralSelect(_)
             | Statement::Select(_)
             | Statement::CrossJoin(_)
@@ -600,11 +606,30 @@ impl Database {
             | Statement::RenameColumn { .. }
             | Statement::DropColumn { .. }
             | Statement::TruncateTable { .. }
-            | Statement::Insert { .. } => Err(Error::InvalidQuery(
+            | Statement::Insert { .. }
+            | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
                     .to_owned(),
             )),
         }
+    }
+
+    fn execute_insert_statement(
+        &mut self,
+        table: String,
+        columns: Option<Vec<String>>,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<StatementResult> {
+        let rows = self
+            .catalog
+            .table(&table)?
+            .prepare_insert_rows(columns.as_deref(), rows)?;
+        let affected_rows = rows.len();
+        self.catalog.table_mut(&table)?.insert_rows(rows)?;
+        Ok(StatementResult::Command {
+            tag: "INSERT",
+            affected_rows,
+        })
     }
 
     fn execute_literal_select(
@@ -1009,7 +1034,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. } | Statement::DropColumn { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
-        Statement::Insert { .. } => "INSERT",
+        Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
         | Statement::Select(_)
         | Statement::CrossJoin(_)

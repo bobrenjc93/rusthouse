@@ -41,6 +41,15 @@ numeric HAVING comparison. `COUNT` is always non-`NULL`.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
+`INSERT INTO <table> (<columns>) VALUES ...` accepts a complete explicit
+column list in any order. Names resolve case-insensitively, every schema column
+must appear exactly once, and each row is reordered into schema order before
+typed validation and columnar storage. Duplicate, omitted, or unknown columns
+are errors; partial lists are not defaults, and positional `INSERT INTO
+<table> VALUES ...` remains supported. The atomic insert-only APIs validate
+and reorder every statement during preflight, so a named-column failure rolls
+back the complete batch.
+
 Regular ungrouped, non-window projections support
 `LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`. `WHERE` filtering
 and `ORDER BY` happen before rows are skipped. Ordered pagination uses the
@@ -220,7 +229,8 @@ standard input through EOF, with explicit limits of 64 MiB and 4,096
 statements. Parsing is
 lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
-covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
+covers `CREATE` and explicit `INSERT` columns plus `SELECT`, `GROUP BY`, and
+`ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
 combined levels of parenthesized or unary-`NOT` nesting.

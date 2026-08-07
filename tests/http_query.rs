@@ -2158,9 +2158,9 @@ fn authenticated_insert_route_commits_a_batch_and_returns_an_empty_response() {
         .unwrap();
     let (request, _) = request_with_authorization_for_target(
         "/insert",
-        b"INSERT INTO events VALUES (1, 'one'), (2, 'two'); \
-          INSERT INTO readings VALUES (1.5); \
-          INSERT INTO events VALUES (3, 'three');",
+        b"INSERT INTO events (name, ID) VALUES ('one', 1), ('two', 2); \
+          INSERT INTO readings (VALUE) VALUES (1.5); \
+          INSERT INTO events (id, name) VALUES (3, 'three');",
         "Authorization: Bearer correct-token\r\n",
     );
 
@@ -2209,6 +2209,10 @@ fn authenticated_insert_route_rolls_back_invalid_and_mixed_batches() {
         (
             b"INSERT INTO events VALUES (3); ALTER TABLE events RENAME COLUMN id TO event_id;",
             r#"{"error":"INSERT-only batch accepts only INSERT statements; found ALTER TABLE"}"#,
+        ),
+        (
+            b"INSERT INTO events (id) VALUES (4); INSERT INTO readings (missing) VALUES (1.5);",
+            r#"{"error":"column 'missing' does not exist in table 'readings'"}"#,
         ),
     ];
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::batch::error::{Error, Result};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -218,6 +218,76 @@ impl Table {
                 table: self.name.clone(),
                 column: name.to_owned(),
             })
+    }
+
+    /// Resolves a complete explicit INSERT column list and returns rows in
+    /// physical schema order. Positional rows are returned unchanged.
+    ///
+    /// Explicit names resolve case-insensitively. Every schema column must be
+    /// named exactly once; unknown, duplicate, and omitted names are rejected
+    /// before any row is changed.
+    pub(crate) fn prepare_insert_rows(
+        &self,
+        insert_columns: Option<&[String]>,
+        mut rows: Vec<Vec<Value>>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let Some(insert_columns) = insert_columns else {
+            return Ok(rows);
+        };
+
+        let schema_indexes_by_name = self
+            .schema
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (field.name.to_ascii_lowercase(), index))
+            .collect::<HashMap<_, _>>();
+        let mut schema_indexes = Vec::with_capacity(insert_columns.len());
+        let mut seen = vec![false; self.schema.len()];
+        for name in insert_columns {
+            let Some(&schema_index) = schema_indexes_by_name.get(&name.to_ascii_lowercase()) else {
+                return Err(Error::ColumnNotFound {
+                    table: self.name.clone(),
+                    column: name.clone(),
+                });
+            };
+            if std::mem::replace(&mut seen[schema_index], true) {
+                return Err(Error::DuplicateColumn(name.clone()));
+            }
+            schema_indexes.push(schema_index);
+        }
+        if let Some((index, _)) = seen.iter().enumerate().find(|(_, present)| !**present) {
+            return Err(Error::MissingInsertColumn {
+                table: self.name.clone(),
+                column: self.schema[index].name.clone(),
+            });
+        }
+
+        for row in &rows {
+            if row.len() != self.schema.len() {
+                return Err(Error::RowLength {
+                    table: self.name.clone(),
+                    expected: self.schema.len(),
+                    actual: row.len(),
+                });
+            }
+        }
+
+        if schema_indexes.iter().copied().eq(0..self.schema.len()) {
+            return Ok(rows);
+        }
+        for row in &mut rows {
+            let source = std::mem::take(row);
+            let mut reordered = Vec::with_capacity(source.len());
+            reordered.resize_with(source.len(), || None);
+            for (value, schema_index) in source.into_iter().zip(schema_indexes.iter().copied()) {
+                reordered[schema_index] = Some(value);
+            }
+            *row = reordered
+                .into_iter()
+                .map(|value| value.expect("complete INSERT columns cover every schema position"))
+                .collect();
+        }
+        Ok(rows)
     }
 
     /// Changes only a column's display name after validating the complete rename.
