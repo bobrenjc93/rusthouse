@@ -64,12 +64,12 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
-fn json_cli_executes_comparison_delete_silently() {
+fn json_cli_executes_conjoined_comparison_delete_silently() {
     let output = run(
         &["--format", "json"],
         b"CREATE TABLE events (id Int64, label String); \
           INSERT INTO events VALUES (1, 'keep'), (2, 'remove'), (3, 'remove'); \
-          DELETE FROM events WHERE id >= 2; \
+          DELETE FROM events WHERE id >= 2 AND label = 'remove'; \
           SELECT id, label FROM events;",
     );
 
