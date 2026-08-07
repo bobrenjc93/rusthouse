@@ -111,12 +111,17 @@ the normal result row, value, and byte limits before allocating result storage.
 returns exactly one `Bool` column named `result` with one row: `true` when the
 table is present and `false` when it is missing, including after `DROP TABLE`.
 The result is subject to the normal row, value, byte, and retained-result limits.
-Two existing `SELECT` queries can be combined with `UNION ALL`. Their rows are
-concatenated left-first, the left query supplies the result column names, and
-both operands must return the same number and sequence of column types. Each
-operand applies its own clauses; nested unions and union-level outer clauses
-are not supported. The combined result remains subject to the normal query
-result limits before its row vector is grown.
+Two existing `SELECT` queries can be combined with exact `UNION ALL` or
+`UNION DISTINCT`. `UNION ALL` concatenates their rows left-first;
+`UNION DISTINCT` retains the first occurrence of each complete typed row in
+that same order, including treating equal typed `NULL` aggregate results as
+duplicates. The left query supplies the result column names, and both operands
+must return the same number and sequence of column types. Each operand applies
+its own clauses; nested unions and union-level outer clauses are not supported.
+The raw combined result remains subject to the normal query result limits
+before duplicate elimination. `UNION DISTINCT` additionally charges every
+retained row key, plus the reusable key probe for rows wider than two columns,
+to the grouped-query group, key-cell, and estimated key-byte limits.
 `SELECT * FROM left_table CROSS JOIN right_table [LIMIT n]` returns every
 typed column from the left table followed by every column from the right, with
 rows in deterministic left-major order. This deliberately narrow form does
@@ -266,7 +271,7 @@ column names and strings use ClickHouse's backslash escapes.
 A table-backed `SELECT` inspects at most 1,000,000 source rows by default. This
 scanned-row limit is checked against the full source table before matching-row
 indices are allocated, so `WHERE` selectivity and `LIMIT` do not reduce it;
-each `UNION ALL` operand and each `CROSS JOIN` input has its own source scan.
+each `UNION` operand and each `CROSS JOIN` input has its own source scan.
 It is distinct from the 10,000-row output limit, which applies after filtering,
 grouping, ordering, and `LIMIT`. Query output is also checked before cloning
 against a limit of 250,000 values and an estimated 16 MiB. Grouped queries

@@ -52,7 +52,6 @@ fn parses_exactly_two_complete_select_operands() {
 fn rejects_malformed_nested_and_outer_union_syntax() {
     for sql in [
         "SELECT n FROM l UNION SELECT n FROM r",
-        "SELECT n FROM l UNION DISTINCT SELECT n FROM r",
         "SELECT n FROM l UNION ALL",
         "SELECT n FROM l UNION ALL SHOW TABLES",
         "SELECT n FROM l UNION ALL (SELECT n FROM r)",

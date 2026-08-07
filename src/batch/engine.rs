@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::batch::catalog::Catalog;
@@ -45,7 +45,7 @@ pub struct QueryResultLimits {
     ///
     /// This is checked before row inspection and matching-row index allocation.
     /// `WHERE` and `LIMIT` therefore cannot reduce the charged scan. Each
-    /// `UNION ALL` operand and each `CROSS JOIN` input is checked independently.
+    /// `UNION` operand and each `CROSS JOIN` input is checked independently.
     pub max_scan_rows: usize,
     pub max_rows: usize,
     pub max_values: usize,
@@ -563,6 +563,7 @@ impl Database {
             | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
+            | Statement::UnionDistinct { .. }
             | Statement::ShowTables
             | Statement::ShowCreateTable { .. }
             | Statement::DescribeTable { .. }
@@ -587,6 +588,9 @@ impl Database {
             }
             Statement::UnionAll { left, right } => {
                 self.execute_union_all(left, right, query_result_limits)
+            }
+            Statement::UnionDistinct { left, right } => {
+                self.execute_union_distinct(left, right, query_result_limits)
             }
             Statement::ShowTables => self.execute_show_tables(query_result_limits),
             Statement::ShowCreateTable { name } => {
@@ -875,7 +879,7 @@ impl Database {
         if let Some(prefix) = result_prefix {
             // Reject a UNION schema mismatch before scanning or materializing
             // any rows from its right operand.
-            validate_union_schema(prefix.columns, &result_columns)?;
+            validate_union_schema(prefix.operation, prefix.columns, &result_columns)?;
         }
 
         // The source bound is deliberately independent of WHERE and LIMIT:
@@ -976,11 +980,33 @@ impl Database {
         right: Select,
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
+        self.execute_union_operands(left, right, query_result_limits, "UNION ALL")
+    }
+
+    fn execute_union_distinct(
+        &self,
+        left: Select,
+        right: Select,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        let mut result =
+            self.execute_union_operands(left, right, query_result_limits, "UNION DISTINCT")?;
+        deduplicate_union_rows(&mut result.rows, result.columns.len(), query_result_limits)?;
+        Ok(result)
+    }
+
+    fn execute_union_operands(
+        &self,
+        left: Select,
+        right: Select,
+        query_result_limits: QueryResultLimits,
+        operation: &'static str,
+    ) -> Result<QueryResult> {
         let mut left_result = self.execute_select(left, query_result_limits)?;
         let mut right_result = self.execute_select_with_prefix(
             right,
             query_result_limits,
-            Some(SelectResultPrefix::from_result(&left_result)),
+            Some(SelectResultPrefix::from_result(&left_result, operation)),
         )?;
 
         left_result.rows.append(&mut right_result.rows);
@@ -1038,7 +1064,8 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::LiteralSelect(_)
         | Statement::Select(_)
         | Statement::CrossJoin(_)
-        | Statement::UnionAll { .. } => "SELECT",
+        | Statement::UnionAll { .. }
+        | Statement::UnionDistinct { .. } => "SELECT",
         Statement::ShowTables => "SHOW TABLES",
         Statement::ShowCreateTable { .. } => "SHOW CREATE TABLE",
         Statement::DescribeTable { .. } => "DESCRIBE TABLE",
@@ -1160,10 +1187,11 @@ struct SelectResultPrefix<'a> {
     columns: &'a [ResultColumn],
     row_count: usize,
     string_bytes: usize,
+    operation: &'static str,
 }
 
 impl<'a> SelectResultPrefix<'a> {
-    fn from_result(result: &'a QueryResult) -> Self {
+    fn from_result(result: &'a QueryResult, operation: &'static str) -> Self {
         let string_bytes = result
             .rows
             .iter()
@@ -1177,28 +1205,167 @@ impl<'a> SelectResultPrefix<'a> {
             columns: &result.columns,
             row_count: result.rows.len(),
             string_bytes,
+            operation,
         }
     }
 }
 
-fn validate_union_schema(left: &[ResultColumn], right: &[ResultColumn]) -> Result<()> {
+fn validate_union_schema(
+    operation: &'static str,
+    left: &[ResultColumn],
+    right: &[ResultColumn],
+) -> Result<()> {
     if left.len() != right.len() {
-        return Err(Error::UnionColumnCountMismatch {
-            left: left.len(),
-            right: right.len(),
+        return Err(if operation == "UNION DISTINCT" {
+            Error::UnionDistinctColumnCountMismatch {
+                left: left.len(),
+                right: right.len(),
+            }
+        } else {
+            Error::UnionColumnCountMismatch {
+                left: left.len(),
+                right: right.len(),
+            }
         });
     }
 
     for (index, (left, right)) in left.iter().zip(right).enumerate() {
         if left.data_type != right.data_type {
             return Err(Error::TypeMismatch {
-                context: format!("UNION ALL column {}", index + 1),
+                context: format!("{operation} column {}", index + 1),
                 expected: left.data_type.to_string(),
                 actual: right.data_type.to_string(),
             });
         }
     }
     Ok(())
+}
+
+fn deduplicate_union_rows(
+    rows: &mut Vec<Vec<Value>>,
+    column_count: usize,
+    limits: QueryResultLimits,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let probe_key_cells = if column_count > 2 { column_count } else { 0 };
+    let first_key_cells = probe_key_cells.saturating_add(column_count);
+    enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
+    enforce_resource_limit(
+        "SELECT group key cells",
+        first_key_cells,
+        limits.max_group_key_cells,
+    )?;
+    enforce_resource_limit(
+        "SELECT group key bytes",
+        first_key_cells.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES),
+        limits.max_group_key_bytes,
+    )?;
+
+    let retained = union_distinct_retained_rows(rows, column_count, probe_key_cells, limits)?;
+    let mut row = 0;
+    rows.retain(|_| {
+        let keep = retained[row];
+        row += 1;
+        keep
+    });
+    Ok(())
+}
+
+fn union_distinct_retained_rows(
+    rows: &[Vec<Value>],
+    column_count: usize,
+    probe_key_cells: usize,
+    limits: QueryResultLimits,
+) -> Result<Vec<bool>> {
+    let mut keys = UnionDistinctKeys::new(column_count);
+    let mut probe = Vec::with_capacity(probe_key_cells);
+    let mut retained = Vec::with_capacity(rows.len());
+    let mut group_count = 0_usize;
+    let mut group_key_cells = probe_key_cells;
+
+    for row in rows {
+        debug_assert_eq!(row.len(), column_count);
+        if keys.contains(row, &mut probe) {
+            retained.push(false);
+            continue;
+        }
+
+        let next_group_count = group_count.saturating_add(1);
+        enforce_resource_limit("SELECT groups", next_group_count, limits.max_groups)?;
+        let next_key_cells = group_key_cells.saturating_add(column_count);
+        enforce_resource_limit(
+            "SELECT group key cells",
+            next_key_cells,
+            limits.max_group_key_cells,
+        )?;
+        enforce_resource_limit(
+            "SELECT group key bytes",
+            next_key_cells.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES),
+            limits.max_group_key_bytes,
+        )?;
+
+        keys.insert(row, &probe);
+        group_count = next_group_count;
+        group_key_cells = next_key_cells;
+        retained.push(true);
+    }
+
+    Ok(retained)
+}
+
+#[derive(Debug)]
+enum UnionDistinctKeys<'a> {
+    Empty(bool),
+    One(HashSet<ValueRef<'a>>),
+    Multiple(HashSet<Box<[ValueRef<'a>]>>),
+}
+
+impl<'a> UnionDistinctKeys<'a> {
+    fn new(column_count: usize) -> Self {
+        match column_count {
+            0 => Self::Empty(false),
+            1 => Self::One(HashSet::new()),
+            _ => Self::Multiple(HashSet::new()),
+        }
+    }
+
+    fn contains(&self, row: &'a [Value], probe: &mut Vec<ValueRef<'a>>) -> bool {
+        match self {
+            Self::Empty(present) => *present,
+            Self::One(keys) => keys.contains(&row[0].as_ref()),
+            Self::Multiple(keys) if row.len() == 2 => {
+                let key = [row[0].as_ref(), row[1].as_ref()];
+                keys.contains(key.as_slice())
+            }
+            Self::Multiple(keys) => {
+                probe.clear();
+                probe.extend(row.iter().map(Value::as_ref));
+                keys.contains(probe.as_slice())
+            }
+        }
+    }
+
+    fn insert(&mut self, row: &'a [Value], probe: &[ValueRef<'a>]) {
+        let inserted = match self {
+            Self::Empty(present) => {
+                let inserted = !*present;
+                *present = true;
+                inserted
+            }
+            Self::One(keys) => keys.insert(row[0].as_ref()),
+            Self::Multiple(keys) if row.len() == 2 => {
+                keys.insert([row[0].as_ref(), row[1].as_ref()].into())
+            }
+            Self::Multiple(keys) => {
+                debug_assert_eq!(probe.len(), row.len());
+                keys.insert(probe.into())
+            }
+        };
+        debug_assert!(inserted, "new UNION DISTINCT row keys must be unique");
+    }
 }
 
 fn validate_distinct_shape(select: &Select) -> Result<()> {
