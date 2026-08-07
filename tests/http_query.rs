@@ -15,8 +15,12 @@ fn request(sql: &[u8]) -> Vec<u8> {
 }
 
 fn request_for_target(target: &str, sql: &[u8]) -> Vec<u8> {
+    request_for_target_with_headers(target, sql, "")
+}
+
+fn request_for_target_with_headers(target: &str, sql: &[u8], headers: &str) -> Vec<u8> {
     let mut request = format!(
-        "POST {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Length: {}\r\n\r\n",
         sql.len()
     )
     .into_bytes();
@@ -301,6 +305,166 @@ fn root_query_returns_the_existing_json_result_shape() {
         ),
         "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"]]}"#,
+    );
+}
+
+#[test]
+fn both_query_routes_stream_typed_json_compact_each_row_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String); \
+             INSERT INTO typed_values VALUES (-7, 2.0, false, 'ready'), \
+                                               (0, -1.25, true, 'snow 雪'); \
+             CREATE TABLE empty_values (id Int64, score Float64, active Bool, label String);",
+        )
+        .unwrap();
+
+    for target in ["/", "/query"] {
+        let typed_request = request_for_target_with_headers(
+            target,
+            b"SELECT id, score, active, label FROM typed_values ORDER BY id;",
+            "x-cLiCkHoUsE-fOrMaT:\tJSONCompactEachRow \r\n",
+        );
+        assert_response(
+            &exchange(&database, &typed_request),
+            "HTTP/1.1 200 OK",
+            "[-7,2.0,false,\"ready\"]\n[0,-1.25,true,\"snow 雪\"]\n",
+        );
+
+        let null_request = request_for_target_with_headers(
+            target,
+            b"SELECT MIN(id), MIN(score), MIN(active), MIN(label) FROM empty_values;",
+            "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+        );
+        assert_response(
+            &exchange(&database, &null_request),
+            "HTTP/1.1 200 OK",
+            "[null,null,null,null]\n",
+        );
+
+        let empty_request = request_for_target_with_headers(
+            target,
+            b"SELECT id, score, active, label FROM empty_values;",
+            "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+        );
+        assert_response(&exchange(&database, &empty_request), "HTTP/1.1 200 OK", "");
+    }
+}
+
+#[test]
+fn bearer_authenticated_queries_honor_json_compact_each_row() {
+    let database = SharedDatabase::default();
+    let sql = b"SELECT -7 AS integer;";
+    let unauthorized = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+    );
+
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &unauthorized),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let (authorized, _) = request_with_authorization(
+        sql,
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Format: JSONCompactEachRow\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &authorized),
+        "HTTP/1.1 200 OK",
+        "[-7]\n",
+    );
+}
+
+#[test]
+fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
+    let database = SharedDatabase::default();
+    let duplicate_headers = [
+        concat!(
+            "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+            "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+        ),
+        concat!(
+            "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+            "x-clickhouse-format: JSONEachRow\r\n",
+        ),
+        concat!(
+            "X-ClickHouse-Format: JSONEachRow\r\n",
+            "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+        ),
+    ];
+
+    for target in ["/", "/query"] {
+        for headers in duplicate_headers {
+            assert_response(
+                &exchange(
+                    &database,
+                    &request_for_target_with_headers(target, b"SELECT 1;", headers),
+                ),
+                "HTTP/1.1 400 Bad Request",
+                r#"{"error":"duplicate X-ClickHouse-Format header"}"#,
+            );
+        }
+
+        for unsupported in ["JSONEachRow", "jsoncompacteachrow", ""] {
+            let headers = format!("X-ClickHouse-Format: {unsupported}\r\n");
+            assert_response(
+                &exchange(
+                    &database,
+                    &request_for_target_with_headers(target, b"SELECT 1;", &headers),
+                ),
+                "HTTP/1.1 400 Bad Request",
+                r#"{"error":"unsupported X-ClickHouse-Format header"}"#,
+            );
+        }
+    }
+}
+
+#[test]
+fn json_compact_each_row_honors_the_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let sql = format!("SELECT '{}' AS value;", "x".repeat(1_000));
+    let request = request_for_target_with_headers(
+        "/query",
+        sql.as_bytes(),
+        "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+    );
+    let expected_response = exchange(&database, &request);
+
+    let mut exact_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut exact_response,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect("the exact complete response size is accepted");
+    assert_eq!(exact_response, expected_response);
+
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut capped_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut capped_response,
+        limits,
+    )
+    .expect("the fixed response-limit error fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
     );
 }
 

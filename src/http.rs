@@ -4,7 +4,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use crate::batch::format::{write_json, write_json_string};
+use crate::batch::format::{write_json, write_json_compact_each_row, write_json_string};
 use crate::{SharedDatabase, SharedDatabaseError};
 
 /// Default maximum size of the request line and headers, including the final
@@ -87,7 +87,9 @@ impl StdError for HttpQueryError {
 /// `POST /` and `POST /query` require exactly one decimal `Content-Length`.
 /// Their body must be UTF-8 SQL and is passed to [`SharedDatabase::query`],
 /// which accepts exactly one read-only statement. A successful query response
-/// uses the same JSON result shape as the batch JSON formatter.
+/// uses the same JSON result shape as the batch JSON formatter unless exactly
+/// one `X-ClickHouse-Format: JSONCompactEachRow` header requests positional
+/// JSON arrays separated by line feeds.
 ///
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
@@ -230,7 +232,7 @@ fn handle_http_query_exchange(
         }
     };
 
-    let sql = match request {
+    let (sql, response_format) = match request {
         HttpRequest::Ping => {
             return write_response(
                 &mut output,
@@ -260,13 +262,22 @@ fn handle_http_query_exchange(
                 limits.max_response_bytes,
             );
         }
-        HttpRequest::Query(sql) => sql,
+        HttpRequest::Query {
+            sql,
+            response_format,
+        } => (sql, response_format),
     };
 
     match database.query(&sql) {
         Ok(result) => {
             let mut body = BoundedVec::new(limits.max_response_bytes);
-            if write_json(&mut body, &result).is_err() {
+            let write_result = match response_format {
+                QueryResponseFormat::Json => write_json(&mut body, &result),
+                QueryResponseFormat::JsonCompactEachRow => {
+                    write_json_compact_each_row(&mut body, &result)
+                }
+            };
+            if write_result.is_err() {
                 debug_assert!(body.limit_exceeded);
                 return write_response_limit_error(&mut output, limits.max_response_bytes);
             }
@@ -358,7 +369,10 @@ fn read_request(
             }
 
             String::from_utf8(body)
-                .map(HttpRequest::Query)
+                .map(|sql| HttpRequest::Query {
+                    sql,
+                    response_format: request.response_format,
+                })
                 .map_err(|_| {
                     RequestFailure::new(Status::BAD_REQUEST, "SQL body is not valid UTF-8").into()
                 })
@@ -421,12 +435,22 @@ fn read_header_block(
 struct ParsedRequest {
     kind: RequestKind,
     content_length: Option<usize>,
+    response_format: QueryResponseFormat,
 }
 
 enum HttpRequest {
-    Query(String),
+    Query {
+        sql: String,
+        response_format: QueryResponseFormat,
+    },
     Ping,
     Ready,
+}
+
+#[derive(Clone, Copy)]
+enum QueryResponseFormat {
+    Json,
+    JsonCompactEachRow,
 }
 
 #[derive(Clone, Copy)]
@@ -458,6 +482,8 @@ fn parse_headers(
     let mut expect_seen = false;
     let mut authorization = None;
     let mut duplicate_authorization = false;
+    let mut clickhouse_format = None;
+    let mut duplicate_clickhouse_format = false;
     while let Some(raw_line) = lines.next() {
         let line = strict_header_line(raw_line, lines.peek().is_some())?;
         header_count = header_count.saturating_add(1);
@@ -503,6 +529,10 @@ fn parse_headers(
             && authorization.replace(value).is_some()
         {
             duplicate_authorization = true;
+        } else if name.eq_ignore_ascii_case(b"x-clickhouse-format")
+            && clickhouse_format.replace(value).is_some()
+        {
+            duplicate_clickhouse_format = true;
         }
     }
 
@@ -536,9 +566,32 @@ fn parse_headers(
     if !host_seen {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "Host header is required").into());
     }
+    let response_format = if matches!(kind, RequestKind::Query) {
+        if duplicate_clickhouse_format {
+            return Err(RequestFailure::new(
+                Status::BAD_REQUEST,
+                "duplicate X-ClickHouse-Format header",
+            )
+            .into());
+        }
+        match clickhouse_format {
+            None => QueryResponseFormat::Json,
+            Some(b"JSONCompactEachRow") => QueryResponseFormat::JsonCompactEachRow,
+            Some(_) => {
+                return Err(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "unsupported X-ClickHouse-Format header",
+                )
+                .into());
+            }
+        }
+    } else {
+        QueryResponseFormat::Json
+    };
     Ok(ParsedRequest {
         kind,
         content_length,
+        response_format,
     })
 }
 
