@@ -163,6 +163,29 @@ impl Column {
             Self::String(values) => values.clear(),
         }
     }
+
+    fn delete_rows(&mut self, row_indexes: &[usize]) {
+        match self {
+            Self::Int64(values) => compact_deleted_rows(values, row_indexes),
+            Self::Float64(values) => compact_deleted_rows(values, row_indexes),
+            Self::Bool(values) => compact_deleted_rows(values, row_indexes),
+            Self::String(values) => compact_deleted_rows(values, row_indexes),
+        }
+    }
+}
+
+fn compact_deleted_rows<T>(values: &mut Vec<T>, row_indexes: &[usize]) {
+    let mut source_row = 0;
+    let mut deletion_position = 0;
+    values.retain(|_| {
+        let delete = row_indexes.get(deletion_position) == Some(&source_row);
+        source_row += 1;
+        if delete {
+            deletion_position += 1;
+        }
+        !delete
+    });
+    debug_assert_eq!(deletion_position, row_indexes.len());
 }
 
 /// A table stores one typed vector per schema field.
@@ -551,6 +574,33 @@ impl Table {
         self.row_count += 1;
     }
 
+    /// Deletes selected source rows and returns the number deleted.
+    ///
+    /// `row_indexes` must be unique and strictly increasing, and every index
+    /// must be less than the row count at the start of this call. The complete
+    /// selection is validated before any typed column is compacted, so an
+    /// error leaves the table unchanged. Survivors retain their source order;
+    /// the table's name, schema, and resource limits are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SelectionIndexOutOfBounds`] for an index outside the
+    /// original table or [`Error::SelectionNotStrictlyIncreasing`] for a
+    /// duplicate or decreasing index.
+    pub fn delete_rows(&mut self, row_indexes: &[usize]) -> Result<usize> {
+        validate_row_selection(row_indexes, self.row_count)?;
+        if row_indexes.is_empty() {
+            return Ok(0);
+        }
+
+        for column in &mut self.columns {
+            debug_assert_eq!(column.len(), self.row_count);
+            column.delete_rows(row_indexes);
+        }
+        self.row_count -= row_indexes.len();
+        Ok(row_indexes.len())
+    }
+
     /// Removes every row while retaining the table name, schema, and physical columns.
     pub fn truncate(&mut self) -> usize {
         let removed_rows = self.row_count;
@@ -560,6 +610,30 @@ impl Table {
         self.row_count = 0;
         removed_rows
     }
+}
+
+fn validate_row_selection(row_indexes: &[usize], input_rows: usize) -> Result<()> {
+    let mut previous = None;
+    for (selection_position, &row_index) in row_indexes.iter().enumerate() {
+        if row_index >= input_rows {
+            return Err(Error::SelectionIndexOutOfBounds {
+                selection_position,
+                row_index,
+                input_rows,
+            });
+        }
+        if let Some(previous_row_index) = previous {
+            if row_index <= previous_row_index {
+                return Err(Error::SelectionNotStrictlyIncreasing {
+                    selection_position,
+                    previous_row_index,
+                    row_index,
+                });
+            }
+        }
+        previous = Some(row_index);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
