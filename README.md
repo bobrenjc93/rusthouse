@@ -108,6 +108,13 @@ unaliased expression can be ordered with `ORDER BY LENGTH(<column>)`; aliased
 projections can be ordered by their alias. Both forms support `LIMIT`.
 Non-`String` arguments and byte lengths outside the `Int64` range are reported
 as typed errors.
+`LOWER(string_column)` is an ungrouped scalar projection that lowercases ASCII
+letters while leaving every non-ASCII UTF-8 byte unchanged. Because this
+transformation preserves byte length, its owned `String` results are charged
+against the normal result-byte cap before materialization. It accepts an
+optional `AS alias`; otherwise, the result column is named `LOWER(<column>)`.
+`WHERE`, ordering by that expression or its alias, and `LIMIT` are supported;
+non-`String` arguments and grouped query shapes are rejected.
 `ABS(int64_column)` is an ungrouped scalar projection that returns a checked
 `Int64` absolute value. It supports an optional `AS alias`, ordering by the
 unaliased expression or alias, `WHERE`, and `LIMIT`. Filtering and limiting
