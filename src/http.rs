@@ -4,7 +4,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use crate::batch::format::{write_json, write_json_compact_each_row, write_json_string};
+use crate::batch::format::{write_csv, write_json, write_json_compact_each_row, write_json_string};
 use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 
 /// Default maximum size of the request line and headers, including the final
@@ -88,8 +88,9 @@ impl StdError for HttpQueryError {
 /// Their body must be UTF-8 SQL and is passed to [`SharedDatabase::query`],
 /// which accepts exactly one read-only statement. A successful query response
 /// uses the same JSON result shape as the batch JSON formatter unless exactly
-/// one `X-ClickHouse-Format: JSONCompactEachRow` header requests positional
-/// JSON arrays separated by line feeds.
+/// one `X-ClickHouse-Format` header requests `CSVWithNames` or
+/// `JSONCompactEachRow`. CSV responses use the batch CSV writer; positional
+/// JSON responses contain arrays separated by line feeds.
 ///
 /// `GET /metrics` accepts no request body and returns three Prometheus gauges
 /// for retained tables, columns, and rows. It takes a nonblocking, consistent
@@ -299,11 +300,15 @@ fn handle_http_query_exchange(
     match database.query(&sql) {
         Ok(result) => {
             let mut body = BoundedVec::new(limits.max_response_bytes);
-            let write_result = match response_format {
-                QueryResponseFormat::Json => write_json(&mut body, &result),
-                QueryResponseFormat::JsonCompactEachRow => {
-                    write_json_compact_each_row(&mut body, &result)
+            let (write_result, content_type) = match response_format {
+                QueryResponseFormat::Json => (write_json(&mut body, &result), CONTENT_TYPE_JSON),
+                QueryResponseFormat::CsvWithNames => {
+                    (write_csv(&mut body, &result), CONTENT_TYPE_CSV)
                 }
+                QueryResponseFormat::JsonCompactEachRow => (
+                    write_json_compact_each_row(&mut body, &result),
+                    CONTENT_TYPE_JSON,
+                ),
             };
             if write_result.is_err() {
                 debug_assert!(body.limit_exceeded);
@@ -313,7 +318,7 @@ fn handle_http_query_exchange(
                 &mut output,
                 Status::OK,
                 &[],
-                CONTENT_TYPE_JSON,
+                content_type,
                 body.bytes,
                 limits.max_response_bytes,
             )
@@ -489,6 +494,7 @@ enum HttpRequest {
 #[derive(Clone, Copy)]
 enum QueryResponseFormat {
     Json,
+    CsvWithNames,
     JsonCompactEachRow,
 }
 
@@ -616,6 +622,7 @@ fn parse_headers(
         }
         match clickhouse_format {
             None => QueryResponseFormat::Json,
+            Some(b"CSVWithNames") => QueryResponseFormat::CsvWithNames,
             Some(b"JSONCompactEachRow") => QueryResponseFormat::JsonCompactEachRow,
             Some(_) => {
                 return Err(RequestFailure::new(
@@ -874,6 +881,7 @@ impl From<RequestFailure> for RequestReadError {
 }
 
 const RESPONSE_LIMIT_MESSAGE: &str = "response exceeds configured byte limit";
+const CONTENT_TYPE_CSV: &[u8] = b"text/csv; charset=utf-8";
 const CONTENT_TYPE_JSON: &[u8] = b"application/json";
 const CONTENT_TYPE_TEXT: &[u8] = b"text/plain; charset=utf-8";
 const CONTENT_TYPE_PROMETHEUS: &[u8] = b"text/plain; version=0.0.4; charset=utf-8";
