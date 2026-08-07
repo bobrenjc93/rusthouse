@@ -207,6 +207,143 @@ fn configured_and_retained_result_limits_are_enforced() {
 }
 
 #[test]
+fn try_queries_succeed_and_preserve_sql_and_resource_errors() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (value Int64); \
+             INSERT INTO readings VALUES (7);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        database
+            .try_query("SELECT value FROM readings;")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(7)]]
+    );
+    assert_eq!(
+        database.try_query("SELECT value FROM missing;"),
+        Err(SharedDatabaseError::Sql(Error::TableNotFound(
+            "missing".to_owned()
+        )))
+    );
+    assert!(matches!(
+        database.try_query_with_result_limit("SHOW TABLES;", 0),
+        Err(SharedDatabaseError::Sql(Error::ResultLimitExceeded {
+            max_bytes: 0,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn try_query_allows_concurrent_readers() {
+    let mut initial = Database::new();
+    initial
+        .execute(
+            "CREATE TABLE readings (value Int64); \
+             INSERT INTO readings VALUES (11);",
+        )
+        .unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let existing_reader = inner.read().unwrap();
+
+    assert_eq!(
+        database
+            .try_query("SELECT value FROM readings;")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(11)]]
+    );
+    assert_eq!(
+        existing_reader
+            .catalog()
+            .table("readings")
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
+
+#[test]
+fn try_query_completes_while_writer_lock_remains_held() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let writer = inner.write().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(worker_database.try_query("SHOW TABLES;"))
+            .unwrap();
+    });
+
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(Err(SharedDatabaseError::DatabaseBusy)),
+        "the query must finish without waiting for the held write lock"
+    );
+    assert_eq!(
+        writer.catalog().table_count(),
+        0,
+        "the writer is still held"
+    );
+    drop(writer);
+    worker.join().unwrap();
+}
+
+#[test]
+fn try_query_preserves_lock_poisoning() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+
+    assert!(poisoner.join().is_err());
+    assert_eq!(
+        database.try_query("SHOW TABLES;"),
+        Err(SharedDatabaseError::LockPoisoned)
+    );
+}
+
+#[test]
+fn try_query_validation_precedes_lock_acquisition() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let writer = inner.write().unwrap();
+
+    assert!(matches!(
+        database.try_query("SELECT FROM;"),
+        Err(SharedDatabaseError::Sql(Error::Sql { .. }))
+    ));
+    assert_eq!(
+        database.try_query(""),
+        Err(SharedDatabaseError::QueryStatementCount { statements: 0 })
+    );
+    assert_eq!(
+        database.try_query("SHOW TABLES; SHOW TABLES;"),
+        Err(SharedDatabaseError::QueryStatementCount { statements: 2 })
+    );
+    assert_eq!(
+        database.try_query("CREATE TABLE blocked (value Int64);"),
+        Err(SharedDatabaseError::ReadOnlyStatementRequired {
+            statement: "CREATE TABLE",
+        })
+    );
+    assert_eq!(
+        database.try_query("SHOW TABLES;"),
+        Err(SharedDatabaseError::DatabaseBusy)
+    );
+
+    drop(writer);
+}
+
+#[test]
 fn shared_queries_enforce_the_scan_limit_before_where_and_limit() {
     let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
         max_scan_rows: 2,

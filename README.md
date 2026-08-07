@@ -25,7 +25,9 @@ The early implementation should favor Rust's standard library and a small depend
 The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and composable `WHERE`
-comparisons with unary `NOT`, `AND`, and `OR`,
+comparisons with unary `NOT`, `AND`, and `OR`, plus case-sensitive String prefix
+predicates of the exact form `column LIKE 'prefix%'`. A prefix may be empty or
+Unicode, and the pattern must contain exactly one `%`, in the terminal position.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
 projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
@@ -90,7 +92,8 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison predicates, including unary `NOT`, as regular `SELECT`.
+composable comparison and prefix `LIKE` predicates, including unary `NOT`, as
+regular `SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -278,8 +281,13 @@ poisoning is reported separately.
 engine. Its `query` method accepts exactly one `SELECT`, `SHOW TABLES`, `SHOW
 CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a shared read lock,
 and returns an owned, resource-bounded result, so cloned handles can run
-analytical reads concurrently. Mutating batches passed to
-`execute` retain one write lock for the entire batch and cannot interleave.
+analytical reads concurrently. `try_query` and `try_query_with_result_limit`
+accept and validate the same single read-only statement before making one
+nonblocking read-lock attempt. They return the typed `DatabaseBusy` error when
+a writer prevents immediate lock acquisition, while lock poisoning, SQL
+failures, and resource-limit failures remain distinguishable. Mutating batches
+passed to `execute` retain one write lock for the entire batch and cannot
+interleave.
 For transactional ingestion, `Database::execute_insert_batch` and the matching
 `SharedDatabase` method accept a nonempty `INSERT`-only batch, preflight every
 statement and cumulative per-table row cap, then commit in statement order.

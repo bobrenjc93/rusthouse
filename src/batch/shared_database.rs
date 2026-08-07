@@ -36,6 +36,8 @@ pub enum SharedDatabaseError {
     QueryStatementCount { statements: usize },
     /// The read-only query API received a mutating statement.
     ReadOnlyStatementRequired { statement: &'static str },
+    /// A nonblocking query could not immediately acquire a database read lock.
+    DatabaseBusy,
     /// A thread panicked while it held the database write lock.
     LockPoisoned,
 }
@@ -53,6 +55,7 @@ impl fmt::Display for SharedDatabaseError {
                 formatter,
                 "read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found {statement}"
             ),
+            Self::DatabaseBusy => write!(formatter, "shared database is busy"),
             Self::LockPoisoned => write!(formatter, "shared database lock is poisoned"),
         }
     }
@@ -65,6 +68,7 @@ impl StdError for SharedDatabaseError {
             Self::TsvIngest(error) => Some(error),
             Self::QueryStatementCount { .. }
             | Self::ReadOnlyStatementRequired { .. }
+            | Self::DatabaseBusy
             | Self::LockPoisoned => None,
         }
     }
@@ -88,8 +92,10 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// [`Self::execute`] retains one write lock while every statement executes, so
 /// statements from concurrent mutating batches cannot interleave. [`Self::query`]
 /// executes one `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`,
-/// or `EXISTS TABLE` under a shared read lock. Results own their columns and
-/// values and remain valid after the lock is released.
+/// or `EXISTS TABLE` under a shared read lock. [`Self::try_query`] accepts the
+/// same input but returns [`SharedDatabaseError::DatabaseBusy`] instead of
+/// waiting for a writer. Results own their columns and values and remain valid
+/// after the lock is released.
 ///
 /// A batch passed to [`Self::execute`] is not a rollback transaction: once
 /// parsing succeeds, earlier statements remain applied if a later statement
@@ -244,6 +250,32 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
+    /// Attempts to execute exactly one read-only query without waiting for a lock.
+    ///
+    /// Parsing, statement-count validation, and read-only validation all finish
+    /// before the single read-lock attempt. If a writer prevents immediate lock
+    /// acquisition, this returns [`SharedDatabaseError::DatabaseBusy`].
+    pub fn try_query(&self, input: &str) -> Result<QueryResult, SharedDatabaseError> {
+        self.try_query_with_result_limit(input, DEFAULT_MAX_RETAINED_RESULT_BYTES)
+    }
+
+    /// Attempts one read-only query with an explicit retained-result byte limit.
+    ///
+    /// This has the same validation and execution semantics as
+    /// [`Self::query_with_result_limit`], but never waits to acquire the database
+    /// read lock. Lock poisoning, SQL failures, and resource-limit failures
+    /// retain their distinct typed errors.
+    pub fn try_query_with_result_limit(
+        &self,
+        input: &str,
+        max_result_bytes: usize,
+    ) -> Result<QueryResult, SharedDatabaseError> {
+        let statement = parse_query_statement(input)?;
+        self.try_read()?
+            .execute_query_statement_with_result_limit(statement, max_result_bytes)
+            .map_err(Into::into)
+    }
+
     /// Reports whether a database read lock is immediately available.
     ///
     /// This check never waits, parses SQL, or accesses database contents. A
@@ -260,6 +292,14 @@ impl SharedDatabase {
         self.inner
             .read()
             .map_err(|_| SharedDatabaseError::LockPoisoned)
+    }
+
+    fn try_read(&self) -> Result<RwLockReadGuard<'_, Database>, SharedDatabaseError> {
+        match self.inner.try_read() {
+            Ok(database) => Ok(database),
+            Err(TryLockError::WouldBlock) => Err(SharedDatabaseError::DatabaseBusy),
+            Err(TryLockError::Poisoned(_)) => Err(SharedDatabaseError::LockPoisoned),
+        }
     }
 
     fn write(&self) -> Result<RwLockWriteGuard<'_, Database>, SharedDatabaseError> {
