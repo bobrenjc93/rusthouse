@@ -69,6 +69,10 @@ pub enum Statement {
     DescribeTable {
         name: String,
     },
+    /// ClickHouse-compatible catalog membership query.
+    ExistsTable {
+        name: String,
+    },
 }
 
 /// `SELECT <literal> [AS <alias>]`.
@@ -584,8 +588,10 @@ impl<'a> Parser<'a> {
             self.parse_show()
         } else if self.eat_keyword("DESCRIBE") {
             self.parse_describe()
+        } else if self.eat_keyword("EXISTS") {
+            self.parse_exists()
         } else {
-            self.error("expected CREATE, DROP, TRUNCATE, INSERT, SELECT, SHOW, or DESCRIBE")
+            self.error("expected CREATE, DROP, TRUNCATE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS")
         }
     }
 
@@ -705,6 +711,15 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after DESCRIBE TABLE <name>");
         }
         Ok(Statement::DescribeTable { name })
+    }
+
+    fn parse_exists(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let name = self.expect_identifier("table name")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after EXISTS TABLE <name>");
+        }
+        Ok(Statement::ExistsTable { name })
     }
 
     fn parse_create(&mut self) -> Result<Statement> {

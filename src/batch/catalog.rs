@@ -55,6 +55,13 @@ impl Catalog {
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
+    /// Reports catalog membership using the same case-insensitive resolution
+    /// as table access.
+    #[must_use]
+    pub fn table_exists(&self, name: &str) -> bool {
+        self.tables.contains_key(&normalize(name))
+    }
+
     /// Returns the number of registered tables without allocating.
     #[must_use]
     pub fn table_count(&self) -> usize {
