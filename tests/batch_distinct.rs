@@ -20,18 +20,27 @@ fn query(database: &mut Database, sql: &str) -> QueryResult {
 
 #[test]
 fn parses_only_the_bounded_unaliased_column_list_distinct_shape() {
-    for (sql, expected_columns, has_predicate) in [
-        ("SELECT DISTINCT value FROM samples", vec!["value"], false),
+    for (sql, expected_columns, has_predicate, expected_ordering) in [
         (
-            "select distinct Value, Other from Samples limit 0;",
+            "SELECT DISTINCT value FROM samples",
+            vec!["value"],
+            false,
+            vec![],
+        ),
+        (
+            "select distinct Value, Other from Samples \
+             order by Other desc, Value asc limit 0;",
             vec!["Value", "Other"],
             false,
+            vec![("Other", true), ("Value", false)],
         ),
         (
             "SELECT DISTINCT value, other FROM samples \
-             WHERE (active = true AND score >= 2.5) OR label = 'override' LIMIT 2",
+             WHERE (active = true AND score >= 2.5) OR label = 'override' \
+             ORDER BY other, value DESC LIMIT 2",
             vec!["value", "other"],
             true,
+            vec![("other", false), ("value", true)],
         ),
     ] {
         let statements = parse(sql).expect("valid DISTINCT query");
@@ -49,6 +58,14 @@ fn parses_only_the_bounded_unaliased_column_list_distinct_shape() {
             .collect::<Vec<_>>();
         assert_eq!(columns, expected_columns);
         assert_eq!(select.predicate.is_some(), has_predicate);
+        assert_eq!(
+            select
+                .order_by
+                .iter()
+                .map(|order| (order.name.as_str(), order.descending))
+                .collect::<Vec<_>>(),
+            expected_ordering
+        );
     }
 
     for sql in [
@@ -61,8 +78,9 @@ fn parses_only_the_bounded_unaliased_column_list_distinct_shape() {
         "SELECT DISTINCT value FROM samples WHERE value = 1 GROUP BY value",
         "SELECT DISTINCT value FROM samples HAVING value = 1",
         "SELECT DISTINCT value FROM samples WHERE value = 1 HAVING value = 1",
-        "SELECT DISTINCT value FROM samples ORDER BY value",
-        "SELECT DISTINCT value FROM samples WHERE value = 1 ORDER BY value",
+        "SELECT DISTINCT value FROM samples ORDER BY value AS renamed",
+        "SELECT DISTINCT value FROM samples ORDER BY LENGTH(value)",
+        "SELECT DISTINCT value FROM samples ORDER BY value - 1",
         "SELECT DISTINCT value FROM samples LIMIT -1",
     ] {
         assert!(
@@ -91,6 +109,29 @@ fn parses_only_the_bounded_unaliased_column_list_distinct_shape() {
             resource: "SQL AST list items",
             actual: 2,
             max: 1,
+        })
+    );
+
+    parse_with_limits(
+        "SELECT DISTINCT value, other FROM samples ORDER BY other DESC, value ASC",
+        BatchSqlLimits {
+            max_ast_list_items: 4,
+            ..BatchSqlLimits::default()
+        },
+    )
+    .expect("two projections and two order keys fit the exact AST limit");
+    assert_eq!(
+        parse_with_limits(
+            "SELECT DISTINCT value, other FROM samples ORDER BY other DESC, value ASC",
+            BatchSqlLimits {
+                max_ast_list_items: 3,
+                ..BatchSqlLimits::default()
+            },
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SQL AST list items",
+            actual: 4,
+            max: 3,
         })
     );
 }
@@ -240,6 +281,66 @@ fn deduplicates_all_physical_types_in_first_seen_order() {
 }
 
 #[test]
+fn orders_distinct_tuples_by_all_physical_types_with_mixed_directions() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (i Int64, f Float64, b Bool, s String); \
+             INSERT INTO samples VALUES \
+             (2, 1.5, true, 'beta'), \
+             (1, 1.5, true, 'beta'), \
+             (3, 2.5, true, 'beta'), \
+             (4, 0.5, true, 'alpha'), \
+             (5, 4.5, false, 'omega'), \
+             (3, 2.5, true, 'beta'), \
+             (0, 9.5, true, 'excluded');",
+        )
+        .expect("setup");
+
+    let sql = "SELECT DISTINCT s, i, b, f FROM samples \
+        WHERE s != 'excluded' \
+        ORDER BY b DESC, s ASC, f DESC, i ASC";
+    let expected = vec![
+        vec![
+            Value::String("alpha".to_owned()),
+            Value::Int64(4),
+            Value::Bool(true),
+            Value::Float64(0.5),
+        ],
+        vec![
+            Value::String("beta".to_owned()),
+            Value::Int64(3),
+            Value::Bool(true),
+            Value::Float64(2.5),
+        ],
+        vec![
+            Value::String("beta".to_owned()),
+            Value::Int64(1),
+            Value::Bool(true),
+            Value::Float64(1.5),
+        ],
+        vec![
+            Value::String("beta".to_owned()),
+            Value::Int64(2),
+            Value::Bool(true),
+            Value::Float64(1.5),
+        ],
+        vec![
+            Value::String("omega".to_owned()),
+            Value::Int64(5),
+            Value::Bool(false),
+            Value::Float64(4.5),
+        ],
+    ];
+
+    assert_eq!(query(&mut database, sql).rows, expected);
+    assert_eq!(
+        query(&mut database, &format!("{sql} LIMIT 3")).rows,
+        expected[..3]
+    );
+}
+
+#[test]
 fn filters_distinct_values_with_every_physical_predicate_type() {
     let mut database = Database::new();
     database
@@ -383,7 +484,7 @@ fn deduplicates_mixed_type_tuples_in_first_seen_order() {
 }
 
 #[test]
-fn rejects_unknown_and_duplicate_tuple_columns_with_typed_errors() {
+fn rejects_unknown_duplicate_and_unprojected_order_columns_with_typed_errors() {
     let mut database = Database::new();
     database
         .execute("CREATE TABLE samples (value Int64, label String)")
@@ -404,6 +505,18 @@ fn rejects_unknown_and_duplicate_tuple_columns_with_typed_errors() {
             .expect_err("one physical column cannot appear twice"),
         Error::InvalidQuery("DISTINCT column 'VALUE' is listed more than once".to_owned())
     );
+    for name in ["label", "missing"] {
+        assert_eq!(
+            database
+                .execute(&format!(
+                    "SELECT DISTINCT value FROM samples ORDER BY {name}"
+                ))
+                .expect_err("ORDER BY must name a projected physical column"),
+            Error::InvalidQuery(format!(
+                "ORDER BY column or alias '{name}' is not in the SELECT output"
+            ))
+        );
+    }
 
     assert_eq!(
         database
@@ -517,9 +630,20 @@ fn handles_empty_input_and_zero_exact_and_exceeded_limits() {
         .expect("setup");
 
     assert!(
-        query(&mut database, "SELECT DISTINCT value FROM samples LIMIT 0")
-            .rows
-            .is_empty()
+        query(
+            &mut database,
+            "SELECT DISTINCT value FROM samples ORDER BY value DESC LIMIT 0"
+        )
+        .rows
+        .is_empty()
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT value FROM samples ORDER BY value DESC LIMIT 2"
+        )
+        .rows,
+        [vec![Value::Int64(3)], vec![Value::Int64(2)]]
     );
     assert_eq!(
         query(&mut database, "SELECT DISTINCT value FROM samples LIMIT 3").rows,
@@ -555,7 +679,10 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
     group_limited.execute(setup).expect("setup");
     assert_eq!(
         group_limited
-            .execute("SELECT DISTINCT value, label FROM samples WHERE included = true LIMIT 0",)
+            .execute(
+                "SELECT DISTINCT value, label FROM samples WHERE included = true \
+                 ORDER BY label DESC, value ASC LIMIT 0",
+            )
             .expect_err("LIMIT cannot bypass DISTINCT working-state limits"),
         Error::ResourceLimitExceeded {
             resource: "SELECT groups",
@@ -575,17 +702,21 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
     assert_eq!(
         query(
             &mut result_limited,
-            "SELECT DISTINCT value, label FROM samples WHERE included = true LIMIT 2"
+            "SELECT DISTINCT value, label FROM samples WHERE included = true \
+             ORDER BY value DESC LIMIT 2"
         )
         .rows,
         [
-            vec![Value::Int64(1), Value::String("a".to_owned())],
+            vec![Value::Int64(3), Value::String("c".to_owned())],
             vec![Value::Int64(2), Value::String("b".to_owned())]
         ]
     );
     assert_eq!(
         result_limited
-            .execute("SELECT DISTINCT value, label FROM samples WHERE included = true")
+            .execute(
+                "SELECT DISTINCT value, label FROM samples WHERE included = true \
+                 ORDER BY value DESC",
+            )
             .expect_err("three output rows exceed the result cap"),
         Error::ResourceLimitExceeded {
             resource: "SELECT result rows",
@@ -604,7 +735,10 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
     value_limited.execute(setup).expect("setup");
     assert_eq!(
         value_limited
-            .execute("SELECT DISTINCT value, label FROM samples WHERE included = true LIMIT 2",)
+            .execute(
+                "SELECT DISTINCT value, label FROM samples WHERE included = true \
+                 ORDER BY value DESC LIMIT 2",
+            )
             .expect_err("two tuple rows exceed a three-value result cap"),
         Error::ResourceLimitExceeded {
             resource: "SELECT result values",

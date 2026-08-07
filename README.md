@@ -84,14 +84,17 @@ rows in deterministic left-major order. This deliberately narrow form does
 not accept projections, predicates, aliases, or additional joins. The
 LIMIT-reduced Cartesian row, scalar-value, and estimated byte counts are all
 checked before result rows are materialized.
-`SELECT DISTINCT column [, ...] FROM table [WHERE predicate] [LIMIT n]`
+`SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
+`[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n]`
 supports tuples of physical columns of any supported types and the same typed,
 composable comparison predicates, including unary `NOT`, as regular `SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
-order. Distinct tuples are collected under the grouped-query cap before
-`LIMIT` is applied, and the limited output remains subject to the normal result
-caps.
+order when no ordering is requested. `ORDER BY` accepts only projected physical
+columns, supports multiple independently directed keys, and sorts the unique
+tuples before `LIMIT`. Distinct tuples are collected under the grouped-query cap
+before ordering and `LIMIT`, and the limited output remains subject to the
+normal result caps.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 
