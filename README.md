@@ -38,6 +38,12 @@ numeric HAVING comparison. `COUNT` is always non-`NULL`.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
+`CREATE TABLE IF NOT EXISTS <name> (...)` creates the table normally when its
+case-insensitive name is absent. If that name is already registered, it returns
+a successful no-op command and retains the existing display name, schema, rows,
+and row cap even when the requested schema differs. Plain `CREATE TABLE`
+continues to report an error for an existing case-insensitive name.
+
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
 such as `-7`; `Float64` literals are optionally signed, finite decimal or
@@ -213,6 +219,9 @@ session. It reads one statement from each nonempty input line and prints a row
 list such as `[7, NULL, -2]` for each projection. That session allows 65,536
 input bytes, 1,024 statements, 64 tables, and 1,024 rows per table. In either
 mode, malformed or failed SQL is reported on standard error and exits nonzero.
+The legacy session also accepts the exact `CREATE TABLE IF NOT EXISTS` form;
+its existence check is case-insensitive while ordinary legacy names retain
+their existing exact-match behavior.
 
 ```bash
 printf '%s\n' \
@@ -260,6 +269,15 @@ decimal `Content-Length` and sends its UTF-8 SQL body through
 metadata and positional-row shape as `--format json`; protocol and query
 failures return deterministic JSON error objects with an appropriate HTTP
 status. Targets are exact, so a query string or any other suffix is rejected.
+
+Either query route also accepts one optional
+`X-ClickHouse-Format: JSONCompactEachRow` header. When present, a successful
+response has content type `application/json` and contains one positional JSON
+array per row, each followed by a line feed; column metadata is omitted and an
+empty result has an empty body. Header names are case-insensitive, but the
+format value must use that exact spelling. Duplicate format headers and all
+other format values receive deterministic `400 Bad Request` JSON errors. When
+the header is absent, the existing JSON response shape is unchanged.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`

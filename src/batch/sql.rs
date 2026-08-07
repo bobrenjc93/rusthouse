@@ -42,6 +42,11 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
     },
+    /// `CREATE TABLE IF NOT EXISTS`; a case-insensitive match is a no-op.
+    CreateTableIfNotExists {
+        name: String,
+        columns: Vec<ColumnDef>,
+    },
     DropTable {
         name: String,
     },
@@ -755,6 +760,21 @@ impl<'a> Parser<'a> {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
+        let if_not_exists = if self.at_keyword("IF") {
+            let lexer = self.lexer;
+            let current = self.current.clone();
+            self.advance();
+            if self.eat_keyword("NOT") {
+                self.expect_keyword("EXISTS")?;
+                true
+            } else {
+                self.lexer = lexer;
+                self.current = current;
+                false
+            }
+        } else {
+            false
+        };
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
@@ -784,7 +804,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
-        Ok(Statement::CreateTable { name, columns })
+        if if_not_exists {
+            Ok(Statement::CreateTableIfNotExists { name, columns })
+        } else {
+            Ok(Statement::CreateTable { name, columns })
+        }
     }
 
     fn parse_drop(&mut self) -> Result<Statement> {

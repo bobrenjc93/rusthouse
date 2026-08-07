@@ -785,6 +785,37 @@ fn malformed_statement_is_reported_on_stderr_with_failure_status() {
 }
 
 #[test]
+fn cli_conditional_create_is_silent_and_preserves_the_existing_table_lifecycle() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE IF NOT EXISTS Events (id Int64, label String); \
+          INSERT INTO Events VALUES (1, 'original'); \
+          CREATE TABLE IF NOT EXISTS eVeNtS (replacement Bool); \
+          INSERT INTO events VALUES (2, 'retained'); \
+          SELECT id, label FROM EVENTS ORDER BY id;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"id,label\n1,original\n2,retained\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn legacy_cli_conditional_create_preserves_rows_across_case_variants() {
+    let output = run(
+        &[],
+        b"CREATE TABLE IF NOT EXISTS Events (value Int64)\n\
+          INSERT INTO Events VALUES (7)\n\
+          CREATE TABLE IF NOT EXISTS events (replacement Int64 NOT NULL)\n\
+          SELECT value FROM Events\n",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"[7]\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn accepts_exact_session_byte_bound() {
     let input = vec![b' '; DEFAULT_MAX_SESSION_BYTES];
     let output = run(&[], &input);

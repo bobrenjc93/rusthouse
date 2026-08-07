@@ -301,6 +301,14 @@ impl Catalog {
     /// Registers the empty table described by a parsed `CREATE TABLE`.
     pub fn create(&mut self, statement: &CreateTableStatement) -> Result<(), CatalogError> {
         let name = statement.table_name().as_str();
+        if statement.if_not_exists()
+            && self
+                .tables
+                .keys()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+        {
+            return Ok(());
+        }
         if self.tables.contains_key(name) {
             return Err(CatalogError::TableAlreadyExists {
                 name: name.to_owned(),
