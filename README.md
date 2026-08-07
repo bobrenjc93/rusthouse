@@ -12,8 +12,8 @@ The first useful release should support:
 - a genuinely columnar in-memory representation;
 - `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
 - projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, and `LIMIT`;
-- a batch/interactive CLI with readable table, CSV, TSV, JSON, and
-  JSONCompactEachRow output;
+- a batch/interactive CLI with readable table, CSV, TSV, JSON, JSONEachRow,
+  and JSONCompactEachRow output;
 - durable local snapshots with an explicit, documented file format;
 - an HTTP endpoint for executing SQL;
 - deterministic tests and a small benchmark that demonstrate analytical behavior.
@@ -177,9 +177,10 @@ and output bounds.
 ## Command-line session
 
 `rusthouse --format table`, `rusthouse --format csv`, `rusthouse --format tsv`,
-`rusthouse --format json`, and `rusthouse --format JSONCompactEachRow` read one
-complete SQL batch from standard input through EOF, with explicit limits of 64
-MiB and 4,096 statements. Parsing is
+`rusthouse --format json`, `rusthouse --format JSONEachRow`, and
+`rusthouse --format JSONCompactEachRow` read one complete SQL batch from
+standard input through EOF, with explicit limits of 64 MiB and 4,096
+statements. Parsing is
 lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
 covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
@@ -197,6 +198,13 @@ typed rows; commas, quotes, and newlines in strings are CSV-escaped. JSON output
 is newline-delimited, with one compact object per query containing typed column
 metadata and positional rows. Numbers and booleans use native JSON values, SQL
 `NULL` becomes `null`, and strings are JSON-escaped.
+JSONEachRow output follows ClickHouse's row-oriented streaming shape: it emits
+one object per row, using JSON-escaped output column names as keys. Numbers and
+booleans remain native JSON values, SQL `NULL` is `null`, and strings use the
+same JSON escaping as `--format json`. Each result's exact escaped size,
+including its repeated keys, is checked against a 16 MiB formatted-output
+limit before any bytes are written. Empty results emit no rows, and rows from
+multiple results continue in statement order.
 JSONCompactEachRow output follows ClickHouse's positional streaming shape: it
 omits column metadata and emits one JSON array per row. Numbers and booleans
 remain native JSON values, SQL `NULL` is `null`, and strings use the same JSON
@@ -245,6 +253,7 @@ printf '%s\n' \
 
 Use `--format csv` instead to emit the same query results as CSVWithNames.
 Use `--format tsv` for ClickHouse-style TabSeparatedWithNames output.
+Use `--format JSONEachRow` for one column-name-keyed JSON object per result row.
 Use `--format JSONCompactEachRow` for one positional JSON array per result row.
 Use `--format table` for bordered output intended for direct terminal reading.
 
