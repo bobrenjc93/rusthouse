@@ -325,7 +325,14 @@ fn batch_formats_emit_canonical_show_create_table_ddl() {
 
 #[test]
 fn batch_cli_keeps_drop_table_command_output_silent() {
-    for format in ["table", "csv", "tsv", "json", "JSONCompactEachRow"] {
+    for format in [
+        "table",
+        "csv",
+        "tsv",
+        "json",
+        "JSONEachRow",
+        "JSONCompactEachRow",
+    ] {
         let output = run(
             &["--format", format],
             b"CREATE TABLE temporary (id Int64); DROP TABLE TEMPORARY;",
@@ -356,7 +363,14 @@ fn batch_cli_supports_an_idempotent_conditional_drop_lifecycle() {
 
 #[test]
 fn batch_cli_keeps_truncate_table_command_output_silent() {
-    for format in ["table", "csv", "tsv", "json", "JSONCompactEachRow"] {
+    for format in [
+        "table",
+        "csv",
+        "tsv",
+        "json",
+        "JSONEachRow",
+        "JSONCompactEachRow",
+    ] {
         let output = run(
             &["--format", format],
             b"CREATE TABLE temporary (id Int64); \
@@ -614,6 +628,41 @@ line	tab'),
 }
 
 #[test]
+fn json_each_row_emits_all_types_empty_and_multiple_results() {
+    let output = run(
+        &["--format", "JSONEachRow"],
+        br#"CREATE TABLE metrics (
+              id Int64,
+              score Float64,
+              enabled Bool,
+              label String
+          );
+          SELECT id, score, enabled, label FROM metrics;
+          INSERT INTO metrics VALUES
+              (1, 1.5, true, 'quote" and slash\
+line	tab'),
+              (2, 2.0, false, 'plain');
+          SELECT id AS identifier, score, enabled, label AS text_name
+          FROM metrics ORDER BY identifier;
+          SELECT MIN(id) AS missing FROM metrics WHERE id < 0;"#,
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        concat!(
+            r#"{"identifier":1,"score":1.5,"enabled":true,"text_name":"quote\" and slash\\\nline\ttab"}"#,
+            "\n",
+            r#"{"identifier":2,"score":2.0,"enabled":false,"text_name":"plain"}"#,
+            "\n",
+            "{\"missing\":null}\n",
+        )
+        .as_bytes()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn fixed_harness_style_write_completes_without_early_exit_or_broken_pipe() {
     const ROWS: usize = 4_096;
     let mut sql = String::from(
@@ -682,11 +731,14 @@ fn only_exact_supported_format_arguments_are_accepted() {
         &["--format", "CSV"][..],
         &["--format", "JSON"][..],
         &["--format", "TSV"][..],
+        &["--format", "jsoneachrow"][..],
+        &["--format", "JSONEACHROW"][..],
         &["--format", "JSONCOMPACTEACHROW"][..],
         &["--format", "table", "extra"][..],
         &["--format", "csv", "extra"][..],
         &["--format", "json", "extra"][..],
         &["--format", "tsv", "extra"][..],
+        &["--format", "JSONEachRow", "extra"][..],
         &["--format", "JSONCompactEachRow", "extra"][..],
     ] {
         let output = run(args, b"");
@@ -799,6 +851,7 @@ fn help_prints_usage_without_reading_a_session() {
         assert!(stdout.contains("--format table"));
         assert!(stdout.contains("--format tsv"));
         assert!(stdout.contains("--format json"));
+        assert!(stdout.contains("--format JSONEachRow"));
         assert!(stdout.contains("--format JSONCompactEachRow"));
         assert!(stdout.contains("65536 input bytes, 1024 statements, 64 tables"));
         assert!(output.stderr.is_empty());

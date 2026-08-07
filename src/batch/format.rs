@@ -11,6 +11,7 @@ pub enum OutputFormat {
     Csv,
     Tsv,
     Json,
+    JsonEachRow,
     JsonCompactEachRow,
 }
 
@@ -22,6 +23,7 @@ impl OutputFormat {
             "csv" => Some(Self::Csv),
             "tsv" => Some(Self::Tsv),
             "json" => Some(Self::Json),
+            "jsoneachrow" => Some(Self::JsonEachRow),
             "jsoncompacteachrow" => Some(Self::JsonCompactEachRow),
             _ => None,
         }
@@ -35,6 +37,7 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
         OutputFormat::Csv => render_csv(result),
         OutputFormat::Tsv => render_tsv(result),
         OutputFormat::Json => render_json(result),
+        OutputFormat::JsonEachRow => render_json_each_row(result),
         OutputFormat::JsonCompactEachRow => render_json_compact_each_row(result),
     }
 }
@@ -471,6 +474,33 @@ pub fn write_json(output: &mut impl io::Write, result: &QueryResult) -> io::Resu
     output.write_all(b"]}")
 }
 
+fn render_json_each_row(result: &QueryResult) -> String {
+    let mut output = Vec::new();
+    write_json_each_row(&mut output, result).expect("writing JSONEachRow to a Vec cannot fail");
+    String::from_utf8(output).expect("JSONEachRow rendering preserves UTF-8")
+}
+
+/// Streams one column-name-keyed JSON object per result row.
+///
+/// Column names and string values are JSON-escaped, SQL `NULL` is emitted as
+/// JSON `null`, and native numbers and booleans retain their JSON scalar types.
+/// Every row is terminated by a line feed; an empty result emits no bytes.
+pub fn write_json_each_row(output: &mut impl io::Write, result: &QueryResult) -> io::Result<()> {
+    for row in &result.rows {
+        output.write_all(b"{")?;
+        for (column_index, value) in row.iter().enumerate() {
+            if column_index > 0 {
+                output.write_all(b",")?;
+            }
+            write_json_string(output, &result.columns[column_index].name)?;
+            output.write_all(b":")?;
+            write_json_value(output, value)?;
+        }
+        output.write_all(b"}\n")?;
+    }
+    Ok(())
+}
+
 fn render_json_compact_each_row(result: &QueryResult) -> String {
     let mut output = Vec::new();
     write_json_compact_each_row(&mut output, result)
@@ -745,6 +775,77 @@ mod tests {
 
         assert_eq!(output, expected.as_bytes());
         assert_eq!(render(&result, OutputFormat::Json), expected);
+    }
+
+    #[test]
+    fn streams_json_each_row_with_escaped_names_and_all_value_types() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "missing".to_owned(),
+                    data_type: DataType::String,
+                },
+                ResultColumn {
+                    name: "integer".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ResultColumn {
+                    name: "float".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ResultColumn {
+                    name: "boolean".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ResultColumn {
+                    name: "text\"\n".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+            rows: vec![
+                vec![
+                    Value::Null(DataType::String),
+                    Value::Int64(i64::MIN),
+                    Value::Float64(2.0),
+                    Value::Bool(false),
+                    Value::String("\"\\\u{08}\u{0c}\n\r\t\u{01}雪".to_owned()),
+                ],
+                vec![
+                    Value::String("present".to_owned()),
+                    Value::Int64(7),
+                    Value::Float64(-1.25),
+                    Value::Bool(true),
+                    Value::String(String::new()),
+                ],
+            ],
+        };
+        let expected = concat!(
+            "{\"missing\":null,\"integer\":-9223372036854775808,\"float\":2.0,\"boolean\":false,\"text\\\"\\n\":\"\\\"\\\\\\b\\f\\n\\r\\t\\u0001雪\"}\n",
+            "{\"missing\":\"present\",\"integer\":7,\"float\":-1.25,\"boolean\":true,\"text\\\"\\n\":\"\"}\n",
+        );
+        let mut output = Vec::new();
+
+        write_json_each_row(&mut output, &result).expect("Vec accepts streamed JSONEachRow");
+
+        assert_eq!(output, expected.as_bytes());
+        assert_eq!(render(&result, OutputFormat::JsonEachRow), expected);
+    }
+
+    #[test]
+    fn json_each_row_empty_result_emits_nothing() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "empty".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            rows: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        write_json_each_row(&mut output, &result).expect("Vec accepts empty JSONEachRow output");
+
+        assert!(output.is_empty());
+        assert_eq!(render(&result, OutputFormat::JsonEachRow), String::new());
     }
 
     #[test]

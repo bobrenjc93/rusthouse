@@ -18,8 +18,8 @@ use std::io::{self, Read, Write};
 
 use engine::{DEFAULT_MAX_QUERY_RESULT_BYTES, Database, StatementResult};
 use format::{
-    TableWriteError, write_csv, write_json, write_json_compact_each_row, write_table_with_affixes,
-    write_tsv,
+    TableWriteError, write_csv, write_json, write_json_compact_each_row, write_json_each_row,
+    write_table_with_affixes, write_tsv,
 };
 
 /// Default maximum SQL batch size accepted from standard input.
@@ -52,6 +52,8 @@ pub enum BatchError {
     WriteTsv(io::Error),
     /// Writing newline-delimited JSON output failed.
     WriteJson(io::Error),
+    /// Writing JSONEachRow output failed.
+    WriteJsonEachRow(io::Error),
     /// Writing JSONCompactEachRow output failed.
     WriteJsonCompactEachRow(io::Error),
 }
@@ -76,6 +78,9 @@ impl fmt::Display for BatchError {
             Self::Write(error) => write!(formatter, "could not write CSV to stdout: {error}"),
             Self::WriteTsv(error) => write!(formatter, "could not write TSV to stdout: {error}"),
             Self::WriteJson(error) => write!(formatter, "could not write JSON to stdout: {error}"),
+            Self::WriteJsonEachRow(error) => {
+                write!(formatter, "could not write JSONEachRow to stdout: {error}")
+            }
             Self::WriteJsonCompactEachRow(error) => write!(
                 formatter,
                 "could not write JSONCompactEachRow to stdout: {error}"
@@ -92,6 +97,7 @@ impl StdError for BatchError {
             | Self::Write(error)
             | Self::WriteTsv(error)
             | Self::WriteJson(error)
+            | Self::WriteJsonEachRow(error)
             | Self::WriteJsonCompactEachRow(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::Sql(error) => Some(error),
@@ -185,6 +191,29 @@ pub fn run_json_batch_with_limit(
     run_batch_with_limit(input, output, max_input_bytes, BatchOutputFormat::Json)
 }
 
+/// Reads one bounded SQL batch to EOF and emits JSONEachRow.
+///
+/// Setup and mutation statements are silent. Every row from every query result
+/// is emitted as one column-name-keyed JSON object followed by a line feed.
+/// Empty query results emit no bytes.
+pub fn run_json_each_row_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
+    run_json_each_row_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
+}
+
+/// Executes the JSONEachRow batch protocol with an explicit input byte limit.
+pub fn run_json_each_row_batch_with_limit(
+    input: impl Read,
+    output: impl Write,
+    max_input_bytes: usize,
+) -> Result<(), BatchError> {
+    run_batch_with_limit(
+        input,
+        output,
+        max_input_bytes,
+        BatchOutputFormat::JsonEachRow,
+    )
+}
+
 /// Reads one bounded SQL batch to EOF and emits JSONCompactEachRow.
 ///
 /// Setup and mutation statements are silent. Every row from every query result
@@ -218,6 +247,7 @@ enum BatchOutputFormat {
     Csv,
     Tsv,
     Json,
+    JsonEachRow,
     JsonCompactEachRow,
 }
 
@@ -271,6 +301,10 @@ fn run_batch_with_limit(
                 BatchOutputFormat::Json => {
                     write_json(&mut output, &query).map_err(BatchError::WriteJson)?;
                     output.write_all(b"\n").map_err(BatchError::WriteJson)?;
+                }
+                BatchOutputFormat::JsonEachRow => {
+                    write_json_each_row(&mut output, &query)
+                        .map_err(BatchError::WriteJsonEachRow)?;
                 }
                 BatchOutputFormat::JsonCompactEachRow => {
                     write_json_compact_each_row(&mut output, &query)
@@ -396,6 +430,37 @@ mod tests {
         run_json_compact_each_row_batch(&input[..], &mut output).expect("batch succeeds");
 
         assert_eq!(output, b"[1]\n[2]\n[null]\n");
+    }
+
+    #[test]
+    fn json_each_row_batch_streams_empty_and_multiple_results() {
+        let input = b"CREATE TABLE t (n Int64);\n\
+            SELECT n FROM t;\n\
+            INSERT INTO t VALUES (2), (1);\n\
+            SELECT n FROM t ORDER BY n;\n\
+            SELECT MIN(n) AS missing FROM t WHERE n < 0;\n";
+        let mut output = Vec::new();
+
+        run_json_each_row_batch(&input[..], &mut output).expect("batch succeeds");
+
+        assert_eq!(output, b"{\"n\":1}\n{\"n\":2}\n{\"missing\":null}\n");
+    }
+
+    #[test]
+    fn json_each_row_batch_preserves_typed_short_writer_failures() {
+        let mut output = FailAfterBytes {
+            remaining: 8,
+            written: 0,
+        };
+
+        let error = run_json_each_row_batch(&b"SELECT 'escaped' AS text;"[..], &mut output)
+            .expect_err("writer stops during the JSONEachRow result");
+
+        let BatchError::WriteJsonEachRow(source) = error else {
+            panic!("expected a typed JSONEachRow write error");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert_eq!(output.written, 8);
     }
 
     #[test]
