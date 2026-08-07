@@ -948,7 +948,7 @@ fn mutating_and_multi_statement_sql_are_rejected_without_side_effects() {
     assert_response(
         &exchange(&database, &request(b"DROP TABLE retained;")),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, or DESCRIBE TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(&database, &request(b"SHOW TABLES; SHOW TABLES;")),

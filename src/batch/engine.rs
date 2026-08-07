@@ -310,7 +310,8 @@ impl Database {
                             "SELECT result bytes"
                             | "SHOW TABLES result bytes"
                             | "SHOW CREATE TABLE result bytes"
-                            | "DESCRIBE TABLE result bytes",
+                            | "DESCRIBE TABLE result bytes"
+                            | "EXISTS TABLE result bytes",
                         actual,
                         ..
                     } if tightened_result_limit => Error::ResultLimitExceeded {
@@ -396,7 +397,8 @@ impl Database {
                         "SELECT result bytes"
                         | "SHOW TABLES result bytes"
                         | "SHOW CREATE TABLE result bytes"
-                        | "DESCRIBE TABLE result bytes",
+                        | "DESCRIBE TABLE result bytes"
+                        | "EXISTS TABLE result bytes",
                     actual,
                     ..
                 } if tightened_result_limit => Error::ResultLimitExceeded {
@@ -466,7 +468,8 @@ impl Database {
             | Statement::UnionAll { .. }
             | Statement::ShowTables
             | Statement::ShowCreateTable { .. }
-            | Statement::DescribeTable { .. }) => self
+            | Statement::DescribeTable { .. }
+            | Statement::ExistsTable { .. }) => self
                 .execute_query_statement_with_limits(statement, query_result_limits)
                 .map(StatementResult::Query),
         }
@@ -495,11 +498,14 @@ impl Database {
             Statement::DescribeTable { name } => {
                 self.execute_describe_table(&name, query_result_limits)
             }
+            Statement::ExistsTable { name } => {
+                self.execute_exists_table(&name, query_result_limits)
+            }
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
             | Statement::TruncateTable { .. }
             | Statement::Insert { .. } => Err(Error::InvalidQuery(
-                "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, or DESCRIBE TABLE"
+                "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
                     .to_owned(),
             )),
         }
@@ -680,6 +686,31 @@ impl Database {
             .collect();
 
         Ok(QueryResult { columns, rows })
+    }
+
+    fn execute_exists_table(
+        &self,
+        name: &str,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const RESULT_COLUMN_NAME: &str = "result";
+
+        validate_result_shape_parts(
+            1,
+            1,
+            1,
+            RESULT_COLUMN_NAME.len(),
+            query_result_limits,
+            EXISTS_TABLE_RESULT_RESOURCES,
+        )?;
+
+        Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: RESULT_COLUMN_NAME.to_owned(),
+                data_type: DataType::Bool,
+            }],
+            rows: vec![vec![Value::Bool(self.catalog.table_exists(name))]],
+        })
     }
 
     fn execute_select(
@@ -869,6 +900,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::ShowTables => "SHOW TABLES",
         Statement::ShowCreateTable { .. } => "SHOW CREATE TABLE",
         Statement::DescribeTable { .. } => "DESCRIBE TABLE",
+        Statement::ExistsTable { .. } => "EXISTS TABLE",
     }
 }
 
@@ -1956,6 +1988,12 @@ const DESCRIBE_TABLE_RESULT_RESOURCES: QueryResultResources = QueryResultResourc
     rows: "DESCRIBE TABLE result rows",
     values: "DESCRIBE TABLE result values",
     bytes: "DESCRIBE TABLE result bytes",
+};
+
+const EXISTS_TABLE_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "EXISTS TABLE result rows",
+    values: "EXISTS TABLE result values",
+    bytes: "EXISTS TABLE result bytes",
 };
 
 fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> Result<()> {
