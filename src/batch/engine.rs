@@ -74,9 +74,9 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// `CAST`, `LENGTH`, `ABS`, `ROUND`, and the minimal unpartitioned `ROW_NUMBER`
-/// window forms provide bounded projections in ungrouped queries. An optional
-/// `AS` alias controls each result column name.
+/// `CAST`, `LENGTH`, `ABS`, `ROUND`, `FLOOR`, and the minimal unpartitioned
+/// `ROW_NUMBER` window forms provide bounded projections in ungrouped queries.
+/// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
 ///
@@ -310,7 +310,8 @@ impl Database {
                             "SELECT result bytes"
                             | "SHOW TABLES result bytes"
                             | "SHOW CREATE TABLE result bytes"
-                            | "DESCRIBE TABLE result bytes",
+                            | "DESCRIBE TABLE result bytes"
+                            | "EXISTS TABLE result bytes",
                         actual,
                         ..
                     } if tightened_result_limit => Error::ResultLimitExceeded {
@@ -396,7 +397,8 @@ impl Database {
                         "SELECT result bytes"
                         | "SHOW TABLES result bytes"
                         | "SHOW CREATE TABLE result bytes"
-                        | "DESCRIBE TABLE result bytes",
+                        | "DESCRIBE TABLE result bytes"
+                        | "EXISTS TABLE result bytes",
                     actual,
                     ..
                 } if tightened_result_limit => Error::ResultLimitExceeded {
@@ -466,7 +468,8 @@ impl Database {
             | Statement::UnionAll { .. }
             | Statement::ShowTables
             | Statement::ShowCreateTable { .. }
-            | Statement::DescribeTable { .. }) => self
+            | Statement::DescribeTable { .. }
+            | Statement::ExistsTable { .. }) => self
                 .execute_query_statement_with_limits(statement, query_result_limits)
                 .map(StatementResult::Query),
         }
@@ -495,11 +498,14 @@ impl Database {
             Statement::DescribeTable { name } => {
                 self.execute_describe_table(&name, query_result_limits)
             }
+            Statement::ExistsTable { name } => {
+                self.execute_exists_table(&name, query_result_limits)
+            }
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
             | Statement::TruncateTable { .. }
             | Statement::Insert { .. } => Err(Error::InvalidQuery(
-                "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, or DESCRIBE TABLE"
+                "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
                     .to_owned(),
             )),
         }
@@ -680,6 +686,31 @@ impl Database {
             .collect();
 
         Ok(QueryResult { columns, rows })
+    }
+
+    fn execute_exists_table(
+        &self,
+        name: &str,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const RESULT_COLUMN_NAME: &str = "result";
+
+        validate_result_shape_parts(
+            1,
+            1,
+            1,
+            RESULT_COLUMN_NAME.len(),
+            query_result_limits,
+            EXISTS_TABLE_RESULT_RESOURCES,
+        )?;
+
+        Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: RESULT_COLUMN_NAME.to_owned(),
+                data_type: DataType::Bool,
+            }],
+            rows: vec![vec![Value::Bool(self.catalog.table_exists(name))]],
+        })
     }
 
     fn execute_select(
@@ -869,6 +900,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::ShowTables => "SHOW TABLES",
         Statement::ShowCreateTable { .. } => "SHOW CREATE TABLE",
         Statement::DescribeTable { .. } => "DESCRIBE TABLE",
+        Statement::ExistsTable { .. } => "EXISTS TABLE",
     }
 }
 
@@ -1231,6 +1263,9 @@ enum ResolvedItem {
     Float64Round {
         source: usize,
     },
+    Float64Floor {
+        source: usize,
+    },
     RowNumber,
     Aggregate {
         state: usize,
@@ -1457,6 +1492,30 @@ fn resolve_select_items(
                     data_type: DataType::Float64,
                 });
             }
+            SelectItem::Floor { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::Float64 {
+                    return Err(Error::TypeMismatch {
+                        context: format!("FLOOR argument '{name}'"),
+                        expected: DataType::Float64.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "FLOOR projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::Float64Floor { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("FLOOR({})", table.schema()[source].name)),
+                    data_type: DataType::Float64,
+                });
+            }
             SelectItem::RowNumber { alias, .. } => {
                 items.push(ResolvedItem::RowNumber);
                 result_columns.push(ResultColumn {
@@ -1636,6 +1695,9 @@ fn execute_projection(
                         ResolvedItem::Float64Round { source } => {
                             Value::Float64(float64_at(table, *source, *row).round())
                         }
+                        ResolvedItem::Float64Floor { source } => {
+                            Value::Float64(float64_at(table, *source, *row).floor())
+                        }
                         ResolvedItem::RowNumber => Value::Int64(checked_row_number(row_number)?),
                         ResolvedItem::Aggregate { .. } => {
                             unreachable!("projection does not contain aggregates")
@@ -1759,6 +1821,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
+                | ResolvedItem::Float64Floor { .. }
                 | ResolvedItem::RowNumber => None,
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
@@ -1811,6 +1874,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::Float64Round { .. } => {
                     unreachable!("ROUND projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Floor { .. } => {
+                    unreachable!("FLOOR projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
@@ -1922,6 +1988,12 @@ const DESCRIBE_TABLE_RESULT_RESOURCES: QueryResultResources = QueryResultResourc
     rows: "DESCRIBE TABLE result rows",
     values: "DESCRIBE TABLE result values",
     bytes: "DESCRIBE TABLE result bytes",
+};
+
+const EXISTS_TABLE_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "EXISTS TABLE result rows",
+    values: "EXISTS TABLE result values",
+    bytes: "EXISTS TABLE result bytes",
 };
 
 fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> Result<()> {
@@ -2242,6 +2314,9 @@ impl GroupedData<'_> {
                         }
                         ResolvedItem::Float64Round { .. } => {
                             unreachable!("ROUND projections are restricted to ungrouped queries")
+                        }
+                        ResolvedItem::Float64Floor { .. } => {
+                            unreachable!("FLOOR projections are restricted to ungrouped queries")
                         }
                         ResolvedItem::RowNumber => {
                             unreachable!(
@@ -2567,6 +2642,11 @@ fn order_source_rows(
                     let right = ValueRef::Float64(float64_at(table, source, right).round());
                     left.cmp(&right)
                 }
+                ResolvedItem::Float64Floor { source } => {
+                    let left = ValueRef::Float64(float64_at(table, source, left).floor());
+                    let right = ValueRef::Float64(float64_at(table, source, right).floor());
+                    left.cmp(&right)
+                }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections cannot be ordered")
                 }
@@ -2618,6 +2698,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::Float64Round { .. } => {
                     unreachable!("ROUND projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Floor { .. } => {
+                    unreachable!("FLOOR projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")

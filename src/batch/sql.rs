@@ -69,6 +69,10 @@ pub enum Statement {
     DescribeTable {
         name: String,
     },
+    /// ClickHouse-compatible catalog membership query.
+    ExistsTable {
+        name: String,
+    },
 }
 
 /// `SELECT <literal> [AS <alias>]`.
@@ -128,6 +132,10 @@ pub enum SelectItem {
         alias: Option<String>,
     },
     Round {
+        name: String,
+        alias: Option<String>,
+    },
+    Floor {
         name: String,
         alias: Option<String>,
     },
@@ -584,8 +592,10 @@ impl<'a> Parser<'a> {
             self.parse_show()
         } else if self.eat_keyword("DESCRIBE") {
             self.parse_describe()
+        } else if self.eat_keyword("EXISTS") {
+            self.parse_exists()
         } else {
-            self.error("expected CREATE, DROP, TRUNCATE, INSERT, SELECT, SHOW, or DESCRIBE")
+            self.error("expected CREATE, DROP, TRUNCATE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS")
         }
     }
 
@@ -705,6 +715,15 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after DESCRIBE TABLE <name>");
         }
         Ok(Statement::DescribeTable { name })
+    }
+
+    fn parse_exists(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let name = self.expect_identifier("table name")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after EXISTS TABLE <name>");
+        }
+        Ok(Statement::ExistsTable { name })
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -1074,6 +1093,13 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::Round { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("FLOOR") {
+                let name = self.expect_identifier("Float64 column in FLOOR")?;
+                self.expect(&TokenKind::RightParen, "')' after FLOOR expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Floor { name, alias });
+            }
+
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
@@ -1116,6 +1142,13 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY ROUND expression",
             )?;
             Ok(format!("ROUND({argument})"))
+        } else if name.eq_ignore_ascii_case("FLOOR") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("Float64 column in ORDER BY FLOOR")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY FLOOR expression",
+            )?;
+            Ok(format!("FLOOR({argument})"))
         } else {
             Ok(name)
         }
