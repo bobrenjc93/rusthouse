@@ -56,9 +56,12 @@ such as `-7`; `Float64` literals are optionally signed, finite decimal or
 scientific forms containing a decimal point or exponent, such as `+2.5` or
 `6.25e1`; and `Bool` literals are case-insensitive `TRUE` or `FALSE`. `String`
 literals are single-quoted and escape a quote by doubling it, as in
-`SELECT 'it''s ready' AS message`. This form accepts exactly one literal
-expression and an optional `AS` alias: expression lists, `NULL`, operator
-expressions, `FROM`, and other trailing clauses are not supported.
+`SELECT 'it''s ready' AS message`. An explicitly typed null uses the exact form
+`SELECT CAST(NULL AS Int64|Float64|Bool|String) [AS <alias>]`; without an alias,
+the normalized `CAST` expression is the result column name. This form accepts
+exactly one literal expression and an optional `AS` alias: expression lists,
+bare `NULL`, operator expressions, `FROM`, and other trailing clauses are not
+supported.
 
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
@@ -398,6 +401,18 @@ quote (for example, `"say ""hello"""`). Decoded contents use the same schema
 type rules as unquoted fields, and embedded line endings are retained exactly.
 Headers must remain unquoted, and malformed quoting is rejected. Any input,
 schema, value, limit, or remaining-capacity failure leaves the table unchanged.
+
+`Database::ingest_tsv_with_names` provides the corresponding bounded,
+multi-column `TabSeparatedWithNames` importer, with
+`SharedDatabase::ingest_tsv_with_names` retaining one write lock for the same
+atomic operation. The decoded header must exactly match every schema column in
+order and case. Data rows accept the same `Int64`, finite `Float64`, exact
+lowercase `Bool`, and `String` types, with LF or CRLF record endings. Fields
+decode the escape sequences emitted by RustHouse's TSV writer: `\\`, `\t`,
+`\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Callers supply complete-input byte,
+row, and total-value limits. Invalid UTF-8, line endings, escapes, headers,
+field counts, typed values, configured limits, or remaining table capacity are
+rejected before any row is appended.
 
 ## Snapshot envelope
 

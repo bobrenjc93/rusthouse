@@ -9,6 +9,7 @@ use super::engine::{
 };
 use super::error::Error;
 use super::sql::{self, Statement};
+use super::tsv::{TsvIngestError, TsvIngestLimits};
 
 /// An instantaneous count of data retained by a [`SharedDatabase`].
 ///
@@ -29,6 +30,8 @@ pub struct DatabaseMetrics {
 pub enum SharedDatabaseError {
     /// Parsing or executing the SQL batch failed.
     Sql(Error),
+    /// The database rejected a TSV ingestion request.
+    TsvIngest(TsvIngestError),
     /// The read-only query API received zero or multiple statements.
     QueryStatementCount { statements: usize },
     /// The read-only query API received a mutating statement.
@@ -41,6 +44,7 @@ impl fmt::Display for SharedDatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sql(error) => error.fmt(formatter),
+            Self::TsvIngest(error) => write!(formatter, "database TSV ingestion failed: {error}"),
             Self::QueryStatementCount { statements } => write!(
                 formatter,
                 "read-only query requires exactly one statement; found {statements}"
@@ -58,6 +62,7 @@ impl StdError for SharedDatabaseError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Sql(error) => Some(error),
+            Self::TsvIngest(error) => Some(error),
             Self::QueryStatementCount { .. }
             | Self::ReadOnlyStatementRequired { .. }
             | Self::LockPoisoned => None,
@@ -68,6 +73,12 @@ impl StdError for SharedDatabaseError {
 impl From<Error> for SharedDatabaseError {
     fn from(error: Error) -> Self {
         Self::Sql(error)
+    }
+}
+
+impl From<TsvIngestError> for SharedDatabaseError {
+    fn from(error: TsvIngestError) -> Self {
+        Self::TsvIngest(error)
     }
 }
 
@@ -182,6 +193,21 @@ impl SharedDatabase {
         let statements = sql::parse(input)?;
         self.write()?
             .execute_insert_statements(statements)
+            .map_err(Into::into)
+    }
+
+    /// Atomically ingests bounded `TabSeparatedWithNames` bytes under one write lock.
+    ///
+    /// The lock is retained through parsing, limit and capacity validation, and
+    /// the final append, so concurrent operations cannot expose partial input.
+    pub fn ingest_tsv_with_names(
+        &self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: TsvIngestLimits,
+    ) -> Result<usize, SharedDatabaseError> {
+        self.write()?
+            .ingest_tsv_with_names(table, input, limits)
             .map_err(Into::into)
     }
 

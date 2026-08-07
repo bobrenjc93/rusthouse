@@ -88,7 +88,7 @@ pub enum Statement {
     },
 }
 
-/// `SELECT <literal> [AS <alias>]`.
+/// `SELECT <literal> [AS <alias>]`, including an explicitly typed `NULL`.
 ///
 /// This deliberately separate syntax tree keeps expression lists, table
 /// sources, and trailing clauses unrepresentable for literal-only queries.
@@ -644,6 +644,9 @@ impl<'a> Parser<'a> {
         if self.at_literal_start() {
             return self.parse_literal_select();
         }
+        if self.at_complete_typed_null_select() {
+            return self.parse_typed_null_select();
+        }
 
         let left = self.parse_select()?;
         if self.eat_keyword("CROSS") {
@@ -675,6 +678,95 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Statement::LiteralSelect(LiteralSelect { value, alias }))
+    }
+
+    fn parse_typed_null_select(&mut self) -> Result<Statement> {
+        const SHAPE: &str = "typed NULL SELECT supports exactly CAST(NULL AS Int64|Float64|Bool|String) with an optional AS alias and no trailing clauses";
+
+        self.reserve_ast_list_item()?;
+        self.expect_keyword("CAST")?;
+        self.expect(&TokenKind::LeftParen, "'(' after CAST")?;
+        self.expect_keyword("NULL")?;
+        self.expect_keyword("AS")?;
+        let position = self.position();
+        let type_name = self.expect_identifier("target type in typed NULL CAST")?;
+        let data_type = Self::typed_null_cast_data_type(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown typed NULL CAST target type '{type_name}'; expected Int64, Float64, Bool, or String"
+            ),
+        })?;
+        self.expect(&TokenKind::RightParen, "')' after typed NULL CAST")?;
+        let alias = self.parse_alias()?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::LiteralSelect(LiteralSelect {
+            value: Value::Null(data_type),
+            alias,
+        }))
+    }
+
+    fn at_complete_typed_null_select(&self) -> bool {
+        if !self.at_keyword("CAST") {
+            return false;
+        }
+
+        let mut lexer = self.lexer;
+        if !matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen) {
+            return false;
+        }
+        if !matches!(
+            Self::next_or_invalid(&mut lexer).kind,
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("NULL")
+        ) {
+            return false;
+        }
+        if !matches!(
+            Self::next_or_invalid(&mut lexer).kind,
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("AS")
+        ) {
+            return false;
+        }
+        let TokenKind::Identifier(type_name) = Self::next_or_invalid(&mut lexer).kind else {
+            return false;
+        };
+        if Self::typed_null_cast_data_type(&type_name).is_none()
+            || !matches!(
+                Self::next_or_invalid(&mut lexer).kind,
+                TokenKind::RightParen
+            )
+        {
+            return false;
+        }
+
+        match Self::next_or_invalid(&mut lexer).kind {
+            TokenKind::Semicolon | TokenKind::End => true,
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("AS") => {
+                matches!(
+                    (
+                        Self::next_or_invalid(&mut lexer).kind,
+                        Self::next_or_invalid(&mut lexer).kind,
+                    ),
+                    (
+                        TokenKind::Identifier(_),
+                        TokenKind::Semicolon | TokenKind::End,
+                    )
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn typed_null_cast_data_type(type_name: &str) -> Option<DataType> {
+        match type_name.to_ascii_uppercase().as_str() {
+            "INT64" => Some(DataType::Int64),
+            "FLOAT64" => Some(DataType::Float64),
+            "BOOL" => Some(DataType::Bool),
+            "STRING" => Some(DataType::String),
+            _ => None,
+        }
     }
 
     fn at_literal_start(&self) -> bool {

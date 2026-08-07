@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::mem::size_of;
 use std::process::{Command, Output, Stdio};
 
@@ -6,7 +6,7 @@ use rusthouse::batch::engine::{Database, QueryResultLimits, ResultColumn, Statem
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{self, BatchSqlLimits, LiteralSelect, Statement};
 use rusthouse::batch::value::{DataType, Value};
-use rusthouse::{SharedDatabase, SharedDatabaseError};
+use rusthouse::{SharedDatabase, SharedDatabaseError, handle_http_query};
 
 fn query_result(result: &StatementResult) -> &rusthouse::batch::engine::QueryResult {
     let StatementResult::Query(result) = result else {
@@ -25,6 +25,30 @@ fn run_cli(format: &str, input: &[u8]) -> Output {
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()
+}
+
+fn run_http(format: Option<&str>, sql: &[u8]) -> Vec<u8> {
+    let database = SharedDatabase::default();
+    let format_header = format.map_or_else(String::new, |format| {
+        format!("X-ClickHouse-Format: {format}\r\n")
+    });
+    let mut request = format!(
+        "POST /query HTTP/1.1\r\nHost: localhost\r\n{format_header}Content-Length: {}\r\n\r\n",
+        sql.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(sql);
+
+    let mut response = Vec::new();
+    handle_http_query(&database, Cursor::new(request), &mut response).unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let separator = b"\r\n\r\n";
+    let body = response
+        .windows(separator.len())
+        .position(|window| window == separator)
+        .expect("HTTP response has a header terminator")
+        + separator.len();
+    response[body..].to_vec()
 }
 
 #[test]
@@ -53,6 +77,31 @@ fn parses_each_literal_type_signed_numbers_escaped_strings_and_aliases() {
 }
 
 #[test]
+fn parses_every_explicitly_typed_null_and_optional_aliases() {
+    let statements = sql::parse(
+        "SELECT CAST(NULL AS Int64); \
+         SELECT cast(null as float64) AS floating; \
+         SELECT CaSt(NuLl As BoOl); \
+         SELECT CAST(NULL AS String) AS text;",
+    )
+    .unwrap();
+
+    let expected = [
+        (DataType::Int64, None),
+        (DataType::Float64, Some("floating")),
+        (DataType::Bool, None),
+        (DataType::String, Some("text")),
+    ];
+    for (statement, (data_type, alias)) in statements.iter().zip(expected) {
+        let Statement::LiteralSelect(select) = statement else {
+            panic!("expected a literal-only SELECT");
+        };
+        assert_eq!(select.value, Value::Null(data_type));
+        assert_eq!(select.alias.as_deref(), alias);
+    }
+}
+
+#[test]
 fn rejects_expression_lists_unsupported_literals_and_trailing_clauses() {
     for sql in [
         "SELECT 1, 2",
@@ -65,6 +114,19 @@ fn rejects_expression_lists_unsupported_literals_and_trailing_clauses() {
         "SELECT 1 AS value extra",
         "SELECT 1 AS",
         "SELECT NULL",
+        "SELECT CAST(NULL)",
+        "SELECT CAST(NULL Int64)",
+        "SELECT CAST(NULL AS)",
+        "SELECT CAST(NULL AS Int64",
+        "SELECT CAST(NULL AS Int64))",
+        "SELECT CAST(NULL AS UInt64)",
+        "SELECT CAST(NULL AS Boolean)",
+        "SELECT CAST(NULL AS Int64), 1",
+        "SELECT CAST(NULL AS Int64) WHERE true",
+        "SELECT CAST(NULL AS Int64) LIMIT 1",
+        "SELECT CAST(NULL AS Int64) UNION ALL SELECT 1",
+        "SELECT CAST(NULL AS Bool) AS",
+        "SELECT CAST(NULL AS String) AS value extra",
         "SELECT -true",
     ] {
         assert!(
@@ -82,6 +144,14 @@ fn literal_select_counts_toward_the_ast_item_limit() {
     };
     assert_eq!(
         sql::parse_with_limits("SELECT 1", limits),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SQL AST list items",
+            actual: 1,
+            max: 0,
+        })
+    );
+    assert_eq!(
+        sql::parse_with_limits("SELECT CAST(NULL AS Int64)", limits),
         Err(Error::ResourceLimitExceeded {
             resource: "SQL AST list items",
             actual: 1,
@@ -126,19 +196,40 @@ fn database_returns_one_inferred_column_and_row_for_each_literal_type() {
 }
 
 #[test]
-fn direct_ast_execution_rejects_null_and_non_finite_literal_values() {
+fn database_returns_one_typed_null_column_and_row_for_every_type() {
+    let mut database = Database::new();
+    let results = database
+        .execute(
+            "SELECT CAST(NULL AS Int64); \
+             SELECT CAST(NULL AS Float64) AS floating; \
+             SELECT CAST(NULL AS Bool); \
+             SELECT CAST(NULL AS String) AS text;",
+        )
+        .unwrap();
+
+    let expected = [
+        ("CAST(NULL AS Int64)", DataType::Int64),
+        ("floating", DataType::Float64),
+        ("CAST(NULL AS Bool)", DataType::Bool),
+        ("text", DataType::String),
+    ];
+    for (result, (name, data_type)) in results.iter().zip(expected) {
+        let result = query_result(result);
+        assert_eq!(
+            result.columns,
+            vec![ResultColumn {
+                name: name.to_owned(),
+                data_type,
+            }]
+        );
+        assert_eq!(result.rows, vec![vec![Value::Null(data_type)]]);
+    }
+}
+
+#[test]
+fn direct_ast_execution_rejects_non_finite_literal_values() {
     let mut database = Database::new();
     let cases = [
-        (
-            Value::Null(DataType::Int64),
-            None,
-            "literal SELECT does not support NULL",
-        ),
-        (
-            Value::Null(DataType::String),
-            Some("aliased_null"),
-            "literal SELECT does not support NULL",
-        ),
         (
             Value::Float64(f64::NAN),
             None,
@@ -223,13 +314,20 @@ fn direct_ast_unaliased_string_is_preflighted_at_exact_result_limits() {
 #[test]
 fn direct_ast_generated_scalar_names_have_exact_byte_accounting() {
     for value in [
+        Value::Null(DataType::Int64),
+        Value::Null(DataType::Float64),
+        Value::Null(DataType::Bool),
+        Value::Null(DataType::String),
         Value::Int64(i64::MIN),
         Value::Float64(2.0),
         Value::Float64(f64::MAX),
         Value::Float64(f64::MIN_POSITIVE),
         Value::Bool(true),
     ] {
-        let expected_name = value.as_display_string();
+        let expected_name = match &value {
+            Value::Null(data_type) => format!("CAST(NULL AS {data_type})"),
+            _ => value.as_display_string(),
+        };
         let required_bytes = size_of::<ResultColumn>()
             + expected_name.len()
             + size_of::<Vec<Value>>()
@@ -279,6 +377,97 @@ fn shared_database_executes_literal_select_under_a_read_lock() {
         }]
     );
     assert_eq!(result.rows, vec![vec![Value::String("ready".to_owned())]]);
+
+    let result = database
+        .query("SELECT CAST(NULL AS String) AS missing;")
+        .unwrap();
+    assert_eq!(
+        result.columns,
+        vec![ResultColumn {
+            name: "missing".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert_eq!(result.rows, vec![vec![Value::Null(DataType::String)]]);
+}
+
+#[test]
+fn typed_null_select_obeys_exact_query_and_retained_result_limits() {
+    let column_name = "CAST(NULL AS String)";
+    let exact_bytes = size_of::<ResultColumn>()
+        + column_name.len()
+        + size_of::<Vec<Value>>()
+        + size_of::<Value>();
+    let sql = "SELECT CAST(NULL AS String)";
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    let result = exact.execute(sql).expect("all exact query limits fit");
+    assert_eq!(query_result(&result[0]).columns[0].name, column_name);
+
+    for (limits, resource, actual, max) in [
+        (
+            QueryResultLimits {
+                max_rows: 0,
+                ..QueryResultLimits::default()
+            },
+            "SELECT result rows",
+            1,
+            0,
+        ),
+        (
+            QueryResultLimits {
+                max_values: 0,
+                ..QueryResultLimits::default()
+            },
+            "SELECT result values",
+            1,
+            0,
+        ),
+        (
+            QueryResultLimits {
+                max_bytes: exact_bytes - 1,
+                ..QueryResultLimits::default()
+            },
+            "SELECT result bytes",
+            exact_bytes,
+            exact_bytes - 1,
+        ),
+    ] {
+        let mut database = Database::with_query_result_limits(limits);
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::ResourceLimitExceeded {
+                resource,
+                actual,
+                max,
+            })
+        );
+    }
+
+    let mut retained = Database::new();
+    assert!(retained.execute_with_result_limit(sql, exact_bytes).is_ok());
+    assert_eq!(
+        retained.execute_with_result_limit(sql, exact_bytes - 1),
+        Err(Error::ResultLimitExceeded {
+            bytes: exact_bytes,
+            max_bytes: exact_bytes - 1,
+        })
+    );
+
+    let shared = SharedDatabase::default();
+    assert!(shared.query_with_result_limit(sql, exact_bytes).is_ok());
+    assert_eq!(
+        shared.query_with_result_limit(sql, exact_bytes - 1),
+        Err(SharedDatabaseError::Sql(Error::ResultLimitExceeded {
+            bytes: exact_bytes,
+            max_bytes: exact_bytes - 1,
+        }))
+    );
 }
 
 #[test]
@@ -344,35 +533,46 @@ fn literal_select_obeys_query_shape_payload_and_retained_result_limits() {
 }
 
 #[test]
-fn cli_emits_literal_selects_in_table_csv_and_json_formats() {
-    let table = run_cli("table", b"SELECT -7 AS signed;");
-    assert!(table.status.success(), "{:?}", table.stderr);
-    assert_eq!(
-        table.stdout,
-        b"+--------+\n| signed |\n+--------+\n| -7     |\n+--------+\n"
-    );
-    assert!(table.stderr.is_empty());
+fn cli_emits_typed_null_select_in_every_output_format() {
+    let sql = b"SELECT CAST(NULL AS Int64) AS missing;";
+    let cases: [(&str, &[u8]); 6] = [
+        (
+            "table",
+            b"+---------+\n| missing |\n+---------+\n| NULL    |\n+---------+\n",
+        ),
+        ("csv", b"missing\nNULL\n"),
+        ("tsv", b"missing\n\\N\n"),
+        (
+            "json",
+            b"{\"columns\":[{\"name\":\"missing\",\"type\":\"Int64\"}],\"rows\":[[null]]}\n",
+        ),
+        ("JSONEachRow", b"{\"missing\":null}\n"),
+        ("JSONCompactEachRow", b"[null]\n"),
+    ];
 
-    let csv = run_cli("csv", b"SELECT 'it''s, ready' AS message;");
-    assert!(csv.status.success(), "{:?}", csv.stderr);
-    assert_eq!(csv.stdout, b"message\n\"it's, ready\"\n");
-    assert!(csv.stderr.is_empty());
+    for (format, expected) in cases {
+        let output = run_cli(format, sql);
+        assert!(output.status.success(), "{format}: {:?}", output.stderr);
+        assert_eq!(output.stdout, expected, "{format}");
+        assert!(output.stderr.is_empty(), "{format}");
+    }
+}
 
-    let json = run_cli(
-        "json",
-        b"SELECT -7 AS integer; SELECT +2.5 AS float; \
-          SELECT false AS boolean; SELECT 'ready' AS string;",
-    );
-    assert!(json.status.success(), "{:?}", json.stderr);
-    assert_eq!(
-        json.stdout,
-        concat!(
-            "{\"columns\":[{\"name\":\"integer\",\"type\":\"Int64\"}],\"rows\":[[-7]]}\n",
-            "{\"columns\":[{\"name\":\"float\",\"type\":\"Float64\"}],\"rows\":[[2.5]]}\n",
-            "{\"columns\":[{\"name\":\"boolean\",\"type\":\"Bool\"}],\"rows\":[[false]]}\n",
-            "{\"columns\":[{\"name\":\"string\",\"type\":\"String\"}],\"rows\":[[\"ready\"]]}\n",
-        )
-        .as_bytes()
-    );
-    assert!(json.stderr.is_empty());
+#[test]
+fn http_exposes_typed_null_select_in_every_supported_wire_format() {
+    let sql = b"SELECT CAST(NULL AS String) AS missing;";
+    let cases: [(Option<&str>, &[u8]); 5] = [
+        (
+            None,
+            b"{\"columns\":[{\"name\":\"missing\",\"type\":\"String\"}],\"rows\":[[null]]}",
+        ),
+        (Some("CSVWithNames"), b"missing\nNULL\n"),
+        (Some("TabSeparatedWithNames"), b"missing\n\\N\n"),
+        (Some("JSONEachRow"), b"{\"missing\":null}\n"),
+        (Some("JSONCompactEachRow"), b"[null]\n"),
+    ];
+
+    for (format, expected) in cases {
+        assert_eq!(run_http(format, sql), expected, "{format:?}");
+    }
 }

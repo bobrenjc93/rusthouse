@@ -10,6 +10,7 @@ use crate::batch::sql::{
     HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
 };
 use crate::batch::storage::{Column, Table};
+use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
 
 pub use crate::batch::storage::DEFAULT_MAX_ROWS_PER_TABLE;
@@ -254,6 +255,48 @@ impl Database {
         let rows = {
             let target = self.catalog.table(table)?;
             csv::parse_rows(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        self.catalog.table_mut(table)?.insert_rows(rows)?;
+        Ok(affected_rows)
+    }
+
+    /// Atomically appends bounded, typed `TabSeparatedWithNames` input.
+    ///
+    /// The decoded header must exactly match the target schema in order and
+    /// case. Fields use the TSV writer's ClickHouse-style escapes: `\\`, `\t`,
+    /// `\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Values are parsed as `Int64`,
+    /// finite `Float64`, `Bool`, or `String`; records may use LF or CRLF.
+    ///
+    /// Parsing, all configured limits, and remaining table capacity are
+    /// validated before any physical column changes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::engine::Database;
+    /// use rusthouse::batch::tsv::TsvIngestLimits;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute("CREATE TABLE notes (id Int64, text String);")?;
+    /// let input = b"id\ttext\n1\tline\\nwith\\ttab\n";
+    /// let rows = database.ingest_tsv_with_names(
+    ///     "notes",
+    ///     input,
+    ///     TsvIngestLimits::new(input.len(), 1, 2),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_tsv_with_names(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: TsvIngestLimits,
+    ) -> std::result::Result<usize, TsvIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            tsv::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
         self.catalog.table_mut(table)?.insert_rows(rows)?;
@@ -986,7 +1029,9 @@ fn literal_result_name_len(value: &Value) -> usize {
         Value::Float64(value) => float64_result_name_len(*value),
         Value::Bool(true) => 4,
         Value::Bool(false) => 5,
-        Value::Null(_) => 4,
+        Value::Null(data_type) => "CAST(NULL AS )"
+            .len()
+            .saturating_add(data_type.as_str().len()),
     }
 }
 
@@ -1024,13 +1069,14 @@ fn float64_result_name_len(value: f64) -> usize {
 
 fn validate_literal_select_value(value: &Value) -> Result<()> {
     match value {
-        Value::Null(_) => Err(Error::InvalidQuery(
-            "literal SELECT does not support NULL".to_owned(),
-        )),
         Value::Float64(value) if !value.is_finite() => Err(Error::InvalidQuery(
             "literal SELECT Float64 must be finite".to_owned(),
         )),
-        Value::Int64(_) | Value::Float64(_) | Value::Bool(_) | Value::String(_) => Ok(()),
+        Value::Null(_)
+        | Value::Int64(_)
+        | Value::Float64(_)
+        | Value::Bool(_)
+        | Value::String(_) => Ok(()),
     }
 }
 
@@ -1048,9 +1094,8 @@ fn literal_result_name(value: &Value) -> String {
             name.push('\'');
             name
         }
-        Value::Null(_) | Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => {
-            value.as_display_string()
-        }
+        Value::Null(data_type) => format!("CAST(NULL AS {})", data_type.as_str()),
+        Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => value.as_display_string(),
     }
 }
 
