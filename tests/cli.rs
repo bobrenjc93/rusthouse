@@ -64,6 +64,24 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn json_cli_executes_equality_delete_silently() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE events (id Int64, label String); \
+          INSERT INTO events VALUES (1, 'keep'), (2, 'remove'), (3, 'remove'); \
+          DELETE FROM events WHERE label = 'remove'; \
+          SELECT id, label FROM events;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[1,\"keep\"]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_accepts_complete_insert_columns_in_any_order() {
     let output = run(
         &["--format", "json"],

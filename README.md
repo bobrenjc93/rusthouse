@@ -42,6 +42,17 @@ numeric HAVING comparison. `COUNT` is always non-`NULL`.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
+`DELETE FROM <table> WHERE <column> = <literal>` removes rows matching one
+typed equality predicate. Table and column lookup are case-insensitive, and
+the literal accepts the same finite `Int64`, `Float64`, `Bool`, and `String`
+forms as `WHERE`. The full source row count is checked against the configured
+scan limit before any row is inspected or changed. Missing names, type errors,
+and scan-limit failures leave the table unchanged; after validation and the
+bounded scan, all matching row indexes are passed to one atomic deletion.
+Other predicates, clauses, and bare `NULL` are not supported by this narrow
+form. A successful command reports its deleted-row count through the library
+API and is silent in formatted CLI output.
+
 `INSERT INTO <table> (<columns>) VALUES ...` accepts a complete explicit
 column list in any order. Names resolve case-insensitively, every schema column
 must appear exactly once, and each row is reordered into schema order before
@@ -263,8 +274,8 @@ compact input cannot expand into an unbounded retained token or AST graph.
 Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
 combined levels of parenthesized or unary-`NOT` nesting.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
-`DROP`, `RENAME`, `TRUNCATE`, and `INSERT` statements are silent, and each
-`SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
+`DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
+each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE` query is executed and emitted before the next statement. Table output
 uses bordered, human-readable columns, escapes control characters, renders SQL
 `NULL` as `NULL`, and separates multiple query results with a blank line. Each
@@ -291,10 +302,11 @@ TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
 carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
 column names and strings use ClickHouse's backslash escapes.
-A table-backed `SELECT` inspects at most 1,000,000 source rows by default. This
-scanned-row limit is checked against the full source table before matching-row
-indices are allocated, so `WHERE` selectivity and `LIMIT` do not reduce it;
-each `UNION` operand and each `CROSS JOIN` input has its own source scan.
+A table-backed `SELECT` or equality `DELETE` inspects at most 1,000,000 source
+rows by default. This scanned-row limit is checked against the full source
+table before matching-row indices are allocated, so `WHERE` selectivity and
+`LIMIT` do not reduce it; each `UNION` operand and each `CROSS JOIN` input has
+its own source scan.
 It is distinct from the 10,000-row output limit, which applies after filtering,
 grouping, ordering, and `LIMIT`. Query output is also checked before cloning
 against a limit of 250,000 values and an estimated 16 MiB. Grouped queries
@@ -309,7 +321,7 @@ and 4,000,000 physical scalar cells each by default. The cell count is the
 current row count multiplied by the schema width, so repeated `ADD COLUMN` and
 `INSERT` calls cannot grow storage without a cumulative bound. CREATE, INSERT,
 and ADD COLUMN reject an exceeded cap before allocating or changing table
-state; DROP COLUMN and TRUNCATE TABLE restore reusable cell capacity.
+state; DROP COLUMN, TRUNCATE TABLE, and DELETE restore reusable cell capacity.
 `Database::with_query_result_limits` and the matching `SharedDatabase`
 constructor configure the scan and output limits.
 `Database::with_max_rows_per_table` and its shared counterpart configure the
