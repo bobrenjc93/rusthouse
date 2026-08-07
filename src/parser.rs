@@ -91,6 +91,7 @@ impl ColumnDefinition {
 pub struct CreateTableStatement {
     table_name: Identifier,
     column: ColumnDefinition,
+    if_not_exists: bool,
 }
 
 impl CreateTableStatement {
@@ -102,6 +103,11 @@ impl CreateTableStatement {
     /// Returns the statement's only column definition.
     pub fn column(&self) -> &ColumnDefinition {
         &self.column
+    }
+
+    /// Returns whether an existing table should make this statement a no-op.
+    pub const fn if_not_exists(&self) -> bool {
+        self.if_not_exists
     }
 }
 
@@ -542,7 +548,7 @@ impl Error for ParseError {}
 /// accepted grammar is:
 ///
 /// ```text
-/// CREATE TABLE identifier (identifier Int64 [NULL | NOT NULL])
+/// CREATE TABLE [IF NOT EXISTS] identifier (identifier Int64 [NULL | NOT NULL])
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted. Statement and
@@ -885,6 +891,18 @@ impl<'input> Parser<'input> {
         self.require_whitespace("whitespace after CREATE")?;
         self.expect_keyword("TABLE")?;
         self.require_whitespace("whitespace after TABLE")?;
+        let if_not_exists =
+            if self.keyword_at_position("IF") && self.keyword_follows_current_word("NOT") {
+                self.expect_keyword("IF")?;
+                self.require_whitespace("whitespace after IF")?;
+                self.expect_keyword("NOT")?;
+                self.require_whitespace("whitespace after NOT")?;
+                self.expect_keyword("EXISTS")?;
+                self.require_whitespace("whitespace after EXISTS")?;
+                true
+            } else {
+                false
+            };
         let table_name = self.parse_identifier()?;
 
         self.skip_whitespace();
@@ -912,6 +930,7 @@ impl<'input> Parser<'input> {
                 data_type: DataType::Int64,
                 nullable,
             },
+            if_not_exists,
         })
     }
 

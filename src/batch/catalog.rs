@@ -19,6 +19,35 @@ impl Catalog {
         self.create_table_with_row_cap(name, schema, DEFAULT_MAX_ROWS_PER_TABLE)
     }
 
+    /// Creates a default-cap table unless its case-insensitive name exists.
+    ///
+    /// Returns `true` when a table was created and `false` when the existing
+    /// table was retained unchanged.
+    pub fn create_table_if_not_exists(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+    ) -> Result<bool> {
+        self.create_table_if_not_exists_with_row_cap(name, schema, DEFAULT_MAX_ROWS_PER_TABLE)
+    }
+
+    /// Creates a table unless its case-insensitive name is already registered.
+    ///
+    /// Returns `true` when a table was created and `false` when the existing
+    /// table was retained unchanged.
+    pub fn create_table_if_not_exists_with_row_cap(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+        row_cap: usize,
+    ) -> Result<bool> {
+        if self.table_exists(&name) {
+            return Ok(false);
+        }
+        self.create_table_with_row_cap(name, schema, row_cap)?;
+        Ok(true)
+    }
+
     /// Creates a table with an explicit maximum retained row count.
     pub fn create_table_with_row_cap(
         &mut self,

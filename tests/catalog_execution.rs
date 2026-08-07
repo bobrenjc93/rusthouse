@@ -265,6 +265,40 @@ fn create_enforces_exact_names_and_the_table_bound_atomically() {
 }
 
 #[test]
+fn conditional_create_uses_case_insensitive_no_op_without_changing_legacy_names() {
+    let limits = ParseLimits::default();
+    let mut catalog = catalog(1, 2);
+    catalog
+        .execute_create("CREATE TABLE Events (value Int64)", limits)
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO Events VALUES (7)", limits)
+        .unwrap();
+
+    catalog
+        .execute_create(
+            "CREATE TABLE IF NOT EXISTS events (replacement Int64 NOT NULL)",
+            limits,
+        )
+        .expect("existing case-insensitive name is a no-op before the table limit");
+
+    let original = catalog.table("Events").expect("original spelling remains");
+    assert_eq!(original.schema().column().name(), "value");
+    assert!(original.schema().column().is_nullable());
+    assert_eq!(original.values(), [Some(7)]);
+    assert_eq!(original.row_cap(), 2);
+    assert!(catalog.table("events").is_none());
+
+    assert_eq!(
+        catalog.execute_create("CREATE TABLE events (value Int64)", limits),
+        Err(CatalogError::TableLimitExceeded {
+            tables: 2,
+            max_tables: 1,
+        })
+    );
+}
+
+#[test]
 fn insert_preserves_lookup_storage_and_nullability_errors() {
     let limits = ParseLimits::default();
     let mut catalog = catalog(1, 1);

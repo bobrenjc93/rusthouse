@@ -22,9 +22,42 @@ fn parses_whitespace_casing_and_nullability_table() {
         let statement = parse_create_table(input, ParseLimits::default()).unwrap();
 
         assert_eq!(statement.table_name().as_str(), table_name, "{input:?}");
+        assert!(!statement.if_not_exists(), "{input:?}");
         assert_eq!(statement.column().name().as_str(), column_name, "{input:?}");
         assert_eq!(statement.column().data_type(), DataType::Int64, "{input:?}");
         assert_eq!(statement.column().is_nullable(), nullable, "{input:?}");
+    }
+}
+
+#[test]
+fn parses_if_not_exists_with_keyword_casing_and_preserves_if_table_name() {
+    let statement = parse_create_table(
+        "cReAtE tAbLe iF nOt eXiStS Events (value Int64)",
+        ParseLimits::default(),
+    )
+    .unwrap();
+    assert!(statement.if_not_exists());
+    assert_eq!(statement.table_name().as_str(), "Events");
+
+    let ordinary =
+        parse_create_table("CREATE TABLE IF (value Int64)", ParseLimits::default()).unwrap();
+    assert!(!ordinary.if_not_exists());
+    assert_eq!(ordinary.table_name().as_str(), "IF");
+}
+
+#[test]
+fn rejects_malformed_if_not_exists_forms() {
+    for input in [
+        "CREATE TABLE IF EXISTS events (value Int64)",
+        "CREATE TABLE IF NOT events (value Int64)",
+        "CREATE TABLE IF NOT EXIST events (value Int64)",
+        "CREATE TABLE IF NOT EXISTS (value Int64)",
+        "CREATE TABLE IF NOT EXISTS events value Int64)",
+    ] {
+        assert!(
+            parse_create_table(input, ParseLimits::default()).is_err(),
+            "malformed conditional create was accepted: {input:?}"
+        );
     }
 }
 

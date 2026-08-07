@@ -440,6 +440,17 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::CreateTableIfNotExists { name, columns } => {
+                self.catalog.create_table_if_not_exists_with_row_cap(
+                    name,
+                    columns,
+                    self.max_rows_per_table,
+                )?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::DropTable { name } => {
                 self.catalog.drop_table(&name)?;
                 Ok(StatementResult::Command {
@@ -513,6 +524,7 @@ impl Database {
                 self.execute_exists_table(&name, query_result_limits)
             }
             Statement::CreateTable { .. }
+            | Statement::CreateTableIfNotExists { .. }
             | Statement::DropTable { .. }
             | Statement::RenameTable { .. }
             | Statement::TruncateTable { .. }
@@ -901,7 +913,7 @@ impl Database {
 
 fn statement_name(statement: &Statement) -> &'static str {
     match statement {
-        Statement::CreateTable { .. } => "CREATE TABLE",
+        Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
