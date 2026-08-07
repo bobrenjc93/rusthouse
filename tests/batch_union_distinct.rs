@@ -345,6 +345,71 @@ fn empty_operands_require_no_deduplication_state() {
 }
 
 #[test]
+fn multi_result_retained_limit_does_not_keep_raw_union_row_capacity() {
+    const RAW_ROWS: usize = 10_000;
+    const OPERAND_ROWS: usize = RAW_ROWS / 2;
+    const RESULT_COUNT: usize = 3;
+
+    let mut setup = String::from(
+        "CREATE TABLE left_rows (n Int64); CREATE TABLE right_rows (n Int64); \
+         INSERT INTO left_rows VALUES ",
+    );
+    for row in 0..OPERAND_ROWS {
+        if row > 0 {
+            setup.push(',');
+        }
+        setup.push_str("(1)");
+    }
+    setup.push_str("; INSERT INTO right_rows VALUES ");
+    for row in 0..OPERAND_ROWS {
+        if row > 0 {
+            setup.push(',');
+        }
+        setup.push_str("(1)");
+    }
+    setup.push(';');
+
+    let mut database = Database::new();
+    database.execute(&setup).expect("setup succeeds");
+
+    let query = "SELECT n FROM left_rows UNION DISTINCT SELECT n FROM right_rows";
+    let batch = std::iter::repeat_n(query, RESULT_COUNT)
+        .collect::<Vec<_>>()
+        .join(";");
+    let one_retained_result = std::mem::size_of::<ResultColumn>()
+        + "n".len()
+        + std::mem::size_of::<Vec<Value>>()
+        + std::mem::size_of::<Value>();
+    let one_raw_result = std::mem::size_of::<ResultColumn>()
+        + "n".len()
+        + RAW_ROWS * std::mem::size_of::<Vec<Value>>()
+        + RAW_ROWS * std::mem::size_of::<Value>();
+    let retained_limit = one_raw_result + (RESULT_COUNT - 1) * one_retained_result;
+    let uncompacted_outer_row_bytes = RESULT_COUNT * RAW_ROWS * std::mem::size_of::<Vec<Value>>();
+    assert!(uncompacted_outer_row_bytes > retained_limit);
+
+    let results = database
+        .execute_with_result_limit(&batch, retained_limit)
+        .expect("each raw result fits while compacted results remain retained");
+    assert_eq!(results.len(), RESULT_COUNT);
+
+    let mut retained_outer_row_bytes = 0;
+    for result in results {
+        let StatementResult::Query(result) = result else {
+            panic!("every statement returns a query result");
+        };
+        assert_eq!(result.rows, [vec![Value::Int64(1)]]);
+        assert_eq!(
+            result.rows.capacity(),
+            result.rows.len(),
+            "UNION DISTINCT must release raw outer row capacity"
+        );
+        retained_outer_row_bytes += result.rows.capacity() * std::mem::size_of::<Vec<Value>>();
+    }
+    assert!(retained_outer_row_bytes <= retained_limit);
+}
+
+#[test]
 fn shared_database_accepts_union_distinct_as_one_read_only_query() {
     let database = SharedDatabase::default();
     database

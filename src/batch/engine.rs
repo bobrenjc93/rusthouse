@@ -1271,6 +1271,11 @@ fn deduplicate_union_rows(
         row += 1;
         keep
     });
+    // `retain` drops duplicate row contents but deliberately preserves the
+    // raw UNION allocation. Rebuilding through a boxed slice makes capacity
+    // equal the deduplicated length, matching retained-result accounting.
+    *rows = std::mem::take(rows).into_boxed_slice().into_vec();
+    debug_assert_eq!(rows.capacity(), rows.len());
     Ok(())
 }
 
