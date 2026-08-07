@@ -402,6 +402,19 @@ Success returns `200 OK` with an empty plain-text body. The route is not
 recognized by `handle_http_query` or `handle_http_query_with_limits`, and query
 routes remain read-only even when their request is authenticated.
 
+Those authenticated handlers also expose exact `POST /insert/<table>` for
+`CSVWithNames` ingestion. `<table>` is one literal RustHouse SQL identifier;
+extra path segments, query strings, and percent-encoded names are not accepted.
+The request requires one decimal `Content-Length`, and its body starts with an
+unquoted header that exactly matches the target table's schema, followed by
+typed CSV records. For example, `POST /insert/events` with the body
+`id,label\n1,"one, quoted"\n` imports one row into `events`. No content-type or
+format header is required: this route always treats the body as
+`CSVWithNames`. It calls `SharedDatabase::try_ingest_csv_with_names`, so typed
+CSV, schema, capacity, and configured CSV-limit failures return `400 Bad
+Request` and append no rows. Success returns the same empty `200 OK` response
+as the SQL insert route. The unauthenticated handlers do not recognize it.
+
 HTTP query admission never waits for the database lock. After request parsing,
 authentication, SQL decoding, and read-only statement validation, each query
 makes one immediate shared read-lock attempt. Concurrent readers are admitted;
@@ -411,12 +424,13 @@ Internal Server Error`, and SQL errors remain `400 Bad Request`. Authentication,
 format negotiation, SQL/result resource limits, and the complete HTTP response
 limit retain their existing ordering and behavior.
 
-HTTP insert admission likewise never waits. After authentication, bounded body
-reading, and full SQL parsing, it makes one immediate write-lock attempt. Any
-active reader or writer returns the same deterministic `503 Service
-Unavailable`; a poisoned lock returns `500 Internal Server Error`. Validation
-and commit occur under the acquired write lock so concurrent work cannot expose
-or cause a partial batch.
+HTTP insert admission likewise never waits. After authentication and bounded
+body reading, the SQL route completes SQL parsing before its immediate
+write-lock attempt; the CSV route passes the bounded bytes to the ingestion API,
+which attempts the lock before table lookup and CSV parsing. Any active reader
+or writer returns the same deterministic `503 Service Unavailable`; a poisoned
+lock returns `500 Internal Server Error`. Validation and commit occur under the
+acquired write lock so concurrent work cannot expose or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, or
@@ -468,15 +482,19 @@ never waits for a writer; lock contention and poisoning return the same
 deterministic `503 Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a
-POST SQL body or decoded GET SQL, and 16 MiB for the complete response including
-headers. Header limits apply to all routes, as does the complete-response
-limit. The full response is prepared and checked before anything is written.
-Call `handle_http_query_with_limits` with `HttpQueryLimits` to set smaller
-embedding limits. Each call reads exactly one header block and, only for a POST
-query or authenticated insert, exactly its declared body; it emits at most one
-final `Connection: close` response and never reads or handles a subsequent
-request. This single-exchange API deliberately leaves listener, connection,
-timeout, and shutdown lifecycle to the embedding application.
+POST body or decoded GET SQL, and 16 MiB for the complete response including
+headers. CSV insertion additionally applies the ingestion defaults of 8 MiB,
+100,000 rows, and 1,000,000 values; the default 1 MiB HTTP body cap is reached
+first for byte size. `HttpQueryLimits::csv_ingest_limits` configures those CSV
+bounds independently. Header limits apply to all routes, as does the
+complete-response limit. The full response is prepared and checked before
+anything is written. Call an authenticated handler's `*_and_limits` variant
+with `HttpQueryLimits` to set explicit insertion limits. Each call reads exactly
+one header block and, only for a POST query or authenticated insert, exactly its
+declared body; it emits at most one final `Connection: close` response and never
+reads or handles a subsequent request. This single-exchange API deliberately
+leaves listener, connection, timeout, and shutdown lifecycle to the embedding
+application.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or
@@ -489,7 +507,7 @@ credentials receive the same bounded `401 Unauthorized` response before a
 request body is read or the database lock is acquired. Invalid configured
 tokens are rejected before any request input is read. The original
 `handle_http_query` APIs intentionally remain unauthenticated for existing
-in-process read-only embeddings and do not expose `/insert`.
+in-process read-only embeddings and do not expose either insertion route.
 
 For ClickHouse HTTP credential compatibility, embedders can instead call
 `handle_http_query_with_clickhouse_key`, or

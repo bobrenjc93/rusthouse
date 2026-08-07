@@ -4,10 +4,12 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 
+use crate::batch::csv::CsvIngestLimits;
 use crate::batch::format::{
     write_csv, write_json, write_json_compact_each_row, write_json_each_row_with_limit,
     write_json_string, write_tsv,
 };
+use crate::batch::storage::validate_table_name;
 use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 
 /// Default maximum size of the request line and headers, including the final
@@ -30,8 +32,12 @@ pub struct HttpQueryLimits {
     pub max_header_bytes: usize,
     /// Maximum number of request header fields.
     pub max_header_count: usize,
-    /// Maximum SQL bytes in a POST body or decoded GET query parameter.
+    /// Maximum bytes in a POST body or decoded GET SQL query parameter.
     pub max_sql_bytes: usize,
+    /// Byte, row, and value limits for one `POST /insert/<table>` CSV body.
+    ///
+    /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
+    pub csv_ingest_limits: CsvIngestLimits,
     /// Maximum bytes in the complete HTTP response, including its headers.
     pub max_response_bytes: usize,
 }
@@ -42,6 +48,7 @@ impl Default for HttpQueryLimits {
             max_header_bytes: DEFAULT_MAX_HTTP_HEADER_BYTES,
             max_header_count: DEFAULT_MAX_HTTP_HEADER_COUNT,
             max_sql_bytes: DEFAULT_MAX_HTTP_SQL_BYTES,
+            csv_ingest_limits: CsvIngestLimits::default(),
             max_response_bytes: DEFAULT_MAX_HTTP_RESPONSE_BYTES,
         }
     }
@@ -104,10 +111,13 @@ impl StdError for HttpQueryError {
 /// The bearer-authenticated handlers additionally accept exact `POST /insert`
 /// requests with the same body framing and limits. They pass the SQL to
 /// [`SharedDatabase::try_execute_insert_batch`], which atomically executes a
-/// nonempty `INSERT`-only batch after one nonblocking write-lock attempt.
-/// Success returns an empty `200 OK` response. The unauthenticated handlers do
-/// not expose this route. The `X-ClickHouse-Key`-authenticated handlers expose
-/// the same authenticated route set.
+/// nonempty `INSERT`-only batch after one nonblocking write-lock attempt. Exact
+/// `POST /insert/<table>` requests instead treat the bounded body as
+/// `CSVWithNames` and pass it with [`HttpQueryLimits::csv_ingest_limits`] to
+/// [`SharedDatabase::try_ingest_csv_with_names`]. Success returns an empty
+/// `200 OK` response. The unauthenticated handlers do not expose either route.
+/// The `X-ClickHouse-Key`-authenticated handlers expose the same authenticated
+/// route set.
 ///
 /// `GET /metrics` accepts no request body and returns three Prometheus gauges
 /// for retained tables, columns, and rows. It takes a nonblocking, consistent
@@ -477,6 +487,55 @@ fn handle_http_query_exchange(
                 ),
             };
         }
+        HttpRequest::CsvInsert { table, body } => {
+            let success_response = match prepare_response(
+                Status::OK,
+                &[],
+                response_headers,
+                CONTENT_TYPE_TEXT,
+                &[],
+                limits.max_response_bytes,
+            ) {
+                Ok(response) => response,
+                Err(_) => {
+                    return write_response_limit_error(
+                        &mut output,
+                        response_headers,
+                        limits.max_response_bytes,
+                    );
+                }
+            };
+            return match database.try_ingest_csv_with_names(&table, body, limits.csv_ingest_limits)
+            {
+                Ok(_) => output
+                    .write_all(&success_response)
+                    .map_err(HttpQueryError::Write),
+                Err(SharedDatabaseError::DatabaseBusy) => write_error_response(
+                    &mut output,
+                    Status::SERVICE_UNAVAILABLE,
+                    &[],
+                    response_headers,
+                    "database is unavailable",
+                    limits.max_response_bytes,
+                ),
+                Err(SharedDatabaseError::LockPoisoned) => write_error_response(
+                    &mut output,
+                    Status::INTERNAL_SERVER_ERROR,
+                    &[],
+                    response_headers,
+                    "database is unavailable",
+                    limits.max_response_bytes,
+                ),
+                Err(error) => write_error_response(
+                    &mut output,
+                    Status::BAD_REQUEST,
+                    &[],
+                    response_headers,
+                    &error.to_string(),
+                    limits.max_response_bytes,
+                ),
+            };
+        }
         HttpRequest::Query {
             sql,
             response_format,
@@ -604,6 +663,10 @@ fn read_request(
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
             Ok(HttpRequest::Insert { sql })
         }
+        RequestKind::CsvInsert(table) => {
+            let body = read_bounded_body(input, request.content_length, limits.max_sql_bytes)?;
+            Ok(HttpRequest::CsvInsert { table, body })
+        }
         RequestKind::Query(QuerySource::UrlEncoded(encoded_sql)) => {
             if request.content_length.unwrap_or(0) != 0 {
                 return Err(RequestFailure::new(
@@ -631,6 +694,16 @@ fn read_sql_body(
     content_length: Option<usize>,
     max_sql_bytes: usize,
 ) -> Result<String, RequestReadError> {
+    let body = read_bounded_body(input, content_length, max_sql_bytes)?;
+    String::from_utf8(body)
+        .map_err(|_| RequestFailure::new(Status::BAD_REQUEST, "SQL body is not valid UTF-8").into())
+}
+
+fn read_bounded_body(
+    input: &mut impl Read,
+    content_length: Option<usize>,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, RequestReadError> {
     let Some(content_length) = content_length else {
         return Err(RequestFailure::new(
             Status::LENGTH_REQUIRED,
@@ -638,7 +711,7 @@ fn read_sql_body(
         )
         .into());
     };
-    if content_length > max_sql_bytes {
+    if content_length > max_body_bytes {
         return Err(RequestFailure::new(
             Status::PAYLOAD_TOO_LARGE,
             "request body exceeds configured byte limit",
@@ -662,8 +735,7 @@ fn read_sql_body(
         }
     }
 
-    String::from_utf8(body)
-        .map_err(|_| RequestFailure::new(Status::BAD_REQUEST, "SQL body is not valid UTF-8").into())
+    Ok(body)
 }
 
 fn read_header_block(
@@ -732,6 +804,10 @@ enum HttpRequest {
     Insert {
         sql: String,
     },
+    CsvInsert {
+        table: String,
+        body: Vec<u8>,
+    },
     Ping,
     Ready,
     Metrics,
@@ -749,6 +825,7 @@ enum QueryResponseFormat {
 enum RequestKind {
     Query(QuerySource),
     Insert,
+    CsvInsert(String),
     Ping,
     Ready,
     Metrics,
@@ -994,6 +1071,16 @@ fn parse_request_line(
     match (method, target) {
         (b"POST", b"/" | b"/query") => Ok(RequestKind::Query(QuerySource::Body)),
         (b"POST", b"/insert") if authenticated_insert_enabled => Ok(RequestKind::Insert),
+        (b"POST", target) if authenticated_insert_enabled && target.starts_with(b"/insert/") => {
+            parse_csv_insert_target(target)
+                .map(|table| RequestKind::CsvInsert(table.to_owned()))
+                .ok_or_else(|| {
+                    RequestReadError::from(RequestFailure::new(
+                        Status::NOT_FOUND,
+                        "request target must be / or /query",
+                    ))
+                })
+        }
         (b"GET", target) if target.starts_with(GET_QUERY_PREFIX) => Ok(RequestKind::Query(
             QuerySource::UrlEncoded(target[GET_QUERY_PREFIX.len()..].to_vec()),
         )),
@@ -1036,6 +1123,16 @@ fn parse_request_line(
             &[b"Allow: POST\r\n"],
         )
         .into()),
+        (_, target)
+            if authenticated_insert_enabled && parse_csv_insert_target(target).is_some() =>
+        {
+            Err(RequestFailure::with_headers(
+                Status::METHOD_NOT_ALLOWED,
+                "method must be POST for /insert/<table>",
+                &[b"Allow: POST\r\n"],
+            )
+            .into())
+        }
         (b"POST", _) => {
             Err(RequestFailure::new(Status::NOT_FOUND, "request target must be / or /query").into())
         }
@@ -1051,6 +1148,12 @@ fn parse_request_line(
         )
         .into()),
     }
+}
+
+fn parse_csv_insert_target(target: &[u8]) -> Option<&str> {
+    let table = target.strip_prefix(b"/insert/")?;
+    let table = std::str::from_utf8(table).ok()?;
+    validate_table_name(table).is_ok().then_some(table)
 }
 
 fn decode_query_parameter(

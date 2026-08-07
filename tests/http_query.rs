@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use rusthouse::batch::csv::CsvIngestLimits;
 use rusthouse::batch::engine::{Database, QueryResultLimits};
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
@@ -2737,6 +2738,338 @@ fn authenticated_insert_route_preflights_the_response_cap_before_commit() {
     let (request, _) = request_with_authorization_for_target(
         "/insert",
         b"INSERT INTO events VALUES (1);",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let sizing_database = SharedDatabase::default();
+    sizing_database
+        .execute("CREATE TABLE events (id Int64);")
+        .unwrap();
+    let success_response = authenticated_exchange(&sizing_database, "correct-token", &request);
+
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let max_response_bytes = success_response.len() - 1;
+    let mut response = Vec::new();
+    let error = handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        Cursor::new(request),
+        &mut response,
+        HttpQueryLimits {
+            max_response_bytes,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("the fixed success response exceeds the cap");
+
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes, .. }
+            if max_bytes == max_response_bytes
+    ));
+    assert!(response.is_empty());
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
+fn authenticated_csv_insert_ingests_all_physical_types_quoting_and_is_query_visible() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
+        .unwrap();
+    let csv = b"id,score,active,label\r\n\
+-9223372036854775808,1.5,true,\"comma, quote \"\" and LF\nline\"\r\n\
+9223372036854775807,-0.125,false,\"CRLF\r\nline\"\r\n";
+    let (request, _) = request_with_authorization_for_target(
+        "/insert/typed_values",
+        csv,
+        "Authorization: Bearer correct-token\r\n",
+    );
+
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target(
+                "/query",
+                b"SELECT id, score, active, label FROM typed_values ORDER BY id;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"score","type":"Float64"},{"name":"active","type":"Bool"},{"name":"label","type":"String"}],"rows":[[-9223372036854775808,1.5,true,"comma, quote \" and LF\nline"],[9223372036854775807,-0.125,false,"CRLF\r\nline"]]}"#,
+    );
+}
+
+#[test]
+fn clickhouse_key_csv_insert_uses_the_same_authenticated_route() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .unwrap();
+    let request = request_for_target_with_headers(
+        "/insert/events",
+        b"id,label\n7,key-authenticated\n",
+        "x-cLiCkHoUsE-kEy: correct key:42\r\n",
+    );
+
+    let response = clickhouse_key_exchange(&database, "correct key:42", &request);
+    assert_response_with_content_type(
+        &response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&response);
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id, label FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[7,"key-authenticated"]]}"#,
+    );
+}
+
+#[test]
+fn csv_insert_reports_typed_malformed_errors_and_rolls_back_late_rows() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String); \
+             INSERT INTO metrics VALUES (9, 9.0, true, 'existing');",
+        )
+        .unwrap();
+    let cases: &[(&[u8], &str)] = &[
+        (
+            b"id,score,active,label\n1,1.5,true,valid\n2,2.5,false,\"unclosed\n",
+            r#"{"error":"database CSV ingestion failed: CSV field at line 3, column 4 has malformed quoting"}"#,
+        ),
+        (
+            b"id,score,active,label\n1,1.5,true,valid\n2,NaN,false,late\n",
+            r#"{"error":"database CSV ingestion failed: CSV field at line 3, column 2 is not a valid Float64"}"#,
+        ),
+    ];
+
+    for (csv, expected_body) in cases {
+        let (request, _) = request_with_authorization_for_target(
+            "/insert/metrics",
+            csv,
+            "Authorization: Bearer correct-token\r\n",
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 400 Bad Request",
+            expected_body,
+        );
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id, label FROM metrics;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[9,"existing"]]}"#,
+    );
+}
+
+#[test]
+fn csv_insert_is_authenticated_and_requires_an_exact_table_target() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let csv = b"id\n1\n";
+
+    assert_response(
+        &exchange(&database, &request_for_target("/insert/events", csv)),
+        "HTTP/1.1 404 Not Found",
+        r#"{"error":"request target must be / or /query"}"#,
+    );
+
+    let (missing_credentials, body_offset) =
+        request_with_authorization_for_target("/insert/events", csv, "");
+    let mut input = Cursor::new(missing_credentials);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    for target in ["/insert/events/", "/insert/events?async=1", "/insert/"] {
+        let (request, _) = request_with_authorization_for_target(
+            target,
+            csv,
+            "Authorization: Bearer correct-token\r\n",
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 404 Not Found",
+            r#"{"error":"request target must be / or /query"}"#,
+        );
+    }
+
+    let wrong_method = authenticated_exchange(
+        &database,
+        "correct-token",
+        b"GET /insert/events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+    );
+    assert_response(
+        &wrong_method,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be POST for /insert/<table>"}"#,
+    );
+    assert_response_header(&wrong_method, "Allow: POST");
+}
+
+#[test]
+fn csv_insert_preserves_http_and_csv_ingest_limits_without_partial_rows() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .unwrap();
+    let csv = b"id,label\n1,one\n2,two\n";
+    let (request, body_offset) = request_with_authorization_for_target(
+        "/insert/events",
+        csv,
+        "Authorization: Bearer correct-token\r\n",
+    );
+
+    let mut input = Cursor::new(&request);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        &mut input,
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: csv.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"request body exceeds configured byte limit"}"#,
+    );
+
+    let csv_limit_cases = [
+        (
+            CsvIngestLimits::new(csv.len() - 1, 2, 4),
+            format!(
+                r#"{{"error":"database CSV ingestion failed: CSV input is {} bytes, exceeding the limit of {} bytes"}}"#,
+                csv.len(),
+                csv.len() - 1,
+            ),
+        ),
+        (
+            CsvIngestLimits::new(csv.len(), 1, 4),
+            r#"{"error":"database CSV ingestion failed: CSV record at line 3 raises the row count to 2, exceeding the limit of 1"}"#.to_owned(),
+        ),
+        (
+            CsvIngestLimits::new(csv.len(), 2, 3),
+            r#"{"error":"database CSV ingestion failed: CSV record at line 3 raises the value count to 4, exceeding the limit of 3"}"#.to_owned(),
+        ),
+    ];
+
+    for (csv_ingest_limits, expected_body) in csv_limit_cases {
+        let mut response = Vec::new();
+        handle_http_query_with_bearer_token_and_limits(
+            &database,
+            "correct-token",
+            Cursor::new(&request),
+            &mut response,
+            HttpQueryLimits {
+                csv_ingest_limits,
+                ..HttpQueryLimits::default()
+            },
+        )
+        .unwrap();
+        assert_response(&response, "HTTP/1.1 400 Bad Request", &expected_body);
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
+fn csv_insert_returns_503_without_waiting_for_a_reader() {
+    let mut initial = Database::new();
+    initial.execute("CREATE TABLE events (id Int64);").unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let mut reader = Some(inner.read().unwrap());
+    let (request, _) = request_with_authorization_for_target(
+        "/insert/events",
+        b"id\n1\n",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(authenticated_exchange(
+                &worker_database,
+                "correct-token",
+                &request,
+            ))
+            .unwrap();
+    });
+
+    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(response) => response,
+        Err(error) => {
+            drop(reader.take());
+            worker.join().unwrap();
+            panic!("HTTP CSV admission blocked behind a reader: {error}");
+        }
+    };
+    assert_response(
+        &response,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    assert_eq!(
+        reader
+            .as_ref()
+            .unwrap()
+            .catalog()
+            .table("events")
+            .unwrap()
+            .row_count(),
+        0
+    );
+    drop(reader.take());
+    worker.join().unwrap();
+}
+
+#[test]
+fn csv_insert_preflights_the_response_cap_before_commit() {
+    let (request, _) = request_with_authorization_for_target(
+        "/insert/events",
+        b"id\n1\n",
         "Authorization: Bearer correct-token\r\n",
     );
     let sizing_database = SharedDatabase::default();
