@@ -151,3 +151,42 @@ fn named_insert_batch_reorders_before_validation_and_rolls_back_every_target() {
     assert_eq!(database.catalog().table("events").unwrap().row_count(), 2);
     assert_eq!(database.catalog().table("metrics").unwrap().row_count(), 1);
 }
+
+#[test]
+fn named_insert_batches_follow_the_schema_after_a_column_is_dropped() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Metrics (id Int64, score Float64, active Bool); \
+             INSERT INTO metrics VALUES (1, 1.5, true); \
+             ALTER TABLE metrics DROP COLUMN score;",
+        )
+        .expect("setup and drop succeed");
+
+    assert_eq!(
+        database.execute_insert_batch(
+            "INSERT INTO metrics (active, id) VALUES (false, 2); \
+             INSERT INTO metrics (id, score, active) VALUES (3, 3.5, true);",
+        ),
+        Err(Error::ColumnNotFound {
+            table: "Metrics".to_owned(),
+            column: "score".to_owned(),
+        })
+    );
+    assert_eq!(database.catalog().table("metrics").unwrap().row_count(), 1);
+
+    database
+        .execute_insert_batch(
+            "INSERT INTO metrics (ACTIVE, ID) VALUES (false, 2); \
+             INSERT INTO metrics (id, active) VALUES (3, true);",
+        )
+        .expect("complete lists for the remaining schema commit");
+    assert_eq!(
+        query_rows(&mut database, "SELECT id, active FROM metrics ORDER BY id;"),
+        [
+            vec![Value::Int64(1), Value::Bool(true)],
+            vec![Value::Int64(2), Value::Bool(false)],
+            vec![Value::Int64(3), Value::Bool(true)],
+        ]
+    );
+}
