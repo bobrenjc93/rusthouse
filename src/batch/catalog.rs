@@ -116,6 +116,14 @@ impl Catalog {
         Ok(())
     }
 
+    /// Renames one column using case-insensitive table and column resolution.
+    ///
+    /// The table validates the source and complete destination before changing
+    /// only the column's stored display name.
+    pub fn rename_column(&mut self, table: &str, source: &str, destination: String) -> Result<()> {
+        self.table_mut(table)?.rename_column(source, destination)
+    }
+
     pub fn table(&self, name: &str) -> Result<&Table> {
         self.tables
             .get(&normalize(name))

@@ -61,6 +61,15 @@ case-insensitive name resolution as ordinary `DROP TABLE`. If the table is
 already absent, it returns the normal successful zero-row command result;
 plain `DROP TABLE` continues to report a missing-table error.
 
+`ALTER TABLE <table> RENAME COLUMN <source> TO <destination>` changes only the
+stored column display name. Table, source-column, destination-collision, and
+subsequent query resolution are case-insensitive; a case-only rename updates
+the displayed spelling. The destination must be a valid, non-reserved SQL
+identifier that does not collide with another column. Missing names or an
+invalid, reserved, or colliding destination fail before mutation, preserving
+the column's type, data, schema position, and table row cap. A trailing
+semicolon is optional.
+
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
 such as `-7`; `Float64` literals are optionally signed, finite decimal or
@@ -208,11 +217,11 @@ covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
 combined levels of parenthesized or unary-`NOT` nesting.
-Every statement shares one in-memory catalog. Successful `CREATE`, `DROP`,
-`TRUNCATE`, and `INSERT` statements are silent, and each `SELECT`, `SHOW
-TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` query is
-executed and emitted before the next statement. Table output uses
-bordered, human-readable columns, escapes control characters, renders SQL
+Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
+`DROP`, `RENAME`, `TRUNCATE`, and `INSERT` statements are silent, and each
+`SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
+TABLE` query is executed and emitted before the next statement. Table output
+uses bordered, human-readable columns, escapes control characters, renders SQL
 `NULL` as `NULL`, and separates multiple query results with a blank line. Each
 padded table is size-checked against a 16 MiB formatted-output limit before
 being streamed, so a wide cell cannot amplify many short rows into unbounded
