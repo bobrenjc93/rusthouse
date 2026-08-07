@@ -272,14 +272,19 @@ fn line_contents(raw_line: &str, line: usize) -> Result<&str, TsvIngestError> {
 }
 
 fn validate_header(table: &Table, header: &str) -> Result<(), TsvIngestError> {
-    let fields = header.split('\t').collect::<Vec<_>>();
-    if fields.len() != table.schema().len() {
+    let field_count = header
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\t')
+        .count()
+        .saturating_add(1);
+    if field_count != table.schema().len() {
         return Err(TsvIngestError::HeaderColumnCount {
             expected: table.schema().len(),
-            actual: fields.len(),
+            actual: field_count,
         });
     }
-    for (offset, (field, schema)) in fields.into_iter().zip(table.schema()).enumerate() {
+    for (offset, (field, schema)) in header.split('\t').zip(table.schema()).enumerate() {
         let column = offset.saturating_add(1);
         if decode_field(field, 1, column)? != schema.name {
             return Err(TsvIngestError::HeaderMismatch {

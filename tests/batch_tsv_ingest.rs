@@ -1,7 +1,7 @@
 use rusthouse::batch::engine::{Database, QueryResult, ResultColumn, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::format::write_tsv;
-use rusthouse::batch::tsv::{TsvIngestError, TsvIngestLimits};
+use rusthouse::batch::tsv::{DEFAULT_MAX_TSV_BYTES, TsvIngestError, TsvIngestLimits};
 use rusthouse::batch::value::{DataType, Value};
 use rusthouse::{SharedDatabase, SharedDatabaseError};
 
@@ -292,6 +292,25 @@ fn validates_header_utf8_line_endings_and_escape_grammar() {
             "input: {input:?}"
         );
     }
+    assert!(
+        query(&mut database, "SELECT id FROM metrics;")
+            .rows
+            .is_empty()
+    );
+}
+
+#[test]
+fn wide_header_is_counted_without_collecting_fields() {
+    let mut database = database(1);
+    let input = vec![b'\t'; DEFAULT_MAX_TSV_BYTES];
+
+    assert_eq!(
+        database.ingest_tsv_with_names("metrics", &input, TsvIngestLimits::new(input.len(), 0, 0),),
+        Err(TsvIngestError::HeaderColumnCount {
+            expected: 4,
+            actual: DEFAULT_MAX_TSV_BYTES + 1,
+        })
+    );
     assert!(
         query(&mut database, "SELECT id FROM metrics;")
             .rows
