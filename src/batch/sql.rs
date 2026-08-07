@@ -13,7 +13,7 @@ pub const DEFAULT_MAX_BATCH_STATEMENTS: usize = 4_096;
 pub const DEFAULT_MAX_INSERT_ROWS: usize = 100_000;
 /// Maximum `INSERT` scalar values stored across one parsed batch.
 pub const DEFAULT_MAX_INSERT_VALUES: usize = 1_000_000;
-/// Maximum items stored in variable-length schema and query lists across a batch.
+/// Maximum items stored in variable-length schema, INSERT, and query lists across a batch.
 pub const DEFAULT_MAX_AST_LIST_ITEMS: usize = 100_000;
 
 /// Allocation limits applied while constructing a SQL batch AST.
@@ -68,6 +68,9 @@ pub enum Statement {
     },
     Insert {
         table: String,
+        /// An explicit, complete destination-column list. `None` preserves
+        /// positional insertion in schema order.
+        columns: Option<Vec<String>>,
         rows: Vec<Vec<Value>>,
     },
     /// Exactly one typed literal with no `FROM` or other clauses.
@@ -1023,6 +1026,20 @@ impl<'a> Parser<'a> {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_identifier("table name")?;
+        let columns = if self.eat(&TokenKind::LeftParen) {
+            let mut columns = Vec::new();
+            loop {
+                self.reserve_ast_list_item()?;
+                columns.push(self.expect_identifier("column name in INSERT column list")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after INSERT column list")?;
+            Some(columns)
+        } else {
+            None
+        };
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -1058,7 +1075,11 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(Statement::Insert { table, rows })
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
     }
 
     fn parse_select(&mut self) -> Result<Select> {
@@ -2064,11 +2085,39 @@ mod tests {
     fn parses_escaped_strings_and_multiple_rows() {
         let statements =
             parse("INSERT INTO notes VALUES (1, 'it''s good'), (2, 'ok')").expect("valid insert");
-        let Statement::Insert { rows, .. } = &statements[0] else {
+        let Statement::Insert { columns, rows, .. } = &statements[0] else {
             panic!("expected insert");
         };
+        assert_eq!(columns, &None);
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_complete_insert_column_lists_without_changing_positional_rows() {
+        let statements = parse(
+            "INSERT INTO metrics (label, ACTIVE, id, score) VALUES \
+             ('first', true, 1, 2.5), ('second', false, 2, 4.0); \
+             INSERT INTO metrics VALUES (3, 8.0, true, 'third')",
+        )
+        .expect("named and positional inserts parse");
+
+        let Statement::Insert {
+            columns: Some(columns),
+            rows,
+            ..
+        } = &statements[0]
+        else {
+            panic!("expected named insert");
+        };
+        assert_eq!(columns, &["label", "ACTIVE", "id", "score"]);
+        assert_eq!(rows.len(), 2);
+
+        let Statement::Insert { columns, rows, .. } = &statements[1] else {
+            panic!("expected positional insert");
+        };
+        assert_eq!(columns, &None);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
@@ -2166,6 +2215,35 @@ mod tests {
                 resource: "SQL AST list items",
                 actual: 8,
                 max: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn insert_columns_use_the_cumulative_ast_list_item_limit() {
+        let sql = "INSERT INTO metrics (label, active, id) VALUES ('ok', true, 1)";
+        parse_with_limits(
+            sql,
+            BatchSqlLimits {
+                max_ast_list_items: 3,
+                ..BatchSqlLimits::default()
+            },
+        )
+        .expect("three INSERT columns fit the limit");
+
+        assert_eq!(
+            parse_with_limits(
+                sql,
+                BatchSqlLimits {
+                    max_ast_list_items: 2,
+                    ..BatchSqlLimits::default()
+                },
+            )
+            .expect_err("third INSERT column exceeds the limit"),
+            Error::ResourceLimitExceeded {
+                resource: "SQL AST list items",
+                actual: 3,
+                max: 2,
             }
         );
     }

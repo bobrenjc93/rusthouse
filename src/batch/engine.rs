@@ -314,10 +314,11 @@ impl Database {
 
     /// Atomically executes a nonempty SQL batch containing only `INSERT` statements.
     ///
-    /// Every target table, row shape, value type, finite floating-point value,
-    /// and cumulative per-table row count is validated before any row is
-    /// appended. A failure therefore leaves every table unchanged. Successful
-    /// statements are committed and reported in input order.
+    /// Every target table, explicit complete column list, row shape, value
+    /// type, finite floating-point value, and cumulative per-table row count is
+    /// validated before any row is appended. A failure therefore leaves every
+    /// table unchanged. Successful statements are committed and reported in
+    /// input order.
     pub fn execute_insert_batch(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         let statements = sql::parse(sql)?;
         self.execute_insert_statements(statements)
@@ -390,26 +391,28 @@ impl Database {
         }
 
         let mut incoming_rows_by_table = HashMap::<String, usize>::new();
-        for statement in &statements {
-            let Statement::Insert { table, rows } = statement else {
+        let mut prepared = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let Statement::Insert {
+                table,
+                columns,
+                rows,
+            } = statement
+            else {
                 unreachable!("non-INSERT statements were rejected")
             };
-            let target = self.catalog.table(table)?;
+            let target = self.catalog.table(&table)?;
             let cumulative_rows = incoming_rows_by_table
                 .entry(table.to_ascii_lowercase())
                 .or_default();
             *cumulative_rows = cumulative_rows.saturating_add(rows.len());
             target.validate_row_capacity(*cumulative_rows)?;
-            for row in rows {
-                target.validate_row(row)?;
-            }
+            let rows = target.prepare_insert_rows(columns.as_deref(), rows)?;
+            prepared.push((table, rows));
         }
 
-        let mut results = Vec::with_capacity(statements.len());
-        for statement in statements {
-            let Statement::Insert { table, rows } = statement else {
-                unreachable!("non-INSERT statements were rejected")
-            };
+        let mut results = Vec::with_capacity(prepared.len());
+        for (table, rows) in prepared {
             let affected_rows = rows.len();
             self.catalog
                 .table_mut(&table)
@@ -537,10 +540,16 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Insert { table, rows } => {
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
                 let affected_rows = rows.len();
                 let target = self.catalog.table_mut(&table)?;
-                target.insert_rows(rows)?;
+                target.validate_row_capacity(affected_rows)?;
+                let rows = target.prepare_insert_rows(columns.as_deref(), rows)?;
+                target.append_validated_rows(rows);
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
@@ -3332,10 +3341,12 @@ mod tests {
         let statements = vec![
             Statement::Insert {
                 table: "events".to_owned(),
+                columns: None,
                 rows: vec![vec![Value::Int64(1)]],
             },
             Statement::Insert {
                 table: "samples".to_owned(),
+                columns: None,
                 rows: vec![vec![Value::Float64(f64::INFINITY)]],
             },
         ];

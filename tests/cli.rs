@@ -64,6 +64,24 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn json_cli_reorders_complete_case_insensitive_insert_column_lists() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE metrics (id Int64, score Float64, enabled Bool, label String); \
+          INSERT INTO metrics (LABEL, enabled, ID, SCORE) VALUES \
+              ('first', true, 1, 2.5), ('second', false, 2, 4.0); \
+          SELECT id, score, enabled, label FROM metrics ORDER BY id;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"score\",\"type\":\"Float64\"},{\"name\":\"enabled\",\"type\":\"Bool\"},{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[1,2.5,true,\"first\"],[2,4.0,false,\"second\"]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_filters_orders_and_limits_distinct_tuples() {
     let output = run(
         &["--format", "csv"],

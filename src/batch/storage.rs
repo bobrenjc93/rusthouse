@@ -280,6 +280,66 @@ impl Table {
         Ok(())
     }
 
+    /// Resolves an optional complete INSERT column list and validates all rows
+    /// without mutating physical storage.
+    ///
+    /// Explicit names are matched case-insensitively and every schema column
+    /// must appear exactly once. Returned rows are always in schema order.
+    pub(crate) fn prepare_insert_rows(
+        &self,
+        columns: Option<&[String]>,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let Some(columns) = columns else {
+            for row in &rows {
+                self.validate_row(row)?;
+            }
+            return Ok(rows);
+        };
+
+        let mut schema_to_input = vec![None; self.schema.len()];
+        for (input_index, column) in columns.iter().enumerate() {
+            let schema_index = self.column_index(column)?;
+            if schema_to_input[schema_index].replace(input_index).is_some() {
+                return Err(Error::DuplicateColumn(column.clone()));
+            }
+        }
+        if let Some((_, field)) = self
+            .schema
+            .iter()
+            .enumerate()
+            .find(|(index, _)| schema_to_input[*index].is_none())
+        {
+            return Err(Error::MissingInsertColumn {
+                table: self.name.clone(),
+                column: field.name.clone(),
+            });
+        }
+
+        let mut prepared = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != columns.len() {
+                return Err(Error::RowLength {
+                    table: self.name.clone(),
+                    expected: columns.len(),
+                    actual: row.len(),
+                });
+            }
+            let mut values = row.into_iter().map(Some).collect::<Vec<_>>();
+            let reordered = schema_to_input
+                .iter()
+                .map(|input_index| {
+                    values[input_index.expect("complete column list was preflighted")]
+                        .take()
+                        .expect("each INSERT column was unique")
+                })
+                .collect::<Vec<_>>();
+            self.validate_row(&reordered)?;
+            prepared.push(reordered);
+        }
+        Ok(prepared)
+    }
+
     /// Validates the row cap and complete row before appending to any column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row_capacity(1)?;

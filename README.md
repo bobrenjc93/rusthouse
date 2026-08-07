@@ -10,7 +10,8 @@ The first useful release should support:
 
 - typed tables with `Int64`, `Float64`, `Bool`, and `String` columns;
 - a genuinely columnar in-memory representation;
-- `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
+- `CREATE TABLE`, positional or complete-column-list `INSERT INTO ... VALUES`,
+  and `SELECT`;
 - projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, `LIMIT`, and narrow `OFFSET` pagination;
 - a batch/interactive CLI with readable table, CSV, TSV, JSON, JSONEachRow,
   and JSONCompactEachRow output;
@@ -24,7 +25,13 @@ The early implementation should favor Rust's standard library and a small depend
 
 The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
-multi-row `INSERT INTO ... VALUES`, typed projections and composable `WHERE`
+multi-row `INSERT INTO ... VALUES` and
+`INSERT INTO table (column, ...) VALUES ...`. An explicit column list must name
+every schema column exactly once, resolves names case-insensitively, and may use
+any order; each row is reordered into schema order before typed validation and
+insertion. Omissions, duplicates, and unknown columns are rejected without
+mutating the table. Positional INSERT remains in schema order. The engine also
+executes typed projections and composable `WHERE`
 comparisons with unary `NOT`, `AND`, and `OR`, plus case-sensitive String prefix
 predicates of the exact form `column LIKE 'prefix%'`. A prefix may be empty or
 Unicode, and the pattern must contain exactly one `%`, in the terminal position.
@@ -213,7 +220,8 @@ standard input through EOF, with explicit limits of 64 MiB and 4,096
 statements. Parsing is
 lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
-covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
+covers `CREATE` and explicit `INSERT` columns plus `SELECT`, `GROUP BY`, and
+`ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
 combined levels of parenthesized or unary-`NOT` nesting.
@@ -309,8 +317,9 @@ interleave.
 For transactional ingestion, `Database::execute_insert_batch` and the matching
 `SharedDatabase` method accept a nonempty `INSERT`-only batch, preflight every
 statement and cumulative per-table row cap, then commit in statement order.
-Any validation or resource failure leaves all tables unchanged; the shared
-form retains one write lock across preflight and commit.
+Explicit INSERT column lists are resolved and their rows reordered during this
+preflight. Any validation or resource failure leaves all tables unchanged; the
+shared form retains one write lock across preflight and commit.
 `SharedDatabase::try_execute_insert_batch` performs the same parsing and atomic
 execution after one nonblocking write-lock attempt. An active reader or writer
 returns the typed `DatabaseBusy` error without applying any rows, while lock

@@ -22,6 +22,10 @@ pub enum Error {
         table: String,
         column: String,
     },
+    MissingInsertColumn {
+        table: String,
+        column: String,
+    },
     RowLength {
         table: String,
         expected: usize,
@@ -84,6 +88,10 @@ impl fmt::Display for Error {
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column '{column}' does not exist in table '{table}'")
             }
+            Self::MissingInsertColumn { table, column } => write!(
+                f,
+                "column '{column}' is missing from INSERT column list for table '{table}'"
+            ),
             Self::RowLength {
                 table,
                 expected,
