@@ -38,6 +38,10 @@ fn validate_sql_identifier(identifier: &str, context: &str) -> Result<()> {
     }
 }
 
+pub(crate) fn validate_table_name(name: &str) -> Result<()> {
+    validate_sql_identifier(name, "table name")
+}
+
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
 }
@@ -143,7 +147,7 @@ impl Table {
 
     /// Creates an empty table with an explicit maximum retained row count.
     pub fn with_row_cap(name: String, schema: Vec<ColumnDef>, row_cap: usize) -> Result<Self> {
-        validate_sql_identifier(&name, "table name")?;
+        validate_table_name(&name)?;
         if schema.is_empty() {
             return Err(Error::InvalidQuery(
                 "a table must contain at least one column".to_owned(),
@@ -178,6 +182,11 @@ impl Table {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Changes only the display name after the catalog has preflighted a rename.
+    pub(crate) fn set_name(&mut self, name: String) {
+        self.name = name;
     }
 
     #[must_use]

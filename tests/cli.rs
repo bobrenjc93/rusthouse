@@ -336,6 +336,31 @@ fn batch_cli_keeps_truncate_table_command_output_silent() {
 }
 
 #[test]
+fn csv_batch_observes_the_complete_rename_table_lifecycle() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE OldName (id Int64, label String); \
+          INSERT INTO OldName VALUES (7, 'kept'); \
+          RENAME TABLE oldname TO NewName; \
+          SELECT id, label FROM newname; \
+          SHOW TABLES; \
+          SHOW CREATE TABLE NEWNAME;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"id,label\n\
+          7,kept\n\
+          name\n\
+          NewName\n\
+          statement\n\
+          \"CREATE TABLE NewName (id Int64, label String)\"\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn table_batch_observes_truncate_between_query_results() {
     let output = run(
         &["--format", "table"],

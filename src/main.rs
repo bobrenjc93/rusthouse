@@ -10,7 +10,7 @@ With no options, reads the legacy line-oriented Int64 session from stdin.
 With --format table, --format csv, --format tsv, or --format json, reads one
 semicolon-delimited SQL batch through EOF and prints one result for each
 SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE query.
-CREATE, DROP, TRUNCATE, and INSERT remain silent.
+CREATE, DROP, RENAME, TRUNCATE, and INSERT remain silent.
 
 Limits:
   legacy: 65536 input bytes, 1024 statements, 64 tables, 1024 rows per table
