@@ -430,6 +430,8 @@ pub enum NullableI64RlePayloadError {
         declared_rows: u64,
         decoded_rows: u64,
     },
+    /// Storage for the completely validated decoded rows could not be reserved.
+    DecodedRowsAllocationFailed { row_count: u64 },
     /// Bytes remain after the declared runs.
     TrailingData {
         expected_len: usize,
@@ -498,6 +500,10 @@ impl fmt::Display for NullableI64RlePayloadError {
             } => write!(
                 formatter,
                 "nullable Int64 RLE payload declares {declared_rows} rows but its runs contain {decoded_rows}"
+            ),
+            Self::DecodedRowsAllocationFailed { row_count } => write!(
+                formatter,
+                "could not reserve storage for {row_count} decoded nullable Int64 RLE rows"
             ),
             Self::TrailingData {
                 expected_len,
@@ -1353,7 +1359,12 @@ impl NullableI64RlePayloadCodec {
             });
         }
 
-        let mut rows = Vec::with_capacity(row_count);
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(row_count).map_err(|_| {
+            NullableI64RlePayloadError::DecodedRowsAllocationFailed {
+                row_count: declared_rows,
+            }
+        })?;
         let mut offset = NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN;
         for _ in 0..run_count {
             let tag = payload[offset];

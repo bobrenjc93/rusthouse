@@ -239,6 +239,20 @@ fn rejects_run_length_sum_overflow() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
+fn rejects_an_unallocatable_maximum_single_run_without_panicking() {
+    let mut payload = header(u64::MAX, 1);
+    push_null_run(&mut payload, u64::MAX);
+
+    assert_eq!(
+        NullableI64RlePayloadCodec::new(usize::MAX, 1, payload.len()).decode(&payload),
+        Err(NullableI64RlePayloadError::DecodedRowsAllocationFailed {
+            row_count: u64::MAX,
+        })
+    );
+}
+
+#[test]
 fn rejects_truncated_headers_runs_and_values() {
     let codec = NullableI64RlePayloadCodec::new(2, 1, 128);
     assert_eq!(

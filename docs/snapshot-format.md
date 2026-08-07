@@ -151,9 +151,10 @@ value while adding run lengths with checked `u64` arithmetic. The expanded
 total must be within the row limit and exactly equal the declared row count,
 and no trailing bytes are allowed. Only after all of those checks succeed does
 the decoder allocate the row vector. Zero-length runs, sum overflow, unknown
-tags, truncation, trailing data, and each configured limit have distinct typed
-errors. The complete RLE payload can be used directly as the opaque payload of
-`SnapshotCodec` without changing the version 1 envelope.
+tags, truncation, trailing data, an unreservable decoded row vector, and each
+configured limit have distinct typed errors. The complete RLE payload can be
+used directly as the opaque payload of `SnapshotCodec` without changing the
+version 1 envelope.
 
 ## Self-describing Int64 table payload
 
