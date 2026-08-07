@@ -66,10 +66,19 @@ impl Catalog {
 
     /// Removes one table using the catalog's case-insensitive name resolution.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
-        self.tables
-            .remove(&normalize(name))
-            .map(|_| ())
-            .ok_or_else(|| Error::TableNotFound(name.to_owned()))
+        if self.drop_table_if_exists(name) {
+            Ok(())
+        } else {
+            Err(Error::TableNotFound(name.to_owned()))
+        }
+    }
+
+    /// Removes a table if its case-insensitive name exists.
+    ///
+    /// Returns `true` when a table was removed and `false` when the catalog was
+    /// already missing that name.
+    pub fn drop_table_if_exists(&mut self, name: &str) -> bool {
+        self.tables.remove(&normalize(name)).is_some()
     }
 
     /// Renames one table after validating the complete catalog change.
@@ -222,5 +231,23 @@ mod tests {
         );
         assert_eq!(catalog.table_names(), ["readings"]);
         assert!(catalog.table("readings").is_ok());
+    }
+
+    #[test]
+    fn conditional_drop_is_case_insensitive_and_missing_tables_are_no_ops() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "Events".to_owned(),
+                vec![ColumnDef {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                }],
+            )
+            .expect("create table");
+
+        assert!(catalog.drop_table_if_exists("eVeNtS"));
+        assert!(!catalog.drop_table_if_exists("EVENTS"));
+        assert_eq!(catalog.table_count(), 0);
     }
 }

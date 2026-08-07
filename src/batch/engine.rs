@@ -452,8 +452,12 @@ impl Database {
                     affected_rows: 0,
                 })
             }
-            Statement::DropTable { name } => {
-                self.catalog.drop_table(&name)?;
+            Statement::DropTable { name, if_exists } => {
+                if if_exists {
+                    self.catalog.drop_table_if_exists(&name);
+                } else {
+                    self.catalog.drop_table(&name)?;
+                }
                 Ok(StatementResult::Command {
                     tag: "DROP TABLE",
                     affected_rows: 0,

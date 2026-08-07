@@ -44,6 +44,11 @@ a successful no-op command and retains the existing display name, schema, rows,
 and row cap even when the requested schema differs. Plain `CREATE TABLE`
 continues to report an error for an existing case-insensitive name.
 
+`DROP TABLE IF EXISTS <name>` removes a matching table using the same
+case-insensitive name resolution as ordinary `DROP TABLE`. If the table is
+already absent, it returns the normal successful zero-row command result;
+plain `DROP TABLE` continues to report a missing-table error.
+
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
 such as `-7`; `Float64` literals are optionally signed, finite decimal or
