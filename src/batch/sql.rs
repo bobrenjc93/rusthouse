@@ -225,6 +225,11 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    /// A case-sensitive String prefix match parsed from `column LIKE 'prefix%'`.
+    LikePrefix {
+        column: String,
+        prefix: String,
+    },
     Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
@@ -1490,9 +1495,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
-        // `not` remains a valid column name, so a following comparison
+        // `not` remains a valid column name, so a following comparison or LIKE
         // operator makes this token the left operand rather than unary syntax.
-        if !self.at_keyword("NOT") || self.next_token_is_comparison_operator() {
+        if !self.at_keyword("NOT") || self.next_token_is_predicate_operator() {
             return self.parse_predicate_atom();
         }
         self.advance();
@@ -1510,17 +1515,18 @@ impl<'a> Parser<'a> {
         Ok(Predicate::Not(Box::new(predicate)))
     }
 
-    fn next_token_is_comparison_operator(&self) -> bool {
+    fn next_token_is_predicate_operator(&self) -> bool {
         let mut lexer = self.lexer;
-        matches!(
-            Self::next_or_invalid(&mut lexer).kind,
+        match Self::next_or_invalid(&mut lexer).kind {
             TokenKind::Equal
-                | TokenKind::NotEqual
-                | TokenKind::Less
-                | TokenKind::LessOrEqual
-                | TokenKind::Greater
-                | TokenKind::GreaterOrEqual
-        )
+            | TokenKind::NotEqual
+            | TokenKind::Less
+            | TokenKind::LessOrEqual
+            | TokenKind::Greater
+            | TokenKind::GreaterOrEqual => true,
+            TokenKind::Identifier(keyword) => keyword.eq_ignore_ascii_case("LIKE"),
+            _ => false,
+        }
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
@@ -1539,6 +1545,37 @@ impl<'a> Parser<'a> {
         }
 
         let left = self.parse_operand()?;
+        if self.eat_keyword("LIKE") {
+            let Operand::Column(column) = left else {
+                return self.error("LIKE left operand must be a column");
+            };
+            let pattern_position = self.position();
+            let TokenKind::String(mut pattern) = self.take_kind() else {
+                return Err(Error::Sql {
+                    position: pattern_position,
+                    message: "LIKE pattern must be a String literal with exactly one terminal '%'"
+                        .to_owned(),
+                });
+            };
+            if !pattern.ends_with('%') {
+                return Err(Error::Sql {
+                    position: pattern_position,
+                    message: "LIKE pattern must contain exactly one terminal '%'".to_owned(),
+                });
+            }
+            pattern.pop();
+            if pattern.contains('%') {
+                return Err(Error::Sql {
+                    position: pattern_position,
+                    message: "LIKE pattern must contain exactly one terminal '%'".to_owned(),
+                });
+            }
+            self.record_predicate_node()?;
+            return Ok(Predicate::LikePrefix {
+                column,
+                prefix: pattern,
+            });
+        }
         let operator = self.parse_comparison_operator()?;
         let right = self.parse_operand()?;
         self.record_predicate_node()?;
