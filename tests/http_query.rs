@@ -1,6 +1,7 @@
 use std::io::{self, Cursor, Read, Write};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use rusthouse::batch::engine::Database;
 use rusthouse::{
@@ -73,7 +74,7 @@ fn assert_response_with_content_type(
     assert_eq!(body, expected_body);
 }
 
-fn assert_ping_response(response: &[u8]) {
+fn assert_ok_health_response(response: &[u8]) {
     assert_response_with_content_type(
         response,
         "HTTP/1.1 200 OK",
@@ -86,11 +87,11 @@ fn assert_ping_response(response: &[u8]) {
 fn ping_returns_the_clickhouse_health_response_without_content_length() {
     let database = SharedDatabase::default();
 
-    assert_ping_response(&exchange(
+    assert_ok_health_response(&exchange(
         &database,
         b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
     ));
-    assert_ping_response(&exchange(
+    assert_ok_health_response(&exchange(
         &database,
         b"GET /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
     ));
@@ -111,9 +112,120 @@ fn ping_succeeds_when_the_database_lock_is_unavailable() {
         "HTTP/1.1 500 Internal Server Error",
         r#"{"error":"database is unavailable"}"#,
     );
-    assert_ping_response(&exchange(
+    assert_ok_health_response(&exchange(
         &database,
         b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ));
+}
+
+#[test]
+fn ready_returns_ok_when_a_read_lock_is_immediately_available() {
+    let database = SharedDatabase::default();
+
+    assert_ok_health_response(&exchange(
+        &database,
+        b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ));
+    assert_ok_health_response(&exchange(
+        &database,
+        b"GET /ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    ));
+}
+
+#[test]
+fn ready_returns_the_same_503_for_writer_contention_and_poisoning() {
+    const READY_REQUEST: &[u8] = b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    let contended_inner = Arc::new(RwLock::new(Database::new()));
+    let contended_database = SharedDatabase::from_arc(Arc::clone(&contended_inner));
+    let mut writer = Some(contended_inner.write().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = contended_database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(exchange(&worker_database, READY_REQUEST))
+            .unwrap();
+    });
+    let contended_response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(response) => response,
+        Err(error) => {
+            drop(writer.take());
+            worker.join().unwrap();
+            panic!("readiness check blocked behind a writer: {error}");
+        }
+    };
+    assert_response(
+        &contended_response,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    drop(writer.take());
+    worker.join().unwrap();
+
+    let poisoned_inner = Arc::new(RwLock::new(Database::new()));
+    let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = poisoned_inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let poisoned_response = exchange(&poisoned_database, READY_REQUEST);
+    assert_eq!(poisoned_response, contended_response);
+}
+
+#[test]
+fn ready_requires_the_exact_get_target_and_an_empty_body() {
+    let database = SharedDatabase::default();
+
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"GET /ready does not accept a request body"}"#,
+    );
+
+    let wrong_method = exchange(
+        &database,
+        b"POST /ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_response(
+        &wrong_method,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be GET for /ready"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&wrong_method)
+            .unwrap()
+            .contains("\r\nAllow: GET\r\n")
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /ready?details HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 404 Not Found",
+        r#"{"error":"request target must be /ping or /ready"}"#,
+    );
+}
+
+#[test]
+fn bearer_authentication_protects_ready() {
+    let database = SharedDatabase::default();
+    let request = b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", request),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    assert_ok_health_response(&authenticated_exchange(
+        &database,
+        "correct-token",
+        b"GET /ready HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
     ));
 }
 
@@ -193,7 +305,7 @@ fn bearer_authentication_also_protects_ping() {
             .contains("\r\nWWW-Authenticate: Bearer\r\n")
     );
 
-    assert_ping_response(&authenticated_exchange(
+    assert_ok_health_response(&authenticated_exchange(
         &database,
         "correct-token",
         b"GET /ping HTTP/1.1\r\nHost: localhost\r\naUtHoRiZaTiOn: bEaReR correct-token\r\n\r\n",
@@ -587,7 +699,7 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
     assert_response(
         &exchange(&database, b"GET /other HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         "HTTP/1.1 404 Not Found",
-        r#"{"error":"request target must be /ping"}"#,
+        r#"{"error":"request target must be /ping or /ready"}"#,
     );
     assert_response(
         &exchange(
@@ -751,6 +863,48 @@ fn ping_honors_exact_header_and_complete_response_byte_limits() {
         },
     )
     .expect_err("the cap cannot hold either the ping or fixed limit response");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded {
+            max_bytes,
+            ..
+        } if max_bytes == expected_response.len() - 1
+    ));
+    assert!(response_overflow_output.is_empty());
+}
+
+#[test]
+fn ready_honors_exact_header_and_complete_response_byte_limits() {
+    let database = SharedDatabase::default();
+    let request = b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let expected_response = exchange(&database, request);
+
+    let mut response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut response,
+        HttpQueryLimits {
+            max_header_bytes: request.len(),
+            max_header_count: 1,
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(response, expected_response);
+
+    let mut response_overflow_output = Vec::new();
+    let error = handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut response_overflow_output,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("the cap cannot hold either readiness or the fixed limit response");
     assert!(matches!(
         error,
         HttpQueryError::ResponseLimitExceeded {

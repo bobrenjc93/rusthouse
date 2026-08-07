@@ -91,8 +91,10 @@ impl StdError for HttpQueryError {
 ///
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
-/// database. Both targets require CRLF framing and one nonempty `Host` header.
-/// Transfer encoding, including chunked bodies, and `Expect` are rejected.
+/// database. `GET /ready` also accepts no body and returns the same successful
+/// response only when a database read lock is immediately available. All
+/// targets require CRLF framing and one nonempty `Host` header. Transfer
+/// encoding, including chunked bodies, and `Expect` are rejected.
 ///
 /// The handler does not open, close, or otherwise manage a listener or stream.
 /// It reads exactly the declared request body and emits at most one response.
@@ -132,12 +134,13 @@ pub fn handle_http_query_with_limits(
 /// Handles one HTTP query or health exchange that requires a bearer token.
 ///
 /// This is separate from [`handle_http_query`], which remains unauthenticated.
-/// Every request, including `GET /ping`, is authorized only when it has exactly
-/// one `Authorization` header whose value is `Bearer`, one or more spaces, and
-/// a token matching `expected_bearer_token`. Authentication failures receive
-/// the same response before the SQL body is read or the database is accessed.
-/// The configured token must be a nonempty RFC token68 value; invalid
-/// configurations are rejected as a server error without reading any input.
+/// Every request, including `GET /ping` and `GET /ready`, is authorized only
+/// when it has exactly one `Authorization` header whose value is `Bearer`, one
+/// or more spaces, and a token matching `expected_bearer_token`.
+/// Authentication failures receive the same response before the SQL body is
+/// read or the database is accessed. The configured token must be a nonempty
+/// RFC token68 value; invalid configurations are rejected as a server error
+/// without reading any input.
 ///
 /// This function provides authentication only. The embedding application must
 /// provide TLS to keep the bearer token and query contents confidential in
@@ -227,15 +230,37 @@ fn handle_http_query_exchange(
         }
     };
 
-    let HttpRequest::Query(sql) = request else {
-        return write_response(
-            &mut output,
-            Status::OK,
-            &[],
-            CONTENT_TYPE_TEXT,
-            b"Ok.\n".to_vec(),
-            limits.max_response_bytes,
-        );
+    let sql = match request {
+        HttpRequest::Ping => {
+            return write_response(
+                &mut output,
+                Status::OK,
+                &[],
+                CONTENT_TYPE_TEXT,
+                b"Ok.\n".to_vec(),
+                limits.max_response_bytes,
+            );
+        }
+        HttpRequest::Ready if database.is_read_lock_available() => {
+            return write_response(
+                &mut output,
+                Status::OK,
+                &[],
+                CONTENT_TYPE_TEXT,
+                b"Ok.\n".to_vec(),
+                limits.max_response_bytes,
+            );
+        }
+        HttpRequest::Ready => {
+            return write_error_response(
+                &mut output,
+                Status::SERVICE_UNAVAILABLE,
+                &[],
+                "database is unavailable",
+                limits.max_response_bytes,
+            );
+        }
+        HttpRequest::Query(sql) => sql,
     };
 
     match database.query(&sql) {
@@ -289,6 +314,16 @@ fn read_request(
                 .into());
             }
             Ok(HttpRequest::Ping)
+        }
+        RequestKind::Ready => {
+            if request.content_length.unwrap_or(0) != 0 {
+                return Err(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "GET /ready does not accept a request body",
+                )
+                .into());
+            }
+            Ok(HttpRequest::Ready)
         }
         RequestKind::Query => {
             let Some(content_length) = request.content_length else {
@@ -391,12 +426,14 @@ struct ParsedRequest {
 enum HttpRequest {
     Query(String),
     Ping,
+    Ready,
 }
 
 #[derive(Clone, Copy)]
 enum RequestKind {
     Query,
     Ping,
+    Ready,
 }
 
 fn parse_headers(
@@ -568,6 +605,7 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
     match (method, target) {
         (b"POST", b"/query") => Ok(RequestKind::Query),
         (b"GET", b"/ping") => Ok(RequestKind::Ping),
+        (b"GET", b"/ready") => Ok(RequestKind::Ready),
         (_, b"/query") => Err(RequestFailure::with_headers(
             Status::METHOD_NOT_ALLOWED,
             "method must be POST",
@@ -580,15 +618,23 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
             &[b"Allow: GET\r\n"],
         )
         .into()),
+        (_, b"/ready") => Err(RequestFailure::with_headers(
+            Status::METHOD_NOT_ALLOWED,
+            "method must be GET for /ready",
+            &[b"Allow: GET\r\n"],
+        )
+        .into()),
         (b"POST", _) => {
             Err(RequestFailure::new(Status::NOT_FOUND, "request target must be /query").into())
         }
-        (b"GET", _) => {
-            Err(RequestFailure::new(Status::NOT_FOUND, "request target must be /ping").into())
-        }
+        (b"GET", _) => Err(RequestFailure::new(
+            Status::NOT_FOUND,
+            "request target must be /ping or /ready",
+        )
+        .into()),
         _ => Err(RequestFailure::with_headers(
             Status::METHOD_NOT_ALLOWED,
-            "method must be POST for /query or GET for /ping",
+            "method must be POST for /query or GET for /ping or /ready",
             &[b"Allow: GET, POST\r\n"],
         )
         .into()),
@@ -680,6 +726,7 @@ impl Status {
     const EXPECTATION_FAILED: Self = Self::new(417, "Expectation Failed");
     const REQUEST_HEADER_FIELDS_TOO_LARGE: Self = Self::new(431, "Request Header Fields Too Large");
     const INTERNAL_SERVER_ERROR: Self = Self::new(500, "Internal Server Error");
+    const SERVICE_UNAVAILABLE: Self = Self::new(503, "Service Unavailable");
     const HTTP_VERSION_NOT_SUPPORTED: Self = Self::new(505, "HTTP Version Not Supported");
 
     const fn new(code: u16, reason: &'static str) -> Self {
