@@ -113,6 +113,13 @@ exactly one literal expression and an optional `AS` alias: expression lists,
 bare `NULL`, operator expressions, `FROM`, and other trailing clauses are not
 supported.
 
+The exact case-insensitive probe `SELECT version() [AS <alias>]` returns the
+RustHouse package semantic version as one `String` row. Its result column is
+named `version()` unless an alias is supplied. Arguments, expression lists,
+`FROM`, `WHERE`, `ORDER BY`, `LIMIT`, and other trailing clauses are rejected;
+the probe charges one SQL AST list item and uses the normal query row, value,
+byte, retained-result, and formatted-output limits.
+
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a

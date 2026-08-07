@@ -8,6 +8,7 @@ use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having,
     HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
+    VersionSelect,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
@@ -587,6 +588,7 @@ impl Database {
                 rows,
             } => self.execute_insert_statement(table, Some(columns), rows),
             statement @ (Statement::LiteralSelect(_)
+            | Statement::VersionSelect(_)
             | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
@@ -608,6 +610,9 @@ impl Database {
         match statement {
             Statement::LiteralSelect(select) => {
                 self.execute_literal_select(select, query_result_limits)
+            }
+            Statement::VersionSelect(select) => {
+                self.execute_version_select(select, query_result_limits)
             }
             Statement::Select(select) => self.execute_select(select, query_result_limits),
             Statement::CrossJoin(cross_join) => {
@@ -698,6 +703,40 @@ impl Database {
         Ok(QueryResult {
             columns,
             rows: vec![vec![value]],
+        })
+    }
+
+    fn execute_version_select(
+        &self,
+        select: VersionSelect,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const RESULT_COLUMN_NAME: &str = "version()";
+        const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+        let column_name = select
+            .alias
+            .unwrap_or_else(|| RESULT_COLUMN_NAME.to_owned());
+        let fixed_bytes = validate_result_shape_parts(
+            1,
+            1,
+            1,
+            column_name.len(),
+            query_result_limits,
+            SELECT_RESULT_RESOURCES,
+        )?;
+        enforce_resource_limit(
+            SELECT_RESULT_RESOURCES.bytes,
+            fixed_bytes.saturating_add(PACKAGE_VERSION.len()),
+            query_result_limits.max_bytes,
+        )?;
+
+        Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: column_name,
+                data_type: DataType::String,
+            }],
+            rows: vec![vec![Value::String(PACKAGE_VERSION.to_owned())]],
         })
     }
 
@@ -1092,6 +1131,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
+        | Statement::VersionSelect(_)
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
