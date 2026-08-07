@@ -479,8 +479,8 @@ pub fn write_json(output: &mut impl io::Write, result: &QueryResult) -> io::Resu
 
 fn render_json_each_row(result: &QueryResult) -> String {
     let mut output = Vec::new();
-    write_json_each_row(&mut output, result)
-        .expect("JSONEachRow output is within the default formatted-output limit");
+    write_json_each_row_with_limit(&mut output, result, usize::MAX)
+        .expect("writing in-memory JSONEachRow output to a Vec cannot fail");
     String::from_utf8(output).expect("JSONEachRow rendering preserves UTF-8")
 }
 
@@ -1011,6 +1011,28 @@ mod tests {
                 if bytes == expected.len() && max_bytes == expected.len() - 1
         ));
         assert!(rejected_output.is_empty());
+    }
+
+    #[test]
+    fn json_each_row_in_memory_render_exceeds_the_streaming_output_limit() {
+        const ROWS: usize = 10_000;
+        const ALIAS_BYTES: usize = 1_700;
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "a".repeat(ALIAS_BYTES),
+                data_type: DataType::String,
+            }],
+            rows: (0..ROWS)
+                .map(|_| vec![Value::String(String::new())])
+                .collect(),
+        };
+
+        let rendered = render(&result, OutputFormat::JsonEachRow);
+
+        assert_eq!(rendered.len(), ROWS * (ALIAS_BYTES + 8));
+        assert!(rendered.len() > DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES);
+        assert!(rendered.starts_with("{\"aaaa"));
+        assert!(rendered.ends_with("\":\"\"}\n"));
     }
 
     #[test]
