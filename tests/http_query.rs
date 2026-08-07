@@ -2147,6 +2147,349 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
 }
 
 #[test]
+fn authenticated_insert_route_commits_a_batch_and_returns_an_empty_response() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             CREATE TABLE readings (value Float64); \
+             ALTER TABLE events RENAME COLUMN label TO name;",
+        )
+        .unwrap();
+    let (request, _) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO events VALUES (1, 'one'), (2, 'two'); \
+          INSERT INTO readings VALUES (1.5); \
+          INSERT INTO events VALUES (3, 'three');",
+        "Authorization: Bearer correct-token\r\n",
+    );
+
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id, name FROM events ORDER BY id;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"name","type":"String"}],"rows":[[1,"one"],[2,"two"],[3,"three"]]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT value FROM readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Float64"}],"rows":[[1.5]]}"#,
+    );
+}
+
+#[test]
+fn authenticated_insert_route_rolls_back_invalid_and_mixed_batches() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64); \
+             CREATE TABLE readings (value Float64);",
+        )
+        .unwrap();
+    let cases: &[(&[u8], &str)] = &[
+        (
+            b"INSERT INTO events VALUES (1); INSERT INTO readings VALUES ('wrong');",
+            r#"{"error":"type mismatch for column 'readings.value': expected Float64, found String"}"#,
+        ),
+        (
+            b"INSERT INTO events VALUES (2); SELECT id FROM events;",
+            r#"{"error":"INSERT-only batch accepts only INSERT statements; found SELECT"}"#,
+        ),
+        (
+            b"INSERT INTO events VALUES (3); ALTER TABLE events RENAME COLUMN id TO event_id;",
+            r#"{"error":"INSERT-only batch accepts only INSERT statements; found ALTER TABLE"}"#,
+        ),
+    ];
+
+    for (sql, expected_body) in cases {
+        let (request, _) = request_with_authorization_for_target(
+            "/insert",
+            sql,
+            "Authorization: Bearer correct-token\r\n",
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 400 Bad Request",
+            expected_body,
+        );
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT value FROM readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Float64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
+fn insert_route_is_bearer_only_exact_and_does_not_make_query_routes_mutable() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let sql = b"INSERT INTO events VALUES (1);";
+
+    assert_response(
+        &exchange(&database, &request_for_target("/insert", sql)),
+        "HTTP/1.1 404 Not Found",
+        r#"{"error":"request target must be / or /query"}"#,
+    );
+
+    let (missing_credentials, body_offset) =
+        request_with_authorization_for_target("/insert", sql, "");
+    let mut input = Cursor::new(missing_credentials);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let (query_request, _) = request_with_authorization_for_target(
+        "/query",
+        sql,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &query_request),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+
+    for target in ["/insert/", "/insert?async=1"] {
+        let (inexact_request, _) = request_with_authorization_for_target(
+            target,
+            sql,
+            "Authorization: Bearer correct-token\r\n",
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &inexact_request),
+            "HTTP/1.1 404 Not Found",
+            r#"{"error":"request target must be / or /query"}"#,
+        );
+    }
+
+    let wrong_method = authenticated_exchange(
+        &database,
+        "correct-token",
+        b"GET /insert HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+    );
+    assert_response(
+        &wrong_method,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be POST for /insert"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&wrong_method)
+            .unwrap()
+            .contains("\r\nAllow: POST\r\n")
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
+fn authenticated_insert_route_returns_503_without_waiting_for_a_reader() {
+    let mut initial = Database::new();
+    initial.execute("CREATE TABLE events (id Int64);").unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let mut reader = Some(inner.read().unwrap());
+    let (request, _) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO events VALUES (1);",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(authenticated_exchange(
+                &worker_database,
+                "correct-token",
+                &request,
+            ))
+            .unwrap();
+    });
+
+    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(response) => response,
+        Err(error) => {
+            drop(reader.take());
+            worker.join().unwrap();
+            panic!("HTTP insert admission blocked behind a reader: {error}");
+        }
+    };
+    assert_response(
+        &response,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    assert_eq!(
+        reader
+            .as_ref()
+            .unwrap()
+            .catalog()
+            .table("events")
+            .unwrap()
+            .row_count(),
+        0
+    );
+    drop(reader.take());
+    worker.join().unwrap();
+}
+
+#[test]
+fn authenticated_insert_route_reports_lock_poisoning_as_500() {
+    let mut initial = Database::new();
+    initial.execute("CREATE TABLE events (id Int64);").unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+    let (request, _) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO events VALUES (1);",
+        "Authorization: Bearer correct-token\r\n",
+    );
+
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &request),
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"database is unavailable"}"#,
+    );
+}
+
+#[test]
+fn authenticated_insert_route_preserves_the_sql_body_limit() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let sql = b"INSERT INTO events VALUES (1);";
+    let (request, body_offset) = request_with_authorization_for_target(
+        "/insert",
+        sql,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let mut input = Cursor::new(&request);
+    let mut response = Vec::new();
+
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        &mut input,
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: sql.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"request body exceeds configured byte limit"}"#,
+    );
+
+    let mut exact_limit_response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        Cursor::new(request),
+        &mut exact_limit_response,
+        HttpQueryLimits {
+            max_sql_bytes: sql.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_response_with_content_type(
+        &exact_limit_response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+}
+
+#[test]
+fn authenticated_insert_route_preflights_the_response_cap_before_commit() {
+    let (request, _) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO events VALUES (1);",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let sizing_database = SharedDatabase::default();
+    sizing_database
+        .execute("CREATE TABLE events (id Int64);")
+        .unwrap();
+    let success_response = authenticated_exchange(&sizing_database, "correct-token", &request);
+
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let max_response_bytes = success_response.len() - 1;
+    let mut response = Vec::new();
+    let error = handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        Cursor::new(request),
+        &mut response,
+        HttpQueryLimits {
+            max_response_bytes,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("the fixed success response exceeds the cap");
+
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes, .. }
+            if max_bytes == max_response_bytes
+    ));
+    assert!(response.is_empty());
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
 fn complete_response_is_capped_before_any_bytes_are_written() {
     let database = SharedDatabase::default();
     let large_sql = format!("SELECT '{}' AS value;", "x".repeat(1_000));

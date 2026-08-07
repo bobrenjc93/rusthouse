@@ -519,6 +519,17 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::RenameColumn {
+                table,
+                source,
+                destination,
+            } => {
+                self.catalog.rename_column(&table, &source, destination)?;
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::TruncateTable { name } => {
                 let affected_rows = self.catalog.table_mut(&name)?.truncate();
                 Ok(StatementResult::Command {
@@ -579,6 +590,7 @@ impl Database {
             | Statement::DropTable { .. }
             | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
+            | Statement::RenameColumn { .. }
             | Statement::TruncateTable { .. }
             | Statement::Insert { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
@@ -987,6 +999,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
+        Statement::RenameColumn { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Insert { .. } => "INSERT",
         Statement::LiteralSelect(_)

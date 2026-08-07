@@ -220,6 +220,30 @@ impl Table {
             })
     }
 
+    /// Changes only a column's display name after validating the complete rename.
+    ///
+    /// Source and collision checks are case-insensitive. Renaming a column to
+    /// another spelling of its own name is allowed, while invalid, reserved,
+    /// and already-used destinations leave the schema unchanged.
+    pub fn rename_column(&mut self, source: &str, destination: String) -> Result<()> {
+        let source_index = self.column_index(source)?;
+        validate_sql_identifier(&destination, "column name")?;
+        if is_reserved_column_name(&destination) {
+            return Err(Error::ReservedIdentifier {
+                identifier: destination,
+                context: "column name".to_owned(),
+            });
+        }
+        if self.schema.iter().enumerate().any(|(index, field)| {
+            index != source_index && field.name.eq_ignore_ascii_case(&destination)
+        }) {
+            return Err(Error::DuplicateColumn(destination));
+        }
+
+        self.schema[source_index].name = destination;
+        Ok(())
+    }
+
     /// Checks a row without mutating any physical column.
     pub(crate) fn validate_row(&self, row: &[Value]) -> Result<()> {
         if row.len() != self.schema.len() {
