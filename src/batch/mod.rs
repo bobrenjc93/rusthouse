@@ -8,6 +8,7 @@ pub mod format;
 pub mod shared_database;
 pub mod sql;
 pub mod storage;
+pub mod tsv;
 pub mod value;
 
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;

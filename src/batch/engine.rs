@@ -10,6 +10,7 @@ use crate::batch::sql::{
     HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
 };
 use crate::batch::storage::{Column, Table};
+use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
 
 pub use crate::batch::storage::DEFAULT_MAX_ROWS_PER_TABLE;
@@ -254,6 +255,48 @@ impl Database {
         let rows = {
             let target = self.catalog.table(table)?;
             csv::parse_rows(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        self.catalog.table_mut(table)?.insert_rows(rows)?;
+        Ok(affected_rows)
+    }
+
+    /// Atomically appends bounded, typed `TabSeparatedWithNames` input.
+    ///
+    /// The decoded header must exactly match the target schema in order and
+    /// case. Fields use the TSV writer's ClickHouse-style escapes: `\\`, `\t`,
+    /// `\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Values are parsed as `Int64`,
+    /// finite `Float64`, `Bool`, or `String`; records may use LF or CRLF.
+    ///
+    /// Parsing, all configured limits, and remaining table capacity are
+    /// validated before any physical column changes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::engine::Database;
+    /// use rusthouse::batch::tsv::TsvIngestLimits;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute("CREATE TABLE notes (id Int64, text String);")?;
+    /// let input = b"id\ttext\n1\tline\\nwith\\ttab\n";
+    /// let rows = database.ingest_tsv_with_names(
+    ///     "notes",
+    ///     input,
+    ///     TsvIngestLimits::new(input.len(), 1, 2),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_tsv_with_names(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: TsvIngestLimits,
+    ) -> std::result::Result<usize, TsvIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            tsv::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
         self.catalog.table_mut(table)?.insert_rows(rows)?;
