@@ -1494,25 +1494,7 @@ impl<'a> Parser<'a> {
             if name.eq_ignore_ascii_case("CAST") {
                 let name = self.expect_identifier("column in CAST")?;
                 self.expect_keyword("AS")?;
-                let type_position = self.position();
-                let type_name = self.expect_identifier("target type in CAST")?;
-                let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                    position: type_position,
-                    message: format!(
-                        "unknown CAST target type '{type_name}'; expected Int64, Float64, or Bool"
-                    ),
-                })?;
-                if !matches!(
-                    target_type,
-                    DataType::Int64 | DataType::Float64 | DataType::Bool
-                ) {
-                    return Err(Error::Sql {
-                        position: type_position,
-                        message: format!(
-                            "unsupported CAST target type '{type_name}'; expected Int64, Float64, or Bool"
-                        ),
-                    });
-                }
+                let target_type = self.parse_column_cast_target_type()?;
                 self.expect(&TokenKind::RightParen, "')' after CAST expression")?;
                 let alias = self.parse_alias()?;
                 return Ok(SelectItem::Cast {
@@ -1635,8 +1617,38 @@ impl<'a> Parser<'a> {
             let argument = self.expect_identifier("Float64 column in ORDER BY CEIL")?;
             self.expect(&TokenKind::RightParen, "')' after ORDER BY CEIL expression")?;
             Ok(format!("CEIL({argument})"))
+        } else if name.eq_ignore_ascii_case("CAST") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("column in ORDER BY CAST")?;
+            self.expect_keyword("AS")?;
+            let target_type = self.parse_column_cast_target_type()?;
+            self.expect(&TokenKind::RightParen, "')' after ORDER BY CAST expression")?;
+            Ok(format!("CAST({argument} AS {target_type})"))
         } else {
             Ok(name)
+        }
+    }
+
+    fn parse_column_cast_target_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("target type in CAST")?;
+        let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown CAST target type '{type_name}'; expected Int64, Float64, or Bool"
+            ),
+        })?;
+        if matches!(
+            target_type,
+            DataType::Int64 | DataType::Float64 | DataType::Bool
+        ) {
+            Ok(target_type)
+        } else {
+            Err(Error::Sql {
+                position,
+                message: format!(
+                    "unsupported CAST target type '{type_name}'; expected Int64, Float64, or Bool"
+                ),
+            })
         }
     }
 

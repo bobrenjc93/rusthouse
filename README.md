@@ -182,14 +182,17 @@ and `LIMIT` select rows before subtraction, so overflow in an excluded row does
 not fail the query. A selected overflow or non-`Int64` argument is a typed error.
 
 `SELECT` projections support `CAST(int64_column AS Float64)`,
-`CAST(float64_column AS Int64)`, and `CAST(int64_column AS Bool)`. Integer zero
-becomes `false`, and every nonzero integer, including both `Int64` extrema,
-becomes `true`. Float-to-integer casts truncate finite values toward zero and
-report typed numeric-overflow errors outside the `Int64` range. Add an explicit
-`AS alias`; otherwise, the result column is named `CAST(<column> AS <type>)`.
-`WHERE`, `ORDER BY`, and `LIMIT` select rows before conversion. `CAST`
-projections are currently limited to ungrouped queries: they cannot be combined
-with aggregate projections or `GROUP BY`.
+`CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`, and
+`CAST(int64_column AS Bool)`. Boolean `false` becomes `0` and `true` becomes
+`1`; integer zero becomes `false`, and every nonzero integer, including both
+`Int64` extrema, becomes `true`. Float-to-integer casts truncate finite values
+toward zero and report typed numeric-overflow errors outside the `Int64` range.
+Add an explicit `AS alias`; otherwise, the result column is named
+`CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
+its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
+are currently limited to ungrouped queries: they cannot be combined with
+aggregate projections or `GROUP BY`. No other source/target type pairs are
+accepted.
 `LENGTH(string_column)` is another ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
