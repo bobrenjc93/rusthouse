@@ -1,5 +1,12 @@
 {
-  "version": 1,
+  "version": 2,
+  "updatePolicy": {
+    "trigger": "successful_merge",
+    "pointIdentity": "baseline_commit_or_pr_number",
+    "retryBehavior": "upsert_existing_key_preserving_original_timestamp",
+    "scoreValidation": "all_enabled_evaluations_finite_0_to_100",
+    "failureBehavior": "abort_before_artifact_write"
+  },
   "evaluations": {
     "eval_9fbdfec0": {
       "name": "Analytical database capability",
@@ -1319,6 +1326,38 @@
         "eval_29146f21": 95,
         "eval_d43b14a4": 100,
         "eval_63df825b": 85,
+        "eval_c88a7f3d": 50,
+        "eval_d04acec3": 90
+      }
+    },
+    {
+      "key": "base:aab580ef6943378ed9a973907a5b90799d32e550",
+      "commit": "aab580ef6943378ed9a973907a5b90799d32e550",
+      "recordedAt": "2026-08-07T15:00:28.345Z",
+      "label": "base aab580e",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 50,
+        "eval_d04acec3": 90
+      }
+    },
+    {
+      "key": "pr:520",
+      "recordedAt": "2026-08-07T15:00:28.345Z",
+      "label": "PR #520",
+      "kind": "leaf",
+      "prNumber": 520,
+      "title": "Compress nullable Int64 snapshot rows with RLE",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
         "eval_c88a7f3d": 50,
         "eval_d04acec3": 90
       }

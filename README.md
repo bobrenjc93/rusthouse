@@ -480,6 +480,11 @@ row is appended.
 magic value, format version, declared length, and CRC-32 checksum.
 `NullableI64PayloadCodec` provides the first deterministic storage payload: a
 bounded row count and tagged nullable `Int64` values.
+`NullableI64RlePayloadCodec` is a separate versioned payload that compresses
+maximal consecutive runs of `NULL` or one repeated `Int64`. Independent row,
+run, and byte limits bound decompression; the complete run stream, checked row
+sum, and exact byte boundary are validated before decoded rows are allocated.
+It does not change the original row payload or the snapshot envelope format.
 `Int64TablePayloadCodec` is a separate, self-describing payload that also
 persists the column name, nullability, and table row cap. It has independent
 UTF-8 name-byte, row-cap/current-row, and payload-byte bounds; decoding checks
@@ -553,5 +558,5 @@ The repository begins as a deliberately tiny seed. Substantial functionality sho
 
 ![Burner evaluation progress](docs/burner-evaluation-progress.svg)
 
-_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+Burner updates this graph atomically after each successful merge. It validates a complete finite 0–100 score map for every enabled evaluation, then upserts the canonical baseline-commit or `pr:<number>` key; retrying a merge replaces the existing point instead of duplicating it. Missing or malformed scores abort artifact generation before any file is written. The [raw versioned history](docs/burner-evaluation-history.json) records this merge-coupled policy.
 <!-- burner-progress:end -->

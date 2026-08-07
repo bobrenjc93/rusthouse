@@ -2,8 +2,9 @@
 //!
 //! This module does not serialize a catalog. It can create and sync a new
 //! envelope file, atomically replace an envelope through a sibling temporary
-//! file on Unix, and encode either row-only data or one self-describing bounded
-//! `Int64` table. See `docs/snapshot-format.md` for the stable binary layouts.
+//! file on Unix, and encode row-only data with or without run-length
+//! compression or one self-describing bounded `Int64` table. See
+//! `docs/snapshot-format.md` for the stable binary layouts.
 
 use std::error::Error;
 #[cfg(unix)]
@@ -50,6 +51,33 @@ pub const NULLABLE_I64_NULL_TAG: u8 = 0;
 
 /// Tag identifying a present value in a nullable `Int64` payload.
 pub const NULLABLE_I64_VALUE_TAG: u8 = 1;
+
+/// Magic bytes at the start of a run-length encoded nullable `Int64` payload.
+pub const NULLABLE_I64_RLE_PAYLOAD_MAGIC: [u8; 8] = *b"RHNRLEP\0";
+
+/// The run-length encoded nullable `Int64` payload version emitted and accepted.
+pub const NULLABLE_I64_RLE_PAYLOAD_VERSION: u16 = 1;
+
+/// Number of fixed bytes before the runs in a nullable `Int64` RLE payload.
+pub const NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN: usize = NULLABLE_I64_RLE_PAYLOAD_MAGIC.len()
+    + std::mem::size_of::<u16>()
+    + 2 * std::mem::size_of::<u64>();
+
+/// Tag identifying a run of `NULL` rows.
+pub const NULLABLE_I64_RLE_NULL_RUN_TAG: u8 = 0;
+
+/// Tag identifying a run of one repeated present value.
+pub const NULLABLE_I64_RLE_VALUE_RUN_TAG: u8 = 1;
+
+/// Number of bytes in every run before an optional repeated value.
+pub const NULLABLE_I64_RLE_RUN_HEADER_LEN: usize =
+    std::mem::size_of::<u8>() + std::mem::size_of::<u64>();
+
+const NULLABLE_I64_RLE_PAYLOAD_VERSION_OFFSET: usize = NULLABLE_I64_RLE_PAYLOAD_MAGIC.len();
+const NULLABLE_I64_RLE_PAYLOAD_ROW_COUNT_OFFSET: usize =
+    NULLABLE_I64_RLE_PAYLOAD_VERSION_OFFSET + std::mem::size_of::<u16>();
+const NULLABLE_I64_RLE_PAYLOAD_RUN_COUNT_OFFSET: usize =
+    NULLABLE_I64_RLE_PAYLOAD_ROW_COUNT_OFFSET + std::mem::size_of::<u64>();
 
 /// Magic bytes at the start of a self-describing `Int64` table payload.
 pub const INT64_TABLE_PAYLOAD_MAGIC: [u8; 8] = *b"RHITBLP\0";
@@ -362,6 +390,133 @@ impl fmt::Display for NullableI64PayloadError {
 }
 
 impl Error for NullableI64PayloadError {}
+
+/// An error produced while encoding or decoding run-length encoded nullable
+/// `Int64` rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableI64RlePayloadError {
+    /// The row count exceeds the codec's configured bound.
+    RowLimitExceeded { row_count: u64, max_rows: usize },
+    /// The run count exceeds the codec's configured bound.
+    RunLimitExceeded { run_count: u64, max_runs: usize },
+    /// The encoded payload exceeds the codec's configured byte bound.
+    PayloadTooLarge {
+        payload_len: u64,
+        max_payload_len: usize,
+    },
+    /// The payload ends before a complete header or declared run is present.
+    Truncated {
+        expected_len: usize,
+        actual_len: usize,
+    },
+    /// The payload is not a nullable `Int64` RLE payload.
+    IncompatibleMagic {
+        found: [u8; NULLABLE_I64_RLE_PAYLOAD_MAGIC.len()],
+    },
+    /// The payload version is not supported by this codec.
+    UnsupportedVersion { found: u16, supported: u16 },
+    /// A run uses a tag this codec does not know.
+    UnknownRunTag { run_index: usize, tag: u8 },
+    /// A run declares no rows.
+    ZeroLengthRun { run_index: usize },
+    /// Adding a run length overflows the payload's `u64` row-count domain.
+    RowCountOverflow {
+        run_index: usize,
+        decoded_rows: u64,
+        run_length: u64,
+    },
+    /// The run lengths do not sum to the declared row count.
+    RowCountMismatch {
+        declared_rows: u64,
+        decoded_rows: u64,
+    },
+    /// Storage for the completely validated decoded rows could not be reserved.
+    DecodedRowsAllocationFailed { row_count: u64 },
+    /// Bytes remain after the declared runs.
+    TrailingData {
+        expected_len: usize,
+        actual_len: usize,
+    },
+}
+
+impl fmt::Display for NullableI64RlePayloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RowLimitExceeded {
+                row_count,
+                max_rows,
+            } => write!(
+                formatter,
+                "nullable Int64 RLE payload has {row_count} rows, exceeding the limit of {max_rows}"
+            ),
+            Self::RunLimitExceeded {
+                run_count,
+                max_runs,
+            } => write!(
+                formatter,
+                "nullable Int64 RLE payload has {run_count} runs, exceeding the limit of {max_runs}"
+            ),
+            Self::PayloadTooLarge {
+                payload_len,
+                max_payload_len,
+            } => write!(
+                formatter,
+                "nullable Int64 RLE payload has {payload_len} bytes, exceeding the limit of {max_payload_len}"
+            ),
+            Self::Truncated {
+                expected_len,
+                actual_len,
+            } => write!(
+                formatter,
+                "nullable Int64 RLE payload is truncated: expected at least {expected_len} bytes, found {actual_len}"
+            ),
+            Self::IncompatibleMagic { found } => write!(
+                formatter,
+                "incompatible nullable Int64 RLE payload magic bytes: {found:02x?}"
+            ),
+            Self::UnsupportedVersion { found, supported } => write!(
+                formatter,
+                "unsupported nullable Int64 RLE payload version {found}; this codec supports version {supported}"
+            ),
+            Self::UnknownRunTag { run_index, tag } => write!(
+                formatter,
+                "nullable Int64 RLE payload run {run_index} has unknown tag {tag:#04x}"
+            ),
+            Self::ZeroLengthRun { run_index } => write!(
+                formatter,
+                "nullable Int64 RLE payload run {run_index} has zero length"
+            ),
+            Self::RowCountOverflow {
+                run_index,
+                decoded_rows,
+                run_length,
+            } => write!(
+                formatter,
+                "nullable Int64 RLE payload row count overflows at run {run_index}: {decoded_rows} + {run_length}"
+            ),
+            Self::RowCountMismatch {
+                declared_rows,
+                decoded_rows,
+            } => write!(
+                formatter,
+                "nullable Int64 RLE payload declares {declared_rows} rows but its runs contain {decoded_rows}"
+            ),
+            Self::DecodedRowsAllocationFailed { row_count } => write!(
+                formatter,
+                "could not reserve storage for {row_count} decoded nullable Int64 RLE rows"
+            ),
+            Self::TrailingData {
+                expected_len,
+                actual_len,
+            } => write!(
+                formatter,
+                "nullable Int64 RLE payload has trailing data: expected {expected_len} bytes, found {actual_len}"
+            ),
+        }
+    }
+}
+
+impl Error for NullableI64RlePayloadError {}
 
 /// An error produced while encoding or decoding one self-describing table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -953,6 +1108,279 @@ impl NullableI64PayloadCodec {
                 rows.push(Some(i64::from_le_bytes(read_array::<8>(payload, offset))));
                 offset += std::mem::size_of::<i64>();
             }
+        }
+
+        Ok(rows)
+    }
+}
+
+/// Encodes and decodes a versioned run-length payload of nullable `Int64` rows.
+///
+/// Encoding emits one maximal run for each consecutive sequence of `NULL` or
+/// equal present values. This is a separate format from
+/// [`NullableI64PayloadCodec`], whose payload bytes remain unchanged. Decoding
+/// validates the complete payload and all configured limits before allocating
+/// the result vector.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{NullableI64RlePayloadCodec, SnapshotCodec};
+///
+/// let rows = [None, None, Some(7), Some(7), Some(7), None];
+/// let row_codec = NullableI64RlePayloadCodec::new(6, 3, 128);
+/// let snapshot_codec = SnapshotCodec::new(128);
+///
+/// let payload = row_codec.encode(&rows).unwrap();
+/// let envelope = snapshot_codec.encode(&payload).unwrap();
+/// let decoded_payload = snapshot_codec.decode(&envelope).unwrap();
+///
+/// assert_eq!(row_codec.decode(decoded_payload).unwrap(), rows);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NullableI64RlePayloadCodec {
+    max_rows: usize,
+    max_runs: usize,
+    max_payload_len: usize,
+}
+
+impl NullableI64RlePayloadCodec {
+    /// Creates a codec with inclusive row-count, run-count, and byte limits.
+    pub const fn new(max_rows: usize, max_runs: usize, max_payload_len: usize) -> Self {
+        Self {
+            max_rows,
+            max_runs,
+            max_payload_len,
+        }
+    }
+
+    /// Returns the maximum decoded row count accepted by this codec.
+    pub const fn max_rows(self) -> usize {
+        self.max_rows
+    }
+
+    /// Returns the maximum encoded run count accepted by this codec.
+    pub const fn max_runs(self) -> usize {
+        self.max_runs
+    }
+
+    /// Returns the maximum encoded payload size accepted by this codec.
+    pub const fn max_payload_len(self) -> usize {
+        self.max_payload_len
+    }
+
+    /// Encodes rows as deterministic maximal runs in input order.
+    pub fn encode(self, rows: &[Option<i64>]) -> Result<Vec<u8>, NullableI64RlePayloadError> {
+        let row_count = u64::try_from(rows.len()).map_err(|_| {
+            NullableI64RlePayloadError::RowLimitExceeded {
+                row_count: u64::MAX,
+                max_rows: self.max_rows,
+            }
+        })?;
+        if rows.len() > self.max_rows {
+            return Err(NullableI64RlePayloadError::RowLimitExceeded {
+                row_count,
+                max_rows: self.max_rows,
+            });
+        }
+
+        let mut run_count = usize::from(!rows.is_empty());
+        let mut value_run_count = usize::from(rows.first().is_some_and(Option::is_some));
+        for pair in rows.windows(2) {
+            if pair[0] != pair[1] {
+                run_count += 1;
+                if pair[1].is_some() {
+                    value_run_count += 1;
+                }
+            }
+        }
+        let declared_runs =
+            u64::try_from(run_count).map_err(|_| NullableI64RlePayloadError::RunLimitExceeded {
+                run_count: u64::MAX,
+                max_runs: self.max_runs,
+            })?;
+        if run_count > self.max_runs {
+            return Err(NullableI64RlePayloadError::RunLimitExceeded {
+                run_count: declared_runs,
+                max_runs: self.max_runs,
+            });
+        }
+
+        let payload_len = run_count
+            .checked_mul(NULLABLE_I64_RLE_RUN_HEADER_LEN)
+            .and_then(|run_bytes| {
+                value_run_count
+                    .checked_mul(std::mem::size_of::<i64>())
+                    .and_then(|value_bytes| run_bytes.checked_add(value_bytes))
+            })
+            .and_then(|run_bytes| NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN.checked_add(run_bytes));
+        let Some(payload_len) = payload_len else {
+            return Err(NullableI64RlePayloadError::PayloadTooLarge {
+                payload_len: u64::MAX,
+                max_payload_len: self.max_payload_len,
+            });
+        };
+        if payload_len > self.max_payload_len {
+            return Err(NullableI64RlePayloadError::PayloadTooLarge {
+                payload_len: u64::try_from(payload_len).unwrap_or(u64::MAX),
+                max_payload_len: self.max_payload_len,
+            });
+        }
+
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&NULLABLE_I64_RLE_PAYLOAD_MAGIC);
+        payload.extend_from_slice(&NULLABLE_I64_RLE_PAYLOAD_VERSION.to_le_bytes());
+        payload.extend_from_slice(&row_count.to_le_bytes());
+        payload.extend_from_slice(&declared_runs.to_le_bytes());
+
+        let mut run_start = 0;
+        while run_start < rows.len() {
+            let value = rows[run_start];
+            let mut run_end = run_start + 1;
+            while run_end < rows.len() && rows[run_end] == value {
+                run_end += 1;
+            }
+            let run_length = u64::try_from(run_end - run_start).map_err(|_| {
+                NullableI64RlePayloadError::RowLimitExceeded {
+                    row_count: u64::MAX,
+                    max_rows: self.max_rows,
+                }
+            })?;
+
+            match value {
+                None => payload.push(NULLABLE_I64_RLE_NULL_RUN_TAG),
+                Some(_) => payload.push(NULLABLE_I64_RLE_VALUE_RUN_TAG),
+            }
+            payload.extend_from_slice(&run_length.to_le_bytes());
+            if let Some(value) = value {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            run_start = run_end;
+        }
+
+        Ok(payload)
+    }
+
+    /// Validates and decodes a complete nullable `Int64` RLE payload.
+    pub fn decode(self, payload: &[u8]) -> Result<Vec<Option<i64>>, NullableI64RlePayloadError> {
+        if payload.len() > self.max_payload_len {
+            return Err(NullableI64RlePayloadError::PayloadTooLarge {
+                payload_len: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                max_payload_len: self.max_payload_len,
+            });
+        }
+        if payload.len() < NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN {
+            return Err(NullableI64RlePayloadError::Truncated {
+                expected_len: NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN,
+                actual_len: payload.len(),
+            });
+        }
+
+        let found_magic = read_array::<{ NULLABLE_I64_RLE_PAYLOAD_MAGIC.len() }>(payload, 0);
+        if found_magic != NULLABLE_I64_RLE_PAYLOAD_MAGIC {
+            return Err(NullableI64RlePayloadError::IncompatibleMagic { found: found_magic });
+        }
+        let version = u16::from_le_bytes(read_array::<2>(
+            payload,
+            NULLABLE_I64_RLE_PAYLOAD_VERSION_OFFSET,
+        ));
+        if version != NULLABLE_I64_RLE_PAYLOAD_VERSION {
+            return Err(NullableI64RlePayloadError::UnsupportedVersion {
+                found: version,
+                supported: NULLABLE_I64_RLE_PAYLOAD_VERSION,
+            });
+        }
+
+        let declared_rows = u64::from_le_bytes(read_array::<8>(
+            payload,
+            NULLABLE_I64_RLE_PAYLOAD_ROW_COUNT_OFFSET,
+        ));
+        let row_count = usize::try_from(declared_rows).map_err(|_| {
+            NullableI64RlePayloadError::RowLimitExceeded {
+                row_count: declared_rows,
+                max_rows: self.max_rows,
+            }
+        })?;
+        if row_count > self.max_rows {
+            return Err(NullableI64RlePayloadError::RowLimitExceeded {
+                row_count: declared_rows,
+                max_rows: self.max_rows,
+            });
+        }
+
+        let declared_runs = u64::from_le_bytes(read_array::<8>(
+            payload,
+            NULLABLE_I64_RLE_PAYLOAD_RUN_COUNT_OFFSET,
+        ));
+        let run_count = usize::try_from(declared_runs).map_err(|_| {
+            NullableI64RlePayloadError::RunLimitExceeded {
+                run_count: declared_runs,
+                max_runs: self.max_runs,
+            }
+        })?;
+        if run_count > self.max_runs {
+            return Err(NullableI64RlePayloadError::RunLimitExceeded {
+                run_count: declared_runs,
+                max_runs: self.max_runs,
+            });
+        }
+
+        let minimum_len = run_count
+            .checked_mul(NULLABLE_I64_RLE_RUN_HEADER_LEN)
+            .and_then(|run_bytes| NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN.checked_add(run_bytes))
+            .ok_or(NullableI64RlePayloadError::PayloadTooLarge {
+                payload_len: u64::MAX,
+                max_payload_len: self.max_payload_len,
+            })?;
+        if minimum_len > self.max_payload_len {
+            return Err(NullableI64RlePayloadError::PayloadTooLarge {
+                payload_len: u64::try_from(minimum_len).unwrap_or(u64::MAX),
+                max_payload_len: self.max_payload_len,
+            });
+        }
+
+        let (decoded_rows, runs_end) = validate_nullable_i64_rle_runs(payload, run_count)?;
+        if decoded_rows > u64::try_from(self.max_rows).unwrap_or(u64::MAX) {
+            return Err(NullableI64RlePayloadError::RowLimitExceeded {
+                row_count: decoded_rows,
+                max_rows: self.max_rows,
+            });
+        }
+        if decoded_rows != declared_rows {
+            return Err(NullableI64RlePayloadError::RowCountMismatch {
+                declared_rows,
+                decoded_rows,
+            });
+        }
+        if payload.len() > runs_end {
+            return Err(NullableI64RlePayloadError::TrailingData {
+                expected_len: runs_end,
+                actual_len: payload.len(),
+            });
+        }
+
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(row_count).map_err(|_| {
+            NullableI64RlePayloadError::DecodedRowsAllocationFailed {
+                row_count: declared_rows,
+            }
+        })?;
+        let mut offset = NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN;
+        for _ in 0..run_count {
+            let tag = payload[offset];
+            offset += std::mem::size_of::<u8>();
+            let run_length = u64::from_le_bytes(read_array::<8>(payload, offset));
+            offset += std::mem::size_of::<u64>();
+            let run_length = usize::try_from(run_length).expect("validated run length fits usize");
+
+            let value = if tag == NULLABLE_I64_RLE_NULL_RUN_TAG {
+                None
+            } else {
+                let value = i64::from_le_bytes(read_array::<8>(payload, offset));
+                offset += std::mem::size_of::<i64>();
+                Some(value)
+            };
+            rows.resize(rows.len() + run_length, value);
         }
 
         Ok(rows)
@@ -2067,6 +2495,65 @@ fn validate_nullable_i64_rows(
     }
 
     Ok(())
+}
+
+fn validate_nullable_i64_rle_runs(
+    payload: &[u8],
+    run_count: usize,
+) -> Result<(u64, usize), NullableI64RlePayloadError> {
+    let mut offset = NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN;
+    let mut decoded_rows = 0_u64;
+
+    for run_index in 0..run_count {
+        let tag_end = offset.saturating_add(std::mem::size_of::<u8>());
+        let Some(&tag) = payload.get(offset) else {
+            return Err(NullableI64RlePayloadError::Truncated {
+                expected_len: tag_end,
+                actual_len: payload.len(),
+            });
+        };
+        offset = tag_end;
+        if !matches!(
+            tag,
+            NULLABLE_I64_RLE_NULL_RUN_TAG | NULLABLE_I64_RLE_VALUE_RUN_TAG
+        ) {
+            return Err(NullableI64RlePayloadError::UnknownRunTag { run_index, tag });
+        }
+
+        let run_length_end = offset.saturating_add(std::mem::size_of::<u64>());
+        if payload.len() < run_length_end {
+            return Err(NullableI64RlePayloadError::Truncated {
+                expected_len: run_length_end,
+                actual_len: payload.len(),
+            });
+        }
+        let run_length = u64::from_le_bytes(read_array::<8>(payload, offset));
+        offset = run_length_end;
+        if run_length == 0 {
+            return Err(NullableI64RlePayloadError::ZeroLengthRun { run_index });
+        }
+
+        if tag == NULLABLE_I64_RLE_VALUE_RUN_TAG {
+            let value_end = offset.saturating_add(std::mem::size_of::<i64>());
+            if payload.len() < value_end {
+                return Err(NullableI64RlePayloadError::Truncated {
+                    expected_len: value_end,
+                    actual_len: payload.len(),
+                });
+            }
+            offset = value_end;
+        }
+
+        decoded_rows = decoded_rows.checked_add(run_length).ok_or(
+            NullableI64RlePayloadError::RowCountOverflow {
+                run_index,
+                decoded_rows,
+                run_length,
+            },
+        )?;
+    }
+
+    Ok((decoded_rows, offset))
 }
 
 fn validate_int64_table_rows(

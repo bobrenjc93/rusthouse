@@ -1,9 +1,10 @@
 # Snapshot envelope format
 
 RustHouse snapshots use a versioned binary envelope. The envelope provides a
-corruption and resource boundary. One payload serializes nullable `Int64` rows,
-and a separate self-describing payload serializes one bounded `Int64Table`.
-Catalog serialization remains outside this format.
+corruption and resource boundary. Separate payload formats serialize nullable
+`Int64` rows either directly or with run-length compression, and a
+self-describing payload serializes one bounded `Int64Table`. Catalog
+serialization remains outside this format.
 
 ## Version 1 layout
 
@@ -108,6 +109,52 @@ checked during encoding before allocation. Decoding checks the input byte
 length and declared row count before allocation, validates every tag and value,
 rejects truncation and trailing data, and only then allocates the decoded row
 vector. The payload-byte limit includes the row-count field, tags, and values.
+
+## Run-length encoded nullable Int64 row payload
+
+`NullableI64RlePayloadCodec` is a separate, versioned format for one nullable
+`Int64` column. It does not change the bytes or interpretation of
+`NullableI64PayloadCodec`. All integers are little-endian, and expanded rows
+retain their input order.
+
+The version 1 layout is:
+
+| Offset | Size | Field | Value |
+| ---: | ---: | --- | --- |
+| 0 | 8 | Payload magic | ASCII `RHNRLEP` followed by `00` |
+| 8 | 2 | Payload version | `1` (`u16`) |
+| 10 | 8 | Row count | Number of expanded rows (`u64`) |
+| 18 | 8 | Run count | Number of encoded runs (`u64`) |
+| 26 | Variable | Runs | Exactly `run count` runs |
+
+Every run begins with a one-byte tag and a positive eight-byte run length:
+
+| Tag | Following bytes | Meaning |
+| ---: | ---: | --- |
+| `0x00` | Run length (`u64`) | That many `NULL` rows |
+| `0x01` | Run length (`u64`), value (`i64`) | That many rows containing the one value |
+
+The encoder emits maximal runs deterministically: adjacent `NULL` rows share
+one run, adjacent equal present values share one run, and a value change starts
+a new run. Empty input has zero rows and zero runs. For example,
+`[NULL, NULL, -1, -1, -1, NULL]` has three runs: a length-2 null run, a
+length-3 value run containing `-1`, and a length-1 null run. A non-null value
+repeated any positive number of times occupies 43 payload bytes (the 26-byte
+header plus a 17-byte value run), while the original row format occupies
+`8 + 9 * row count` bytes.
+
+Callers configure inclusive row, run, and payload-byte limits. Encoding checks
+all three before allocation. Decoding checks the complete input byte length,
+magic, version, declared row and run limits, and the minimum bytes implied by
+the run count. It then validates every tag, positive run length, and optional
+value while adding run lengths with checked `u64` arithmetic. The expanded
+total must be within the row limit and exactly equal the declared row count,
+and no trailing bytes are allowed. Only after all of those checks succeed does
+the decoder allocate the row vector. Zero-length runs, sum overflow, unknown
+tags, truncation, trailing data, an unreservable decoded row vector, and each
+configured limit have distinct typed errors. The complete RLE payload can be
+used directly as the opaque payload of `SnapshotCodec` without changing the
+version 1 envelope.
 
 ## Self-describing Int64 table payload
 
