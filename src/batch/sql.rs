@@ -63,6 +63,10 @@ pub enum Statement {
         source: String,
         destination: String,
     },
+    AddColumn {
+        table: String,
+        column: ColumnDef,
+    },
     DropColumn {
         table: String,
         column: String,
@@ -1012,6 +1016,32 @@ impl<'a> Parser<'a> {
     fn parse_alter(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
         let table = self.expect_identifier("table name")?;
+        if self.eat_keyword("ADD") {
+            self.expect_keyword("COLUMN")?;
+            let name = self.expect_identifier("column name")?;
+            if is_reserved_column_name(&name) {
+                return Err(Error::ReservedIdentifier {
+                    identifier: name,
+                    context: "column name".to_owned(),
+                });
+            }
+            let position = self.position();
+            let type_name = self.expect_identifier("column type")?;
+            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+                position,
+                message: format!(
+                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+                ),
+            })?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after ALTER TABLE ADD COLUMN");
+            }
+            return Ok(Statement::AddColumn {
+                table,
+                column: ColumnDef { name, data_type },
+            });
+        }
+
         if self.eat_keyword("RENAME") {
             self.expect_keyword("COLUMN")?;
             let source = self.expect_identifier("source column name")?;

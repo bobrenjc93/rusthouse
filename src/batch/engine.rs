@@ -539,6 +539,13 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::AddColumn { table, column } => {
+                self.catalog.add_column(&table, column)?;
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::DropColumn { table, column } => {
                 self.catalog.drop_column(&table, &column)?;
                 Ok(StatementResult::Command {
@@ -608,6 +615,7 @@ impl Database {
             | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
             | Statement::RenameColumn { .. }
+            | Statement::AddColumn { .. }
             | Statement::DropColumn { .. }
             | Statement::TruncateTable { .. }
             | Statement::Insert { .. }
@@ -1058,7 +1066,9 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
-        Statement::RenameColumn { .. } | Statement::DropColumn { .. } => "ALTER TABLE",
+        Statement::RenameColumn { .. }
+        | Statement::AddColumn { .. }
+        | Statement::DropColumn { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)

@@ -314,6 +314,40 @@ impl Table {
         Ok(())
     }
 
+    /// Appends one schema field and an aligned physical column of defaults.
+    ///
+    /// Name validation and case-insensitive collision detection complete
+    /// before either the schema or physical columns are changed. Existing
+    /// rows receive ClickHouse-style non-null defaults for the new type.
+    pub fn add_column(&mut self, field: ColumnDef) -> Result<()> {
+        validate_sql_identifier(&field.name, "column name")?;
+        if is_reserved_column_name(&field.name) {
+            return Err(Error::ReservedIdentifier {
+                identifier: field.name,
+                context: "column name".to_owned(),
+            });
+        }
+        if self
+            .schema
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&field.name))
+        {
+            return Err(Error::DuplicateColumn(field.name));
+        }
+
+        let column = match field.data_type {
+            DataType::Int64 => Column::Int64(vec![0; self.row_count]),
+            DataType::Float64 => Column::Float64(vec![0.0; self.row_count]),
+            DataType::Bool => Column::Bool(vec![false; self.row_count]),
+            DataType::String => Column::String(vec![String::new(); self.row_count]),
+        };
+
+        debug_assert_eq!(self.schema.len(), self.columns.len());
+        self.schema.push(field);
+        self.columns.push(column);
+        Ok(())
+    }
+
     /// Removes one schema field and its aligned physical column.
     ///
     /// Resolution is case-insensitive. The column lookup and the invariant

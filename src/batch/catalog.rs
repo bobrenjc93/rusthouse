@@ -124,6 +124,11 @@ impl Catalog {
         self.table_mut(table)?.rename_column(source, destination)
     }
 
+    /// Adds one typed column using case-insensitive table and column resolution.
+    pub fn add_column(&mut self, table: &str, column: ColumnDef) -> Result<()> {
+        self.table_mut(table)?.add_column(column)
+    }
+
     /// Drops one column using case-insensitive table and column resolution.
     pub fn drop_column(&mut self, table: &str, column: &str) -> Result<()> {
         self.table_mut(table)?.drop_column(column)

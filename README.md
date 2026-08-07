@@ -70,6 +70,17 @@ case-insensitive name resolution as ordinary `DROP TABLE`. If the table is
 already absent, it returns the normal successful zero-row command result;
 plain `DROP TABLE` continues to report a missing-table error.
 
+`ALTER TABLE <table> ADD COLUMN <name> <type>` appends an `Int64`, `Float64`,
+`Bool`, or `String` field to the end of the schema and creates its matching
+physical column. Existing rows are backfilled with the ClickHouse-style
+non-null default for that type: `0`, `0.0`, `false`, or an empty String.
+Table and collision lookup are case-insensitive; the stored column spelling is
+preserved. Invalid, reserved, or already-used names and missing tables fail
+before mutation, leaving schema, data, row count, and row cap unchanged. New
+inserts must provide a value for the extended schema under the existing
+complete-row rules. Default expressions, nullable storage, placement clauses,
+and `IF NOT EXISTS` are not supported. A trailing semicolon is optional.
+
 `ALTER TABLE <table> RENAME COLUMN <source> TO <destination>` changes only the
 stored column display name. Table, source-column, destination-collision, and
 subsequent query resolution are case-insensitive; a case-only rename updates
