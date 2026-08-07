@@ -225,6 +225,7 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -1368,13 +1369,47 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and_predicate(&mut self) -> Result<Predicate> {
-        let mut predicate = self.parse_predicate_atom()?;
+        let mut predicate = self.parse_not_predicate()?;
         while self.eat_keyword("AND") {
-            let right = self.parse_predicate_atom()?;
+            let right = self.parse_not_predicate()?;
             self.record_predicate_node()?;
             predicate = Predicate::And(Box::new(predicate), Box::new(right));
         }
         Ok(predicate)
+    }
+
+    fn parse_not_predicate(&mut self) -> Result<Predicate> {
+        // `not` remains a valid column name, so a following comparison
+        // operator makes this token the left operand rather than unary syntax.
+        if !self.at_keyword("NOT") || self.next_token_is_comparison_operator() {
+            return self.parse_predicate_atom();
+        }
+        self.advance();
+
+        if self.predicate_depth >= MAX_PREDICATE_DEPTH {
+            return self.error(format!(
+                "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
+            ));
+        }
+        self.predicate_depth += 1;
+        let predicate = self.parse_not_predicate();
+        self.predicate_depth -= 1;
+        let predicate = predicate?;
+        self.record_predicate_node()?;
+        Ok(Predicate::Not(Box::new(predicate)))
+    }
+
+    fn next_token_is_comparison_operator(&self) -> bool {
+        let mut lexer = self.lexer;
+        matches!(
+            Self::next_or_invalid(&mut lexer).kind,
+            TokenKind::Equal
+                | TokenKind::NotEqual
+                | TokenKind::Less
+                | TokenKind::LessOrEqual
+                | TokenKind::Greater
+                | TokenKind::GreaterOrEqual
+        )
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {

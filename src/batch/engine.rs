@@ -3060,6 +3060,14 @@ impl CompiledOperand {
 }
 
 fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+    compile_predicate_with_polarity(table, predicate, false)
+}
+
+fn compile_predicate_with_polarity(
+    table: &Table,
+    predicate: &Predicate,
+    negated: bool,
+) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
             left,
@@ -3077,18 +3085,42 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             }
             Ok(CompiledPredicate::Comparison {
                 left,
-                operator: *operator,
+                operator: if negated {
+                    invert_comparison(*operator)
+                } else {
+                    *operator
+                },
                 right,
             })
         }
+        Predicate::Not(predicate) => compile_predicate_with_polarity(table, predicate, !negated),
+        Predicate::And(left, right) if negated => Ok(CompiledPredicate::Or(
+            Box::new(compile_predicate_with_polarity(table, left, true)?),
+            Box::new(compile_predicate_with_polarity(table, right, true)?),
+        )),
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate_with_polarity(table, left, false)?),
+            Box::new(compile_predicate_with_polarity(table, right, false)?),
+        )),
+        Predicate::Or(left, right) if negated => Ok(CompiledPredicate::And(
+            Box::new(compile_predicate_with_polarity(table, left, true)?),
+            Box::new(compile_predicate_with_polarity(table, right, true)?),
         )),
         Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate_with_polarity(table, left, false)?),
+            Box::new(compile_predicate_with_polarity(table, right, false)?),
         )),
+    }
+}
+
+const fn invert_comparison(operator: ComparisonOperator) -> ComparisonOperator {
+    match operator {
+        ComparisonOperator::Equal => ComparisonOperator::NotEqual,
+        ComparisonOperator::NotEqual => ComparisonOperator::Equal,
+        ComparisonOperator::Less => ComparisonOperator::GreaterOrEqual,
+        ComparisonOperator::LessOrEqual => ComparisonOperator::Greater,
+        ComparisonOperator::Greater => ComparisonOperator::LessOrEqual,
+        ComparisonOperator::GreaterOrEqual => ComparisonOperator::Less,
     }
 }
 
