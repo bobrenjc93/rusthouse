@@ -398,10 +398,13 @@ plaintext. The handler provides neither sessions nor token issuance or
 rotation.
 
 The typed engine's `Database::ingest_csv_with_names` API atomically appends a
-bounded, multi-column `CSVWithNames` subset to an existing batch table. Its
-header must exactly match every schema column in order and case. Data fields
-parse according to the table's `Int64`, finite `Float64`, `Bool`, and `String`
-types, and callers provide complete-input byte, row, and total-value limits.
+bounded, multi-column `CSVWithNames` subset to an existing batch table.
+`SharedDatabase::ingest_csv_with_names` is the synchronized equivalent and
+retains one write lock through table lookup, bounded parsing, capacity
+validation, and the atomic append. The header must exactly match every schema
+column in order and case. Data fields parse according to the table's `Int64`,
+finite `Float64`, `Bool`, and `String` types, and callers provide complete-input
+byte, row, and total-value limits.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. Any data field may be double-quoted so it can contain
 commas and LF or CRLF line endings, and doubled quotes inside it decode to one
@@ -412,15 +415,16 @@ schema, value, limit, or remaining-capacity failure leaves the table unchanged.
 
 `Database::ingest_tsv_with_names` provides the corresponding bounded,
 multi-column `TabSeparatedWithNames` importer, with
-`SharedDatabase::ingest_tsv_with_names` retaining one write lock for the same
-atomic operation. The decoded header must exactly match every schema column in
-order and case. Data rows accept the same `Int64`, finite `Float64`, exact
-lowercase `Bool`, and `String` types, with LF or CRLF record endings. Fields
-decode the escape sequences emitted by RustHouse's TSV writer: `\\`, `\t`,
-`\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Callers supply complete-input byte,
-row, and total-value limits. Invalid UTF-8, line endings, escapes, headers,
-field counts, typed values, configured limits, or remaining table capacity are
-rejected before any row is appended.
+`SharedDatabase::ingest_tsv_with_names` likewise retaining one write lock
+through table lookup, bounded parsing, capacity validation, and atomic append.
+The decoded header must exactly match every schema column in order and case.
+Data rows accept the same `Int64`, finite `Float64`, exact lowercase `Bool`, and
+`String` types, with LF or CRLF record endings. Fields decode the escape
+sequences emitted by RustHouse's TSV writer: `\\`, `\t`, `\r`, `\n`, `\0`,
+`\b`, `\f`, and `\'`. Callers supply complete-input byte, row, and total-value
+limits. Invalid UTF-8, line endings, escapes, headers, field counts, typed
+values, configured limits, or remaining table capacity are rejected before any
+row is appended.
 
 ## Snapshot envelope
 
