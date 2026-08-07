@@ -30,6 +30,12 @@ comparisons with unary `NOT`, `AND`, and `OR`. The exact inclusive range form
 as comparisons, binds as one predicate atom, and is equivalent to
 `column >= lower_literal AND column <= upper_literal`. Bounds are not reordered,
 so a lower bound greater than its upper bound matches no rows. Case-sensitive
+String membership uses the nonempty form `column IN (literal [, ...])`; the
+same form also supports every other physical column type. Every member
+accepts the same finite typed literals and numeric compatibility as equality;
+the list binds as one predicate atom and is lowered to a balanced tree of
+equalities joined by `OR`. Incompatible member types report the normal typed
+comparison error. Case-sensitive
 String prefix and containment predicates use the exact forms
 `column LIKE 'prefix%'` and `column LIKE '%substring%'`. Prefixes and substrings
 may be empty or Unicode. Other placements of `%` and patterns with excess
@@ -168,8 +174,8 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison, inclusive `BETWEEN`, prefix `LIKE`, and contains `LIKE`
-predicates, including unary `NOT`, as regular `SELECT`.
+composable comparison, inclusive `BETWEEN`, nonempty `IN`, prefix `LIKE`, and
+contains `LIKE` predicates, including unary `NOT`, as regular `SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -277,12 +283,15 @@ statements. Parsing is
 lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
 covers `CREATE` and explicit `INSERT` columns plus `SELECT`, `GROUP BY`, and
-`ORDER BY` lists, so
+`ORDER BY` lists and every retained `IN` literal, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
 combined levels of parenthesized or unary-`NOT` nesting. A `BETWEEN` atom is
 lowered to two inclusive comparisons joined by `AND`, and all three expanded
-nodes count toward the 256-node limit.
+nodes count toward the 256-node limit. An `IN` atom is lowered to one equality
+per literal and a balanced set of joining `OR` nodes; every expanded node also
+counts toward that limit, while all leaves share one retained copy of the
+column identifier.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
@@ -623,6 +632,11 @@ format remains unchanged for existing callers.
 self-describing format. It recovers the schema, nullability, row cap, and rows
 without caller-supplied table metadata, rejects non-regular and oversized files
 before decoding, and keeps open, read, envelope, and payload failures distinct.
+On Unix, `save_int64_table_payload_to_file` is the matching high-level save
+path. It encodes all table metadata and rows with `Int64TablePayloadCodec`, then
+atomically replaces a checksummed envelope. Its typed error separates payload
+encoding from replacement failures, preserves an existing destination on every
+pre-rename failure, and identifies post-rename directory-sync uncertainty.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries
@@ -636,7 +650,7 @@ stage errors clean up failures before the rename and separately report
 post-rename directory-sync uncertainty. The API is not exposed on Windows
 because RustHouse does not yet implement the required directory-handle and
 flush semantics there.
-`save_int64_table_to_file` is the Unix-only high-level save path: it encodes an
+`save_int64_table_to_file` is a Unix-only row-only save path: it encodes an
 existing `Int64Table` with `NullableI64PayloadCodec`, then uses that atomic
 replacement operation. Its typed error distinguishes payload encoding from
 replacement failures, and every pre-rename failure preserves the destination.
@@ -649,11 +663,12 @@ oversized files before decoding, and keeps filesystem, envelope, RLE payload,
 nullability, and capacity failures typed without returning partial tables. The
 legacy high-level restore helper intentionally continues to accept only the
 uncompressed row format.
-Both save helpers and the legacy restore helpers use row-only payloads, so
+The legacy save and restore helpers use row-only payloads, so
 their schema and table row-cap metadata remain caller-supplied. The
-self-describing codec composes directly with the envelope's `encode`,
-`create_new_file`, and Unix `replace_file` APIs; files written by those APIs are
-reopened with `restore_int64_table_payload_from_file`.
+self-describing save helper is the metadata-preserving counterpart and reopens
+with `restore_int64_table_payload_from_file`. The codec also composes directly
+with the envelope's lower-level `encode`, `create_new_file`, and Unix
+`replace_file` APIs.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary
