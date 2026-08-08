@@ -2052,6 +2052,9 @@ enum ResolvedItem {
     CastBoolToFloat64 {
         source: usize,
     },
+    CastStringToFloat64 {
+        source: usize,
+    },
     CastFloat64ToInt64 {
         source: usize,
     },
@@ -2273,6 +2276,9 @@ fn resolve_select_items(
                     (DataType::Bool, DataType::Float64) => {
                         Some(ResolvedItem::CastBoolToFloat64 { source })
                     }
+                    (DataType::String, DataType::Float64) => {
+                        Some(ResolvedItem::CastStringToFloat64 { source })
+                    }
                     (DataType::Float64, DataType::Int64) => {
                         Some(ResolvedItem::CastFloat64ToInt64 { source })
                     }
@@ -2301,7 +2307,7 @@ fn resolve_select_items(
                 };
                 let Some(resolved) = resolved else {
                     let expected = match target_type {
-                        DataType::Float64 => "Int64 or Bool",
+                        DataType::Float64 => "Int64, Bool, or String",
                         DataType::Bool => "Int64 or Float64",
                         DataType::Int64 => "Float64, Bool, or String",
                         DataType::String => "Int64, Float64, or Bool",
@@ -2692,6 +2698,9 @@ fn execute_projection(
                                 0.0
                             })
                         }
+                        ResolvedItem::CastStringToFloat64 { source } => Value::Float64(
+                            checked_string_to_float64(string_at(table, *source, *row))?,
+                        ),
                         ResolvedItem::CastFloat64ToInt64 { source } => Value::Int64(
                             checked_float64_to_int64(float64_at(table, *source, *row))?,
                         ),
@@ -2863,6 +2872,7 @@ fn validate_projection_result_limits(
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
+                | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastStringToInt64 { .. }
@@ -2941,6 +2951,7 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
+                | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastStringToInt64 { .. }
@@ -3416,6 +3427,7 @@ impl GroupedData<'_> {
                         }
                         ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastBoolToFloat64 { .. }
+                        | ResolvedItem::CastStringToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. }
                         | ResolvedItem::CastBoolToInt64 { .. }
                         | ResolvedItem::CastStringToInt64 { .. }
@@ -3790,6 +3802,9 @@ fn resolved_expression_name(
         ResolvedItem::CastBoolToFloat64 { source } => {
             format!("CAST({} AS Float64)", table.schema()[*source].name)
         }
+        ResolvedItem::CastStringToFloat64 { source } => {
+            format!("CAST({} AS Float64)", table.schema()[*source].name)
+        }
         ResolvedItem::CastFloat64ToInt64 { source }
         | ResolvedItem::CastBoolToInt64 { source }
         | ResolvedItem::CastStringToInt64 { source } => {
@@ -3854,15 +3869,26 @@ fn order_source_rows(
         return Ok(());
     }
 
-    // A String-to-Int64 ordering key must have valid decimal syntax for every
-    // candidate row. Values outside the Int64 range can still be ordered as
-    // mathematical integers, so overflow remains deferred until LIMIT/OFFSET
-    // have selected the rows that are actually converted.
+    // A String-to-number ordering key must have valid numeric syntax for every
+    // candidate row. Values outside the target range can still participate in
+    // numeric ordering, so overflow remains deferred until LIMIT/OFFSET have
+    // selected the rows that are actually converted.
     for order in ordering {
-        if let ResolvedItem::CastStringToInt64 { source } = items[order.output] {
-            for row in rows.iter().copied() {
-                decimal_text(string_at(table, source, row)).ok_or_else(invalid_string_cast)?;
+        match items[order.output] {
+            ResolvedItem::CastStringToInt64 { source } => {
+                for row in rows.iter().copied() {
+                    decimal_text(string_at(table, source, row))
+                        .ok_or_else(invalid_string_to_int64_cast)?;
+                }
             }
+            ResolvedItem::CastStringToFloat64 { source } => {
+                for row in rows.iter().copied() {
+                    float64_text(string_at(table, source, row))
+                        .then_some(())
+                        .ok_or_else(invalid_string_to_float64_cast)?;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3883,6 +3909,11 @@ fn order_source_rows(
                 }
                 ResolvedItem::CastBoolToFloat64 { source } => {
                     bool_at(table, source, left).cmp(&bool_at(table, source, right))
+                }
+                ResolvedItem::CastStringToFloat64 { source } => {
+                    let left = ordering_string_to_float64(string_at(table, source, left));
+                    let right = ordering_string_to_float64(string_at(table, source, right));
+                    ValueRef::Float64(left).cmp(&ValueRef::Float64(right))
                 }
                 ResolvedItem::CastFloat64ToInt64 { source } => {
                     let left = ValueRef::Float64(float64_at(table, source, left).trunc());
@@ -3995,6 +4026,7 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
+                | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastStringToInt64 { .. }
@@ -4162,17 +4194,86 @@ fn checked_float64_to_int64(value: f64) -> Result<i64> {
 }
 
 fn checked_string_to_int64(value: &str) -> Result<i64> {
-    decimal_text(value).ok_or_else(invalid_string_cast)?;
+    decimal_text(value).ok_or_else(invalid_string_to_int64_cast)?;
     value
         .parse::<i64>()
         .map_err(|_| Error::NumericOverflow("CAST(String AS Int64)".to_owned()))
 }
 
-fn invalid_string_cast() -> Error {
+fn invalid_string_to_int64_cast() -> Error {
     Error::InvalidCast {
         source_type: DataType::String,
         target_type: DataType::Int64,
     }
+}
+
+fn checked_string_to_float64(value: &str) -> Result<f64> {
+    if !float64_text(value) {
+        return Err(invalid_string_to_float64_cast());
+    }
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| Error::NumericOverflow("CAST(String AS Float64)".to_owned()))?;
+    if !value.is_finite() {
+        return Err(Error::NumericOverflow("CAST(String AS Float64)".to_owned()));
+    }
+    Ok(value)
+}
+
+fn invalid_string_to_float64_cast() -> Error {
+    Error::InvalidCast {
+        source_type: DataType::String,
+        target_type: DataType::Float64,
+    }
+}
+
+fn float64_text(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut position = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let integer_start = position;
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+    }
+    let integer_digits = position - integer_start;
+
+    let mut fractional_digits = 0;
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        let fractional_start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        fractional_digits = position - fractional_start;
+    }
+    if integer_digits == 0 && fractional_digits == 0 {
+        return false;
+    }
+
+    if matches!(bytes.get(position), Some(b'e' | b'E')) {
+        position += 1;
+        if matches!(bytes.get(position), Some(b'+' | b'-')) {
+            position += 1;
+        }
+        let exponent_start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if position == exponent_start {
+            return false;
+        }
+    }
+    position == bytes.len()
+}
+
+fn ordering_string_to_float64(value: &str) -> f64 {
+    debug_assert!(float64_text(value));
+    value.parse::<f64>().unwrap_or_else(|_| {
+        if value.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }
+    })
 }
 
 #[derive(Clone, Copy)]

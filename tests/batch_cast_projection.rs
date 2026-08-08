@@ -490,6 +490,156 @@ fn string_to_int64_filters_and_pages_before_conversion_with_numeric_ordering() {
 }
 
 #[test]
+fn string_to_float64_accepts_signed_decimal_scientific_and_boundary_text() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, reading String); \
+             INSERT INTO samples VALUES \
+             (1, '-0'), (2, '+17'), (3, '000.125'), (4, '.5'), (5, '5.'), \
+             (6, '-6.25e1'), (7, '1E-3'), (8, '4.9406564584124654e-324'), \
+             (9, '1.7976931348623157e308'), (10, '-1.7976931348623157e308'), \
+             (11, '-2e-324');",
+        )
+        .expect("setup");
+
+    let all = query(
+        &mut database,
+        "SELECT CAST(reading AS Float64) AS converted FROM samples",
+    );
+    assert_eq!(
+        all.columns,
+        [ResultColumn {
+            name: "converted".to_owned(),
+            data_type: DataType::Float64,
+        }]
+    );
+    assert_eq!(
+        all.rows,
+        [
+            vec![Value::Float64(-0.0)],
+            vec![Value::Float64(17.0)],
+            vec![Value::Float64(0.125)],
+            vec![Value::Float64(0.5)],
+            vec![Value::Float64(5.0)],
+            vec![Value::Float64(-62.5)],
+            vec![Value::Float64(0.001)],
+            vec![Value::Float64(f64::from_bits(1))],
+            vec![Value::Float64(f64::MAX)],
+            vec![Value::Float64(f64::MIN)],
+            vec![Value::Float64(-0.0)],
+        ]
+    );
+    for row in [0, 10] {
+        let Value::Float64(value) = all.rows[row][0] else {
+            panic!("expected Float64")
+        };
+        assert_eq!(value.to_bits(), (-0.0_f64).to_bits());
+    }
+}
+
+#[test]
+fn string_to_float64_reports_typed_malformed_and_overflow_errors() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, reading String); \
+             INSERT INTO samples VALUES \
+             (1, ''), (2, ' 1'), (3, '1 '), (4, '+'), (5, '-'), (6, '.'), \
+             (7, '+.'), (8, 'e1'), (9, '1e'), (10, '1e+'), (11, '1.2.3'), \
+             (12, '--1'), (13, 'NaN'), (14, 'inf'), (15, 'Infinity'), \
+             (16, '0x1'), (17, '１２'), (18, '1_0'), \
+             (19, '1.7976931348623159e308'), (20, '-1e309');",
+        )
+        .expect("setup");
+
+    for id in 1..=18 {
+        assert_eq!(
+            database.execute(&format!(
+                "SELECT CAST(reading AS Float64) AS converted FROM samples WHERE id = {id}"
+            )),
+            Err(Error::InvalidCast {
+                source_type: DataType::String,
+                target_type: DataType::Float64,
+            }),
+            "row {id}"
+        );
+    }
+    for id in [19, 20] {
+        assert_eq!(
+            database.execute(&format!(
+                "SELECT CAST(reading AS Float64) AS converted FROM samples WHERE id = {id}"
+            )),
+            Err(Error::NumericOverflow("CAST(String AS Float64)".to_owned())),
+            "row {id}"
+        );
+    }
+}
+
+#[test]
+fn string_to_float64_filters_and_pages_before_conversion_with_numeric_ordering() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, reading String); \
+             INSERT INTO samples VALUES \
+             (1, 'bad'), (2, '10.5'), (3, '2e0'), (4, ''), (5, '-3.25'), \
+             (6, '1e999'), (7, '-1e999'), (8, '.5');",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Float64) AS converted FROM samples \
+             WHERE id = 2 OR id = 3 OR id = 5 OR id = 8 ORDER BY converted",
+        )
+        .rows,
+        [
+            vec![Value::Float64(-3.25)],
+            vec![Value::Float64(0.5)],
+            vec![Value::Float64(2.0)],
+            vec![Value::Float64(10.5)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Float64) FROM samples LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Float64(10.5)], vec![Value::Float64(2.0)]]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Float64) AS converted FROM samples \
+             WHERE id = 2 OR id = 3 OR id = 5 OR id = 6 OR id = 7 \
+             ORDER BY converted LIMIT 3 OFFSET 1",
+        )
+        .rows,
+        [
+            vec![Value::Float64(-3.25)],
+            vec![Value::Float64(2.0)],
+            vec![Value::Float64(10.5)],
+        ]
+    );
+
+    assert_eq!(
+        database.execute(
+            "SELECT CAST(reading AS Float64) AS converted FROM samples \
+             ORDER BY converted LIMIT 1"
+        ),
+        Err(Error::InvalidCast {
+            source_type: DataType::String,
+            target_type: DataType::Float64,
+        })
+    );
+}
+
+#[test]
 fn projects_negative_values_and_integer_extremes_with_filters_aliases_and_limits() {
     let mut database = Database::new();
     database
@@ -1085,17 +1235,14 @@ fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
         })
     );
 
-    for (name, actual) in [("f", DataType::Float64), ("s", DataType::String)] {
-        assert_eq!(
-            database.execute(&format!("SELECT CAST({name} AS Float64) FROM samples")),
-            Err(Error::TypeMismatch {
-                context: format!("CAST argument '{name}'"),
-                expected: "Int64 or Bool".to_owned(),
-                actual: actual.to_string(),
-            }),
-            "column {name}"
-        );
-    }
+    assert_eq!(
+        database.execute("SELECT CAST(f AS Float64) FROM samples"),
+        Err(Error::TypeMismatch {
+            context: "CAST argument 'f'".to_owned(),
+            expected: "Int64, Bool, or String".to_owned(),
+            actual: DataType::Float64.to_string(),
+        })
+    );
 
     assert_eq!(
         database.execute("SELECT CAST(missing AS Int64) FROM samples"),
@@ -1454,6 +1601,79 @@ fn string_to_int64_cast_obeys_result_caps() {
 }
 
 #[test]
+fn string_to_float64_cast_obeys_result_caps() {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 2,
+        max_values: 2,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE samples (reading String); \
+             INSERT INTO samples VALUES ('0.5'), ('1e0'), ('2.25');",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Float64) FROM samples LIMIT 2",
+        )
+        .rows,
+        [vec![Value::Float64(0.5)], vec![Value::Float64(1.0)]]
+    );
+    assert_eq!(
+        database.execute("SELECT CAST(reading AS Float64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+
+    let mut value_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 3,
+        max_values: 5,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    value_limited
+        .execute(
+            "CREATE TABLE samples (reading String); \
+             INSERT INTO samples VALUES ('0.5'), ('1e0'), ('2.25');",
+        )
+        .expect("setup");
+    assert_eq!(
+        value_limited
+            .execute("SELECT CAST(reading AS Float64), CAST(reading AS Float64) FROM samples",),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result values",
+            actual: 6,
+            max: 5,
+        })
+    );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    byte_limited
+        .execute("CREATE TABLE samples (reading String); INSERT INTO samples VALUES ('0.5');")
+        .expect("setup");
+    assert!(matches!(
+        byte_limited.execute("SELECT CAST(reading AS Float64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            max: 0,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn bool_to_float64_cast_obeys_result_caps() {
     let mut database = Database::with_query_result_limits(QueryResultLimits {
         max_rows: 2,
@@ -1722,6 +1942,12 @@ fn cast_remains_an_ordinary_projection() {
         ))
     );
     assert_eq!(
+        database.execute("SELECT CAST(text AS Float64), COUNT(*) FROM samples GROUP BY text"),
+        Err(Error::InvalidQuery(
+            "CAST projections are only supported in ungrouped SELECT queries".to_owned()
+        ))
+    );
+    assert_eq!(
         database.execute("SELECT CAST(enabled AS Float64), COUNT(*) FROM samples GROUP BY enabled"),
         Err(Error::InvalidQuery(
             "CAST projections are only supported in ungrouped SELECT queries".to_owned()
@@ -1815,6 +2041,64 @@ fn emits_string_to_int64_in_all_cli_formats() {
     assert_eq!(
         String::from_utf8(json_compact_each_row).unwrap(),
         "[-10]\n[0]\n[2]\n"
+    );
+}
+
+#[test]
+fn emits_string_to_float64_in_all_cli_formats() {
+    let sql = "CREATE TABLE samples (reading String); \
+               INSERT INTO samples VALUES ('+2e0'), ('-1.25'), ('.5'); \
+               SELECT CAST(reading AS Float64) AS converted \
+               FROM samples ORDER BY converted;";
+
+    let mut table = Vec::new();
+    run_table_batch(sql.as_bytes(), &mut table).expect("table batch succeeds");
+    assert_eq!(
+        String::from_utf8(table).unwrap(),
+        "+-----------+\n\
+         | converted |\n\
+         +-----------+\n\
+         | -1.25     |\n\
+         | 0.5       |\n\
+         | 2.0       |\n\
+         +-----------+\n"
+    );
+
+    let mut csv = Vec::new();
+    run_csv_batch(sql.as_bytes(), &mut csv).expect("CSV batch succeeds");
+    assert_eq!(
+        String::from_utf8(csv).unwrap(),
+        "converted\n-1.25\n0.5\n2.0\n"
+    );
+
+    let mut tsv = Vec::new();
+    run_tsv_batch(sql.as_bytes(), &mut tsv).expect("TSV batch succeeds");
+    assert_eq!(
+        String::from_utf8(tsv).unwrap(),
+        "converted\n-1.25\n0.5\n2.0\n"
+    );
+
+    let mut json = Vec::new();
+    run_json_batch(sql.as_bytes(), &mut json).expect("JSON batch succeeds");
+    assert_eq!(
+        String::from_utf8(json).unwrap(),
+        "{\"columns\":[{\"name\":\"converted\",\"type\":\"Float64\"}],\"rows\":[[-1.25],[0.5],[2.0]]}\n"
+    );
+
+    let mut json_each_row = Vec::new();
+    run_json_each_row_batch(sql.as_bytes(), &mut json_each_row)
+        .expect("JSONEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_each_row).unwrap(),
+        "{\"converted\":-1.25}\n{\"converted\":0.5}\n{\"converted\":2.0}\n"
+    );
+
+    let mut json_compact_each_row = Vec::new();
+    run_json_compact_each_row_batch(sql.as_bytes(), &mut json_compact_each_row)
+        .expect("JSONCompactEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_compact_each_row).unwrap(),
+        "[-1.25]\n[0.5]\n[2.0]\n"
     );
 }
 

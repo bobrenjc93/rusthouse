@@ -252,7 +252,7 @@ and `LIMIT` select rows before subtraction, so overflow in an excluded row does
 not fail the query. A selected overflow or non-`Int64` argument is a typed error.
 
 `SELECT` projections support `CAST(int64_column AS Float64)`,
-`CAST(bool_column AS Float64)`,
+`CAST(bool_column AS Float64)`, `CAST(string_column AS Float64)`,
 `CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`,
 `CAST(string_column AS Int64)`,
 `CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`, and
@@ -280,6 +280,18 @@ outside the `Int64` range return a typed numeric-overflow error. Ordering this
 cast compares the mathematical integer values rather than the source text;
 syntactically valid out-of-range values can therefore be ordered and removed
 by `LIMIT`/`OFFSET` without being converted.
+String-to-float casts accept nonempty, trim-free ASCII decimal text with one
+optional leading sign. A mantissa may use digits alone, digits with a decimal
+point on either end, or a decimal point between digit sequences; an optional
+`e` or `E` exponent has its own optional sign and requires digits. Examples
+include `+17`, `5.`, `.5`, `-0.125`, and `6.25e1`. Conversion uses normal
+nearest-`Float64` rounding, preserves negative zero, admits finite extrema and
+subnormals, and may underflow to signed zero. Malformed text returns a typed
+invalid-cast error; a syntactically valid value that converts to infinity
+returns a typed numeric-overflow error. Ordering compares parsed numeric
+values rather than source text. Syntactically valid positive or negative
+overflow values participate at the corresponding end of that ordering and
+can be removed by `LIMIT`/`OFFSET` before conversion.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
