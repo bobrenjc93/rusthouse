@@ -112,15 +112,16 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// [`SharedDatabaseError::DatabaseBusy`] instead of waiting for a writer.
 /// [`Self::try_execute_insert_batch`] similarly attempts
 /// one nonblocking write lock for an atomic `INSERT`-only batch, and
-/// [`Self::try_ingest_csv_with_names`] and
-/// [`Self::try_ingest_tsv_with_names`] do the same for `CSVWithNames` and
-/// `TabSeparatedWithNames` ingestion. Results own their columns and values and
-/// remain valid after the lock is released.
+/// [`Self::try_ingest_csv`], [`Self::try_ingest_csv_with_names`], and
+/// [`Self::try_ingest_tsv_with_names`] do the same for headerless `CSV`,
+/// `CSVWithNames`, and `TabSeparatedWithNames` ingestion. Results own their
+/// columns and values and remain valid after the lock is released.
 ///
 /// A batch passed to [`Self::execute`] is not a rollback transaction: once
 /// parsing succeeds, earlier statements remain applied if a later statement
 /// fails. [`Self::execute_insert_batch`] provides atomic preflight and commit
-/// for the narrower `INSERT`-only case. [`Self::ingest_csv_with_names`] and
+/// for the narrower `INSERT`-only case. [`Self::ingest_csv`],
+/// [`Self::ingest_csv_with_names`], and
 /// [`Self::ingest_tsv_with_names`] retain a write lock through their complete
 /// bounded, atomic import operations.
 ///
@@ -252,6 +253,59 @@ impl SharedDatabase {
         let statements = sql::parse(input)?;
         self.try_write()?
             .execute_insert_statements(statements)
+            .map_err(Into::into)
+    }
+
+    /// Atomically ingests bounded, headerless `CSV` bytes under one write lock.
+    ///
+    /// Every logical record is data in physical schema order. The lock is
+    /// retained through table lookup, parsing, limit and remaining-capacity
+    /// validation, and the final append. Empty input is a zero-row no-op.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::csv::CsvIngestLimits;
+    /// use rusthouse::SharedDatabase;
+    ///
+    /// let database = SharedDatabase::default();
+    /// database.execute("CREATE TABLE readings (value Int64, note String);")?;
+    /// let input = b"7,ready\n";
+    /// let rows = database.ingest_csv(
+    ///     "readings",
+    ///     input,
+    ///     CsvIngestLimits::new(input.len(), 1, 2),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), rusthouse::SharedDatabaseError>(())
+    /// ```
+    pub fn ingest_csv(
+        &self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, SharedDatabaseError> {
+        self.write()?
+            .ingest_csv(table, input, limits)
+            .map_err(Into::into)
+    }
+
+    /// Attempts one bounded, atomic, headerless `CSV` ingestion without waiting.
+    ///
+    /// Exactly one immediate write-lock attempt occurs before table lookup or
+    /// input access. The acquired guard is retained through parsing, all limit
+    /// and remaining-capacity validation, and commit. An active reader or
+    /// writer returns [`SharedDatabaseError::DatabaseBusy`] without inspecting
+    /// the table or input. Empty input appends zero rows after lock acquisition.
+    pub fn try_ingest_csv(
+        &self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, SharedDatabaseError> {
+        let mut database = self.try_write()?;
+        database
+            .ingest_csv(table, input, limits)
             .map_err(Into::into)
     }
 
