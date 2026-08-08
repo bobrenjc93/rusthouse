@@ -9,9 +9,10 @@ use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
-    self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, ComparisonOperator, CrossJoin,
-    CurrentDatabaseSelect, DeleteComparisonPredicate, Having, HavingPredicate, LiteralSelect,
-    Operand, OrderBy, Predicate, Select, SelectItem, Statement, VersionSelect,
+    self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, AlterUpdateValue,
+    ComparisonOperator, CrossJoin, CurrentDatabaseSelect, DeleteComparisonPredicate, Having,
+    HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
+    VersionSelect,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
@@ -61,8 +62,8 @@ pub const COUNT_IF_PARALLEL_ROWS_PER_WORKER: usize = 128 * 1024;
 /// and admits helper threads through one process-wide budget.
 pub const MAX_COUNT_IF_PARALLEL_WORKERS: usize = 16;
 
-/// Resource limits for source scans, query-result materialization, ordering,
-/// and grouped working state.
+/// Resource limits for source scans, query-result and mutation materialization,
+/// ordering, and grouped working state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryResultLimits {
     /// Maximum rows in the source table of one table-backed `SELECT`, `DELETE`,
@@ -75,6 +76,8 @@ pub struct QueryResultLimits {
     pub max_scan_rows: usize,
     pub max_rows: usize,
     pub max_values: usize,
+    /// Maximum estimated bytes retained in one query result and maximum cloned
+    /// String payload materialized by one `ALTER TABLE UPDATE`.
     pub max_bytes: usize,
     /// Maximum temporary bytes used to cache single-key `lengthUTF8` ordering
     /// state. The complete filtered row set is charged before cache allocation.
@@ -807,6 +810,10 @@ impl Database {
         statement: Statement,
         query_result_limits: QueryResultLimits,
     ) -> Result<StatementResult> {
+        let alter_update_limits = QueryResultLimits {
+            max_bytes: self.query_result_limits.max_bytes,
+            ..query_result_limits
+        };
         match statement {
             Statement::CreateTable { name, columns } => {
                 let measurements = TableMeasurements::empty(columns.len());
@@ -898,12 +905,26 @@ impl Database {
             } => self.execute_alter_update_statement(
                 table,
                 target_column,
-                AlterUpdateLiteral::Int64(value),
+                AlterUpdateLiteral::Int64(value).into(),
                 predicate_column,
-                AlterUpdateLiteral::Int64(predicate_value),
-                query_result_limits,
+                AlterUpdateLiteral::Int64(predicate_value).into(),
+                alter_update_limits,
             ),
             Statement::AlterUpdateTyped {
+                table,
+                target_column,
+                value,
+                predicate_column,
+                predicate_value,
+            } => self.execute_alter_update_statement(
+                table,
+                target_column,
+                value.into(),
+                predicate_column,
+                predicate_value.into(),
+                alter_update_limits,
+            ),
+            Statement::AlterUpdateOwned {
                 table,
                 target_column,
                 value,
@@ -915,7 +936,7 @@ impl Database {
                 value,
                 predicate_column,
                 predicate_value,
-                query_result_limits,
+                alter_update_limits,
             ),
             Statement::TruncateTable { name } => {
                 let affected_rows = self.table_mut(&name)?.truncate();
@@ -1024,6 +1045,7 @@ impl Database {
             | Statement::DropColumn { .. }
             | Statement::AlterUpdate { .. }
             | Statement::AlterUpdateTyped { .. }
+            | Statement::AlterUpdateOwned { .. }
             | Statement::TruncateTable { .. }
             | Statement::Delete { .. }
             | Statement::DeleteComparison { .. }
@@ -1085,9 +1107,9 @@ impl Database {
         &mut self,
         table: String,
         target_column: String,
-        value: AlterUpdateLiteral,
+        value: AlterUpdateValue,
         predicate_column: String,
-        predicate_value: AlterUpdateLiteral,
+        predicate_value: AlterUpdateValue,
         query_result_limits: QueryResultLimits,
     ) -> Result<StatementResult> {
         let replacements = {
@@ -1095,8 +1117,13 @@ impl Database {
             let target_index = target.column_index(&target_column)?;
             let predicate_index = target.column_index(&predicate_column)?;
             for (column, index, literal, role) in [
-                (&target_column, target_index, value, "target"),
-                (&predicate_column, predicate_index, predicate_value, "WHERE"),
+                (&target_column, target_index, &value, "target"),
+                (
+                    &predicate_column,
+                    predicate_index,
+                    &predicate_value,
+                    "WHERE",
+                ),
             ] {
                 let actual = target.schema()[index].data_type;
                 let expected = literal.data_type();
@@ -1111,8 +1138,12 @@ impl Database {
                     });
                 }
             }
-            for (literal, role) in [(value, "assignment"), (predicate_value, "WHERE")] {
-                if matches!(literal, AlterUpdateLiteral::Float64(value) if !value.is_finite()) {
+            for (literal, role) in [(&value, "assignment"), (&predicate_value, "WHERE")] {
+                if matches!(
+                    literal,
+                    AlterUpdateValue::Literal(AlterUpdateLiteral::Float64(value))
+                        if !value.is_finite()
+                ) {
                     return Err(Error::InvalidQuery(format!(
                         "ALTER TABLE UPDATE {role} Float64 literal must be finite"
                     )));
@@ -1124,40 +1155,29 @@ impl Database {
                 "ALTER TABLE UPDATE scanned rows",
             )?;
 
+            let predicate_values = &target.columns()[predicate_index];
+            let string_match_count = if let AlterUpdateValue::String(string) = &value {
+                let match_count = (0..target.row_count())
+                    .filter(|&row| alter_update_matches(predicate_values, &predicate_value, row))
+                    .count();
+                enforce_alter_update_replacement_bytes(
+                    string.len(),
+                    match_count,
+                    query_result_limits.max_bytes,
+                )?;
+                Some(match_count)
+            } else {
+                None
+            };
+
             let replacement = value.value();
-            match (&target.columns()[predicate_index], predicate_value) {
-                (Column::Int64(predicate_values), AlterUpdateLiteral::Int64(predicate_value)) => {
-                    predicate_values
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(row, current)| {
-                            (*current == predicate_value).then_some((row, replacement.clone()))
-                        })
-                        .collect::<Vec<_>>()
+            let mut replacements = string_match_count.map_or_else(Vec::new, Vec::with_capacity);
+            for row in 0..target.row_count() {
+                if alter_update_matches(predicate_values, &predicate_value, row) {
+                    replacements.push((row, replacement.clone()));
                 }
-                (Column::Bool(predicate_values), AlterUpdateLiteral::Bool(predicate_value)) => {
-                    predicate_values
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(row, current)| {
-                            (*current == predicate_value).then_some((row, replacement.clone()))
-                        })
-                        .collect::<Vec<_>>()
-                }
-                (
-                    Column::Float64(predicate_values),
-                    AlterUpdateLiteral::Float64(predicate_value),
-                ) => predicate_values
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(row, current)| {
-                        (*current == predicate_value).then_some((row, replacement.clone()))
-                    })
-                    .collect::<Vec<_>>(),
-                _ => unreachable!(
-                    "the ALTER TABLE UPDATE WHERE column was validated against its literal"
-                ),
             }
+            replacements
         };
 
         let affected_rows = self
@@ -1694,6 +1714,40 @@ impl Database {
     }
 }
 
+fn alter_update_matches(column: &Column, literal: &AlterUpdateValue, row: usize) -> bool {
+    match (column, literal) {
+        (Column::Int64(values), AlterUpdateValue::Literal(AlterUpdateLiteral::Int64(value))) => {
+            values[row] == *value
+        }
+        (
+            Column::Float64(values),
+            AlterUpdateValue::Literal(AlterUpdateLiteral::Float64(value)),
+        ) => values[row] == *value,
+        (Column::Bool(values), AlterUpdateValue::Literal(AlterUpdateLiteral::Bool(value))) => {
+            values[row] == *value
+        }
+        (Column::String(values), AlterUpdateValue::String(value)) => values[row] == *value,
+        _ => unreachable!("ALTER TABLE UPDATE predicate type was validated before its scan"),
+    }
+}
+
+fn enforce_alter_update_replacement_bytes(
+    string_bytes: usize,
+    match_count: usize,
+    max: usize,
+) -> Result<()> {
+    let actual = (string_bytes as u128).saturating_mul(match_count as u128);
+    if actual > max as u128 {
+        Err(Error::ResourceLimitExceeded {
+            resource: "ALTER TABLE UPDATE replacement String bytes",
+            actual: saturating_usize(actual),
+            max,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn statement_name(statement: &Statement) -> &'static str {
     match statement {
         Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => "CREATE TABLE",
@@ -1703,7 +1757,8 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::AddColumn { .. }
         | Statement::DropColumn { .. }
         | Statement::AlterUpdate { .. }
-        | Statement::AlterUpdateTyped { .. } => "ALTER TABLE",
+        | Statement::AlterUpdateTyped { .. }
+        | Statement::AlterUpdateOwned { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Delete { .. }
         | Statement::DeleteComparison { .. }
