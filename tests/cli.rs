@@ -82,6 +82,24 @@ fn json_cli_executes_conjoined_comparison_delete_silently() {
 }
 
 #[test]
+fn json_cli_outputs_mixed_case_string_to_bool_casts() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE flags (id Int64, text String); \
+          INSERT INTO flags VALUES (1, 'TRUE'), (2, 'false'), (3, 'FaLsE'); \
+          SELECT id, CAST(text AS Bool) AS enabled FROM flags \
+          ORDER BY enabled, id;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"enabled\",\"type\":\"Bool\"}],\"rows\":[[2,false],[3,false],[1,true]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_executes_int64_alter_update_silently() {
     let output = run(
         &["--format", "json"],
