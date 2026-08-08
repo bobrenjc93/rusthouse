@@ -209,6 +209,27 @@ fn query_executes_unicode_contains_like_over_http() {
 }
 
 #[test]
+fn query_executes_filtered_count_if_over_http() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (active Bool, included Bool); \
+             INSERT INTO events VALUES \
+                 (true, true), (false, true), (true, false), (true, true);",
+        )
+        .expect("setup");
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT countIf(active) AS true_count FROM events WHERE included = true;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"true_count","type":"Int64"}],"rows":[[2]]}"#,
+    );
+}
+
+#[test]
 fn query_executes_unicode_infix_not_like_over_http() {
     let database = SharedDatabase::default();
     database

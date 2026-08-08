@@ -2589,6 +2589,14 @@ fn resolve_having(
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
+    if function == AggregateFunction::CountIf && input_type != Some(DataType::Bool) {
+        let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
+        return Err(Error::TypeMismatch {
+            context: format!("{} argument", function.name()),
+            expected: DataType::Bool.to_string(),
+            actual,
+        });
+    }
     if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
         && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
     {
@@ -2604,7 +2612,7 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
 
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
-        AggregateFunction::Count => DataType::Int64,
+        AggregateFunction::Count | AggregateFunction::CountIf => DataType::Int64,
         AggregateFunction::Avg => DataType::Float64,
         AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
             input_type.expect("validated column argument")
@@ -3466,7 +3474,7 @@ impl ScaledFloatSum {
 impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
         match spec.function {
-            AggregateFunction::Count => Self::Count(0),
+            AggregateFunction::Count | AggregateFunction::CountIf => Self::Count(0),
             AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => {
                 Self::SumInt { sum: 0, count: 0 }
             }
@@ -3496,9 +3504,23 @@ impl AggregateState {
     ) -> Result<()> {
         match self {
             Self::Count(count) => {
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+                let should_count = match spec.function {
+                    AggregateFunction::Count => true,
+                    AggregateFunction::CountIf => {
+                        let Column::Bool(values) =
+                            &table.columns()[spec.argument.expect("countIf argument")]
+                        else {
+                            unreachable!("countIf input type is resolved")
+                        };
+                        values[row]
+                    }
+                    _ => unreachable!("only count functions use Count state"),
+                };
+                if should_count {
+                    *count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::NumericOverflow(spec.function.name().to_owned()))?;
+                }
             }
             Self::SumInt { sum, count } => {
                 let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]

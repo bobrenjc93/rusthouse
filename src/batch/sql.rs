@@ -255,6 +255,7 @@ pub enum SelectItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateFunction {
     Count,
+    CountIf,
     Sum,
     Min,
     Max,
@@ -266,6 +267,7 @@ impl AggregateFunction {
     pub fn name(self) -> &'static str {
         match self {
             Self::Count => "COUNT",
+            Self::CountIf => "countIf",
             Self::Sum => "SUM",
             Self::Min => "MIN",
             Self::Max => "MAX",
@@ -276,6 +278,7 @@ impl AggregateFunction {
     fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_uppercase().as_str() {
             "COUNT" => Some(Self::Count),
+            "COUNTIF" => Some(Self::CountIf),
             "SUM" => Some(Self::Sum),
             "MIN" => Some(Self::Min),
             "MAX" => Some(Self::Max),
