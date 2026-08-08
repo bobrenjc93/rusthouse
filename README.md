@@ -324,6 +324,12 @@ returns a typed numeric-overflow error. Ordering compares parsed numeric
 values rather than source text. Syntactically valid positive or negative
 overflow values participate at the corresponding end of that ordering and
 can be removed by `LIMIT`/`OFFSET` before conversion.
+Ungrouped ordering by only a String-to-`Float64` cast parses each filtered
+candidate once into a fixed-size `(source row, Float64 key)` cache before
+bounded top-k selection. The complete cache is charged against the separate
+16 MiB ordering-state limit before allocation; `LIMIT` and `OFFSET` do not
+reduce that charge. Ties retain source order, and overflow is still reported
+only when the corresponding row survives pagination and is converted.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections

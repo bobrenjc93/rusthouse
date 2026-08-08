@@ -1,5 +1,6 @@
 use rusthouse::batch::engine::{
-    Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
+    Database, QueryResult, QueryResultLimits, ResultColumn,
+    STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES, StatementResult,
 };
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{BatchSqlLimits, SelectItem, Statement, parse, parse_with_limits};
@@ -636,6 +637,166 @@ fn string_to_float64_filters_and_pages_before_conversion_with_numeric_ordering()
             source_type: DataType::String,
             target_type: DataType::Float64,
         })
+    );
+}
+
+#[test]
+fn cached_string_to_float64_order_matches_comparison_sort_for_ties_and_pages() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, reading String, keep Bool); \
+             INSERT INTO samples VALUES \
+             (0, 'discarded', false), (1, '2', true), (2, '-0', true), \
+             (3, '0.0', true), (4, '5e-1', true), (5, '.5', true), \
+             (6, '-3.25', true), (7, '10.5', true), (8, '2.00', true), \
+             (9, 'also discarded', false);",
+        )
+        .expect("setup");
+
+    let matching_count = 8;
+    let pages = [
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (2, 1),
+        (3, 2),
+        (1, matching_count - 1),
+        (2, matching_count),
+        (matching_count, 0),
+        (matching_count + 2, 1),
+    ];
+    for direction in ["ASC", "DESC"] {
+        for (limit, offset) in pages {
+            let cached = query(
+                &mut database,
+                &format!(
+                    "SELECT id, CAST(reading AS Float64) AS converted FROM samples \
+                     WHERE keep = true ORDER BY converted {direction} \
+                     LIMIT {limit} OFFSET {offset}"
+                ),
+            );
+            // Repeating the key bypasses the sole-key cache while preserving
+            // the same total order, including source-row tie breaking.
+            let comparison_sorted = query(
+                &mut database,
+                &format!(
+                    "SELECT id, CAST(reading AS Float64) AS converted FROM samples \
+                     WHERE keep = true \
+                     ORDER BY converted {direction}, converted {direction} \
+                     LIMIT {limit} OFFSET {offset}"
+                ),
+            );
+
+            assert_eq!(
+                cached.rows, comparison_sorted.rows,
+                "{direction} LIMIT {limit} OFFSET {offset}"
+            );
+        }
+    }
+}
+
+#[test]
+fn string_to_float64_ordering_cache_enforces_exact_filtered_byte_boundaries() {
+    let setup = "CREATE TABLE samples (id Int64, reading String, keep Bool); \
+                 INSERT INTO samples VALUES \
+                 (1, '2', true), (2, 'discarded', false), \
+                 (3, '-0', true), (4, '2.00', true);";
+    let filtered_cache_bytes = 3 * STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES;
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: filtered_cache_bytes,
+        ..QueryResultLimits::default()
+    });
+    exact.execute(setup).expect("setup");
+    assert_eq!(
+        query(
+            &mut exact,
+            "SELECT id, CAST(reading AS Float64) AS converted FROM samples \
+             WHERE keep = true ORDER BY converted LIMIT 2 OFFSET 1"
+        )
+        .rows,
+        [
+            vec![Value::Int64(1), Value::Float64(2.0)],
+            vec![Value::Int64(4), Value::Float64(2.0)],
+        ]
+    );
+
+    assert_eq!(
+        exact.execute(
+            "SELECT CAST(reading AS Float64) AS converted FROM samples \
+             ORDER BY converted LIMIT 1"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: 4 * STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES,
+            max: filtered_cache_bytes,
+        })
+    );
+
+    let mut one_byte_short = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: filtered_cache_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_byte_short.execute(setup).expect("setup");
+    assert_eq!(
+        one_byte_short.execute(
+            "SELECT CAST(reading AS Float64) AS converted FROM samples \
+             WHERE keep = true ORDER BY converted LIMIT 1 OFFSET 1"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: filtered_cache_bytes,
+            max: filtered_cache_bytes - 1,
+        })
+    );
+}
+
+#[test]
+fn string_to_float64_limit_zero_still_charges_filtered_ordering_state() {
+    let setup = "CREATE TABLE samples (reading String, keep Bool); \
+                 INSERT INTO samples VALUES ('bad', true), ('discarded', false);";
+    let mut zero_bytes = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    zero_bytes.execute(setup).expect("setup");
+
+    assert_eq!(
+        zero_bytes.execute(
+            "SELECT CAST(reading AS Float64) AS converted FROM samples \
+             WHERE keep = true ORDER BY converted LIMIT 0"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES,
+            max: 0,
+        })
+    );
+    assert!(
+        query(
+            &mut zero_bytes,
+            "SELECT CAST(reading AS Float64) AS converted FROM samples \
+             WHERE reading = 'missing' ORDER BY converted LIMIT 0"
+        )
+        .rows
+        .is_empty()
+    );
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES,
+        ..QueryResultLimits::default()
+    });
+    exact.execute(setup).expect("setup");
+    assert!(
+        query(
+            &mut exact,
+            "SELECT CAST(reading AS Float64) AS converted FROM samples \
+             WHERE keep = true ORDER BY converted LIMIT 0"
+        )
+        .rows
+        .is_empty(),
+        "LIMIT 0 retains the prior no-conversion behavior after charging state"
     );
 }
 
