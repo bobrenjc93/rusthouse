@@ -3024,6 +3024,42 @@ fn authenticated_read_only_modes_reject_every_insert_surface_without_locking() {
 }
 
 #[test]
+fn authenticated_read_only_modes_reject_string_alter_updates_without_mutation() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String, category String); \
+             INSERT INTO events VALUES (1, 'original', 'queued');",
+        )
+        .unwrap();
+    let update = b"ALTER TABLE events UPDATE label = 'changed' WHERE category = 'queued';";
+    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found ALTER TABLE"}"#;
+
+    let bearer_request =
+        request_for_target_with_headers("/query", update, "Authorization: Bearer read-token\r\n");
+    assert_response(
+        &read_only_bearer_exchange(&database, "read-token", &bearer_request),
+        "HTTP/1.1 400 Bad Request",
+        read_only_error,
+    );
+
+    let key_request =
+        request_for_target_with_headers("/query", update, "X-ClickHouse-Key: read-key\r\n");
+    let key_response = read_only_clickhouse_key_exchange(&database, "read-key", &key_request);
+    assert_response(&key_response, "HTTP/1.1 400 Bad Request", read_only_error);
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT id, label, category FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"},{"name":"category","type":"String"}],"rows":[[1,"original","queued"]]}"#,
+    );
+}
+
+#[test]
 fn authenticated_read_only_modes_preserve_complete_response_limits() {
     let database = SharedDatabase::default();
     let sql = format!("SELECT '{}' AS value;", "x".repeat(256));
