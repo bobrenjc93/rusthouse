@@ -3007,7 +3007,7 @@ fn authenticated_read_only_modes_reject_every_insert_surface_without_locking() {
     assert_response(
         &read_only_bearer_exchange(&database, "read-token", &bearer_standard_insert),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
 
     let key_parameterized_insert = read_only_clickhouse_key_exchange(
@@ -3018,7 +3018,7 @@ fn authenticated_read_only_modes_reject_every_insert_surface_without_locking() {
     assert_response(
         &key_parameterized_insert,
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
     assert_clickhouse_key_response_is_not_cacheable(&key_parameterized_insert);
 }
@@ -3033,7 +3033,7 @@ fn authenticated_read_only_modes_reject_string_alter_updates_without_mutation() 
         )
         .unwrap();
     let update = b"ALTER TABLE events UPDATE label = 'changed' WHERE category = 'queued';";
-    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found ALTER TABLE"}"#;
+    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found ALTER TABLE"}"#;
 
     let bearer_request =
         request_for_target_with_headers("/query", update, "Authorization: Bearer read-token\r\n");
@@ -3843,7 +3843,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
     assert_response(
         &exchange(&database, &request_for_target("/", b"DROP TABLE retained;")),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(
@@ -3851,7 +3851,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
             b"GET /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(
@@ -3859,7 +3859,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
             b"POST /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(&database, &request(b"SHOW TABLES; SHOW TABLES;")),
@@ -4151,7 +4151,7 @@ fn get_and_unauthenticated_standard_query_routes_remain_read_only() {
     let database = SharedDatabase::default();
     database.execute("CREATE TABLE events (id Int64);").unwrap();
     let sql = b"INSERT INTO events VALUES (1);";
-    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#;
+    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#;
 
     for request in [
         request_for_target("/", sql),
@@ -4259,7 +4259,7 @@ fn standard_query_inserts_reject_mixed_batches_formats_and_late_failures_atomica
     assert_response(
         &authenticated_exchange(&database, "correct-token", &formatted),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
 
     let default_formatted = clickhouse_key_exchange(
@@ -4270,7 +4270,7 @@ fn standard_query_inserts_reject_mixed_batches_formats_and_late_failures_atomica
     assert_response(
         &default_formatted,
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
     assert_clickhouse_key_response_is_not_cacheable(&default_formatted);
 
@@ -4282,7 +4282,7 @@ fn standard_query_inserts_reject_mixed_batches_formats_and_late_failures_atomica
     assert_response(
         &authenticated_exchange(&database, "correct-token", &non_insert),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DELETE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DELETE"}"#,
     );
 
     assert_response(
@@ -4752,32 +4752,36 @@ fn clickhouse_key_csv_insert_uses_the_same_authenticated_route() {
 }
 
 #[test]
-fn bearer_authenticated_tsv_insert_accepts_reordered_all_type_fields_and_escapes() {
+fn bearer_authenticated_tsv_insert_accepts_subsets_and_fills_every_typed_default() {
     let database = SharedDatabase::default();
     database
         .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
         .unwrap();
-    let reordered_tsv = concat!(
-        "label\tactive\tscore\tid\n",
-        "slash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\ttrue\t1.5\t-9223372036854775808\n",
-    )
-    .as_bytes();
-    let (request, _) = request_with_authorization_for_target(
-        "/insert/typed_values",
-        reordered_tsv,
-        "Authorization: Bearer correct-token\r\n\
-         X-ClickHouse-Format: TabSeparatedWithNames\r\n",
-    );
 
-    assert_response_with_content_type(
-        &authenticated_exchange(&database, "correct-token", &request),
-        "HTTP/1.1 200 OK",
-        "text/plain; charset=utf-8",
-        b"",
-    );
+    for tsv in [
+        concat!(
+            "label\tid\n",
+            "slash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\t7\n",
+        )
+        .as_bytes(),
+        b"active\tscore\ntrue\t-0.125\n".as_slice(),
+    ] {
+        let (request, _) = request_with_authorization_for_target(
+            "/insert/typed_values",
+            tsv,
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8",
+            b"",
+        );
+    }
     let query = request_for_target_with_headers(
         "/query",
-        b"SELECT id, score, active, label FROM typed_values;",
+        b"SELECT id, score, active, label FROM typed_values ORDER BY id;",
         "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
     );
     assert_response_with_content_type(
@@ -4786,7 +4790,8 @@ fn bearer_authenticated_tsv_insert_accepts_reordered_all_type_fields_and_escapes
         "text/tab-separated-values; charset=utf-8",
         concat!(
             "id\tscore\tactive\tlabel\n",
-            "-9223372036854775808\t1.5\ttrue\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\n",
+            "0\t-0.125\ttrue\t\n",
+            "7\t0.0\tfalse\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\n",
         )
         .as_bytes(),
     );

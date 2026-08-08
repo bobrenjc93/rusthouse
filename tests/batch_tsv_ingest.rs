@@ -6,6 +6,7 @@ use std::time::Duration;
 use rusthouse::batch::engine::{Database, QueryResult, ResultColumn, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::format::write_tsv;
+use rusthouse::batch::storage::TableLimits;
 use rusthouse::batch::tsv::{DEFAULT_MAX_TSV_BYTES, TsvIngestError, TsvIngestLimits};
 use rusthouse::batch::value::{DataType, Value};
 use rusthouse::{SharedDatabase, SharedDatabaseError};
@@ -120,6 +121,65 @@ fn writer_output_round_trips_all_types_and_escapes_with_lf_and_crlf() {
             expected
         );
     }
+}
+
+#[test]
+fn reordered_header_subsets_fill_every_typed_default_and_preserve_escapes() {
+    let mut database = database(3);
+    let label_and_id = concat!(
+        "label\tid\n",
+        "slash\\\\tab\\tcarriage\\rline\\nnull\\0back\\bform\\f\\' snow ☃\t7\n",
+        "two\\nlines\t8\n",
+    )
+    .as_bytes();
+    let active_and_score = b"active\tscore\ntrue\t-0.125\n";
+
+    assert_eq!(
+        database.ingest_tsv_with_names(
+            "metrics",
+            label_and_id,
+            TsvIngestLimits::new(label_and_id.len(), 2, 4),
+        ),
+        Ok(2),
+    );
+    assert_eq!(
+        database.ingest_tsv_with_names(
+            "metrics",
+            active_and_score,
+            TsvIngestLimits::new(active_and_score.len(), 1, 2),
+        ),
+        Ok(1),
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id, score, active, label FROM metrics ORDER BY id;",
+        )
+        .rows,
+        [
+            vec![
+                Value::Int64(0),
+                Value::Float64(-0.125),
+                Value::Bool(true),
+                Value::String(String::new()),
+            ],
+            vec![
+                Value::Int64(7),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String(
+                    "slash\\tab\tcarriage\rline\nnull\0back\u{08}form\u{0c}' snow ☃".to_owned(),
+                ),
+            ],
+            vec![
+                Value::Int64(8),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String("two\nlines".to_owned()),
+            ],
+        ]
+    );
 }
 
 #[test]
@@ -431,6 +491,29 @@ fn exceeded_table_capacity_rolls_back_the_complete_input() {
 }
 
 #[test]
+fn omitted_columns_still_count_toward_projected_table_cell_capacity() {
+    let mut database = Database::with_table_limits(TableLimits::new(2, 4, 4));
+    database
+        .execute("CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);")
+        .unwrap();
+    let input = b"id\n1\n2\n";
+
+    assert_eq!(
+        database.ingest_tsv_with_names("metrics", input, limits(input)),
+        Err(TsvIngestError::Database(Error::ResourceLimitExceeded {
+            resource: "table cells",
+            actual: 8,
+            max: 4,
+        }))
+    );
+    assert!(
+        query(&mut database, "SELECT id FROM metrics;")
+            .rows
+            .is_empty()
+    );
+}
+
+#[test]
 fn malformed_headers_rows_values_and_escapes_preserve_existing_rows() {
     let cases = [
         (
@@ -458,15 +541,15 @@ fn malformed_headers_rows_values_and_escapes_preserve_existing_rows() {
             },
         ),
         (
-            format!("{HEADER}\n1\t1.0\ttrue\tok\n2\t2.0\tfalse\tbad\\x\n").into_bytes(),
-            TsvIngestError::InvalidEscape { line: 3, column: 4 },
+            b"label\nvalid\nbad\\x\n".to_vec(),
+            TsvIngestError::InvalidEscape { line: 3, column: 1 },
         ),
         (
-            format!("{HEADER}\n1\t1.0\ttrue\tok\n2\t2.0\tfalse\n").into_bytes(),
+            b"label\tid\nvalid\t1\nmissing-id\n".to_vec(),
             TsvIngestError::WrongColumnCount {
                 line: 3,
-                expected: 4,
-                actual: 3,
+                expected: 2,
+                actual: 1,
             },
         ),
     ];
@@ -492,37 +575,38 @@ fn validates_header_utf8_line_endings_and_escape_grammar() {
     let mut database = database(2);
     let cases = [
         (Vec::new(), TsvIngestError::MissingHeader { line: 1 }),
+        (b"\n".to_vec(), TsvIngestError::MissingHeader { line: 1 }),
         (
-            b"id\tscore\tactive\n".to_vec(),
+            b"id\tscore\tactive\tlabel\textra\n".to_vec(),
             TsvIngestError::HeaderColumnCount {
                 expected: 4,
-                actual: 3,
+                actual: 5,
             },
         ),
         (
-            b"ID\tscore\tactive\tlabel\n".to_vec(),
+            b"ID\n".to_vec(),
             TsvIngestError::HeaderMismatch {
                 column: 1,
                 expected: "id".to_owned(),
             },
         ),
         (
-            b"id\tscore\tactive\tmystery\n".to_vec(),
+            b"id\tmystery\n".to_vec(),
             TsvIngestError::UnknownHeaderColumn {
-                column: 4,
+                column: 2,
                 name: "mystery".to_owned(),
             },
         ),
         (
-            b"id\tscore\tactive\tid\n".to_vec(),
+            b"id\tid\n".to_vec(),
             TsvIngestError::DuplicateHeaderColumn {
-                column: 4,
+                column: 2,
                 name: "id".to_owned(),
             },
         ),
         (
-            b"id\tscore\tactive\tlabel\\\n".to_vec(),
-            TsvIngestError::InvalidEscape { line: 1, column: 4 },
+            b"label\\\n".to_vec(),
+            TsvIngestError::InvalidEscape { line: 1, column: 1 },
         ),
         (
             b"id\tscore\tactive\tlabel\n1\t1.0\ttrue\tone\r".to_vec(),
@@ -573,32 +657,34 @@ fn shared_database_ingests_under_the_write_lock_and_wraps_errors() {
     database
         .execute("CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);")
         .unwrap();
-    let input = b"label\tactive\tid\tscore\r\nshared\\ntext\ttrue\t1\t2.5\r\n";
+    let input = b"label\tid\r\nshared\\ntext\t1\r\n";
 
     assert_eq!(
         database
-            .ingest_tsv_with_names("metrics", input, TsvIngestLimits::new(input.len(), 1, 4))
+            .ingest_tsv_with_names("metrics", input, TsvIngestLimits::new(input.len(), 1, 2))
             .unwrap(),
         1
     );
-    let bad = b"active\tlabel\tscore\tid\nfalse\tbad\tNaN\t2\n";
+    let bad = b"active\tscore\nfalse\tNaN\n";
     assert_eq!(
         database.ingest_tsv_with_names("metrics", bad, limits(bad)),
         Err(SharedDatabaseError::TsvIngest(
             TsvIngestError::InvalidValue {
                 line: 2,
-                column: 3,
+                column: 2,
                 expected: DataType::Float64,
             }
         ))
     );
     assert_eq!(
         database
-            .query("SELECT id, label FROM metrics;")
+            .query("SELECT id, score, active, label FROM metrics;")
             .unwrap()
             .rows,
         [vec![
             Value::Int64(1),
+            Value::Float64(0.0),
+            Value::Bool(false),
             Value::String("shared\ntext".to_owned())
         ]]
     );

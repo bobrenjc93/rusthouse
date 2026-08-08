@@ -219,6 +219,13 @@ The exact case-insensitive `SHOW DATABASES` returns one `String` column named
 `name` containing RustHouse's single logical database, `default`. Arguments and
 trailing clauses are rejected, and the result uses the normal query row, value,
 byte, retained-result, and formatted-output limits.
+The exact case-insensitive `SHOW SETTINGS` returns `name` and `value` `String`
+columns for every configured `QueryResultLimits` and `TableLimits` field. Rows
+use stable `query_result_limits.<field>` and `table_limits.<field>` names in
+their respective struct declaration order, and values are unsigned decimal
+strings. Arguments and trailing clauses are rejected. The metadata result is
+itself subject to the configured query row, value, and byte limits plus the
+normal retained-result and formatted-output limits.
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
@@ -443,11 +450,11 @@ around that balanced tree. A `LIKE` pattern is one predicate node, and infix
 allocation-free matcher.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
-each `SELECT`, `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE
-TABLE`, or `EXISTS TABLE` query is executed and emitted before the next
-statement. Table output uses bordered, human-readable columns, escapes control
-characters, renders SQL `NULL` as `NULL`, and separates multiple query results
-with a blank line. Each
+each `SELECT`, `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW TABLES`, `SHOW CREATE
+TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` query is executed and emitted before
+the next statement. Table output uses bordered, human-readable columns, escapes
+control characters, renders SQL `NULL` as `NULL`, and separates multiple query
+results with a blank line. Each
 padded table is size-checked against a 16 MiB formatted-output limit before
 being streamed, so a wide cell cannot amplify many short rows into unbounded
 memory or output. CSV output uses a CSVWithNames-compatible header followed by
@@ -539,10 +546,11 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes), `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE
-TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
-shared read lock, and returns an owned, resource-bounded result, so cloned handles can run
-analytical reads concurrently. `try_query` and `try_query_with_result_limit`
+and `currentDatabase()` probes), `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
+TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
+shared read lock, and returns an owned, resource-bounded result, so cloned
+handles can run analytical reads concurrently. `try_query` and
+`try_query_with_result_limit`
 accept and validate the same single read-only statement before making one
 nonblocking read-lock attempt. They return the typed `DatabaseBusy` error when
 a writer prevents immediate lock acquisition, while lock poisoning, SQL
@@ -629,10 +637,9 @@ Those insertion-capable handlers also expose exact `POST /insert/<table>` for
 RustHouse SQL identifier; extra path segments, query strings, and
 percent-encoded names are not accepted. The request requires one decimal
 `Content-Length`, and its body starts with a matching-case column-name header,
-followed by typed records. A CSV header may contain any nonempty target-column
-subset without duplicates and in any order; omitted columns receive `0`, `0.0`,
-`false`, or an empty string according to their schema type. A TSV header must
-still contain every target column exactly once, but may place them in any order.
+followed by typed records. CSV and TSV headers may contain any nonempty
+target-column subset without duplicates and in any order; omitted columns
+receive `0`, `0.0`, `false`, or an empty string according to their schema type.
 With no format header the body remains `CSVWithNames`, so `POST /insert/events`
 with `label,id\n"one, quoted",1\n` imports one CSV row. An exact,
 case-sensitive `X-ClickHouse-Format: TabSeparatedWithNames` selects TSV input;
@@ -839,11 +846,14 @@ one immediate write-lock attempt before table lookup or input access and returns
 the typed `DatabaseBusy` error rather than waiting for an active reader or
 writer. Lock poisoning and typed TSV, limit, and table-capacity failures remain
 distinct, and every failure preserves all existing rows.
-The decoded header must contain every schema column exactly once with matching
-case, but may list those names in any order. Missing, duplicate, unknown, and
-differently cased header names are rejected. Each data field parses as the
-table type selected by its header, and complete rows are restored to schema
-order before the atomic append.
+The decoded header must contain a nonempty, duplicate-free subset of schema
+columns with matching case, and may list those names in any order. Missing,
+duplicate, unknown, over-wide, and differently cased header names are rejected.
+Each supplied data field parses as the table type selected by its header;
+omitted `Int64`, `Float64`, `Bool`, and `String` fields receive `0`, `0.0`,
+`false`, and an empty string, respectively. Parsing and the total-value limit
+charge only supplied fields, while projected rows still undergo the existing
+full physical row and cell-capacity preflight before the atomic append.
 Data rows accept the same `Int64`, finite `Float64`, exact lowercase `Bool`, and
 `String` types, with LF or CRLF record endings. Fields decode the escape
 sequences emitted by RustHouse's TSV writer: `\\`, `\t`, `\r`, `\n`, `\0`,
