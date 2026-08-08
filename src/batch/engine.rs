@@ -3768,6 +3768,11 @@ enum CompiledPredicate {
         prefix: String,
         negated: bool,
     },
+    LikeSuffix {
+        column: usize,
+        suffix: String,
+        negated: bool,
+    },
     LikeContains {
         column: usize,
         substring: String,
@@ -3804,6 +3809,11 @@ impl CompiledPredicate {
                 prefix,
                 negated,
             } => string_at(table, *column, row).starts_with(prefix.as_str()) != *negated,
+            Self::LikeSuffix {
+                column,
+                suffix,
+                negated,
+            } => string_at(table, *column, row).ends_with(suffix.as_str()) != *negated,
             Self::LikeContains {
                 column,
                 substring,
@@ -3884,6 +3894,22 @@ fn compile_predicate_with_polarity(
             Ok(CompiledPredicate::LikePrefix {
                 column: column_index,
                 prefix: prefix.clone(),
+                negated,
+            })
+        }
+        Predicate::LikeSuffix { column, suffix } => {
+            let column_index = table.column_index(column)?;
+            let actual = table.schema()[column_index].data_type;
+            if actual != DataType::String {
+                return Err(Error::TypeMismatch {
+                    context: format!("WHERE LIKE column '{column}'"),
+                    expected: DataType::String.to_string(),
+                    actual: actual.to_string(),
+                });
+            }
+            Ok(CompiledPredicate::LikeSuffix {
+                column: column_index,
+                suffix: suffix.clone(),
                 negated,
             })
         }
