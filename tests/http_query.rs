@@ -2725,7 +2725,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
     assert_response(
         &exchange(&database, &request_for_target("/", b"DROP TABLE retained;")),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(
@@ -2733,7 +2733,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
             b"GET /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(&database, &request(b"SHOW TABLES; SHOW TABLES;")),
@@ -2884,7 +2884,7 @@ fn insert_route_is_bearer_only_exact_and_does_not_make_query_routes_mutable() {
     assert_response(
         &authenticated_exchange(&database, "correct-token", &query_request),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
 
     for target in ["/insert/", "/insert?async=1"] {

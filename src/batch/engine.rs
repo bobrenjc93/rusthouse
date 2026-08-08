@@ -500,6 +500,7 @@ impl Database {
                     Error::ResourceLimitExceeded {
                         resource:
                             "SELECT result bytes"
+                            | "SHOW DATABASES result bytes"
                             | "SHOW TABLES result bytes"
                             | "SHOW CREATE TABLE result bytes"
                             | "DESCRIBE TABLE result bytes"
@@ -591,6 +592,7 @@ impl Database {
                 Error::ResourceLimitExceeded {
                     resource:
                         "SELECT result bytes"
+                        | "SHOW DATABASES result bytes"
                         | "SHOW TABLES result bytes"
                         | "SHOW CREATE TABLE result bytes"
                         | "DESCRIBE TABLE result bytes"
@@ -758,6 +760,7 @@ impl Database {
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
             | Statement::UnionDistinct { .. }
+            | Statement::ShowDatabases
             | Statement::ShowTables
             | Statement::ShowCreateTable { .. }
             | Statement::DescribeTable { .. }
@@ -789,6 +792,7 @@ impl Database {
             Statement::UnionDistinct { left, right } => {
                 self.execute_union_distinct(left, right, query_result_limits)
             }
+            Statement::ShowDatabases => self.execute_show_databases(query_result_limits),
             Statement::ShowTables => self.execute_show_tables(query_result_limits),
             Statement::ShowCreateTable { name } => {
                 self.execute_show_create_table(&name, query_result_limits)
@@ -813,7 +817,7 @@ impl Database {
             | Statement::DeleteConjunction { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
-                "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
+                "read-only execution accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
                     .to_owned(),
             )),
         }
@@ -932,6 +936,36 @@ impl Database {
                 data_type: DataType::String,
             }],
             rows: vec![vec![Value::String(PACKAGE_VERSION.to_owned())]],
+        })
+    }
+
+    fn execute_show_databases(
+        &self,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const DATABASE_NAME: &str = "default";
+        const RESULT_COLUMN_NAME: &str = "name";
+
+        let fixed_bytes = validate_result_shape_parts(
+            1,
+            1,
+            1,
+            RESULT_COLUMN_NAME.len(),
+            query_result_limits,
+            SHOW_DATABASES_RESULT_RESOURCES,
+        )?;
+        enforce_resource_limit(
+            SHOW_DATABASES_RESULT_RESOURCES.bytes,
+            fixed_bytes.saturating_add(DATABASE_NAME.len()),
+            query_result_limits.max_bytes,
+        )?;
+
+        Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: RESULT_COLUMN_NAME.to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: vec![vec![Value::String(DATABASE_NAME.to_owned())]],
         })
     }
 
@@ -1341,6 +1375,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
         | Statement::UnionDistinct { .. } => "SELECT",
+        Statement::ShowDatabases => "SHOW DATABASES",
         Statement::ShowTables => "SHOW TABLES",
         Statement::ShowCreateTable { .. } => "SHOW CREATE TABLE",
         Statement::DescribeTable { .. } => "DESCRIBE TABLE",
@@ -2870,6 +2905,12 @@ const SELECT_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
     rows: "SELECT result rows",
     values: "SELECT result values",
     bytes: "SELECT result bytes",
+};
+
+const SHOW_DATABASES_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "SHOW DATABASES result rows",
+    values: "SHOW DATABASES result values",
+    bytes: "SHOW DATABASES result bytes",
 };
 
 const SHOW_TABLES_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
