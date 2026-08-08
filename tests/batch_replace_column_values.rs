@@ -68,6 +68,7 @@ fn assert_original(table: &Table) {
     );
     assert!(matches!(&table.columns()[3], Column::String(values)
         if values == &["zero", "one", "two", "three"]));
+    assert_eq!(table.retained_value_bytes(), 83);
 }
 
 #[test]
@@ -127,6 +128,7 @@ fn sparse_replacements_update_every_physical_type_and_preserve_other_data() {
     assert_eq!(table.name(), "events");
     assert_eq!(table.schema(), schema);
     assert_eq!(table.row_count(), 4);
+    assert_eq!(table.retained_value_bytes(), 84);
     assert_eq!(table.limits(), TableLimits::new(4, 4, 16));
 }
 
@@ -176,6 +178,7 @@ fn complete_replacements_update_every_physical_type() {
         if values == &[true, false, true, false]));
     assert!(matches!(&table.columns()[3], Column::String(values)
         if values == &["new-0", "new-1", "new-2", "new-3"]));
+    assert_eq!(table.retained_value_bytes(), 88);
 }
 
 #[test]

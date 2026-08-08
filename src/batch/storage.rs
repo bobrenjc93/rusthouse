@@ -217,16 +217,24 @@ impl Column {
         deleted_value_bytes
     }
 
-    fn replace_values(&mut self, replacements: Vec<(usize, Value)>) {
+    fn replace_values(&mut self, replacements: Vec<(usize, Value)>) -> (u128, u128) {
+        let mut removed_value_bytes = 0_u128;
+        let mut added_value_bytes = 0_u128;
         for (row_index, value) in replacements {
             match (&mut *self, value) {
                 (Self::Int64(values), Value::Int64(value)) => values[row_index] = value,
                 (Self::Float64(values), Value::Float64(value)) => values[row_index] = value,
                 (Self::Bool(values), Value::Bool(value)) => values[row_index] = value,
-                (Self::String(values), Value::String(value)) => values[row_index] = value,
+                (Self::String(values), Value::String(value)) => {
+                    removed_value_bytes =
+                        removed_value_bytes.saturating_add(values[row_index].len() as u128);
+                    added_value_bytes = added_value_bytes.saturating_add(value.len() as u128);
+                    values[row_index] = value;
+                }
                 _ => unreachable!("replacement values are validated before mutation"),
             }
         }
+        (removed_value_bytes, added_value_bytes)
     }
 }
 
@@ -755,7 +763,12 @@ impl Table {
         }
 
         let replaced = replacements.len();
-        self.columns[column_index].replace_values(replacements);
+        let (removed_value_bytes, added_value_bytes) =
+            self.columns[column_index].replace_values(replacements);
+        self.retained_value_bytes = self
+            .retained_value_bytes
+            .saturating_sub(removed_value_bytes)
+            .saturating_add(added_value_bytes);
         Ok(replaced)
     }
 
