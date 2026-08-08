@@ -358,6 +358,138 @@ fn ordering_selects_below_range_casts_independent_of_source_order() {
 }
 
 #[test]
+fn string_to_int64_accepts_signed_trim_free_decimal_text_and_extrema() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, reading String); \
+             INSERT INTO samples VALUES \
+             (1, '-9223372036854775808'), (2, '+17'), (3, '000'), \
+             (4, '-0'), (5, '9223372036854775807');",
+        )
+        .expect("setup");
+
+    let all = query(
+        &mut database,
+        "SELECT CAST(reading AS Int64) AS converted FROM samples",
+    );
+    assert_eq!(
+        all.columns,
+        [ResultColumn {
+            name: "converted".to_owned(),
+            data_type: DataType::Int64,
+        }]
+    );
+    assert_eq!(
+        all.rows,
+        [
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Int64(17)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id, CAST(reading AS Int64) FROM samples WHERE id >= 2 \
+             ORDER BY CAST(reading AS Int64) DESC LIMIT 3 OFFSET 1",
+        )
+        .rows,
+        [
+            vec![Value::Int64(2), Value::Int64(17)],
+            vec![Value::Int64(3), Value::Int64(0)],
+            vec![Value::Int64(4), Value::Int64(0)],
+        ]
+    );
+}
+
+#[test]
+fn string_to_int64_reports_invalid_and_overflowing_selected_values() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, reading String); \
+             INSERT INTO samples VALUES \
+             (1, ''), (2, ' 1'), (3, '1 '), (4, '+'), (5, '-'), \
+             (6, '1.0'), (7, '--1'), (8, 'twelve'), (9, '１２'), \
+             (10, '9223372036854775808'), (11, '-9223372036854775809');",
+        )
+        .expect("setup");
+
+    for id in 1..=9 {
+        assert_eq!(
+            database.execute(&format!(
+                "SELECT CAST(reading AS Int64) FROM samples WHERE id = {id}"
+            )),
+            Err(Error::InvalidCast {
+                source_type: DataType::String,
+                target_type: DataType::Int64,
+            }),
+            "row {id}"
+        );
+    }
+    for id in [10, 11] {
+        assert_eq!(
+            database.execute(&format!(
+                "SELECT CAST(reading AS Int64) FROM samples WHERE id = {id}"
+            )),
+            Err(Error::NumericOverflow("CAST(String AS Int64)".to_owned())),
+            "row {id}"
+        );
+    }
+}
+
+#[test]
+fn string_to_int64_filters_and_pages_before_conversion_with_numeric_ordering() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, reading String); \
+             INSERT INTO samples VALUES \
+             (1, 'bad'), (2, '10'), (3, '2'), (4, ''), (5, '-3'), \
+             (6, '9223372036854775808'), (7, '-9223372036854775809');",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Int64) AS converted FROM samples \
+             WHERE id = 2 OR id = 3 OR id = 5 ORDER BY converted",
+        )
+        .rows,
+        [
+            vec![Value::Int64(-3)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(10)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Int64) FROM samples LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Int64(10)], vec![Value::Int64(2)]]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Int64) AS converted FROM samples \
+             WHERE id = 2 OR id = 3 OR id = 6 OR id = 7 \
+             ORDER BY converted LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Int64(2)], vec![Value::Int64(10)]]
+    );
+}
+
+#[test]
 fn projects_negative_values_and_integer_extremes_with_filters_aliases_and_limits() {
     let mut database = Database::new();
     database
@@ -972,17 +1104,14 @@ fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
             column: "missing".to_owned(),
         })
     );
-    for (name, actual) in [("i", DataType::Int64), ("s", DataType::String)] {
-        assert_eq!(
-            database.execute(&format!("SELECT CAST({name} AS Int64) FROM samples")),
-            Err(Error::TypeMismatch {
-                context: format!("CAST argument '{name}'"),
-                expected: "Float64 or Bool".to_owned(),
-                actual: actual.to_string(),
-            }),
-            "column {name}"
-        );
-    }
+    assert_eq!(
+        database.execute("SELECT CAST(i AS Int64) FROM samples"),
+        Err(Error::TypeMismatch {
+            context: "CAST argument 'i'".to_owned(),
+            expected: "Float64, Bool, or String".to_owned(),
+            actual: DataType::Int64.to_string(),
+        })
+    );
 
     assert_eq!(
         database.execute("SELECT CAST(missing AS Bool) FROM samples"),
@@ -1253,6 +1382,78 @@ fn bool_to_int64_cast_obeys_result_caps() {
 }
 
 #[test]
+fn string_to_int64_cast_obeys_result_caps() {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 2,
+        max_values: 2,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE samples (reading String); \
+             INSERT INTO samples VALUES ('0'), ('1'), ('2');",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Int64) FROM samples LIMIT 2",
+        )
+        .rows,
+        [vec![Value::Int64(0)], vec![Value::Int64(1)]]
+    );
+    assert_eq!(
+        database.execute("SELECT CAST(reading AS Int64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+
+    let mut value_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 3,
+        max_values: 5,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    value_limited
+        .execute(
+            "CREATE TABLE samples (reading String); \
+             INSERT INTO samples VALUES ('0'), ('1'), ('2');",
+        )
+        .expect("setup");
+    assert_eq!(
+        value_limited.execute("SELECT CAST(reading AS Int64), CAST(reading AS Int64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result values",
+            actual: 6,
+            max: 5,
+        })
+    );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    byte_limited
+        .execute("CREATE TABLE samples (reading String); INSERT INTO samples VALUES ('0');")
+        .expect("setup");
+    assert!(matches!(
+        byte_limited.execute("SELECT CAST(reading AS Int64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            max: 0,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn bool_to_float64_cast_obeys_result_caps() {
     let mut database = Database::with_query_result_limits(QueryResultLimits {
         max_rows: 2,
@@ -1491,8 +1692,8 @@ fn cast_remains_an_ordinary_projection() {
     let mut database = Database::new();
     database
         .execute(
-            "CREATE TABLE samples (reading Int64, ratio Float64, enabled Bool); \
-             INSERT INTO samples VALUES (1, 1.5, true);",
+            "CREATE TABLE samples (reading Int64, ratio Float64, enabled Bool, text String); \
+             INSERT INTO samples VALUES (1, 1.5, true, '1');",
         )
         .expect("setup");
 
@@ -1510,6 +1711,12 @@ fn cast_remains_an_ordinary_projection() {
     );
     assert_eq!(
         database.execute("SELECT CAST(enabled AS Int64), COUNT(*) FROM samples GROUP BY enabled"),
+        Err(Error::InvalidQuery(
+            "CAST projections are only supported in ungrouped SELECT queries".to_owned()
+        ))
+    );
+    assert_eq!(
+        database.execute("SELECT CAST(text AS Int64), COUNT(*) FROM samples GROUP BY text"),
         Err(Error::InvalidQuery(
             "CAST projections are only supported in ungrouped SELECT queries".to_owned()
         ))
@@ -1556,6 +1763,58 @@ fn emits_float64_to_int64_as_typed_csv_and_json() {
     assert_eq!(
         String::from_utf8(json).unwrap(),
         "{\"columns\":[{\"name\":\"converted\",\"type\":\"Int64\"}],\"rows\":[[-7],[0],[12]]}\n"
+    );
+}
+
+#[test]
+fn emits_string_to_int64_in_all_cli_formats() {
+    let sql = "CREATE TABLE samples (reading String); \
+               INSERT INTO samples VALUES ('2'), ('-10'), ('+0'); \
+               SELECT CAST(reading AS Int64) AS converted \
+               FROM samples ORDER BY converted;";
+
+    let mut table = Vec::new();
+    run_table_batch(sql.as_bytes(), &mut table).expect("table batch succeeds");
+    assert_eq!(
+        String::from_utf8(table).unwrap(),
+        "+-----------+\n\
+         | converted |\n\
+         +-----------+\n\
+         | -10       |\n\
+         | 0         |\n\
+         | 2         |\n\
+         +-----------+\n"
+    );
+
+    let mut csv = Vec::new();
+    run_csv_batch(sql.as_bytes(), &mut csv).expect("CSV batch succeeds");
+    assert_eq!(String::from_utf8(csv).unwrap(), "converted\n-10\n0\n2\n");
+
+    let mut tsv = Vec::new();
+    run_tsv_batch(sql.as_bytes(), &mut tsv).expect("TSV batch succeeds");
+    assert_eq!(String::from_utf8(tsv).unwrap(), "converted\n-10\n0\n2\n");
+
+    let mut json = Vec::new();
+    run_json_batch(sql.as_bytes(), &mut json).expect("JSON batch succeeds");
+    assert_eq!(
+        String::from_utf8(json).unwrap(),
+        "{\"columns\":[{\"name\":\"converted\",\"type\":\"Int64\"}],\"rows\":[[-10],[0],[2]]}\n"
+    );
+
+    let mut json_each_row = Vec::new();
+    run_json_each_row_batch(sql.as_bytes(), &mut json_each_row)
+        .expect("JSONEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_each_row).unwrap(),
+        "{\"converted\":-10}\n{\"converted\":0}\n{\"converted\":2}\n"
+    );
+
+    let mut json_compact_each_row = Vec::new();
+    run_json_compact_each_row_batch(sql.as_bytes(), &mut json_compact_each_row)
+        .expect("JSONCompactEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_compact_each_row).unwrap(),
+        "[-10]\n[0]\n[2]\n"
     );
 }
 
