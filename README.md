@@ -186,6 +186,14 @@ named `version()` unless an alias is supplied. Arguments, expression lists,
 the probe charges one SQL AST list item and uses the normal query row, value,
 byte, retained-result, and formatted-output limits.
 
+The exact case-insensitive probe `SELECT currentDatabase() [AS <alias>]`
+returns RustHouse's single logical database, `default`, as one `String` row.
+Its result column is named `currentDatabase()` unless an alias is supplied.
+Arguments, expression lists, `FROM`, `WHERE`, `ORDER BY`, `LIMIT`, and other
+trailing clauses are rejected; the probe charges one SQL AST list item and
+uses the normal query row, value, byte, retained-result, and formatted-output
+limits.
+
 The exact case-insensitive `SHOW DATABASES` returns one `String` column named
 `name` containing RustHouse's single logical database, `default`. Arguments and
 trailing clauses are rejected, and the result uses the normal query row, value,
@@ -467,8 +475,9 @@ return owned projection rows. Existing catalog failures remain typed, and lock
 poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
-engine. Its `query` method accepts exactly one `SELECT`, `SHOW DATABASES`, `SHOW
-TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
+engine. Its `query` method accepts exactly one `SELECT` (including `version()`
+and `currentDatabase()` probes), `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE
+TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
 shared read lock, and returns an owned, resource-bounded result, so cloned handles can run
 analytical reads concurrently. `try_query` and `try_query_with_result_limit`
 accept and validate the same single read-only statement before making one

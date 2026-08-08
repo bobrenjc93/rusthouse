@@ -119,6 +119,8 @@ pub enum Statement {
     LiteralSelect(LiteralSelect),
     /// Exact ClickHouse-compatible `SELECT version() [AS alias]` probe.
     VersionSelect(VersionSelect),
+    /// Exact ClickHouse-compatible `SELECT currentDatabase() [AS alias]` probe.
+    CurrentDatabaseSelect(CurrentDatabaseSelect),
     Select(Select),
     /// A deliberately narrow, two-table Cartesian product.
     CrossJoin(CrossJoin),
@@ -160,6 +162,12 @@ pub struct LiteralSelect {
 /// `SELECT version() [AS <alias>]`, with no arguments or trailing clauses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionSelect {
+    pub alias: Option<String>,
+}
+
+/// `SELECT currentDatabase() [AS <alias>]`, with no arguments or trailing clauses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentDatabaseSelect {
     pub alias: Option<String>,
 }
 
@@ -785,6 +793,9 @@ impl<'a> Parser<'a> {
         if self.at_version_call_start() {
             return self.parse_version_select();
         }
+        if self.at_current_database_call_start() {
+            return self.parse_current_database_select();
+        }
         if self.at_literal_start() {
             return self.parse_literal_select();
         }
@@ -846,6 +857,35 @@ impl<'a> Parser<'a> {
 
     fn at_version_call_start(&self) -> bool {
         if !self.at_keyword("VERSION") {
+            return false;
+        }
+
+        let mut lexer = self.lexer;
+        matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
+    }
+
+    fn parse_current_database_select(&mut self) -> Result<Statement> {
+        const SHAPE: &str = "currentDatabase() SELECT supports exactly SELECT currentDatabase() with an optional AS alias and no trailing clauses";
+
+        self.reserve_ast_list_item()?;
+        self.expect_keyword("CURRENTDATABASE")?;
+        self.expect(&TokenKind::LeftParen, "'(' after currentDatabase")?;
+        self.expect(
+            &TokenKind::RightParen,
+            "')' after the empty currentDatabase argument list",
+        )?;
+        let alias = self.parse_alias()?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::CurrentDatabaseSelect(CurrentDatabaseSelect {
+            alias,
+        }))
+    }
+
+    fn at_current_database_call_start(&self) -> bool {
+        if !self.at_keyword("CURRENTDATABASE") {
             return false;
         }
 
