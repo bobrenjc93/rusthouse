@@ -600,8 +600,9 @@ one optional `default_format` parameter in any order with `query`, including
 percent-encoded parameter names and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
 `+` becomes a space. `default_format` accepts the exact case-sensitive values
-`JSON`, `CSV`, `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, and
-`JSONCompactEachRow`, selecting the corresponding existing response writer.
+`JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
+`JSONEachRow`, and `JSONCompactEachRow`, selecting the corresponding existing
+response writer.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
 same SQL byte limit as a POST body; the database and format parameters do not
 count toward that limit. Empty parameters or values, duplicate `query`,
@@ -686,16 +687,18 @@ Internal Server Error`. Validation and commit occur under the acquired write
 lock so concurrent work cannot expose or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
-the exact value `CSV`, `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`,
-or `JSONCompactEachRow`. `CSV` and `CSVWithNames` responses have content type
+the exact value `CSV`, `CSVWithNames`, `TabSeparated`,
+`TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. `CSV` and
+`CSVWithNames` responses have content type
 `text/csv; charset=utf-8` and use the same typed-value, `NULL`, and field-escaping
 behavior as `--format csv`. `CSV` omits the column-name header, so an empty
 result has an empty body; `CSVWithNames` retains the header, including for an
-empty result. `TabSeparatedWithNames` responses similarly use the
-existing `--format tsv` writer and content type
-`text/tab-separated-values; charset=utf-8`: column names and typed rows are
-tab-separated, `NULL` is `\N`, ClickHouse backslash escaping is applied, and an
-empty result still contains its escaped column-name header.
+empty result. `TabSeparated` and `TabSeparatedWithNames` responses similarly
+use content type `text/tab-separated-values; charset=utf-8`: typed rows are
+tab-separated, `NULL` is `\N`, and ClickHouse backslash escaping is applied.
+`TabSeparated` omits the column-name header and returns an empty body for an
+empty result. `TabSeparatedWithNames` retains the existing `--format tsv`
+shape, including its escaped column-name header for an empty result.
 `JSONEachRow` responses have content type `application/json` and contain one
 column-name-keyed JSON object per row, each followed by a line feed. Column
 names and strings are JSON-escaped, numbers and booleans retain their native

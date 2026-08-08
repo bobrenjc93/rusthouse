@@ -1224,6 +1224,11 @@ fn url_encoded_post_query_accepts_absent_or_zero_length_and_every_default_format
             b"value\n7\n",
         ),
         (
+            b"POST /?query=SELECT+7+AS+value%3B&default_format=TabSeparated HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "text/tab-separated-values; charset=utf-8",
+            b"7\n",
+        ),
+        (
             b"POST /?database=default&default_format=TabSeparatedWithNames&query=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "text/tab-separated-values; charset=utf-8",
             b"value\n7\n",
@@ -1279,6 +1284,19 @@ fn url_encoded_post_query_reuses_authentication_database_and_header_format() {
         b"value\n7\n",
     );
     assert_clickhouse_key_response_is_not_cacheable(&key_response);
+
+    let tab_separated = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"POST /?query=SELECT+7+AS+value%3B&default_format=TabSeparated HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+    );
+    assert_response_with_content_type(
+        &tab_separated,
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"7\n",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&tab_separated);
 }
 
 #[test]
@@ -1306,6 +1324,10 @@ fn url_encoded_post_query_rejects_bodies_conflicts_and_invalid_parameters() {
             r#"{"error":"default_format parameter cannot be combined with X-ClickHouse-Format header"}"#,
         ),
         (
+            b"POST /?query=SELECT+1%3B&default_format=TabSeparated HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Format: TabSeparated\r\n\r\n",
+            r#"{"error":"default_format parameter cannot be combined with X-ClickHouse-Format header"}"#,
+        ),
+        (
             b"POST /?database=analytics&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
             r#"{"error":"database query parameter must be default"}"#,
         ),
@@ -1315,6 +1337,10 @@ fn url_encoded_post_query_rejects_bodies_conflicts_and_invalid_parameters() {
         ),
         (
             b"POST /?query=SELECT+1%3B&default_format=csv HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"unsupported default_format parameter"}"#,
+        ),
+        (
+            b"POST /?query=SELECT+1%3B&default_format=tabseparated HTTP/1.1\r\nHost: localhost\r\n\r\n",
             r#"{"error":"unsupported default_format parameter"}"#,
         ),
         (
@@ -1388,6 +1414,11 @@ fn get_default_format_selects_every_writer_with_encoded_parameters_in_any_order(
             b"GET /?query=SELECT+7+AS+value%3B&default_format=CSVWithNames&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "text/csv; charset=utf-8",
             b"value\n7\n",
+        ),
+        (
+            b"GET /?query=SELECT+7+AS+value%3B&default_format=TabSeparated&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "text/tab-separated-values; charset=utf-8",
+            b"7\n",
         ),
         (
             b"GET /?database=default&query=SELECT+7+AS+value%3B&default_format=TabSeparatedWithNames HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -2083,7 +2114,7 @@ fn both_query_routes_return_both_csv_formats_for_all_value_types_and_empty_resul
 }
 
 #[test]
-fn both_query_routes_return_tab_separated_with_names_for_all_value_types_and_empty_results() {
+fn both_query_routes_return_both_tab_separated_formats_for_typed_escaped_and_empty_results() {
     let database = SharedDatabase::default();
     database
         .execute(
@@ -2094,48 +2125,64 @@ fn both_query_routes_return_tab_separated_with_names_for_all_value_types_and_emp
              CREATE TABLE empty_values (integer Int64, score Float64, active Bool, label String);",
         )
         .unwrap();
-    let expected = concat!(
-        "integer\tscore\tactive\tlabel\n",
+    let expected_rows = concat!(
         "-9223372036854775808\t2.0\tfalse\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\n",
         "7\t-1.25\ttrue\t\n",
     );
 
     for target in ["/", "/query"] {
-        let typed_request = request_for_target_with_headers(
-            target,
-            b"SELECT integer, score, active, label FROM typed_values ORDER BY integer;",
-            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
-        );
-        assert_response_with_content_type(
-            &exchange(&database, &typed_request),
-            "HTTP/1.1 200 OK",
-            "text/tab-separated-values; charset=utf-8",
-            expected.as_bytes(),
-        );
+        for (format, expected, expected_null, expected_empty) in [
+            (
+                "TabSeparated",
+                expected_rows.to_owned(),
+                "\\N\t\\N\t\\N\t\\N\n".to_owned(),
+                String::new(),
+            ),
+            (
+                "TabSeparatedWithNames",
+                format!("integer\tscore\tactive\tlabel\n{expected_rows}"),
+                "missing_integer\tmissing_float\tmissing_boolean\tmissing_string\n\\N\t\\N\t\\N\t\\N\n"
+                    .to_owned(),
+                "integer\tscore\tactive\tlabel\n".to_owned(),
+            ),
+        ] {
+            let headers = format!("X-ClickHouse-Format: {format}\r\n");
+            let typed_request = request_for_target_with_headers(
+                target,
+                b"SELECT integer, score, active, label FROM typed_values ORDER BY integer;",
+                &headers,
+            );
+            assert_response_with_content_type(
+                &exchange(&database, &typed_request),
+                "HTTP/1.1 200 OK",
+                "text/tab-separated-values; charset=utf-8",
+                expected.as_bytes(),
+            );
 
-        let null_request = request_for_target_with_headers(
-            target,
-            b"SELECT MIN(integer) AS missing_integer, MIN(score) AS missing_float, MIN(active) AS missing_boolean, MIN(label) AS missing_string FROM empty_values;",
-            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
-        );
-        assert_response_with_content_type(
-            &exchange(&database, &null_request),
-            "HTTP/1.1 200 OK",
-            "text/tab-separated-values; charset=utf-8",
-            b"missing_integer\tmissing_float\tmissing_boolean\tmissing_string\n\\N\t\\N\t\\N\t\\N\n",
-        );
+            let null_request = request_for_target_with_headers(
+                target,
+                b"SELECT MIN(integer) AS missing_integer, MIN(score) AS missing_float, MIN(active) AS missing_boolean, MIN(label) AS missing_string FROM empty_values;",
+                &headers,
+            );
+            assert_response_with_content_type(
+                &exchange(&database, &null_request),
+                "HTTP/1.1 200 OK",
+                "text/tab-separated-values; charset=utf-8",
+                expected_null.as_bytes(),
+            );
 
-        let empty_request = request_for_target_with_headers(
-            target,
-            b"SELECT integer, score, active, label FROM empty_values;",
-            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
-        );
-        assert_response_with_content_type(
-            &exchange(&database, &empty_request),
-            "HTTP/1.1 200 OK",
-            "text/tab-separated-values; charset=utf-8",
-            b"integer\tscore\tactive\tlabel\n",
-        );
+            let empty_request = request_for_target_with_headers(
+                target,
+                b"SELECT integer, score, active, label FROM empty_values;",
+                &headers,
+            );
+            assert_response_with_content_type(
+                &exchange(&database, &empty_request),
+                "HTTP/1.1 200 OK",
+                "text/tab-separated-values; charset=utf-8",
+                expected_empty.as_bytes(),
+            );
+        }
     }
 }
 
@@ -2212,34 +2259,34 @@ fn bearer_authenticated_queries_honor_csv_with_names() {
 }
 
 #[test]
-fn bearer_authenticated_queries_honor_tab_separated_with_names_on_both_routes() {
+fn bearer_authenticated_queries_honor_both_tab_separated_formats_on_both_routes() {
     let database = SharedDatabase::default();
     let sql = b"SELECT -7 AS integer;";
 
-    for target in ["/", "/query"] {
-        let unauthorized = request_for_target_with_headers(
-            target,
-            sql,
-            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
-        );
-        assert_response(
-            &authenticated_exchange(&database, "correct-token", &unauthorized),
-            "HTTP/1.1 401 Unauthorized",
-            r#"{"error":"bearer authentication required"}"#,
-        );
+    for (format, expected) in [
+        ("TabSeparated", b"-7\n".as_slice()),
+        ("TabSeparatedWithNames", b"integer\n-7\n".as_slice()),
+    ] {
+        for target in ["/", "/query"] {
+            let format_header = format!("X-ClickHouse-Format: {format}\r\n");
+            let unauthorized = request_for_target_with_headers(target, sql, &format_header);
+            assert_response(
+                &authenticated_exchange(&database, "correct-token", &unauthorized),
+                "HTTP/1.1 401 Unauthorized",
+                r#"{"error":"bearer authentication required"}"#,
+            );
 
-        let (authorized, _) = request_with_authorization_for_target(
-            target,
-            sql,
-            "Authorization: Bearer correct-token\r\n\
-             X-ClickHouse-Format: TabSeparatedWithNames\r\n",
-        );
-        assert_response_with_content_type(
-            &authenticated_exchange(&database, "correct-token", &authorized),
-            "HTTP/1.1 200 OK",
-            "text/tab-separated-values; charset=utf-8",
-            b"integer\n-7\n",
-        );
+            let authorization_headers =
+                format!("Authorization: Bearer correct-token\r\nX-ClickHouse-Format: {format}\r\n");
+            let (authorized, _) =
+                request_with_authorization_for_target(target, sql, &authorization_headers);
+            assert_response_with_content_type(
+                &authenticated_exchange(&database, "correct-token", &authorized),
+                "HTTP/1.1 200 OK",
+                "text/tab-separated-values; charset=utf-8",
+                expected,
+            );
+        }
     }
 }
 
@@ -2279,6 +2326,14 @@ fn query_forms_reject_duplicate_and_unsupported_clickhouse_formats() {
             "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
             "X-ClickHouse-Format: JSONCompactEachRow\r\n",
         ),
+        concat!(
+            "X-ClickHouse-Format: TabSeparated\r\n",
+            "X-ClickHouse-Format: TabSeparated\r\n",
+        ),
+        concat!(
+            "X-ClickHouse-Format: TabSeparated\r\n",
+            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        ),
     ];
 
     for target in ["/", "/query"] {
@@ -2301,8 +2356,9 @@ fn query_forms_reject_duplicate_and_unsupported_clickhouse_formats() {
             "csvwithnames",
             "csv",
             "Csv",
+            "tabseparated",
+            "Tabseparated",
             "tabseparatedwithnames",
-            "TabSeparated",
             "",
         ] {
             let headers = format!("X-ClickHouse-Format: {unsupported}\r\n");
@@ -2478,6 +2534,50 @@ fn headerless_csv_honors_the_exact_complete_response_cap() {
         },
     )
     .expect("the exact complete headerless CSV response size is accepted");
+    assert_eq!(exact_response, expected_response);
+
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut capped_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut capped_response,
+        limits,
+    )
+    .expect("the fixed response-limit error fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
+fn headerless_tab_separated_honors_the_exact_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let sql = format!("SELECT '{}' AS value;", "x".repeat(1_000));
+    let request = request_for_target_with_headers(
+        "/query",
+        sql.as_bytes(),
+        "X-ClickHouse-Format: TabSeparated\r\n",
+    );
+    let expected_response = exchange(&database, &request);
+
+    let mut exact_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut exact_response,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect("the exact complete headerless TSV response size is accepted");
     assert_eq!(exact_response, expected_response);
 
     let limits = HttpQueryLimits {
