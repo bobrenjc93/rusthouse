@@ -328,6 +328,38 @@ fn length_utf8_ordering_cache_enforces_exact_filtered_byte_boundaries() {
 }
 
 #[test]
+fn length_utf8_limit_zero_still_charges_filtered_ordering_state() {
+    let setup = "CREATE TABLE samples (label String, keep Bool); \
+                 INSERT INTO samples VALUES ('é', true), ('discarded', false);";
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    database.execute(setup).expect("setup");
+
+    assert_eq!(
+        database.execute(
+            "SELECT lengthUTF8(label) AS scalars FROM samples \
+             WHERE keep = true ORDER BY scalars LIMIT 0"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES,
+            max: 0,
+        })
+    );
+    assert!(
+        query(
+            &mut database,
+            "SELECT lengthUTF8(label) AS scalars FROM samples \
+             WHERE label = 'missing' ORDER BY scalars LIMIT 0"
+        )
+        .rows
+        .is_empty()
+    );
+}
+
+#[test]
 fn rejects_unknown_non_string_and_grouped_length_utf8_inputs_with_typed_errors() {
     let mut database = Database::new();
     database

@@ -3963,10 +3963,6 @@ fn order_source_rows(
         }
         return Ok(());
     }
-    if limit == Some(0) {
-        rows.clear();
-        return Ok(());
-    }
 
     if let [order] = ordering {
         if let ResolvedItem::StringLengthUtf8 { source } = items[order.output] {
@@ -3980,6 +3976,10 @@ fn order_source_rows(
             )?;
             return Ok(());
         }
+    }
+    if limit == Some(0) {
+        rows.clear();
+        return Ok(());
     }
 
     // A String-to-number ordering key must have valid numeric syntax for every
@@ -4159,6 +4159,10 @@ fn order_source_rows_by_length_utf8(
         ordering_state_bytes,
         max_ordering_state_bytes,
     )?;
+    if limit == Some(0) {
+        rows.clear();
+        return Ok(());
+    }
 
     let mut cached = Vec::with_capacity(rows.len());
     cached.extend(rows.iter().copied().map(|row| CachedLengthUtf8Order {
