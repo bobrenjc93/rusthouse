@@ -10,7 +10,8 @@ With no options, reads the legacy line-oriented Int64 session from stdin.
 With --format table, --format csv, --format tsv, --format json, --format
 JSONEachRow, or --format JSONCompactEachRow, reads one semicolon-delimited SQL
 batch through EOF and prints results for SELECT, SHOW DATABASES, SHOW SETTINGS,
-SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, and EXISTS TABLE queries.
+SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, and EXISTS TABLE
+queries.
 CREATE, ALTER, DROP, RENAME, TRUNCATE, DELETE, and INSERT remain silent.
 
 Limits:

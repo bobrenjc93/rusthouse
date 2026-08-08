@@ -3183,7 +3183,7 @@ fn authenticated_read_only_modes_reject_every_insert_surface_without_locking() {
     assert_response(
         &read_only_bearer_exchange(&database, "read-token", &bearer_standard_insert),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
 
     let key_parameterized_insert = read_only_clickhouse_key_exchange(
@@ -3194,7 +3194,7 @@ fn authenticated_read_only_modes_reject_every_insert_surface_without_locking() {
     assert_response(
         &key_parameterized_insert,
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
     assert_clickhouse_key_response_is_not_cacheable(&key_parameterized_insert);
 }
@@ -3209,7 +3209,7 @@ fn authenticated_read_only_modes_reject_string_alter_updates_without_mutation() 
         )
         .unwrap();
     let update = b"ALTER TABLE events UPDATE label = 'changed' WHERE category = 'queued';";
-    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found ALTER TABLE"}"#;
+    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found ALTER TABLE"}"#;
 
     let bearer_request =
         request_for_target_with_headers("/query", update, "Authorization: Bearer read-token\r\n");
@@ -4019,7 +4019,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
     assert_response(
         &exchange(&database, &request_for_target("/", b"DROP TABLE retained;")),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(
@@ -4027,7 +4027,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
             b"GET /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(
@@ -4035,7 +4035,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
             b"POST /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(&database, &request(b"SHOW TABLES; SHOW TABLES;")),
@@ -4327,7 +4327,7 @@ fn get_and_unauthenticated_standard_query_routes_remain_read_only() {
     let database = SharedDatabase::default();
     database.execute("CREATE TABLE events (id Int64);").unwrap();
     let sql = b"INSERT INTO events VALUES (1);";
-    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#;
+    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#;
 
     for request in [
         request_for_target("/", sql),
@@ -4435,7 +4435,7 @@ fn standard_query_inserts_reject_mixed_batches_formats_and_late_failures_atomica
     assert_response(
         &authenticated_exchange(&database, "correct-token", &formatted),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
 
     let default_formatted = clickhouse_key_exchange(
@@ -4446,7 +4446,7 @@ fn standard_query_inserts_reject_mixed_batches_formats_and_late_failures_atomica
     assert_response(
         &default_formatted,
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
     assert_clickhouse_key_response_is_not_cacheable(&default_formatted);
 
@@ -4458,7 +4458,7 @@ fn standard_query_inserts_reject_mixed_batches_formats_and_late_failures_atomica
     assert_response(
         &authenticated_exchange(&database, "correct-token", &non_insert),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DELETE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DELETE"}"#,
     );
 
     assert_response(
