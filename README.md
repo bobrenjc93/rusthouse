@@ -649,10 +649,10 @@ Protocol and SQL failures return deterministic JSON error objects with an
 appropriate HTTP status. All other targets and query-string shapes are rejected.
 
 As a SQL-level alternative to HTTP format metadata, every query form recognizes
-a terminal `FORMAT CSVWithNames` or `FORMAT JSONEachRow` clause on exactly one
-read-only query. The keywords and format names are case-insensitive, one trailing
-semicolon is optional, and the response uses the corresponding existing bounded
-writer and content type described below.
+a terminal `FORMAT CSVWithNames`, `FORMAT TabSeparated`, or `FORMAT JSONEachRow`
+clause on exactly one read-only query. The keywords and format names are
+case-insensitive, one trailing semicolon is optional, and the response uses the
+corresponding existing bounded writer and content type described below.
 Single-quoted text (including doubled quote escapes) and `--` line comments are
 scanned using the SQL lexer rules and are never mistaken for the clause. A real
 clause cannot be combined with `X-ClickHouse-Format` or `default_format`; the
