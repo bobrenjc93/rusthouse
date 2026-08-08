@@ -2033,6 +2033,22 @@
         "eval_c88a7f3d": 75,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:649",
+      "recordedAt": "2026-08-08T23:40:41.590Z",
+      "label": "PR #649",
+      "kind": "composite",
+      "prNumber": 649,
+      "title": "YOLO generation 90: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 75,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }

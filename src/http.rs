@@ -39,7 +39,7 @@ pub struct HttpQueryLimits {
     /// Maximum bytes in a POST body or decoded URL SQL query parameter.
     pub max_sql_bytes: usize,
     /// Byte, row, and value limits for one `POST /insert/<table>` `CSV` or
-    /// `CSVWithNames` body, including parameterized `CSVWithNames` insertion.
+    /// `CSVWithNames` body, including parameterized insertion in either format.
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub csv_ingest_limits: CsvIngestLimits,
@@ -114,15 +114,14 @@ impl StdError for HttpQueryError {
 /// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, and `+` becomes a space. An
-/// insertion-capable authenticated `POST` additionally accepts either a
-/// `CSVWithNames` body when the decoded SQL is exactly `INSERT INTO <table>
-/// FORMAT CSVWithNames` or a headerless TSV body when it is exactly `INSERT
-/// INTO <table> FORMAT TabSeparated`; it routes the body through the same
-/// bounded, atomic, nonblocking importer as `POST /insert/<table>`. All other
-/// parameterized queries require an absent or zero `Content-Length`. Empty,
-/// duplicate,
-/// unknown, and unsupported parameters are rejected after authentication and
-/// before database access. A
+/// insertion-capable authenticated `POST` additionally accepts a headerless CSV
+/// body when the decoded SQL is exactly `INSERT INTO <table> FORMAT CSV`, a
+/// `CSVWithNames` body when it ends in `FORMAT CSVWithNames`, or a headerless
+/// TSV body when it ends in `FORMAT TabSeparated`; it routes the body through
+/// the same bounded, atomic, nonblocking importer as `POST /insert/<table>`.
+/// All other parameterized queries require an absent or zero `Content-Length`.
+/// Empty, duplicate, unknown, and unsupported parameters are rejected after
+/// authentication and before database access. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
 /// may instead end in a case-insensitive SQL `FORMAT CSVWithNames`, `FORMAT
@@ -1046,7 +1045,9 @@ fn parse_parameterized_table_insert(sql: &str) -> Option<(String, TableInsertFor
     {
         return None;
     }
-    let input_format = if input_format.eq_ignore_ascii_case("CSVWithNames") {
+    let input_format = if input_format.eq_ignore_ascii_case("CSV") {
+        TableInsertFormat::Csv
+    } else if input_format.eq_ignore_ascii_case("CSVWithNames") {
         TableInsertFormat::CsvWithNames
     } else if input_format.eq_ignore_ascii_case("TabSeparated") {
         TableInsertFormat::TabSeparated
@@ -1477,9 +1478,10 @@ enum TableInsertFormat {
 impl TableInsertFormat {
     const fn output_selector_rejection_message(self) -> &'static str {
         match self {
+            Self::Csv => "CSV INSERT does not accept an output format selector",
             Self::CsvWithNames => "CSVWithNames INSERT does not accept an output format selector",
             Self::TabSeparated => "TabSeparated INSERT does not accept an output format selector",
-            Self::Csv | Self::TabSeparatedWithNames => {
+            Self::TabSeparatedWithNames => {
                 "parameterized INSERT does not accept an output format selector"
             }
         }

@@ -5205,6 +5205,359 @@ fn parameterized_csv_with_names_insert_returns_503_without_waiting_for_a_reader(
 }
 
 #[test]
+fn parameterized_headerless_csv_insert_ingests_all_types_quoting_and_empty_input() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
+        .unwrap();
+
+    let bearer_csv = concat!(
+        "-9223372036854775808,2.5,true,\"comma, \"\"quoted\"\"\n",
+        "next\"\r\n",
+    )
+    .as_bytes();
+    let bearer_request = request_for_target_with_headers(
+        "/?query=INSERT+INTO+typed_values+FORMAT+CSV",
+        bearer_csv,
+        "Authorization: Bearer correct-token\r\nX-ClickHouse-Database: default\r\n",
+    );
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &bearer_request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+
+    let key_request = request_for_target_with_headers(
+        "/?database=default&query=insert+into+typed_values+format+csv%3B",
+        b"7,-3e2,false,plain\n",
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    let key_response = clickhouse_key_exchange(&database, "correct-key", &key_request);
+    assert_response_with_content_type(
+        &key_response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+
+    let empty_request = request_for_target_with_headers(
+        "/?query=INSERT+INTO+typed_values+FORMAT+CSV",
+        b"",
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    let empty_response = clickhouse_key_exchange(&database, "correct-key", &empty_request);
+    assert_response_with_content_type(
+        &empty_response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&empty_response);
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target(
+                "/query",
+                b"SELECT id, score, active, label FROM typed_values ORDER BY id;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"score","type":"Float64"},{"name":"active","type":"Bool"},{"name":"label","type":"String"}],"rows":[[-9223372036854775808,2.5,true,"comma, \"quoted\"\nnext"],[7,-300.0,false,"plain"]]}"#,
+    );
+}
+
+#[test]
+fn parameterized_headerless_csv_insert_preserves_auth_access_selectors_and_body_rules() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .unwrap();
+    let csv = b"1,rejected\n";
+
+    let (missing_credentials, body_offset) =
+        request_with_authorization_for_target("/?query=INSERT+INTO+events+FORMAT+CSV", csv, "");
+    let mut input = Cursor::new(missing_credentials);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let (selected_format, body_offset) = request_with_authorization_for_target(
+        "/?query=INSERT+INTO+events+FORMAT+CSV",
+        csv,
+        "Authorization: Bearer correct-token\r\nX-ClickHouse-Format: CSV\r\n",
+    );
+    let mut input = Cursor::new(selected_format);
+    response.clear();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"CSV INSERT does not accept an output format selector"}"#,
+    );
+
+    let (default_format, body_offset) = request_with_authorization_for_target(
+        "/?query=INSERT+INTO+events+FORMAT+CSV&default_format=JSON",
+        csv,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let mut input = Cursor::new(default_format);
+    response.clear();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"CSV INSERT does not accept an output format selector"}"#,
+    );
+
+    let (read_only_request, body_offset) = request_with_authorization_for_target(
+        "/?query=INSERT+INTO+events+FORMAT+CSV",
+        csv,
+        "Authorization: Bearer read-token\r\n",
+    );
+    let mut input = Cursor::new(read_only_request);
+    response.clear();
+    handle_http_query_read_only_with_bearer_token(
+        &database,
+        "read-token",
+        &mut input,
+        &mut response,
+    )
+    .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"POST /?query= does not accept a request body"}"#,
+    );
+
+    let (extra_sql, body_offset) = request_with_authorization_for_target(
+        "/?query=INSERT+INTO+events+FORMAT+CSV%3B+SELECT+1%3B",
+        csv,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let mut input = Cursor::new(extra_sql);
+    response.clear();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"POST /?query= does not accept a request body"}"#,
+    );
+
+    response.clear();
+    handle_http_query_with_bearer_token(
+        &database,
+        "correct-token",
+        Cursor::new(
+            b"POST /?query=INSERT+INTO+events+FORMAT+CSV HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+        ),
+        &mut response,
+    )
+    .unwrap();
+    assert_response(
+        &response,
+        "HTTP/1.1 411 Length Required",
+        r#"{"error":"Content-Length header is required"}"#,
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
+fn parameterized_headerless_csv_insert_preserves_limits_and_atomic_rollback() {
+    let database = SharedDatabase::with_max_rows_per_table(2);
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (9, 'existing');",
+        )
+        .unwrap();
+
+    let late_error = request_for_target_with_headers(
+        "/?query=INSERT+INTO+events+FORMAT+CSV",
+        b"1,valid\nwrong,late\n",
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    let late_response = clickhouse_key_exchange(&database, "correct-key", &late_error);
+    assert_response(
+        &late_response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"database CSV ingestion failed: CSV field at line 2, column 1 is not a valid Int64"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&late_response);
+
+    let oversized_csv = format!("2,{}\n", "x".repeat(128)).into_bytes();
+    let (oversized_request, body_offset) = request_with_authorization_for_target(
+        "/?query=INSERT+INTO+events+FORMAT+CSV",
+        &oversized_csv,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let mut input = Cursor::new(&oversized_request);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        &mut input,
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: oversized_csv.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"request body exceeds configured byte limit"}"#,
+    );
+
+    let mut input = Cursor::new(&oversized_request);
+    response.clear();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        &mut input,
+        &mut response,
+        HttpQueryLimits {
+            csv_ingest_limits: CsvIngestLimits::new(oversized_csv.len() - 1, 10, 20),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        &format!(
+            r#"{{"error":"database CSV ingestion failed: CSV input is {} bytes, exceeding the limit of {} bytes"}}"#,
+            oversized_csv.len(),
+            oversized_csv.len() - 1,
+        ),
+    );
+
+    let limited_csv = b"1,one\n2,two\n";
+    let limited_request = request_for_target_with_headers(
+        "/?query=INSERT+INTO+events+FORMAT+CSV",
+        limited_csv,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    for (csv_ingest_limits, expected_body) in [
+        (
+            CsvIngestLimits::new(limited_csv.len(), 1, 4),
+            r#"{"error":"database CSV ingestion failed: CSV record at line 2 raises the row count to 2, exceeding the limit of 1"}"#,
+        ),
+        (
+            CsvIngestLimits::new(limited_csv.len(), 2, 3),
+            r#"{"error":"database CSV ingestion failed: CSV record at line 2 raises the value count to 4, exceeding the limit of 3"}"#,
+        ),
+    ] {
+        response.clear();
+        handle_http_query_with_bearer_token_and_limits(
+            &database,
+            "correct-token",
+            Cursor::new(&limited_request),
+            &mut response,
+            HttpQueryLimits {
+                csv_ingest_limits,
+                ..HttpQueryLimits::default()
+            },
+        )
+        .unwrap();
+        assert_response(&response, "HTTP/1.1 400 Bad Request", expected_body);
+    }
+
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &limited_request),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"database CSV ingestion failed: could not ingest CSV input: table rows requires at least 3, exceeding the limit of 2"}"#,
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id, label FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[9,"existing"]]}"#,
+    );
+}
+
+#[test]
+fn parameterized_headerless_csv_insert_returns_503_without_waiting_for_a_reader() {
+    let mut initial = Database::new();
+    initial.execute("CREATE TABLE events (id Int64);").unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let mut reader = Some(inner.read().unwrap());
+    let request = request_for_target_with_headers(
+        "/?query=INSERT+INTO+events+FORMAT+CSV",
+        b"1\n",
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(clickhouse_key_exchange(
+                &worker_database,
+                "correct-key",
+                &request,
+            ))
+            .unwrap();
+    });
+
+    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(response) => response,
+        Err(error) => {
+            drop(reader.take());
+            worker.join().unwrap();
+            panic!("parameterized HTTP headerless CSV admission blocked behind a reader: {error}");
+        }
+    };
+    assert_response(
+        &response,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&response);
+    assert_eq!(
+        reader
+            .as_ref()
+            .unwrap()
+            .catalog()
+            .table("events")
+            .unwrap()
+            .row_count(),
+        0
+    );
+    drop(reader.take());
+    worker.join().unwrap();
+}
+
+#[test]
 fn parameterized_tab_separated_insert_works_with_both_credential_modes() {
     let database = SharedDatabase::default();
     database
