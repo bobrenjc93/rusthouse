@@ -230,6 +230,12 @@ against the normal result-byte cap before materialization. It accepts an
 optional `AS alias`; otherwise, the result column is named `LOWER(<column>)`.
 `WHERE`, ordering by that expression or its alias, and `LIMIT` are supported;
 non-`String` arguments and grouped query shapes are rejected.
+`UPPER(string_column)` is the symmetric ungrouped scalar projection. It
+uppercases ASCII letters while preserving every non-ASCII UTF-8 byte and the
+input byte length. It supports an optional `AS alias`, `WHERE`, ordering by
+the unaliased expression or alias, and `LIMIT`/`OFFSET`; non-`String` arguments
+and grouped query shapes are rejected. Its owned `String` results are charged
+exactly against the result-byte cap before materialization.
 `ABS(int64_column)` is an ungrouped scalar projection that returns a checked
 `Int64` absolute value. It supports an optional `AS alias`, ordering by the
 unaliased expression or alias, `WHERE`, and `LIMIT`. Filtering and limiting
