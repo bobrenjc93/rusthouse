@@ -945,6 +945,13 @@ impl Database {
                     });
                 }
             }
+            for (literal, role) in [(value, "assignment"), (predicate_value, "WHERE")] {
+                if matches!(literal, AlterUpdateLiteral::Float64(value) if !value.is_finite()) {
+                    return Err(Error::InvalidQuery(format!(
+                        "ALTER TABLE UPDATE {role} Float64 literal must be finite"
+                    )));
+                }
+            }
             enforce_scan_limit(
                 target,
                 query_result_limits,
@@ -971,6 +978,16 @@ impl Database {
                         })
                         .collect::<Vec<_>>()
                 }
+                (
+                    Column::Float64(predicate_values),
+                    AlterUpdateLiteral::Float64(predicate_value),
+                ) => predicate_values
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, current)| {
+                        (*current == predicate_value).then_some((row, replacement.clone()))
+                    })
+                    .collect::<Vec<_>>(),
                 _ => unreachable!(
                     "the ALTER TABLE UPDATE WHERE column was validated against its literal"
                 ),

@@ -155,19 +155,21 @@ semicolon is optional.
 
 `ALTER TABLE <table> UPDATE <target> = <literal> WHERE <column> = <literal>`
 provides one deliberately narrow ClickHouse-style mutation. The target and
-predicate may independently be existing `Int64` or `Bool` columns, and each
-literal must have its corresponding column's type. `Int64` literals support
-the complete optionally signed range, while Boolean literals are
-case-insensitive `TRUE` or `FALSE`. Table and column lookup is case-insensitive.
-The table and both columns are resolved and type-checked before the full source
-row count is checked against the configured scan limit. After that bounded
-scan, all matches from the original predicate column are passed to one atomic
-column replacement, including an empty replacement for zero matches. Invalid
-syntax, missing names, wrong types, and scan-limit failures leave the table
-unchanged. Expressions, additional assignments or predicates, other operators
-and physical types, and clauses such as `LIMIT` are not supported. A successful
-command reports its matched-row count through the library API and is silent in
-formatted CLI output.
+predicate may independently be existing `Int64`, `Float64`, or `Bool` columns,
+and each literal must have its corresponding column's type. `Int64` literals
+support the complete optionally signed range. `Float64` literals use finite,
+optionally signed decimal or scientific notation; a decimal point or exponent
+distinguishes them from `Int64` literals. Boolean literals are case-insensitive
+`TRUE` or `FALSE`. Table and column lookup is case-insensitive. The table and
+both columns are resolved, type-checked, and checked for finite Float64 literals
+before the full source row count is checked against the configured scan limit.
+After that bounded scan, all matches from the original predicate column are
+passed to one atomic column replacement, including an empty replacement for
+zero matches. Invalid syntax, missing names, wrong types, non-finite values, and
+scan-limit failures leave the table unchanged. Expressions, additional
+assignments or predicates, other operators, `String` operands, and clauses such
+as `LIMIT` are not supported. A successful command reports its matched-row
+count through the library API and is silent in formatted CLI output.
 
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,

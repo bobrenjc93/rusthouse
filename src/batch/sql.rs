@@ -85,7 +85,7 @@ pub enum Statement {
         predicate_column: String,
         predicate_value: i64,
     },
-    /// The same exact mutation shape when either literal is Boolean.
+    /// The same exact mutation shape when either literal is Boolean or Float64.
     AlterUpdateTyped {
         table: String,
         target_column: String,
@@ -161,17 +161,34 @@ pub enum Statement {
 }
 
 /// A non-allocating literal accepted by the exact `ALTER TABLE UPDATE` form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum AlterUpdateLiteral {
     Int64(i64),
+    Float64(f64),
     Bool(bool),
 }
+
+impl PartialEq for AlterUpdateLiteral {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int64(left), Self::Int64(right)) => left == right,
+            (Self::Float64(left), Self::Float64(right)) => {
+                left == right || left.total_cmp(right).is_eq()
+            }
+            (Self::Bool(left), Self::Bool(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AlterUpdateLiteral {}
 
 impl AlterUpdateLiteral {
     #[must_use]
     pub const fn data_type(self) -> DataType {
         match self {
             Self::Int64(_) => DataType::Int64,
+            Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
         }
     }
@@ -180,6 +197,7 @@ impl AlterUpdateLiteral {
     pub const fn value(self) -> Value {
         match self {
             Self::Int64(value) => Value::Int64(value),
+            Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
         }
     }
@@ -1959,9 +1977,22 @@ impl<'a> Parser<'a> {
         };
         let number = self.take_number().ok_or_else(|| Error::Sql {
             position,
-            message: format!("expected an Int64 or Bool literal in {context}"),
+            message: format!("expected an Int64, Float64, or Bool literal in {context}"),
         })?;
         let literal = format!("{sign}{number}");
+        if literal.contains(['.', 'e', 'E']) {
+            let value = literal.parse::<f64>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid Float64 literal '{literal}' in {context}"),
+            })?;
+            if !value.is_finite() {
+                return Err(Error::Sql {
+                    position,
+                    message: format!("Float64 literal must be finite in {context}"),
+                });
+            }
+            return Ok(AlterUpdateLiteral::Float64(value));
+        }
         literal
             .parse::<i64>()
             .map(AlterUpdateLiteral::Int64)
