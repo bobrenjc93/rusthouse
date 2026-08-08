@@ -155,6 +155,8 @@ pub enum Statement {
     },
     /// Exact compatibility query exposing RustHouse's single logical database.
     ShowDatabases,
+    /// Exact metadata query exposing the configured query and table limits.
+    ShowSettings,
     ShowTables,
     ShowCreateTable {
         name: String,
@@ -1169,6 +1171,13 @@ impl<'a> Parser<'a> {
                 return self.error("unexpected trailing input after SHOW DATABASES");
             }
             return Ok(Statement::ShowDatabases);
+        }
+
+        if self.eat_keyword("SETTINGS") {
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after SHOW SETTINGS");
+            }
+            return Ok(Statement::ShowSettings);
         }
 
         self.expect_keyword("TABLES")?;
