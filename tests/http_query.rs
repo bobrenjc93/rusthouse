@@ -3064,9 +3064,9 @@ fn authenticated_csv_insert_ingests_all_physical_types_quoting_and_is_query_visi
     database
         .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
         .unwrap();
-    let csv = b"id,score,active,label\r\n\
--9223372036854775808,1.5,true,\"comma, quote \"\" and LF\nline\"\r\n\
-9223372036854775807,-0.125,false,\"CRLF\r\nline\"\r\n";
+    let csv = b"label,active,score,id\r\n\
+\"comma, quote \"\" and LF\nline\",true,1.5,-9223372036854775808\r\n\
+\"CRLF\r\nline\",false,-0.125,9223372036854775807\r\n";
     let (request, _) = request_with_authorization_for_target(
         "/insert/typed_values",
         csv,
