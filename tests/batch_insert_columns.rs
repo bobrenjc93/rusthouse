@@ -161,6 +161,37 @@ fn explicit_insert_columns_reject_duplicates_unknowns_wrong_widths_and_types() {
 }
 
 #[test]
+fn reordered_multiple_type_errors_report_the_first_schema_column_for_both_insert_apis() {
+    let expected = Error::TypeMismatch {
+        context: "column 'metrics.id'".to_owned(),
+        expected: "Int64".to_owned(),
+        actual: "String".to_owned(),
+    };
+    let invalid = "INSERT INTO metrics (label, id) VALUES (1, 'x');";
+
+    let mut ordinary = Database::new();
+    ordinary
+        .execute("CREATE TABLE metrics (id Int64, label String);")
+        .expect("create ordinary target");
+    assert_eq!(ordinary.execute(invalid), Err(expected.clone()));
+    assert_eq!(ordinary.catalog().table("metrics").unwrap().row_count(), 0);
+
+    let mut atomic = Database::new();
+    atomic
+        .execute(
+            "CREATE TABLE events (id Int64); \
+             CREATE TABLE metrics (id Int64, label String);",
+        )
+        .expect("create atomic targets");
+    assert_eq!(
+        atomic.execute_insert_batch(&format!("INSERT INTO events VALUES (1); {invalid}")),
+        Err(expected),
+    );
+    assert_eq!(atomic.catalog().table("events").unwrap().row_count(), 0);
+    assert_eq!(atomic.catalog().table("metrics").unwrap().row_count(), 0);
+}
+
+#[test]
 fn named_insert_batch_reorders_before_validation_and_rolls_back_every_target() {
     let mut database = Database::new();
     database

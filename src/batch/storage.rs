@@ -427,8 +427,8 @@ impl Table {
     /// are rejected. Omitted columns receive their type's non-null default:
     /// `0`, `0.0`, `false`, or an empty String when the prepared rows are
     /// committed. After column and row-width validation, `capacity_rows` is
-    /// checked before supplied values are type-checked. Atomic callers pass
-    /// the cumulative rows for this table.
+    /// checked before supplied values are type-checked in schema order. Atomic
+    /// callers pass the cumulative rows for this table.
     pub(crate) fn prepare_insert_rows(
         &self,
         insert_columns: Option<&[String]>,
@@ -489,8 +489,10 @@ impl Table {
 
     /// Validates projected input and retains omitted columns for defaulting at commit.
     ///
-    /// `schema_indexes` maps each input field to its physical schema column. Callers
-    /// must resolve a unique, nonempty set of indexes before calling this helper.
+    /// `schema_indexes` maps each input field to its physical schema column.
+    /// Callers must resolve a unique, nonempty set of indexes before calling
+    /// this helper. Supplied values are validated in physical schema order,
+    /// independent of their input order.
     pub(crate) fn prepare_projected_rows(
         &self,
         schema_indexes: Vec<usize>,
@@ -518,6 +520,10 @@ impl Table {
             sorted.dedup();
             sorted.len() == schema_indexes.len()
         });
+        let mut input_indexes_by_schema = vec![None; self.schema.len()];
+        for (input_index, &schema_index) in schema_indexes.iter().enumerate() {
+            input_indexes_by_schema[schema_index] = Some(input_index);
+        }
 
         for row in &rows {
             if row.len() != schema_indexes.len() {
@@ -532,8 +538,10 @@ impl Table {
         self.validate_row_capacity(capacity_rows)?;
 
         for row in &rows {
-            for (&schema_index, value) in schema_indexes.iter().zip(row) {
-                self.validate_value(&self.schema[schema_index], value)?;
+            for (field, input_index) in self.schema.iter().zip(&input_indexes_by_schema) {
+                if let Some(input_index) = input_index {
+                    self.validate_value(field, &row[*input_index])?;
+                }
             }
         }
 
