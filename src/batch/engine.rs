@@ -509,12 +509,12 @@ impl Database {
         )
     }
 
-    pub(crate) fn table_row_counts(&self) -> Vec<(String, usize)> {
-        self.catalog.table_row_counts()
+    pub(crate) fn table_metrics(&self) -> Vec<(String, usize, usize)> {
+        self.catalog.table_metrics()
     }
 
-    pub(crate) fn table_row_metric_variable_bytes(&self) -> (usize, usize) {
-        self.catalog.table_row_metric_variable_bytes()
+    pub(crate) fn table_metric_variable_bytes(&self) -> (usize, usize, usize) {
+        self.catalog.table_metric_variable_bytes()
     }
 
     fn table_mut(&mut self, name: &str) -> Result<DatabaseTableMut<'_>> {

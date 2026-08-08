@@ -30,13 +30,13 @@ pub struct DatabaseMetrics {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DatabaseMetricsWithTableRows {
+pub(crate) struct DatabaseMetricsWithTables {
     pub(crate) totals: DatabaseMetrics,
-    pub(crate) table_rows: Vec<(String, usize)>,
+    pub(crate) tables: Vec<(String, usize, usize)>,
 }
 
 pub(crate) enum DatabaseMetricsSnapshot {
-    Available(DatabaseMetricsWithTableRows),
+    Available(DatabaseMetricsWithTables),
     ResponseLimitExceeded,
     Unavailable,
 }
@@ -233,16 +233,16 @@ impl SharedDatabase {
         })
     }
 
-    /// Captures database totals plus owned per-table row counts under one
-    /// nonblocking read-lock attempt.
+    /// Captures database totals plus owned per-table row and cached
+    /// retained-value byte counts under one nonblocking read-lock attempt.
     ///
     /// The allocation-free sizing callback runs before table names are sorted
     /// or cloned. The table entries are sorted by case-insensitive name and the
     /// read guard is released before the owned snapshot is returned for
     /// response writing.
-    pub(crate) fn metrics_snapshot_with_table_rows(
+    pub(crate) fn metrics_snapshot_with_tables(
         &self,
-        response_fits: impl FnOnce(DatabaseMetrics, usize, usize) -> bool,
+        response_fits: impl FnOnce(DatabaseMetrics, usize, usize, usize) -> bool,
     ) -> DatabaseMetricsSnapshot {
         let database = match self.inner.try_read() {
             Ok(database) => database,
@@ -258,13 +258,19 @@ impl SharedDatabase {
             retained_row_count,
             retained_value_bytes,
         };
-        let (table_name_bytes, row_count_bytes) = database.table_row_metric_variable_bytes();
-        if !response_fits(totals, table_name_bytes, row_count_bytes) {
+        let (table_name_bytes, row_count_bytes, retained_value_byte_count_bytes) =
+            database.table_metric_variable_bytes();
+        if !response_fits(
+            totals,
+            table_name_bytes,
+            row_count_bytes,
+            retained_value_byte_count_bytes,
+        ) {
             return DatabaseMetricsSnapshot::ResponseLimitExceeded;
         }
-        let table_rows = database.table_row_counts();
+        let tables = database.table_metrics();
         drop(database);
-        DatabaseMetricsSnapshot::Available(DatabaseMetricsWithTableRows { totals, table_rows })
+        DatabaseMetricsSnapshot::Available(DatabaseMetricsWithTables { totals, tables })
     }
 
     /// Parses and executes a complete SQL batch under one database lock.
@@ -704,7 +710,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_row_snapshot_preflight_rejects_before_materializing_names() {
+    fn table_snapshot_preflight_sizes_rows_and_bytes_before_materializing_names() {
         let database = SharedDatabase::default();
         database
             .execute(
@@ -716,11 +722,12 @@ mod tests {
             )
             .unwrap();
 
-        let snapshot = database.metrics_snapshot_with_table_rows(
-            |totals, table_name_bytes, row_count_bytes| {
+        let snapshot = database.metrics_snapshot_with_tables(
+            |totals, table_name_bytes, row_count_bytes, retained_value_byte_count_bytes| {
                 assert_eq!(totals.table_count, 2);
                 assert_eq!(table_name_bytes, "Alpha".len() + "longer_name".len());
                 assert_eq!(row_count_bytes, 3);
+                assert_eq!(retained_value_byte_count_bytes, 3);
                 false
             },
         );

@@ -10,7 +10,7 @@ use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
     write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
 };
-use crate::batch::shared_database::{DatabaseMetricsSnapshot, DatabaseMetricsWithTableRows};
+use crate::batch::shared_database::{DatabaseMetricsSnapshot, DatabaseMetricsWithTables};
 use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
 use crate::batch::tsv::{TsvIngestError, TsvIngestLimits};
@@ -177,9 +177,10 @@ impl StdError for HttpQueryError {
 /// enable INSERT execution on standard query routes.
 ///
 /// `GET /metrics` accepts no request body and returns four unlabeled Prometheus
-/// gauges for database totals plus one `rusthouse_table_rows` gauge per current
-/// table. It takes a nonblocking, consistent database metrics snapshot; lock
-/// contention and poisoning return `503`.
+/// gauges for database totals plus `rusthouse_table_rows` and
+/// `rusthouse_table_retained_value_bytes` gauges per current table. It takes a
+/// nonblocking, consistent database metrics snapshot; lock contention and
+/// poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
 /// database. `GET /ready` also accepts no body and returns the same successful
@@ -640,10 +641,14 @@ fn handle_http_query_exchange(
             );
         }
         HttpRequest::Metrics => {
-            let metrics = match database.metrics_snapshot_with_table_rows(
-                |totals, table_name_bytes, row_count_bytes| {
-                    let body_bytes =
-                        prometheus_metrics_body_len(totals, table_name_bytes, row_count_bytes);
+            let metrics = match database.metrics_snapshot_with_tables(
+                |totals, table_name_bytes, row_count_bytes, retained_value_byte_count_bytes| {
+                    let body_bytes = prometheus_metrics_body_len(
+                        totals,
+                        table_name_bytes,
+                        row_count_bytes,
+                        retained_value_byte_count_bytes,
+                    );
                     response_len(
                         Status::OK,
                         &[],
@@ -2257,11 +2262,18 @@ const TABLE_ROWS_METRIC_HEADER: &str = concat!(
 );
 const TABLE_ROW_METRIC_PREFIX: &str = "rusthouse_table_rows{table=\"";
 const TABLE_ROW_METRIC_SEPARATOR: &str = "\"} ";
+const TABLE_RETAINED_VALUE_BYTES_METRIC_HEADER: &str = concat!(
+    "# HELP rusthouse_table_retained_value_bytes Scalar payload bytes retained by a table.\n",
+    "# TYPE rusthouse_table_retained_value_bytes gauge\n",
+);
+const TABLE_RETAINED_VALUE_BYTES_METRIC_PREFIX: &str =
+    "rusthouse_table_retained_value_bytes{table=\"";
 
 fn prometheus_metrics_body_len(
     totals: crate::DatabaseMetrics,
     table_name_bytes: usize,
     row_count_bytes: usize,
+    retained_value_byte_count_bytes: usize,
 ) -> usize {
     let fixed_bytes = TABLES_METRIC_PREFIX
         .len()
@@ -2269,6 +2281,7 @@ fn prometheus_metrics_body_len(
         .saturating_add(RETAINED_ROWS_METRIC_PREFIX.len())
         .saturating_add(RETAINED_VALUE_BYTES_METRIC_PREFIX.len())
         .saturating_add(TABLE_ROWS_METRIC_HEADER.len())
+        .saturating_add(TABLE_RETAINED_VALUE_BYTES_METRIC_HEADER.len())
         .saturating_add(4)
         .saturating_add(usize_decimal_len(totals.table_count))
         .saturating_add(usize_decimal_len(totals.column_count))
@@ -2277,18 +2290,22 @@ fn prometheus_metrics_body_len(
     let per_table_fixed_bytes = TABLE_ROW_METRIC_PREFIX
         .len()
         .saturating_add(TABLE_ROW_METRIC_SEPARATOR.len())
+        .saturating_add(1)
+        .saturating_add(TABLE_RETAINED_VALUE_BYTES_METRIC_PREFIX.len())
+        .saturating_add(TABLE_ROW_METRIC_SEPARATOR.len())
         .saturating_add(1);
     fixed_bytes
         .saturating_add(totals.table_count.saturating_mul(per_table_fixed_bytes))
-        .saturating_add(table_name_bytes)
+        .saturating_add(table_name_bytes.saturating_mul(2))
         .saturating_add(row_count_bytes)
+        .saturating_add(retained_value_byte_count_bytes)
 }
 
 fn write_prometheus_metrics(
     output: &mut impl Write,
-    metrics: DatabaseMetricsWithTableRows,
+    metrics: DatabaseMetricsWithTables,
 ) -> io::Result<()> {
-    let DatabaseMetricsWithTableRows { totals, table_rows } = metrics;
+    let DatabaseMetricsWithTables { totals, tables } = metrics;
     output.write_all(TABLES_METRIC_PREFIX.as_bytes())?;
     writeln!(output, "{}", totals.table_count)?;
     output.write_all(COLUMNS_METRIC_PREFIX.as_bytes())?;
@@ -2298,11 +2315,18 @@ fn write_prometheus_metrics(
     output.write_all(RETAINED_VALUE_BYTES_METRIC_PREFIX.as_bytes())?;
     writeln!(output, "{}", totals.retained_value_bytes)?;
     output.write_all(TABLE_ROWS_METRIC_HEADER.as_bytes())?;
-    for (table, row_count) in table_rows {
+    for (table, row_count, _) in &tables {
         output.write_all(TABLE_ROW_METRIC_PREFIX.as_bytes())?;
         output.write_all(table.as_bytes())?;
         output.write_all(TABLE_ROW_METRIC_SEPARATOR.as_bytes())?;
         writeln!(output, "{row_count}")?;
+    }
+    output.write_all(TABLE_RETAINED_VALUE_BYTES_METRIC_HEADER.as_bytes())?;
+    for (table, _, retained_value_bytes) in tables {
+        output.write_all(TABLE_RETAINED_VALUE_BYTES_METRIC_PREFIX.as_bytes())?;
+        output.write_all(table.as_bytes())?;
+        output.write_all(TABLE_ROW_METRIC_SEPARATOR.as_bytes())?;
+        writeln!(output, "{retained_value_bytes}")?;
     }
     Ok(())
 }
