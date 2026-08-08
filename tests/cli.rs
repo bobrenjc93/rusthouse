@@ -715,6 +715,25 @@ fn csv_batch_filters_grouped_rows_with_a_count_alias() {
 }
 
 #[test]
+fn csv_batch_executes_grouped_count_if_with_alias_having_and_pagination() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (kind String, active Bool, included Bool);
+          INSERT INTO events VALUES
+              ('a', true, true), ('a', false, true),
+              ('b', true, true), ('b', true, true),
+              ('c', false, true), ('ignored', true, false);
+          SELECT kind, countIf(active) AS true_count FROM events
+          WHERE included = true GROUP BY kind HAVING true_count >= 1
+          ORDER BY true_count DESC, kind ASC LIMIT 1 OFFSET 1;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"kind,true_count\na,1\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_filters_grouped_rows_with_a_float64_aggregate_alias() {
     let output = run(
         &["--format", "csv"],

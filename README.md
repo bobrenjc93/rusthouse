@@ -11,7 +11,7 @@ The first useful release should support:
 - typed tables with `Int64`, `Float64`, `Bool`, and `String` columns;
 - a genuinely columnar in-memory representation;
 - `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
-- projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, `LIMIT`, and narrow `OFFSET` pagination;
+- projections, `WHERE` comparisons, `COUNT`, `countIf`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, `LIMIT`, and narrow `OFFSET` pagination;
 - a batch/interactive CLI with readable table, CSV, TSV, JSON, JSONEachRow,
   and JSONCompactEachRow output;
 - durable local snapshots with an explicit, documented file format;
@@ -49,7 +49,7 @@ available independently. Matches are case-sensitive, and the bounded text may
 be empty or Unicode. Other placements of `%` and patterns with excess wildcards
 are rejected. The single-wildcard pattern `LIKE '%'` is the shared empty
 prefix/suffix form and matches every String, so `NOT LIKE '%'` matches none.
-`COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
+`COUNT`, `countIf`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT <count> [OFFSET <offset>]`. Grouped results can be
 filtered by comparing a unique projected numeric aggregate alias to a finite
 `Int64` or `Float64` threshold in `HAVING`. This includes `COUNT`, numeric
@@ -58,8 +58,11 @@ filtered by comparing a unique projected numeric aggregate alias to a finite
 `String` or `Bool` `MIN` and `MAX`. HAVING filtering happens before `ORDER BY`,
 `LIMIT`, and `OFFSET`. Empty `SUM`, `MIN`, `MAX`, and `AVG` results are typed
 `NULL` values: they satisfy `IS NULL`, do not satisfy `IS NOT NULL`, and remain
-unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` is
-always non-`NULL`.
+unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` and
+`countIf` are always non-`NULL`. `countIf(bool_column)` counts rows where its
+non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
+global and grouped aggregation, including aliases, `HAVING`, ordering, and
+pagination. `countIf(*)` and non-`Bool` arguments are rejected.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
@@ -231,8 +234,8 @@ first-seen order. Distinct tuples are collected under the grouped-query cap
 before ordering, `LIMIT`, and `OFFSET`, and the paged output remains subject to
 the normal result caps. Each operand of a union applies its own DISTINCT
 pagination clauses before the union combines the operand results.
-Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
-`MAX`, and `AVG` are typed `NULL` values.
+Empty aggregate inputs produce one row: `COUNT` and `countIf` are `Int64` zero,
+while `SUM`, `MIN`, `MAX`, and `AVG` are typed `NULL` values.
 
 `int64_column - signed_int64_literal` is a checked, ungrouped scalar projection.
 It accepts an optional `AS alias`; otherwise, its normalized expression is the
