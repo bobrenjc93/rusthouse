@@ -296,7 +296,7 @@ fn query_executes_not_between_for_distinct_where_over_http() {
 }
 
 #[test]
-fn query_pages_ordered_distinct_typed_in_results_over_http() {
+fn query_accepts_clickhouse_comma_limit_pagination_over_http() {
     let database = SharedDatabase::default();
     database
         .execute(
@@ -311,7 +311,7 @@ fn query_pages_ordered_distinct_typed_in_results_over_http() {
             &database,
             &request(
                 b"SELECT DISTINCT label FROM readings WHERE id IN (2, 3, 4) \
-                  ORDER BY label LIMIT 1 OFFSET 1;",
+                  ORDER BY label LIMIT 1, 1;",
             ),
         ),
         "HTTP/1.1 200 OK",

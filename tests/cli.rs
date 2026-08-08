@@ -139,12 +139,12 @@ fn csv_batch_pages_filtered_ordered_distinct_tuples() {
 }
 
 #[test]
-fn csv_batch_pages_filtered_ordered_rows_with_limit_offset() {
+fn csv_batch_accepts_clickhouse_comma_limit_pagination() {
     let output = run(
         &["--format", "csv"],
         b"CREATE TABLE events (id Int64, active Bool); \
           INSERT INTO events VALUES (4, true), (1, true), (3, false), (2, true), (5, true); \
-          SELECT id FROM events WHERE active = true ORDER BY id LIMIT 2 OFFSET 1;",
+          SELECT id FROM events WHERE active = true ORDER BY id LIMIT 1, 2;",
     );
 
     assert!(output.status.success(), "{:?}", output.stderr);
