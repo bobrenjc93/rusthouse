@@ -1,5 +1,7 @@
 use std::fmt;
 
+use super::value::DataType;
+
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -45,6 +47,10 @@ pub enum Error {
         context: String,
         expected: String,
         actual: String,
+    },
+    InvalidCast {
+        source_type: DataType,
+        target_type: DataType,
     },
     UnionColumnCountMismatch {
         left: usize,
@@ -137,6 +143,13 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "type mismatch for {context}: expected {expected}, found {actual}"
+            ),
+            Self::InvalidCast {
+                source_type,
+                target_type,
+            } => write!(
+                f,
+                "invalid {source_type} value for CAST({source_type} AS {target_type})"
             ),
             Self::UnionColumnCountMismatch { left, right } => write!(
                 f,

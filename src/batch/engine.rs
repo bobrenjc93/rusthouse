@@ -8,8 +8,8 @@ use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin,
-    DeleteComparisonPredicate, Having, HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement, VersionSelect,
+    CurrentDatabaseSelect, DeleteComparisonPredicate, Having, HavingPredicate, LiteralSelect,
+    Operand, OrderBy, Predicate, Select, SelectItem, Statement, VersionSelect,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
@@ -772,6 +772,7 @@ impl Database {
             } => self.execute_insert_statement(table, Some(columns), rows),
             statement @ (Statement::LiteralSelect(_)
             | Statement::VersionSelect(_)
+            | Statement::CurrentDatabaseSelect(_)
             | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
@@ -797,6 +798,9 @@ impl Database {
             }
             Statement::VersionSelect(select) => {
                 self.execute_version_select(select, query_result_limits)
+            }
+            Statement::CurrentDatabaseSelect(select) => {
+                self.execute_current_database_select(select, query_result_limits)
             }
             Statement::Select(select) => self.execute_select(select, query_result_limits),
             Statement::CrossJoin(cross_join) => {
@@ -1010,6 +1014,40 @@ impl Database {
                 data_type: DataType::String,
             }],
             rows: vec![vec![Value::String(PACKAGE_VERSION.to_owned())]],
+        })
+    }
+
+    fn execute_current_database_select(
+        &self,
+        select: CurrentDatabaseSelect,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const RESULT_COLUMN_NAME: &str = "currentDatabase()";
+        const DATABASE_NAME: &str = "default";
+
+        let column_name = select
+            .alias
+            .unwrap_or_else(|| RESULT_COLUMN_NAME.to_owned());
+        let fixed_bytes = validate_result_shape_parts(
+            1,
+            1,
+            1,
+            column_name.len(),
+            query_result_limits,
+            SELECT_RESULT_RESOURCES,
+        )?;
+        enforce_resource_limit(
+            SELECT_RESULT_RESOURCES.bytes,
+            fixed_bytes.saturating_add(DATABASE_NAME.len()),
+            query_result_limits.max_bytes,
+        )?;
+
+        Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: column_name,
+                data_type: DataType::String,
+            }],
+            rows: vec![vec![Value::String(DATABASE_NAME.to_owned())]],
         })
     }
 
@@ -1332,7 +1370,7 @@ impl Database {
                 &items,
                 &ordering,
                 selection_limit,
-            );
+            )?;
             apply_offset(&mut matching_rows, select.offset.unwrap_or(0));
             validate_projection_result_limits(
                 table,
@@ -1446,6 +1484,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
+        | Statement::CurrentDatabaseSelect(_)
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
@@ -2019,6 +2058,9 @@ enum ResolvedItem {
     CastBoolToInt64 {
         source: usize,
     },
+    CastStringToInt64 {
+        source: usize,
+    },
     CastInt64ToBool {
         source: usize,
     },
@@ -2237,6 +2279,9 @@ fn resolve_select_items(
                     (DataType::Bool, DataType::Int64) => {
                         Some(ResolvedItem::CastBoolToInt64 { source })
                     }
+                    (DataType::String, DataType::Int64) => {
+                        Some(ResolvedItem::CastStringToInt64 { source })
+                    }
                     (DataType::Int64, DataType::Bool) => {
                         Some(ResolvedItem::CastInt64ToBool { source })
                     }
@@ -2258,7 +2303,7 @@ fn resolve_select_items(
                     let expected = match target_type {
                         DataType::Float64 => "Int64 or Bool",
                         DataType::Bool => "Int64 or Float64",
-                        DataType::Int64 => "Float64 or Bool",
+                        DataType::Int64 => "Float64, Bool, or String",
                         DataType::String => "Int64, Float64, or Bool",
                     };
                     return Err(Error::TypeMismatch {
@@ -2653,6 +2698,9 @@ fn execute_projection(
                         ResolvedItem::CastBoolToInt64 { source } => {
                             Value::Int64(if bool_at(table, *source, *row) { 1 } else { 0 })
                         }
+                        ResolvedItem::CastStringToInt64 { source } => {
+                            Value::Int64(checked_string_to_int64(string_at(table, *source, *row))?)
+                        }
                         ResolvedItem::CastInt64ToBool { source } => {
                             Value::Bool(int64_at(table, *source, *row) != 0)
                         }
@@ -2817,6 +2865,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
+                | ResolvedItem::CastStringToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
@@ -2894,6 +2943,7 @@ fn validate_grouped_result_limits(
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
+                | ResolvedItem::CastStringToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
@@ -3368,6 +3418,7 @@ impl GroupedData<'_> {
                         | ResolvedItem::CastBoolToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. }
                         | ResolvedItem::CastBoolToInt64 { .. }
+                        | ResolvedItem::CastStringToInt64 { .. }
                         | ResolvedItem::CastInt64ToBool { .. }
                         | ResolvedItem::CastFloat64ToBool { .. }
                         | ResolvedItem::CastInt64ToString { .. }
@@ -3739,7 +3790,9 @@ fn resolved_expression_name(
         ResolvedItem::CastBoolToFloat64 { source } => {
             format!("CAST({} AS Float64)", table.schema()[*source].name)
         }
-        ResolvedItem::CastFloat64ToInt64 { source } | ResolvedItem::CastBoolToInt64 { source } => {
+        ResolvedItem::CastFloat64ToInt64 { source }
+        | ResolvedItem::CastBoolToInt64 { source }
+        | ResolvedItem::CastStringToInt64 { source } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
         ResolvedItem::CastInt64ToBool { source } | ResolvedItem::CastFloat64ToBool { source } => {
@@ -3789,12 +3842,28 @@ fn order_source_rows(
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
-) {
+) -> Result<()> {
     if ordering.is_empty() {
         if let Some(limit) = limit {
             rows.truncate(limit);
         }
-        return;
+        return Ok(());
+    }
+    if limit == Some(0) {
+        rows.clear();
+        return Ok(());
+    }
+
+    // A String-to-Int64 ordering key must have valid decimal syntax for every
+    // candidate row. Values outside the Int64 range can still be ordered as
+    // mathematical integers, so overflow remains deferred until LIMIT/OFFSET
+    // have selected the rows that are actually converted.
+    for order in ordering {
+        if let ResolvedItem::CastStringToInt64 { source } = items[order.output] {
+            for row in rows.iter().copied() {
+                decimal_text(string_at(table, source, row)).ok_or_else(invalid_string_cast)?;
+            }
+        }
     }
 
     sort_and_limit(rows, limit, |left, right| {
@@ -3823,6 +3892,10 @@ fn order_source_rows(
                 ResolvedItem::CastBoolToInt64 { source } => {
                     bool_at(table, source, left).cmp(&bool_at(table, source, right))
                 }
+                ResolvedItem::CastStringToInt64 { source } => decimal_text_cmp(
+                    string_at(table, source, left),
+                    string_at(table, source, right),
+                ),
                 ResolvedItem::CastInt64ToBool { source } => {
                     (int64_at(table, source, left) != 0).cmp(&(int64_at(table, source, right) != 0))
                 }
@@ -3892,6 +3965,7 @@ fn order_source_rows(
         }
         left.cmp(&right)
     });
+    Ok(())
 }
 
 fn order_grouped_rows(
@@ -3923,6 +3997,7 @@ fn order_grouped_rows(
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
+                | ResolvedItem::CastStringToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
@@ -4084,6 +4159,70 @@ fn checked_float64_to_int64(value: f64) -> Result<i64> {
         return Err(Error::NumericOverflow("CAST(Float64 AS Int64)".to_owned()));
     }
     Ok(value.trunc() as i64)
+}
+
+fn checked_string_to_int64(value: &str) -> Result<i64> {
+    decimal_text(value).ok_or_else(invalid_string_cast)?;
+    value
+        .parse::<i64>()
+        .map_err(|_| Error::NumericOverflow("CAST(String AS Int64)".to_owned()))
+}
+
+fn invalid_string_cast() -> Error {
+    Error::InvalidCast {
+        source_type: DataType::String,
+        target_type: DataType::Int64,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DecimalText<'a> {
+    negative: bool,
+    magnitude: &'a [u8],
+}
+
+fn decimal_text(value: &str) -> Option<DecimalText<'_>> {
+    let bytes = value.as_bytes();
+    let (negative, digits) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        Some(_) => (false, bytes),
+        None => return None,
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+
+    let first_nonzero = digits.iter().position(|digit| *digit != b'0');
+    let magnitude = first_nonzero.map_or_else(
+        || &digits[digits.len() - 1..],
+        |first_nonzero| &digits[first_nonzero..],
+    );
+    Some(DecimalText {
+        negative: negative && magnitude != b"0",
+        magnitude,
+    })
+}
+
+fn decimal_text_cmp(left: &str, right: &str) -> Ordering {
+    let left = decimal_text(left).expect("String-to-Int64 ordering values were validated");
+    let right = decimal_text(right).expect("String-to-Int64 ordering values were validated");
+    match (left.negative, right.negative) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (left_negative, _) => {
+            let magnitude_order = left
+                .magnitude
+                .len()
+                .cmp(&right.magnitude.len())
+                .then_with(|| left.magnitude.cmp(right.magnitude));
+            if left_negative {
+                magnitude_order.reverse()
+            } else {
+                magnitude_order
+            }
+        }
+    }
 }
 
 fn string_at(table: &Table, source: usize, row: usize) -> &str {

@@ -473,6 +473,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
     match statement {
         statement @ (Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
+        | Statement::CurrentDatabaseSelect(_)
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }

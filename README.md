@@ -186,6 +186,14 @@ named `version()` unless an alias is supplied. Arguments, expression lists,
 the probe charges one SQL AST list item and uses the normal query row, value,
 byte, retained-result, and formatted-output limits.
 
+The exact case-insensitive probe `SELECT currentDatabase() [AS <alias>]`
+returns RustHouse's single logical database, `default`, as one `String` row.
+Its result column is named `currentDatabase()` unless an alias is supplied.
+Arguments, expression lists, `FROM`, `WHERE`, `ORDER BY`, `LIMIT`, and other
+trailing clauses are rejected; the probe charges one SQL AST list item and
+uses the normal query row, value, byte, retained-result, and formatted-output
+limits.
+
 The exact case-insensitive `SHOW DATABASES` returns one `String` column named
 `name` containing RustHouse's single logical database, `default`. Arguments and
 trailing clauses are rejected, and the result uses the normal query row, value,
@@ -246,6 +254,7 @@ not fail the query. A selected overflow or non-`Int64` argument is a typed error
 `SELECT` projections support `CAST(int64_column AS Float64)`,
 `CAST(bool_column AS Float64)`,
 `CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`,
+`CAST(string_column AS Int64)`,
 `CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`, and
 `CAST(int64_column AS String)`, `CAST(float64_column AS String)`, and
 `CAST(bool_column AS String)`. Integer-to-String casts use canonical base-10
@@ -263,7 +272,14 @@ lexicographically. Boolean-to-String casts produce the exact lowercase values
 `true`. For `Float64`, positive and negative zero become `false`, while every
 finite nonzero value becomes `true`. Float-to-integer casts truncate finite
 values toward zero and report typed numeric-overflow errors outside the
-`Int64` range.
+`Int64` range. String-to-integer casts accept nonempty, trim-free ASCII
+base-10 digits with one optional leading `+` or `-`; leading zeroes are
+accepted, and both `Int64` extrema are exact. Empty, whitespace-padded, or
+otherwise malformed text returns a typed invalid-cast error, while values
+outside the `Int64` range return a typed numeric-overflow error. Ordering this
+cast compares the mathematical integer values rather than the source text;
+syntactically valid out-of-range values can therefore be ordered and removed
+by `LIMIT`/`OFFSET` without being converted.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
@@ -467,8 +483,9 @@ return owned projection rows. Existing catalog failures remain typed, and lock
 poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
-engine. Its `query` method accepts exactly one `SELECT`, `SHOW DATABASES`, `SHOW
-TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
+engine. Its `query` method accepts exactly one `SELECT` (including `version()`
+and `currentDatabase()` probes), `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE
+TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
 shared read lock, and returns an owned, resource-bounded result, so cloned handles can run
 analytical reads concurrently. `try_query` and `try_query_with_result_limit`
 accept and validate the same single read-only statement before making one
