@@ -3710,7 +3710,7 @@ fn authenticated_insert_route_rolls_back_invalid_and_mixed_batches() {
 }
 
 #[test]
-fn insert_route_is_bearer_only_exact_and_does_not_make_query_routes_mutable() {
+fn insert_route_is_bearer_only_exact_and_standard_query_writes_require_authentication() {
     let database = SharedDatabase::default();
     database.execute("CREATE TABLE events (id Int64);").unwrap();
     let sql = b"INSERT INTO events VALUES (1);";
@@ -3739,10 +3739,11 @@ fn insert_route_is_bearer_only_exact_and_does_not_make_query_routes_mutable() {
         sql,
         "Authorization: Bearer correct-token\r\n",
     );
-    assert_response(
+    assert_response_with_content_type(
         &authenticated_exchange(&database, "correct-token", &query_request),
-        "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
     );
 
     for target in ["/insert/", "/insert?async=1"] {
@@ -3780,8 +3781,389 @@ fn insert_route_is_bearer_only_exact_and_does_not_make_query_routes_mutable() {
             &request_for_target("/query", b"SELECT id FROM events;"),
         ),
         "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[1]]}"#,
+    );
+}
+
+#[test]
+fn authenticated_standard_post_routes_insert_with_both_credential_modes() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+
+    for (target, sql) in [
+        (
+            "/",
+            &b"INSERT INTO events VALUES (1); INSERT INTO events VALUES (2);"[..],
+        ),
+        ("/query", &b"INSERT INTO events VALUES (3);"[..]),
+    ] {
+        let (request, _) = request_with_authorization_for_target(
+            target,
+            sql,
+            "Authorization: Bearer correct-token\r\n",
+        );
+        assert_response_with_content_type(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8",
+            b"",
+        );
+    }
+
+    let key_response = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"POST /?database=default&query=INSERT+INTO+events+VALUES+%284%29%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\nX-ClickHouse-Database: default\r\n\r\n",
+    );
+    assert_response_with_content_type(
+        &key_response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events ORDER BY id;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[1],[2],[3],[4]]}"#,
+    );
+}
+
+#[test]
+fn get_and_unauthenticated_standard_query_routes_remain_read_only() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let sql = b"INSERT INTO events VALUES (1);";
+    let read_only_error = r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#;
+
+    for request in [
+        request_for_target("/", sql),
+        request_for_target("/query", sql),
+        b"POST /?query=INSERT+INTO+events+VALUES+%281%29%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            .to_vec(),
+    ] {
+        assert_response(
+            &exchange(&database, &request),
+            "HTTP/1.1 400 Bad Request",
+            read_only_error,
+        );
+    }
+
+    assert_response(
+        &authenticated_exchange(
+            &database,
+            "correct-token",
+            b"GET /?query=INSERT+INTO+events+VALUES+%281%29%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        read_only_error,
+    );
+
+    let (missing_credentials, body_offset) =
+        request_with_authorization_for_target("/query", sql, "");
+    let mut input = Cursor::new(missing_credentials);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let (invalid_database, body_offset) = request_with_authorization_for_target(
+        "/",
+        sql,
+        "Authorization: Bearer correct-token\r\nX-ClickHouse-Database: analytics\r\n",
+    );
+    let mut input = Cursor::new(invalid_database);
+    response.clear();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"X-ClickHouse-Database header must be default"}"#,
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
     );
+}
+
+#[test]
+fn standard_query_inserts_reject_mixed_batches_formats_and_late_failures_atomically() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64); \
+             CREATE TABLE readings (value Float64); \
+             CREATE TABLE protected (id Int64); \
+             INSERT INTO protected VALUES (9);",
+        )
+        .unwrap();
+
+    let (mixed, _) = request_with_authorization_for_target(
+        "/query",
+        b"INSERT INTO events VALUES (1); SELECT id FROM events;",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &mixed),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"INSERT-only batch accepts only INSERT statements; found SELECT"}"#,
+    );
+
+    let late_failure = request_for_target_with_headers(
+        "/",
+        b"INSERT INTO events VALUES (2); INSERT INTO readings VALUES ('wrong');",
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    let late_failure_response = clickhouse_key_exchange(&database, "correct-key", &late_failure);
+    assert_response(
+        &late_failure_response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"type mismatch for column 'readings.value': expected Float64, found String"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&late_failure_response);
+
+    let (formatted, _) = request_with_authorization_for_target(
+        "/query",
+        b"INSERT INTO events VALUES (3);",
+        "Authorization: Bearer correct-token\r\nX-ClickHouse-Format: CSVWithNames\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &formatted),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+
+    let default_formatted = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"POST /?query=INSERT+INTO+events+VALUES+%284%29%3B&default_format=JSON HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+    );
+    assert_response(
+        &default_formatted,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&default_formatted);
+
+    let (non_insert, _) = request_with_authorization_for_target(
+        "/",
+        b"DELETE FROM protected WHERE id = 9;",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &non_insert),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DELETE"}"#,
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM protected;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[9]]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT value FROM readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Float64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
+fn standard_query_inserts_preserve_sql_body_capacity_and_response_limits() {
+    let sql = b"INSERT INTO events VALUES (1);";
+    let body_limited_database = SharedDatabase::default();
+    body_limited_database
+        .execute("CREATE TABLE events (id Int64);")
+        .unwrap();
+    let (oversized_body, body_offset) = request_with_authorization_for_target(
+        "/query",
+        sql,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let mut input = Cursor::new(&oversized_body);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &body_limited_database,
+        "correct-token",
+        &mut input,
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: sql.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"request body exceeds configured byte limit"}"#,
+    );
+
+    let mut url_response = Vec::new();
+    handle_http_query_with_clickhouse_key_and_limits(
+        &body_limited_database,
+        "correct-key",
+        Cursor::new(
+            b"POST /?query=INSERT+INTO+events+VALUES+%281%29%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+        ),
+        &mut url_response,
+        HttpQueryLimits {
+            max_sql_bytes: sql.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_response(
+        &url_response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"SQL query exceeds configured byte limit"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&url_response);
+
+    let capacity_database = SharedDatabase::with_max_rows_per_table(1);
+    capacity_database
+        .execute("CREATE TABLE events (id Int64);")
+        .unwrap();
+    let (capacity_request, _) = request_with_authorization_for_target(
+        "/",
+        b"INSERT INTO events VALUES (1); INSERT INTO events VALUES (2);",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&capacity_database, "correct-token", &capacity_request),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"table rows requires at least 2, exceeding the limit of 1"}"#,
+    );
+    assert_response(
+        &exchange(
+            &capacity_database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+
+    let (response_limited_request, _) =
+        request_with_authorization_for_target("/", sql, "Authorization: Bearer correct-token\r\n");
+    let sizing_database = SharedDatabase::default();
+    sizing_database
+        .execute("CREATE TABLE events (id Int64);")
+        .unwrap();
+    let success_response =
+        authenticated_exchange(&sizing_database, "correct-token", &response_limited_request);
+    let response_limited_database = SharedDatabase::default();
+    response_limited_database
+        .execute("CREATE TABLE events (id Int64);")
+        .unwrap();
+    let max_response_bytes = success_response.len() - 1;
+    let mut limited_output = Vec::new();
+    let error = handle_http_query_with_bearer_token_and_limits(
+        &response_limited_database,
+        "correct-token",
+        Cursor::new(response_limited_request),
+        &mut limited_output,
+        HttpQueryLimits {
+            max_response_bytes,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("the insert success response exceeds the configured cap");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes, .. }
+            if max_bytes == max_response_bytes
+    ));
+    assert!(limited_output.is_empty());
+    assert_response(
+        &exchange(
+            &response_limited_database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
+fn authenticated_standard_query_insert_returns_503_without_waiting_for_a_reader() {
+    let mut initial = Database::new();
+    initial.execute("CREATE TABLE events (id Int64);").unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let mut reader = Some(inner.read().unwrap());
+    let (request, _) = request_with_authorization_for_target(
+        "/query",
+        b"INSERT INTO events VALUES (1);",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(authenticated_exchange(
+                &worker_database,
+                "correct-token",
+                &request,
+            ))
+            .unwrap();
+    });
+
+    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(response) => response,
+        Err(error) => {
+            drop(reader.take());
+            worker.join().unwrap();
+            panic!("standard HTTP insert admission blocked behind a reader: {error}");
+        }
+    };
+    assert_response(
+        &response,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    assert_eq!(
+        reader
+            .as_ref()
+            .unwrap()
+            .catalog()
+            .table("events")
+            .unwrap()
+            .row_count(),
+        0
+    );
+    drop(reader.take());
+    worker.join().unwrap();
 }
 
 #[test]
