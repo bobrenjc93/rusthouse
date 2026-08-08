@@ -10,10 +10,11 @@ use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
     write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
 };
+use crate::batch::shared_database::DatabaseMetricsWithTableRows;
 use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
 use crate::batch::tsv::{TsvIngestError, TsvIngestLimits};
-use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
+use crate::{SharedDatabase, SharedDatabaseError};
 
 /// Default maximum size of the request line and headers, including the final
 /// empty line.
@@ -166,10 +167,10 @@ impl StdError for HttpQueryError {
 /// same credentials but do not expose either explicit insertion route or
 /// enable INSERT execution on standard query routes.
 ///
-/// `GET /metrics` accepts no request body and returns four Prometheus gauges
-/// for retained tables, columns, rows, and scalar payload bytes. The byte gauge
-/// is named `rusthouse_retained_value_bytes`. It takes a nonblocking, consistent
-/// database metrics snapshot; lock contention and poisoning return `503`.
+/// `GET /metrics` accepts no request body and returns four unlabeled Prometheus
+/// gauges for database totals plus one `rusthouse_table_rows` gauge per current
+/// table. It takes a nonblocking, consistent database metrics snapshot; lock
+/// contention and poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
 /// database. `GET /ready` also accepts no body and returns the same successful
@@ -630,7 +631,7 @@ fn handle_http_query_exchange(
             );
         }
         HttpRequest::Metrics => {
-            let Some(metrics) = database.metrics_snapshot() else {
+            let Some(metrics) = database.metrics_snapshot_with_table_rows() else {
                 return write_error_response(
                     &mut output,
                     Status::SERVICE_UNAVAILABLE,
@@ -2016,7 +2017,11 @@ const CONTENT_TYPE_TEXT: &[u8] = b"text/plain; charset=utf-8";
 const CONTENT_TYPE_TSV: &[u8] = b"text/tab-separated-values; charset=utf-8";
 const CONTENT_TYPE_PROMETHEUS: &[u8] = b"text/plain; version=0.0.4; charset=utf-8";
 
-fn write_prometheus_metrics(output: &mut impl Write, metrics: DatabaseMetrics) -> io::Result<()> {
+fn write_prometheus_metrics(
+    output: &mut impl Write,
+    metrics: DatabaseMetricsWithTableRows,
+) -> io::Result<()> {
+    let DatabaseMetricsWithTableRows { totals, table_rows } = metrics;
     writeln!(
         output,
         "# HELP rusthouse_tables Number of tables retained by the database.\n\
@@ -2030,12 +2035,22 @@ fn write_prometheus_metrics(output: &mut impl Write, metrics: DatabaseMetrics) -
          rusthouse_retained_rows {}\n\
          # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
          # TYPE rusthouse_retained_value_bytes gauge\n\
-         rusthouse_retained_value_bytes {}",
-        metrics.table_count,
-        metrics.column_count,
-        metrics.retained_row_count,
-        metrics.retained_value_bytes,
-    )
+         rusthouse_retained_value_bytes {}\n\
+         # HELP rusthouse_table_rows Number of rows retained by a table.\n\
+         # TYPE rusthouse_table_rows gauge",
+        totals.table_count,
+        totals.column_count,
+        totals.retained_row_count,
+        totals.retained_value_bytes,
+    )?;
+    for (table, row_count) in table_rows {
+        writeln!(
+            output,
+            "rusthouse_table_rows{{table=\"{}\"}} {}",
+            table, row_count
+        )?;
+    }
+    Ok(())
 }
 
 fn write_error_response(

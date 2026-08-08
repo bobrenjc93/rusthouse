@@ -244,6 +244,18 @@ impl Catalog {
         tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         tables.into_iter().map(|(_, table)| table.name()).collect()
     }
+
+    /// Returns owned display names and row counts in deterministic,
+    /// case-insensitive table-name order.
+    #[must_use]
+    pub(crate) fn table_row_counts(&self) -> Vec<(String, usize)> {
+        let mut tables = self.tables.iter().collect::<Vec<_>>();
+        tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        tables
+            .into_iter()
+            .map(|(_, table)| (table.name().to_owned(), table.row_count()))
+            .collect()
+    }
 }
 
 fn saturating_usize(value: u128) -> usize {
@@ -300,6 +312,14 @@ mod tests {
         assert_eq!(catalog.retained_row_count(), 0);
         assert_eq!(catalog.table_name_bytes(), 14);
         assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
+        assert_eq!(
+            catalog.table_row_counts(),
+            [
+                ("Alpha".to_owned(), 0),
+                ("beta".to_owned(), 0),
+                ("zebra".to_owned(), 0),
+            ]
+        );
     }
 
     #[test]

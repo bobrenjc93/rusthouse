@@ -29,6 +29,12 @@ pub struct DatabaseMetrics {
     pub retained_value_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DatabaseMetricsWithTableRows {
+    pub(crate) totals: DatabaseMetrics,
+    pub(crate) table_rows: Vec<(String, usize)>,
+}
+
 /// An error produced while accessing a [`SharedDatabase`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedDatabaseError {
@@ -218,6 +224,31 @@ impl SharedDatabase {
             column_count,
             retained_row_count,
             retained_value_bytes,
+        })
+    }
+
+    /// Captures database totals plus owned per-table row counts under one
+    /// nonblocking read-lock attempt.
+    ///
+    /// The table entries are sorted by case-insensitive name and the read guard
+    /// is released before the owned snapshot is returned for response writing.
+    pub(crate) fn metrics_snapshot_with_table_rows(&self) -> Option<DatabaseMetricsWithTableRows> {
+        let database = match self.inner.try_read() {
+            Ok(database) => database,
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return None,
+        };
+        let (table_count, column_count, retained_row_count, retained_value_bytes) =
+            database.retained_metrics();
+        let table_rows = database.table_row_counts();
+        drop(database);
+        Some(DatabaseMetricsWithTableRows {
+            totals: DatabaseMetrics {
+                table_count,
+                column_count,
+                retained_row_count,
+                retained_value_bytes,
+            },
+            table_rows,
         })
     }
 

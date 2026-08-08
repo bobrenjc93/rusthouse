@@ -509,6 +509,10 @@ impl Database {
         )
     }
 
+    pub(crate) fn table_row_counts(&self) -> Vec<(String, usize)> {
+        self.catalog.table_row_counts()
+    }
+
     fn table_mut(&mut self, name: &str) -> Result<DatabaseTableMut<'_>> {
         let Self {
             catalog,

@@ -165,8 +165,9 @@ fn metrics_body(
     columns: usize,
     retained_rows: usize,
     retained_value_bytes: usize,
+    table_rows: &[(&str, usize)],
 ) -> String {
-    format!(
+    let mut body = format!(
         "# HELP rusthouse_tables Number of tables retained by the database.\n\
          # TYPE rusthouse_tables gauge\n\
          rusthouse_tables {tables}\n\
@@ -178,8 +179,16 @@ fn metrics_body(
          rusthouse_retained_rows {retained_rows}\n\
          # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
          # TYPE rusthouse_retained_value_bytes gauge\n\
-         rusthouse_retained_value_bytes {retained_value_bytes}\n"
-    )
+         rusthouse_retained_value_bytes {retained_value_bytes}\n\
+         # HELP rusthouse_table_rows Number of rows retained by a table.\n\
+         # TYPE rusthouse_table_rows gauge\n"
+    );
+    for (table, rows) in table_rows {
+        body.push_str(&format!(
+            "rusthouse_table_rows{{table=\"{table}\"}} {rows}\n"
+        ));
+    }
+    body
 }
 
 fn assert_ok_metrics_response(
@@ -188,12 +197,20 @@ fn assert_ok_metrics_response(
     columns: usize,
     retained_rows: usize,
     retained_value_bytes: usize,
+    table_rows: &[(&str, usize)],
 ) {
     assert_response_with_content_type(
         response,
         "HTTP/1.1 200 OK",
         "text/plain; version=0.0.4; charset=utf-8",
-        metrics_body(tables, columns, retained_rows, retained_value_bytes).as_bytes(),
+        metrics_body(
+            tables,
+            columns,
+            retained_rows,
+            retained_value_bytes,
+            table_rows,
+        )
+        .as_bytes(),
     );
 }
 
@@ -928,26 +945,49 @@ fn metrics_reports_state_changes_as_prometheus_gauges() {
     let database = SharedDatabase::default();
     const REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 0, 0, 0, 0);
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 0, 0, 0, 0, &[]);
     database
         .execute(
-            "CREATE TABLE events (id Int64, score Float64, active Bool, label String); \
-             CREATE TABLE flags (active Bool); \
-             INSERT INTO events VALUES (1, 1.5, true, 'one'), (2, 2.5, false, 'two'); \
-             INSERT INTO flags VALUES (true);",
+            "CREATE TABLE zebra (id Int64, score Float64, active Bool, label String); \
+             CREATE TABLE Alpha (active Bool);",
         )
         .unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 2, 5, 3, 41);
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        2,
+        5,
+        0,
+        0,
+        &[("Alpha", 0), ("zebra", 0)],
+    );
 
     database
-        .execute("DELETE FROM events WHERE id = 2;")
+        .execute(
+            "INSERT INTO zebra VALUES (1, 1.5, true, 'one'), (2, 2.5, false, 'two'); \
+             INSERT INTO Alpha VALUES (true);",
+        )
         .unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 2, 5, 2, 21);
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        2,
+        5,
+        3,
+        41,
+        &[("Alpha", 1), ("zebra", 2)],
+    );
 
-    database
-        .execute("TRUNCATE TABLE events; DROP TABLE flags;")
-        .unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 1, 4, 0, 0);
+    database.execute("TRUNCATE TABLE zebra;").unwrap();
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        2,
+        5,
+        1,
+        1,
+        &[("Alpha", 1), ("zebra", 0)],
+    );
+
+    database.execute("DROP TABLE Alpha;").unwrap();
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 1, 4, 0, 0, &[("zebra", 0)]);
 }
 
 #[test]
@@ -1036,6 +1076,7 @@ fn metrics_requires_exact_get_without_a_body_and_retains_bearer_authentication()
         0,
         0,
         0,
+        &[],
     );
 }
 
@@ -3012,7 +3053,7 @@ fn clickhouse_key_authentication_wires_query_insert_and_operational_routes() {
         key,
         b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
     );
-    assert_ok_metrics_response(&metrics_response, 1, 1, 1, 8);
+    assert_ok_metrics_response(&metrics_response, 1, 1, 1, 8, &[("events", 1)]);
     assert_clickhouse_key_response_is_not_cacheable(&metrics_response);
 }
 
@@ -3075,13 +3116,14 @@ fn authenticated_read_only_modes_wire_queries_and_operational_routes() {
         1,
         1,
         8,
+        &[("events", 1)],
     );
     let key_metrics = read_only_clickhouse_key_exchange(
         &database,
         "read-key",
         b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: read-key\r\n\r\n",
     );
-    assert_ok_metrics_response(&key_metrics, 1, 1, 1, 8);
+    assert_ok_metrics_response(&key_metrics, 1, 1, 1, 8, &[("events", 1)]);
     assert_clickhouse_key_response_is_not_cacheable(&key_metrics);
 }
 
@@ -3956,6 +3998,9 @@ fn ready_honors_exact_header_and_complete_response_byte_limits() {
 #[test]
 fn metrics_honors_the_complete_response_byte_limit() {
     let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE Observed (id Int64); INSERT INTO Observed VALUES (1), (2);")
+        .unwrap();
     let request = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let expected_response = exchange(&database, request);
 
