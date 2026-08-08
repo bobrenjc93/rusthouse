@@ -301,7 +301,7 @@ aggregate projections or `GROUP BY`. Generated `String` payload bytes—four or
 five for booleans, one through twenty for integers, and one through 327 for
 finite floats—are charged exactly against the result-byte limit before
 materialization. No other source/target type pairs are accepted.
-`LENGTH(string_column)` is another ungrouped scalar projection and returns the
+`LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
 `LENGTH(<column>)`. `WHERE` filters source rows before evaluation, and the
@@ -309,6 +309,16 @@ unaliased expression can be ordered with `ORDER BY LENGTH(<column>)`; aliased
 projections can be ordered by their alias. Both forms support `LIMIT`.
 Non-`String` arguments and byte lengths outside the `Int64` range are reported
 as typed errors.
+`lengthUTF8(string_column)` is the Unicode counterpart: it returns the number
+of Unicode scalar values as `Int64`. For a column containing `é`, it returns
+one while `LENGTH` returns two bytes. Combining marks and zero-width joiners
+count as their own scalar values. The function is case-insensitive in SQL and
+accepts the same optional alias, `WHERE`, expression-or-alias ordering, and
+`LIMIT`/`OFFSET` behavior as `LENGTH`; its default result name uses the
+ClickHouse spelling `lengthUTF8(<column>)`. Evaluation and ordering scan the
+UTF-8 text without creating a transformed `String`, and result bounds charge
+only the fixed-size `Int64` output. Non-`String` arguments and grouped query
+shapes are rejected with typed errors.
 `LOWER(string_column)` is an ungrouped scalar projection that lowercases ASCII
 letters while leaving every non-ASCII UTF-8 byte unchanged. Because this
 transformation preserves byte length, its owned `String` results are charged
@@ -530,17 +540,22 @@ whose sender may be awaiting an interim response.
 `POST /` and `POST /query` are equivalent query routes. Each requires one
 decimal `Content-Length` and sends its UTF-8 SQL body through
 `SharedDatabase::try_query`. The standard ClickHouse-style
-`GET /?query=<percent-encoded SQL>` form does the same with exactly one query
-parameter and no body (`Content-Length` may be omitted or be zero). Its value
-uses form-style decoding: each `%HH` escape becomes one byte and `+` becomes a
-space, followed by strict UTF-8 validation. Malformed escapes, invalid UTF-8,
-and an unencoded `&` introducing any extra parameter are rejected. The decoded
-SQL is subject to the same SQL byte limit as a POST body, and all query forms
-use the read-only, exactly-one-statement `SharedDatabase::try_query` path.
-Successful responses use the same compact JSON column metadata and
-positional-row shape as `--format json`; protocol and query failures return
-deterministic JSON error objects with an appropriate HTTP status. All other
-targets and query-string shapes are rejected.
+`GET /?query=<percent-encoded SQL>` form does the same with no body
+(`Content-Length` may be omitted or be zero). It also accepts one optional
+`database=default` parameter before or after `query`, including percent-encoded
+parameter names and values. All names and values use form-style decoding: each
+`%HH` escape becomes one byte and `+` becomes a space. The decoded SQL then
+undergoes strict UTF-8 validation and is subject to the same SQL byte limit as
+a POST body; the database parameter does not count toward that limit. Empty
+parameters or values, duplicate `query` or `database` parameters, unknown
+parameters, malformed escapes, non-default database values, and invalid SQL
+UTF-8 are rejected. Parameter validation follows configured authentication and
+precedes database access. All query forms use the read-only,
+exactly-one-statement `SharedDatabase::try_query` path. Successful responses use
+the same compact JSON column metadata and positional-row shape as `--format
+json`; protocol and query failures return deterministic JSON error objects with
+an appropriate HTTP status. All other targets and query-string shapes are
+rejected.
 
 Every query route and both authenticated insert routes accept one optional
 `X-ClickHouse-Database: default` header for ClickHouse client compatibility.
@@ -551,6 +566,8 @@ values return `400 Bad Request`. Database-header validation runs after either
 configured authentication mode, so credential failures retain precedence, but
 before a POST body is read or any database lock is attempted. Omitting the
 header retains the existing single-database behavior.
+For GET queries, the header and `database=default` query parameter may coexist;
+each is validated independently against the same single database.
 
 The bearer- and `X-ClickHouse-Key`-authenticated handlers additionally expose
 exact `POST /insert`. It requires one decimal `Content-Length`, applies the
@@ -582,10 +599,10 @@ response as the SQL insert route. The unauthenticated handlers do not recognize
 it.
 
 HTTP query admission never waits for the database lock. After request parsing,
-authentication, optional database-header validation, SQL decoding, and
-read-only statement validation, each query makes one immediate shared
-read-lock attempt. Concurrent readers are admitted; an active writer returns
-`503 Service Unavailable` with the deterministic JSON body
+authentication, optional database-header and query-parameter validation, SQL
+decoding, and read-only statement validation, each query makes one immediate
+shared read-lock attempt. Concurrent readers are admitted; an active writer
+returns `503 Service Unavailable` with the deterministic JSON body
 `{"error":"database is unavailable"}`. A poisoned lock remains a `500 Internal
 Server Error`, and SQL errors remain `400 Bad Request`. Authentication, database
 and format header validation, SQL/result resource limits, and the complete HTTP

@@ -82,9 +82,10 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// Checked `Int64` column-minus-literal expressions, `CAST`, `LENGTH`, `LOWER`,
-/// `UPPER`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned
-/// `ROW_NUMBER` window forms provide bounded projections in ungrouped queries.
+/// Checked `Int64` column-minus-literal expressions, `CAST`, `LENGTH`,
+/// `lengthUTF8`, `LOWER`, `UPPER`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, and the
+/// minimal unpartitioned `ROW_NUMBER` window forms provide bounded projections
+/// in ungrouped queries.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
@@ -2082,6 +2083,9 @@ enum ResolvedItem {
     StringLength {
         source: usize,
     },
+    StringLengthUtf8 {
+        source: usize,
+    },
     StringLower {
         source: usize,
     },
@@ -2353,6 +2357,30 @@ fn resolve_select_items(
                     name: alias
                         .clone()
                         .unwrap_or_else(|| format!("LENGTH({})", table.schema()[source].name)),
+                    data_type: DataType::Int64,
+                });
+            }
+            SelectItem::LengthUtf8 { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::String {
+                    return Err(Error::TypeMismatch {
+                        context: format!("lengthUTF8 argument '{name}'"),
+                        expected: DataType::String.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "lengthUTF8 projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::StringLengthUtf8 { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("lengthUTF8({})", table.schema()[source].name)),
                     data_type: DataType::Int64,
                 });
             }
@@ -2728,6 +2756,9 @@ fn execute_projection(
                         ResolvedItem::StringLength { source } => Value::Int64(
                             string_length_to_i64(string_at(table, *source, *row).len())?,
                         ),
+                        ResolvedItem::StringLengthUtf8 { source } => Value::Int64(
+                            string_length_utf8_to_i64(string_at(table, *source, *row))?,
+                        ),
                         ResolvedItem::StringLower { source } => {
                             Value::String(string_at(table, *source, *row).to_ascii_lowercase())
                         }
@@ -2882,6 +2913,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. }
                 | ResolvedItem::StringLength { .. }
+                | ResolvedItem::StringLengthUtf8 { .. }
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::Float64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
@@ -2964,6 +2996,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringLengthUtf8 { .. } => {
+                    unreachable!("lengthUTF8 projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLower { .. } => {
                     unreachable!("LOWER projections are restricted to ungrouped queries")
@@ -3441,6 +3476,11 @@ impl GroupedData<'_> {
                         ResolvedItem::StringLength { .. } => {
                             unreachable!("LENGTH projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::StringLengthUtf8 { .. } => {
+                            unreachable!(
+                                "lengthUTF8 projections are restricted to ungrouped queries"
+                            )
+                        }
                         ResolvedItem::StringLower { .. } => {
                             unreachable!("LOWER projections are restricted to ungrouped queries")
                         }
@@ -3821,6 +3861,9 @@ fn resolved_expression_name(
         ResolvedItem::StringLength { source } => {
             format!("LENGTH({})", table.schema()[*source].name)
         }
+        ResolvedItem::StringLengthUtf8 { source } => {
+            format!("lengthUTF8({})", table.schema()[*source].name)
+        }
         ResolvedItem::StringLower { source } => {
             format!("LOWER({})", table.schema()[*source].name)
         }
@@ -3948,6 +3991,10 @@ fn order_source_rows(
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
                     .cmp(&string_at(table, source, right).len()),
+                ResolvedItem::StringLengthUtf8 { source } => string_at(table, source, left)
+                    .chars()
+                    .count()
+                    .cmp(&string_at(table, source, right).chars().count()),
                 ResolvedItem::StringLower { source } => ascii_lower_cmp(
                     string_at(table, source, left),
                     string_at(table, source, right),
@@ -4039,6 +4086,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringLengthUtf8 { .. } => {
+                    unreachable!("lengthUTF8 projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLower { .. } => {
                     unreachable!("LOWER projections are restricted to ungrouped queries")
@@ -4347,6 +4397,11 @@ fn ascii_upper_cmp(left: &str, right: &str) -> Ordering {
 
 fn string_length_to_i64(length: usize) -> Result<i64> {
     i64::try_from(length).map_err(|_| Error::NumericOverflow("LENGTH(String)".to_owned()))
+}
+
+fn string_length_utf8_to_i64(value: &str) -> Result<i64> {
+    i64::try_from(value.chars().count())
+        .map_err(|_| Error::NumericOverflow("lengthUTF8(String)".to_owned()))
 }
 
 fn checked_int64_abs(value: i64) -> Result<i64> {
@@ -4664,6 +4719,14 @@ mod tests {
             string_length_to_i64(overflow),
             Err(Error::NumericOverflow("LENGTH(String)".to_owned()))
         );
+    }
+
+    #[test]
+    fn length_utf8_counts_unicode_scalars_without_allocating() {
+        assert_eq!(string_length_utf8_to_i64("ASCII"), Ok(5));
+        assert_eq!(string_length_utf8_to_i64("é東京"), Ok(3));
+        assert_eq!(string_length_utf8_to_i64("é"), Ok(2));
+        assert_eq!(string_length_utf8_to_i64("👨‍👩‍👧‍👦"), Ok(7));
     }
 
     #[test]

@@ -104,13 +104,16 @@ impl StdError for HttpQueryError {
 ///
 /// `POST /` and `POST /query` require exactly one decimal `Content-Length` and
 /// carry UTF-8 SQL in their body. `GET /?query=<percent-encoded SQL>` carries
-/// the same SQL in its sole form-style query parameter: percent escapes are
-/// decoded, `+` becomes a space, and no request body is accepted. All three
-/// forms pass the SQL to [`SharedDatabase::try_query`], which accepts exactly
-/// one read-only statement and makes one nonblocking read-lock attempt. Writer
-/// contention returns `503 Service Unavailable`; lock poisoning remains a
-/// `500 Internal Server Error`. A successful query response uses the same JSON
-/// result shape as the batch JSON formatter unless exactly one
+/// the same SQL in a required form-style query parameter and optionally accepts
+/// one `database=default` parameter in either order. Parameter names and values
+/// are percent-decoded, `+` becomes a space, and no request body is accepted.
+/// Empty, duplicate, unknown, and non-default parameters are rejected after
+/// authentication and before database access. All three forms pass the SQL to
+/// [`SharedDatabase::try_query`], which accepts exactly one read-only statement
+/// and makes one nonblocking read-lock attempt. Writer contention returns
+/// `503 Service Unavailable`; lock poisoning remains a `500 Internal Server Error`.
+/// A successful query response uses the same JSON result shape as the batch
+/// JSON formatter unless exactly one
 /// `X-ClickHouse-Format` header requests `CSVWithNames`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. CSV, TSV,
 /// and row-oriented JSON responses use the corresponding batch writers;
@@ -712,7 +715,7 @@ fn read_request(
                 input_format: request.table_insert_format,
             })
         }
-        RequestKind::Query(QuerySource::UrlEncoded(encoded_sql)) => {
+        RequestKind::Query(QuerySource::UrlEncodedParameters(encoded_parameters)) => {
             if request.content_length.unwrap_or(0) != 0 {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
@@ -721,7 +724,7 @@ fn read_request(
                 .into());
             }
 
-            let sql = decode_query_parameter(&encoded_sql, limits.max_sql_bytes)?;
+            let sql = decode_get_query_parameters(&encoded_parameters, limits.max_sql_bytes)?;
             String::from_utf8(sql)
                 .map(|sql| HttpRequest::Query {
                     sql,
@@ -942,7 +945,7 @@ enum TableInsertFormat {
 
 enum QuerySource {
     Body,
-    UrlEncoded(Vec<u8>),
+    UrlEncodedParameters(Vec<u8>),
 }
 
 fn parse_headers(
@@ -1224,7 +1227,7 @@ fn parse_request_line(
         )
         .into());
     }
-    const GET_QUERY_PREFIX: &[u8] = b"/?query=";
+    const GET_PARAMETERS_PREFIX: &[u8] = b"/?";
 
     match (method, target) {
         (b"POST", b"/" | b"/query") => Ok(RequestKind::Query(QuerySource::Body)),
@@ -1239,8 +1242,8 @@ fn parse_request_line(
                     ))
                 })
         }
-        (b"GET", target) if target.starts_with(GET_QUERY_PREFIX) => Ok(RequestKind::Query(
-            QuerySource::UrlEncoded(target[GET_QUERY_PREFIX.len()..].to_vec()),
+        (b"GET", target) if target.starts_with(GET_PARAMETERS_PREFIX) => Ok(RequestKind::Query(
+            QuerySource::UrlEncodedParameters(target[GET_PARAMETERS_PREFIX.len()..].to_vec()),
         )),
         (b"GET", b"/ping") => Ok(RequestKind::Ping),
         (b"GET", b"/ready") => Ok(RequestKind::Ready),
@@ -1251,12 +1254,14 @@ fn parse_request_line(
             &[b"Allow: POST\r\n"],
         )
         .into()),
-        (_, target) if target.starts_with(GET_QUERY_PREFIX) => Err(RequestFailure::with_headers(
-            Status::METHOD_NOT_ALLOWED,
-            "method must be GET for /?query=",
-            &[b"Allow: GET\r\n"],
-        )
-        .into()),
+        (_, target) if target.starts_with(b"/?query=") || target.starts_with(b"/?database=") => {
+            Err(RequestFailure::with_headers(
+                Status::METHOD_NOT_ALLOWED,
+                "method must be GET for /?query=",
+                &[b"Allow: GET\r\n"],
+            )
+            .into())
+        }
         (_, b"/ping") => Err(RequestFailure::with_headers(
             Status::METHOD_NOT_ALLOWED,
             "method must be GET for /ping",
@@ -1314,21 +1319,87 @@ fn parse_table_insert_target(target: &[u8]) -> Option<&str> {
     validate_table_name(table).is_ok().then_some(table)
 }
 
-fn decode_query_parameter(
-    encoded: &[u8],
+fn decode_get_query_parameters(
+    encoded_parameters: &[u8],
     max_sql_bytes: usize,
 ) -> Result<Vec<u8>, RequestReadError> {
-    let mut decoded = Vec::with_capacity(encoded.len().min(max_sql_bytes));
-    let mut index = 0_usize;
-    while index < encoded.len() {
-        let byte = match encoded[index] {
-            b'&' => {
+    let mut query = None;
+    let mut database_seen = false;
+
+    for encoded_parameter in encoded_parameters.split(|byte| *byte == b'&') {
+        let Some(equals) = encoded_parameter.iter().position(|byte| *byte == b'=') else {
+            return Err(RequestFailure::new(
+                Status::BAD_REQUEST,
+                "GET query parameters must have nonempty names and values",
+            )
+            .into());
+        };
+        let encoded_name = &encoded_parameter[..equals];
+        let encoded_value = &encoded_parameter[equals + 1..];
+        if encoded_name.is_empty() || encoded_value.is_empty() {
+            return Err(RequestFailure::new(
+                Status::BAD_REQUEST,
+                "GET query parameters must have nonempty names and values",
+            )
+            .into());
+        }
+
+        let name = decode_form_component(encoded_name, None)?;
+        match name.as_slice() {
+            b"query" => {
+                if query.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate query parameter",
+                    )
+                    .into());
+                }
+                query = Some(decode_form_component(encoded_value, Some(max_sql_bytes))?);
+            }
+            b"database" => {
+                if database_seen {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate database parameter",
+                    )
+                    .into());
+                }
+                database_seen = true;
+                if decode_form_component(encoded_value, None)? != b"default" {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "database query parameter must be default",
+                    )
+                    .into());
+                }
+            }
+            _ => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
-                    "GET query target must contain exactly one query parameter",
+                    "GET query target contains an unknown parameter",
                 )
                 .into());
             }
+        }
+    }
+
+    query.ok_or_else(|| {
+        RequestReadError::from(RequestFailure::new(
+            Status::BAD_REQUEST,
+            "GET query target must contain exactly one query parameter",
+        ))
+    })
+}
+
+fn decode_form_component(
+    encoded: &[u8],
+    max_decoded_bytes: Option<usize>,
+) -> Result<Vec<u8>, RequestReadError> {
+    let capacity = max_decoded_bytes.map_or(encoded.len(), |limit| encoded.len().min(limit));
+    let mut decoded = Vec::with_capacity(capacity);
+    let mut index = 0_usize;
+    while index < encoded.len() {
+        let byte = match encoded[index] {
             b'+' => b' ',
             b'%' => {
                 let Some(hex) = encoded.get(index + 1..index + 3) else {
@@ -1358,7 +1429,7 @@ fn decode_query_parameter(
             byte => byte,
         };
 
-        if decoded.len() == max_sql_bytes {
+        if max_decoded_bytes.is_some_and(|limit| decoded.len() == limit) {
             return Err(RequestFailure::new(
                 Status::PAYLOAD_TOO_LARGE,
                 "SQL query exceeds configured byte limit",
