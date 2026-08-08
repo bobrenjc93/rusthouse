@@ -722,6 +722,20 @@ impl Database {
             } => self.execute_alter_update_statement(
                 table,
                 target_column,
+                AlterUpdateLiteral::Int64(value),
+                predicate_column,
+                AlterUpdateLiteral::Int64(predicate_value),
+                query_result_limits,
+            ),
+            Statement::AlterUpdateTyped {
+                table,
+                target_column,
+                value,
+                predicate_column,
+                predicate_value,
+            } => self.execute_alter_update_statement(
+                table,
+                target_column,
                 value,
                 predicate_column,
                 predicate_value,
@@ -833,6 +847,7 @@ impl Database {
             | Statement::AddColumn { .. }
             | Statement::DropColumn { .. }
             | Statement::AlterUpdate { .. }
+            | Statement::AlterUpdateTyped { .. }
             | Statement::TruncateTable { .. }
             | Statement::Delete { .. }
             | Statement::DeleteComparison { .. }
@@ -1492,7 +1507,8 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::RenameColumn { .. }
         | Statement::AddColumn { .. }
         | Statement::DropColumn { .. }
-        | Statement::AlterUpdate { .. } => "ALTER TABLE",
+        | Statement::AlterUpdate { .. }
+        | Statement::AlterUpdateTyped { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Delete { .. }
         | Statement::DeleteComparison { .. }

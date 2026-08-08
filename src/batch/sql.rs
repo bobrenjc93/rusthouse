@@ -73,9 +73,20 @@ pub enum Statement {
         table: String,
         column: String,
     },
-    /// Exact Int64-or-Bool mutation: `ALTER TABLE <table> UPDATE <target> =
-    /// <literal> WHERE <column> = <literal>`.
+    /// Exact Int64 mutation: `ALTER TABLE <table> UPDATE <target> = <literal>
+    /// WHERE <column> = <literal>`.
+    ///
+    /// This original AST shape remains available for downstream callers that
+    /// construct or match Int64 updates directly.
     AlterUpdate {
+        table: String,
+        target_column: String,
+        value: i64,
+        predicate_column: String,
+        predicate_value: i64,
+    },
+    /// The same exact mutation shape when either literal is Boolean.
+    AlterUpdateTyped {
         table: String,
         target_column: String,
         value: AlterUpdateLiteral,
@@ -1267,12 +1278,23 @@ impl<'a> Parser<'a> {
             if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("unexpected trailing input after ALTER TABLE UPDATE");
             }
-            return Ok(Statement::AlterUpdate {
-                table,
-                target_column,
-                value,
-                predicate_column,
-                predicate_value,
+            return Ok(match (value, predicate_value) {
+                (AlterUpdateLiteral::Int64(value), AlterUpdateLiteral::Int64(predicate_value)) => {
+                    Statement::AlterUpdate {
+                        table,
+                        target_column,
+                        value,
+                        predicate_column,
+                        predicate_value,
+                    }
+                }
+                (value, predicate_value) => Statement::AlterUpdateTyped {
+                    table,
+                    target_column,
+                    value,
+                    predicate_column,
+                    predicate_value,
+                },
             });
         }
 

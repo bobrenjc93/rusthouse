@@ -33,14 +33,14 @@ fn parses_the_exact_int64_alter_update_shape_and_extrema() {
         Ok(vec![Statement::AlterUpdate {
             table: "Events".to_owned(),
             target_column: "Value".to_owned(),
-            value: AlterUpdateLiteral::Int64(i64::MIN),
+            value: i64::MIN,
             predicate_column: "Selector".to_owned(),
-            predicate_value: AlterUpdateLiteral::Int64(i64::MAX),
+            predicate_value: i64::MAX,
         }])
     );
     assert_eq!(
         parse("ALTER TABLE Events UPDATE Active = TrUe WHERE Selected = fAlSe"),
-        Ok(vec![Statement::AlterUpdate {
+        Ok(vec![Statement::AlterUpdateTyped {
             table: "Events".to_owned(),
             target_column: "Active".to_owned(),
             value: AlterUpdateLiteral::Bool(true),
@@ -48,6 +48,32 @@ fn parses_the_exact_int64_alter_update_shape_and_extrema() {
             predicate_value: AlterUpdateLiteral::Bool(false),
         }])
     );
+}
+
+#[test]
+fn original_public_int64_ast_shape_remains_directly_executable() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, value Int64); \
+             INSERT INTO events VALUES (1, 10), (2, 20), (2, 30);",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database.execute_statement(Statement::AlterUpdate {
+            table: "events".to_owned(),
+            target_column: "value".to_owned(),
+            value: -7,
+            predicate_column: "id".to_owned(),
+            predicate_value: 2,
+        }),
+        Ok(StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 2,
+        })
+    );
+    assert_eq!(int64_column(&database, "events", "value"), vec![10, -7, -7]);
 }
 
 #[test]
