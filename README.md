@@ -219,6 +219,13 @@ The exact case-insensitive `SHOW DATABASES` returns one `String` column named
 `name` containing RustHouse's single logical database, `default`. Arguments and
 trailing clauses are rejected, and the result uses the normal query row, value,
 byte, retained-result, and formatted-output limits.
+The exact case-insensitive `SHOW SETTINGS` returns `name` and `value` `String`
+columns for every configured `QueryResultLimits` and `TableLimits` field. Rows
+use stable `query_result_limits.<field>` and `table_limits.<field>` names in
+their respective struct declaration order, and values are unsigned decimal
+strings. Arguments and trailing clauses are rejected. The metadata result is
+itself subject to the configured query row, value, and byte limits plus the
+normal retained-result and formatted-output limits.
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
@@ -443,11 +450,11 @@ around that balanced tree. A `LIKE` pattern is one predicate node, and infix
 allocation-free matcher.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
-each `SELECT`, `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE
-TABLE`, or `EXISTS TABLE` query is executed and emitted before the next
-statement. Table output uses bordered, human-readable columns, escapes control
-characters, renders SQL `NULL` as `NULL`, and separates multiple query results
-with a blank line. Each
+each `SELECT`, `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW TABLES`, `SHOW CREATE
+TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` query is executed and emitted before
+the next statement. Table output uses bordered, human-readable columns, escapes
+control characters, renders SQL `NULL` as `NULL`, and separates multiple query
+results with a blank line. Each
 padded table is size-checked against a 16 MiB formatted-output limit before
 being streamed, so a wide cell cannot amplify many short rows into unbounded
 memory or output. CSV output uses a CSVWithNames-compatible header followed by
@@ -539,10 +546,11 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes), `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE
-TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
-shared read lock, and returns an owned, resource-bounded result, so cloned handles can run
-analytical reads concurrently. `try_query` and `try_query_with_result_limit`
+and `currentDatabase()` probes), `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
+TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
+shared read lock, and returns an owned, resource-bounded result, so cloned
+handles can run analytical reads concurrently. `try_query` and
+`try_query_with_result_limit`
 accept and validate the same single read-only statement before making one
 nonblocking read-lock attempt. They return the typed `DatabaseBusy` error when
 a writer prevents immediate lock acquisition, while lock poisoning, SQL

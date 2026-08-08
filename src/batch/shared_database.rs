@@ -60,7 +60,7 @@ impl fmt::Display for SharedDatabaseError {
             ),
             Self::ReadOnlyStatementRequired { statement } => write!(
                 formatter,
-                "read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found {statement}"
+                "read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found {statement}"
             ),
             Self::DatabaseBusy => write!(formatter, "shared database is busy"),
             Self::LockPoisoned => write!(formatter, "shared database lock is poisoned"),
@@ -105,8 +105,9 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// Each SQL batch is completely parsed before the database lock is acquired.
 /// [`Self::execute`] retains one write lock while every statement executes, so
 /// statements from concurrent mutating batches cannot interleave. [`Self::query`]
-/// executes one `SELECT`, `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE TABLE`,
-/// `DESCRIBE TABLE`, or `EXISTS TABLE` under a shared read lock.
+/// executes one `SELECT`, `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW TABLES`,
+/// `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` under a shared read
+/// lock.
 /// [`Self::try_query`] accepts the same input but returns
 /// [`SharedDatabaseError::DatabaseBusy`] instead of waiting for a writer.
 /// [`Self::try_execute_insert_batch`] similarly attempts
@@ -479,6 +480,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         | Statement::UnionAll { .. }
         | Statement::UnionDistinct { .. }
         | Statement::ShowDatabases
+        | Statement::ShowSettings
         | Statement::ShowTables
         | Statement::ShowCreateTable { .. }
         | Statement::DescribeTable { .. }

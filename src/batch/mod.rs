@@ -121,9 +121,10 @@ impl StdError for BatchError {
 ///
 /// `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE
 /// TABLE`, `DELETE`, and `INSERT` statements are silent. Each `SELECT`, `SHOW
-/// DATABASES`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
-/// TABLE` result is rendered with the existing table formatter. Results remain
-/// in statement order and are separated by one blank line.
+/// DATABASES`, `SHOW SETTINGS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE
+/// TABLE`, or `EXISTS TABLE` result is rendered with the existing table
+/// formatter. Results remain in statement order and are separated by one blank
+/// line.
 pub fn run_table_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
     run_table_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
 }
@@ -142,10 +143,10 @@ pub fn run_table_batch_with_limit(
 ///
 /// `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE
 /// TABLE`, `DELETE`, and `INSERT` statements are silent. `SELECT`, `SHOW
-/// DATABASES`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, and
-/// `EXISTS TABLE` produce query results. All statements share one in-memory
-/// catalog, and the SQL parser handles semicolons inside string literals rather
-/// than splitting on raw bytes.
+/// DATABASES`, `SHOW SETTINGS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE
+/// TABLE`, and `EXISTS TABLE` produce query results. All statements share one
+/// in-memory catalog, and the SQL parser handles semicolons inside string
+/// literals rather than splitting on raw bytes.
 pub fn run_csv_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
     run_batch_with_limit(
         input,

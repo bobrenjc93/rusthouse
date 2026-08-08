@@ -683,6 +683,7 @@ impl Database {
                         resource:
                             "SELECT result bytes"
                             | "SHOW DATABASES result bytes"
+                            | "SHOW SETTINGS result bytes"
                             | "SHOW TABLES result bytes"
                             | "SHOW CREATE TABLE result bytes"
                             | "DESCRIBE TABLE result bytes"
@@ -775,6 +776,7 @@ impl Database {
                     resource:
                         "SELECT result bytes"
                         | "SHOW DATABASES result bytes"
+                        | "SHOW SETTINGS result bytes"
                         | "SHOW TABLES result bytes"
                         | "SHOW CREATE TABLE result bytes"
                         | "DESCRIBE TABLE result bytes"
@@ -990,6 +992,7 @@ impl Database {
             | Statement::UnionAll { .. }
             | Statement::UnionDistinct { .. }
             | Statement::ShowDatabases
+            | Statement::ShowSettings
             | Statement::ShowTables
             | Statement::ShowCreateTable { .. }
             | Statement::DescribeTable { .. }
@@ -1025,6 +1028,7 @@ impl Database {
                 self.execute_union_distinct(left, right, query_result_limits)
             }
             Statement::ShowDatabases => self.execute_show_databases(query_result_limits),
+            Statement::ShowSettings => self.execute_show_settings(query_result_limits),
             Statement::ShowTables => self.execute_show_tables(query_result_limits),
             Statement::ShowCreateTable { name } => {
                 self.execute_show_create_table(&name, query_result_limits)
@@ -1052,7 +1056,7 @@ impl Database {
             | Statement::DeleteConjunction { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
-                "read-only execution accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
+                "read-only execution accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
                     .to_owned(),
             )),
         }
@@ -1323,6 +1327,102 @@ impl Database {
             }],
             rows: vec![vec![Value::String(DATABASE_NAME.to_owned())]],
         })
+    }
+
+    fn execute_show_settings(&self, query_result_limits: QueryResultLimits) -> Result<QueryResult> {
+        const RESULT_COLUMN_COUNT: usize = 2;
+        const RESULT_COLUMN_NAME_BYTES: usize = "name".len() + "value".len();
+
+        let configured_query_limits = self.query_result_limits;
+        let configured_table_limits = self.table_limits;
+        let settings = [
+            (
+                "query_result_limits.max_scan_rows",
+                configured_query_limits.max_scan_rows,
+            ),
+            (
+                "query_result_limits.max_rows",
+                configured_query_limits.max_rows,
+            ),
+            (
+                "query_result_limits.max_values",
+                configured_query_limits.max_values,
+            ),
+            (
+                "query_result_limits.max_bytes",
+                configured_query_limits.max_bytes,
+            ),
+            (
+                "query_result_limits.max_ordering_state_bytes",
+                configured_query_limits.max_ordering_state_bytes,
+            ),
+            (
+                "query_result_limits.max_groups",
+                configured_query_limits.max_groups,
+            ),
+            (
+                "query_result_limits.max_group_key_cells",
+                configured_query_limits.max_group_key_cells,
+            ),
+            (
+                "query_result_limits.max_group_key_bytes",
+                configured_query_limits.max_group_key_bytes,
+            ),
+            (
+                "query_result_limits.max_aggregate_state_cells",
+                configured_query_limits.max_aggregate_state_cells,
+            ),
+            (
+                "query_result_limits.max_aggregate_state_bytes",
+                configured_query_limits.max_aggregate_state_bytes,
+            ),
+            ("table_limits.max_rows", configured_table_limits.max_rows),
+            (
+                "table_limits.max_columns",
+                configured_table_limits.max_columns,
+            ),
+            ("table_limits.max_cells", configured_table_limits.max_cells),
+        ];
+
+        let fixed_bytes = validate_result_shape_parts(
+            settings.len(),
+            RESULT_COLUMN_COUNT,
+            RESULT_COLUMN_COUNT,
+            RESULT_COLUMN_NAME_BYTES,
+            query_result_limits,
+            SHOW_SETTINGS_RESULT_RESOURCES,
+        )?;
+        let value_bytes = settings
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(usize_decimal_len(*value)))
+            .fold(0_usize, usize::saturating_add);
+        enforce_resource_limit(
+            SHOW_SETTINGS_RESULT_RESOURCES.bytes,
+            fixed_bytes.saturating_add(value_bytes),
+            query_result_limits.max_bytes,
+        )?;
+
+        let columns = vec![
+            ResultColumn {
+                name: "name".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "value".to_owned(),
+                data_type: DataType::String,
+            },
+        ];
+        let rows = settings
+            .into_iter()
+            .map(|(name, value)| {
+                vec![
+                    Value::String(name.to_owned()),
+                    Value::String(value.to_string()),
+                ]
+            })
+            .collect();
+
+        Ok(QueryResult { columns, rows })
     }
 
     fn execute_show_tables(&self, query_result_limits: QueryResultLimits) -> Result<QueryResult> {
@@ -1772,6 +1872,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::UnionAll { .. }
         | Statement::UnionDistinct { .. } => "SELECT",
         Statement::ShowDatabases => "SHOW DATABASES",
+        Statement::ShowSettings => "SHOW SETTINGS",
         Statement::ShowTables => "SHOW TABLES",
         Statement::ShowCreateTable { .. } => "SHOW CREATE TABLE",
         Statement::DescribeTable { .. } => "DESCRIBE TABLE",
@@ -3413,6 +3514,12 @@ const SHOW_DATABASES_RESULT_RESOURCES: QueryResultResources = QueryResultResourc
     bytes: "SHOW DATABASES result bytes",
 };
 
+const SHOW_SETTINGS_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "SHOW SETTINGS result rows",
+    values: "SHOW SETTINGS result values",
+    bytes: "SHOW SETTINGS result bytes",
+};
+
 const SHOW_TABLES_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
     rows: "SHOW TABLES result rows",
     values: "SHOW TABLES result values",
@@ -3447,6 +3554,15 @@ fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> 
     } else {
         Ok(())
     }
+}
+
+fn usize_decimal_len(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 fn enforce_select_scan_limit(table: &Table, limits: QueryResultLimits) -> Result<()> {
