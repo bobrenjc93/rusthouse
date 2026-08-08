@@ -167,6 +167,10 @@ named `version()` unless an alias is supplied. Arguments, expression lists,
 the probe charges one SQL AST list item and uses the normal query row, value,
 byte, retained-result, and formatted-output limits.
 
+The exact case-insensitive `SHOW DATABASES` returns one `String` column named
+`name` containing RustHouse's single logical database, `default`. Arguments and
+trailing clauses are rejected, and the result uses the normal query row, value,
+byte, retained-result, and formatted-output limits.
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
@@ -348,10 +352,11 @@ the column identifier. `NOT IN` adds and charges exactly one negation node
 around that balanced tree.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
-each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
-TABLE` query is executed and emitted before the next statement. Table output
-uses bordered, human-readable columns, escapes control characters, renders SQL
-`NULL` as `NULL`, and separates multiple query results with a blank line. Each
+each `SELECT`, `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE
+TABLE`, or `EXISTS TABLE` query is executed and emitted before the next
+statement. Table output uses bordered, human-readable columns, escapes control
+characters, renders SQL `NULL` as `NULL`, and separates multiple query results
+with a blank line. Each
 padded table is size-checked against a 16 MiB formatted-output limit before
 being streamed, so a wide cell cannot amplify many short rows into unbounded
 memory or output. CSV output uses a CSVWithNames-compatible header followed by
@@ -438,9 +443,9 @@ return owned projection rows. Existing catalog failures remain typed, and lock
 poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
-engine. Its `query` method accepts exactly one `SELECT`, `SHOW TABLES`, `SHOW
-CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a shared read lock,
-and returns an owned, resource-bounded result, so cloned handles can run
+engine. Its `query` method accepts exactly one `SELECT`, `SHOW DATABASES`, `SHOW
+TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a
+shared read lock, and returns an owned, resource-bounded result, so cloned handles can run
 analytical reads concurrently. `try_query` and `try_query_with_result_limit`
 accept and validate the same single read-only statement before making one
 nonblocking read-lock attempt. They return the typed `DatabaseBusy` error when

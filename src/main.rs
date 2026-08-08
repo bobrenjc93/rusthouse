@@ -9,9 +9,9 @@ Usage: rusthouse [OPTIONS]
 With no options, reads the legacy line-oriented Int64 session from stdin.
 With --format table, --format csv, --format tsv, --format json, --format
 JSONEachRow, or --format JSONCompactEachRow, reads one semicolon-delimited SQL
-batch through EOF and prints results for SELECT, SHOW TABLES, SHOW CREATE TABLE,
-DESCRIBE TABLE, and EXISTS TABLE queries. CREATE, ALTER, DROP, RENAME,
-TRUNCATE, DELETE, and INSERT remain silent.
+batch through EOF and prints results for SELECT, SHOW DATABASES, SHOW TABLES,
+SHOW CREATE TABLE, DESCRIBE TABLE, and EXISTS TABLE queries. CREATE, ALTER,
+DROP, RENAME, TRUNCATE, DELETE, and INSERT remain silent.
 
 Limits:
   legacy: 65536 input bytes, 1024 statements, 64 tables, 1024 rows per table

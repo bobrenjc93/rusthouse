@@ -123,6 +123,8 @@ pub enum Statement {
         left: Select,
         right: Select,
     },
+    /// Exact compatibility query exposing RustHouse's single logical database.
+    ShowDatabases,
     ShowTables,
     ShowCreateTable {
         name: String,
@@ -1008,6 +1010,13 @@ impl<'a> Parser<'a> {
                 return self.error("unexpected trailing input after SHOW CREATE TABLE <name>");
             }
             return Ok(Statement::ShowCreateTable { name });
+        }
+
+        if self.eat_keyword("DATABASES") {
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after SHOW DATABASES");
+            }
+            return Ok(Statement::ShowDatabases);
         }
 
         self.expect_keyword("TABLES")?;
