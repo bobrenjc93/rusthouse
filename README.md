@@ -594,7 +594,7 @@ one optional `default_format` parameter in any order with `query`, including
 percent-encoded parameter names and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
 `+` becomes a space. `default_format` accepts the exact case-sensitive values
-`JSON`, `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, and
+`JSON`, `CSV`, `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, and
 `JSONCompactEachRow`, selecting the corresponding existing response writer.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
 same SQL byte limit as a POST body; the database and format parameters do not
@@ -680,11 +680,12 @@ Internal Server Error`. Validation and commit occur under the acquired write
 lock so concurrent work cannot expose or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
-the exact value `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, or
-`JSONCompactEachRow`. `CSVWithNames` responses have content type
-`text/csv; charset=utf-8` and use the same header, typed-value, `NULL`, and
-field-escaping behavior as `--format csv`; an empty result still contains its
-column-name header. `TabSeparatedWithNames` responses similarly use the
+the exact value `CSV`, `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`,
+or `JSONCompactEachRow`. `CSV` and `CSVWithNames` responses have content type
+`text/csv; charset=utf-8` and use the same typed-value, `NULL`, and field-escaping
+behavior as `--format csv`. `CSV` omits the column-name header, so an empty
+result has an empty body; `CSVWithNames` retains the header, including for an
+empty result. `TabSeparatedWithNames` responses similarly use the
 existing `--format tsv` writer and content type
 `text/tab-separated-values; charset=utf-8`: column names and typed rows are
 tab-separated, `NULL` is `\N`, ClickHouse backslash escaping is applied, and an

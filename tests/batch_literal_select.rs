@@ -561,11 +561,12 @@ fn cli_emits_typed_null_select_in_every_output_format() {
 #[test]
 fn http_exposes_typed_null_select_in_every_supported_wire_format() {
     let sql = b"SELECT CAST(NULL AS String) AS missing;";
-    let cases: [(Option<&str>, &[u8]); 5] = [
+    let cases: [(Option<&str>, &[u8]); 6] = [
         (
             None,
             b"{\"columns\":[{\"name\":\"missing\",\"type\":\"String\"}],\"rows\":[[null]]}",
         ),
+        (Some("CSV"), b"NULL\n"),
         (Some("CSVWithNames"), b"missing\nNULL\n"),
         (Some("TabSeparatedWithNames"), b"missing\n\\N\n"),
         (Some("JSONEachRow"), b"{\"missing\":null}\n"),
