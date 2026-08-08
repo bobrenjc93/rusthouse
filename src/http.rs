@@ -129,8 +129,9 @@ impl StdError for HttpQueryError {
 /// `X-ClickHouse-Key`-authenticated handlers expose the same authenticated
 /// route set.
 ///
-/// `GET /metrics` accepts no request body and returns three Prometheus gauges
-/// for retained tables, columns, and rows. It takes a nonblocking, consistent
+/// `GET /metrics` accepts no request body and returns four Prometheus gauges
+/// for retained tables, columns, rows, and scalar payload bytes. The byte gauge
+/// is named `rusthouse_retained_value_bytes`. It takes a nonblocking, consistent
 /// database metrics snapshot; lock contention and poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
@@ -1506,8 +1507,14 @@ fn write_prometheus_metrics(output: &mut impl Write, metrics: DatabaseMetrics) -
          rusthouse_columns {}\n\
          # HELP rusthouse_retained_rows Number of rows retained across all tables.\n\
          # TYPE rusthouse_retained_rows gauge\n\
-         rusthouse_retained_rows {}",
-        metrics.table_count, metrics.column_count, metrics.retained_row_count,
+         rusthouse_retained_rows {}\n\
+         # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
+         # TYPE rusthouse_retained_value_bytes gauge\n\
+         rusthouse_retained_value_bytes {}",
+        metrics.table_count,
+        metrics.column_count,
+        metrics.retained_row_count,
+        metrics.retained_value_bytes,
     )
 }
 

@@ -253,6 +253,7 @@ fn shared_database_serializes_drop_and_updates_metadata() {
             table_count: 1,
             column_count: 2,
             retained_row_count: 2,
+            retained_value_bytes: 18,
         })
     );
 

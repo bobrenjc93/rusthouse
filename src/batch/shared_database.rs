@@ -13,9 +13,9 @@ use super::error::Error;
 use super::sql::{self, Statement};
 use super::tsv::{TsvIngestError, TsvIngestLimits};
 
-/// An instantaneous count of data retained by a [`SharedDatabase`].
+/// An instantaneous measurement of data retained by a [`SharedDatabase`].
 ///
-/// The counts describe one consistent database read-lock acquisition. They do
+/// The values describe one consistent database read-lock acquisition. They do
 /// not include query results or configured capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabaseMetrics {
@@ -25,6 +25,8 @@ pub struct DatabaseMetrics {
     pub column_count: usize,
     /// Number of rows retained across all registered tables.
     pub retained_row_count: usize,
+    /// Scalar payload bytes retained across all registered tables.
+    pub retained_value_bytes: usize,
 }
 
 /// An error produced while accessing a [`SharedDatabase`].
@@ -192,10 +194,12 @@ impl SharedDatabase {
         Ok(self.read()?.table_limits())
     }
 
-    /// Takes a consistent metrics snapshot without waiting for the database lock.
+    /// Takes a consistent, constant-time metrics snapshot without waiting for
+    /// the database lock.
     ///
     /// Returns `None` when a read lock is not immediately available or when the
-    /// lock is poisoned. The acquired read guard is released before this method
+    /// lock is poisoned. Cached database totals are read without scanning tables
+    /// or values, and the acquired read guard is released before this method
     /// returns.
     #[must_use]
     pub fn metrics_snapshot(&self) -> Option<DatabaseMetrics> {
@@ -203,11 +207,13 @@ impl SharedDatabase {
             Ok(database) => database,
             Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return None,
         };
-        let catalog = database.catalog();
+        let (table_count, column_count, retained_row_count, retained_value_bytes) =
+            database.retained_metrics();
         Some(DatabaseMetrics {
-            table_count: catalog.table_count(),
-            column_count: catalog.column_count(),
-            retained_row_count: catalog.retained_row_count(),
+            table_count,
+            column_count,
+            retained_row_count,
+            retained_value_bytes,
         })
     }
 

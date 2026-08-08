@@ -458,6 +458,7 @@ fn shared_database_serializes_add_updates_metrics_and_keeps_queries_read_only() 
             table_count: 1,
             column_count: 2,
             retained_row_count: 2,
+            retained_value_bytes: 16,
         })
     );
     assert_eq!(

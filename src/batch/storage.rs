@@ -127,6 +127,28 @@ impl Column {
         self.len() == 0
     }
 
+    /// Returns the scalar payload bytes retained by this column without allocating.
+    ///
+    /// Each `Int64` and `Float64` counts as eight bytes, each `Bool` as one byte,
+    /// and each `String` as its UTF-8 payload length. The result saturates at
+    /// [`usize::MAX`]. Container capacity and allocation metadata are excluded.
+    #[must_use]
+    pub fn retained_value_bytes(&self) -> usize {
+        saturating_usize(self.retained_value_bytes_exact())
+    }
+
+    fn retained_value_bytes_exact(&self) -> u128 {
+        match self {
+            Self::Int64(values) => (values.len() as u128).saturating_mul(8),
+            Self::Float64(values) => (values.len() as u128).saturating_mul(8),
+            Self::Bool(values) => values.len() as u128,
+            Self::String(values) => values
+                .iter()
+                .map(|value| value.len() as u128)
+                .fold(0_u128, u128::saturating_add),
+        }
+    }
+
     #[must_use]
     pub fn value(&self, row: usize) -> Value {
         self.value_ref(row).to_owned()
@@ -145,12 +167,25 @@ impl Column {
         self.value_ref(left).cmp(&self.value_ref(right))
     }
 
-    fn push(&mut self, value: Value) {
+    fn push(&mut self, value: Value) -> u128 {
         match (self, value) {
-            (Self::Int64(values), Value::Int64(value)) => values.push(value),
-            (Self::Float64(values), Value::Float64(value)) => values.push(value),
-            (Self::Bool(values), Value::Bool(value)) => values.push(value),
-            (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Int64(values), Value::Int64(value)) => {
+                values.push(value);
+                8
+            }
+            (Self::Float64(values), Value::Float64(value)) => {
+                values.push(value);
+                8
+            }
+            (Self::Bool(values), Value::Bool(value)) => {
+                values.push(value);
+                1
+            }
+            (Self::String(values), Value::String(value)) => {
+                let value_bytes = value.len() as u128;
+                values.push(value);
+                value_bytes
+            }
             _ => unreachable!("values are validated before insertion"),
         }
     }
@@ -164,14 +199,47 @@ impl Column {
         }
     }
 
-    fn delete_rows(&mut self, row_indexes: &[usize]) {
+    fn delete_rows(&mut self, row_indexes: &[usize]) -> u128 {
+        let deleted_value_bytes = match self {
+            Self::Int64(_) | Self::Float64(_) => (row_indexes.len() as u128).saturating_mul(8),
+            Self::Bool(_) => row_indexes.len() as u128,
+            Self::String(values) => row_indexes
+                .iter()
+                .map(|&row_index| values[row_index].len() as u128)
+                .fold(0_u128, u128::saturating_add),
+        };
         match self {
             Self::Int64(values) => compact_deleted_rows(values, row_indexes),
             Self::Float64(values) => compact_deleted_rows(values, row_indexes),
             Self::Bool(values) => compact_deleted_rows(values, row_indexes),
             Self::String(values) => compact_deleted_rows(values, row_indexes),
         }
+        deleted_value_bytes
     }
+
+    fn replace_values(&mut self, replacements: Vec<(usize, Value)>) -> (u128, u128) {
+        let mut removed_value_bytes = 0_u128;
+        let mut added_value_bytes = 0_u128;
+        for (row_index, value) in replacements {
+            match (&mut *self, value) {
+                (Self::Int64(values), Value::Int64(value)) => values[row_index] = value,
+                (Self::Float64(values), Value::Float64(value)) => values[row_index] = value,
+                (Self::Bool(values), Value::Bool(value)) => values[row_index] = value,
+                (Self::String(values), Value::String(value)) => {
+                    removed_value_bytes =
+                        removed_value_bytes.saturating_add(values[row_index].len() as u128);
+                    added_value_bytes = added_value_bytes.saturating_add(value.len() as u128);
+                    values[row_index] = value;
+                }
+                _ => unreachable!("replacement values are validated before mutation"),
+            }
+        }
+        (removed_value_bytes, added_value_bytes)
+    }
+}
+
+fn saturating_usize(value: u128) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn compact_deleted_rows<T>(values: &mut Vec<T>, row_indexes: &[usize]) {
@@ -210,6 +278,7 @@ pub struct Table {
     schema: Vec<ColumnDef>,
     columns: Vec<Column>,
     row_count: usize,
+    retained_value_bytes: u128,
     limits: TableLimits,
 }
 
@@ -268,6 +337,7 @@ impl Table {
             schema,
             columns,
             row_count: 0,
+            retained_value_bytes: 0,
             limits,
         })
     }
@@ -325,6 +395,19 @@ impl Table {
     #[must_use]
     pub fn retained_cell_count(&self) -> usize {
         self.row_count.saturating_mul(self.schema.len())
+    }
+
+    /// Returns cached scalar payload bytes retained across all columns in constant time.
+    ///
+    /// The total is maintained during mutations and saturates at [`usize::MAX`].
+    /// Container capacity, schema text, and allocation metadata are excluded.
+    #[must_use]
+    pub fn retained_value_bytes(&self) -> usize {
+        saturating_usize(self.retained_value_bytes)
+    }
+
+    pub(crate) const fn retained_value_bytes_exact(&self) -> u128 {
+        self.retained_value_bytes
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
@@ -490,10 +573,12 @@ impl Table {
             DataType::Bool => Column::Bool(vec![false; self.row_count]),
             DataType::String => Column::String(vec![String::new(); self.row_count]),
         };
+        let added_value_bytes = column.retained_value_bytes_exact();
 
         debug_assert_eq!(self.schema.len(), self.columns.len());
         self.schema.push(field);
         self.columns.push(column);
+        self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
         Ok(())
     }
 
@@ -513,7 +598,10 @@ impl Table {
 
         debug_assert_eq!(self.schema.len(), self.columns.len());
         self.schema.remove(column_index);
-        self.columns.remove(column_index);
+        let removed_column = self.columns.remove(column_index);
+        self.retained_value_bytes = self
+            .retained_value_bytes
+            .saturating_sub(removed_column.retained_value_bytes_exact());
         Ok(())
     }
 
@@ -632,10 +720,56 @@ impl Table {
     }
 
     fn append_validated_row(&mut self, row: Vec<Value>) {
+        let mut added_value_bytes = 0_u128;
         for (column, value) in self.columns.iter_mut().zip(row) {
-            column.push(value);
+            added_value_bytes = added_value_bytes.saturating_add(column.push(value));
         }
         self.row_count += 1;
+        self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
+    }
+
+    /// Replaces selected values in one column and returns the number replaced.
+    ///
+    /// The column name is resolved case-insensitively. `replacements` must be
+    /// unique and strictly increasing by row index, and every index must be
+    /// less than the row count at the start of this call. Every replacement
+    /// must have the column's physical type; `NULL` and non-finite `Float64`
+    /// values are rejected. The column, complete index selection, and all
+    /// values are validated before mutation, so an error leaves the entire
+    /// table unchanged. Valid owned values are moved into the selected cells
+    /// without cloning. All other cells and table metadata are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ColumnNotFound`] for an unknown column,
+    /// [`Error::SelectionIndexOutOfBounds`] for an index outside the table,
+    /// [`Error::SelectionNotStrictlyIncreasing`] for a duplicate or decreasing
+    /// index, [`Error::TypeMismatch`] for `NULL` or a different physical type,
+    /// or [`Error::InvalidQuery`] for a non-finite `Float64` value.
+    pub fn replace_column_values(
+        &mut self,
+        column: &str,
+        replacements: Vec<(usize, Value)>,
+    ) -> Result<usize> {
+        let column_index = self.column_index(column)?;
+        validate_row_selection(
+            replacements.iter().map(|(row_index, _)| *row_index),
+            self.row_count,
+        )?;
+
+        let field = &self.schema[column_index];
+        for (_, value) in &replacements {
+            self.validate_value(field, value)?;
+        }
+
+        let replaced = replacements.len();
+        let (removed_value_bytes, added_value_bytes) =
+            self.columns[column_index].replace_values(replacements);
+        self.retained_value_bytes = self
+            .retained_value_bytes
+            .saturating_sub(removed_value_bytes)
+            .saturating_add(added_value_bytes);
+        Ok(replaced)
     }
 
     /// Deletes selected source rows and returns the number deleted.
@@ -652,16 +786,21 @@ impl Table {
     /// original table or [`Error::SelectionNotStrictlyIncreasing`] for a
     /// duplicate or decreasing index.
     pub fn delete_rows(&mut self, row_indexes: &[usize]) -> Result<usize> {
-        validate_row_selection(row_indexes, self.row_count)?;
+        validate_row_selection(row_indexes.iter().copied(), self.row_count)?;
         if row_indexes.is_empty() {
             return Ok(0);
         }
 
+        let mut deleted_value_bytes = 0_u128;
         for column in &mut self.columns {
             debug_assert_eq!(column.len(), self.row_count);
-            column.delete_rows(row_indexes);
+            deleted_value_bytes =
+                deleted_value_bytes.saturating_add(column.delete_rows(row_indexes));
         }
         self.row_count -= row_indexes.len();
+        self.retained_value_bytes = self
+            .retained_value_bytes
+            .saturating_sub(deleted_value_bytes);
         Ok(row_indexes.len())
     }
 
@@ -672,13 +811,17 @@ impl Table {
             column.clear();
         }
         self.row_count = 0;
+        self.retained_value_bytes = 0;
         removed_rows
     }
 }
 
-fn validate_row_selection(row_indexes: &[usize], input_rows: usize) -> Result<()> {
+fn validate_row_selection(
+    row_indexes: impl IntoIterator<Item = usize>,
+    input_rows: usize,
+) -> Result<()> {
     let mut previous = None;
-    for (selection_position, &row_index) in row_indexes.iter().enumerate() {
+    for (selection_position, row_index) in row_indexes.into_iter().enumerate() {
         if row_index >= input_rows {
             return Err(Error::SelectionIndexOutOfBounds {
                 selection_position,
@@ -730,6 +873,65 @@ mod tests {
 
         assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
         assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
+    }
+
+    #[test]
+    fn retained_value_bytes_counts_every_type_and_tracks_row_removal() {
+        assert_eq!(Column::Int64(vec![1, 2]).retained_value_bytes(), 16);
+        assert_eq!(Column::Float64(vec![1.0, 2.0]).retained_value_bytes(), 16);
+        assert_eq!(Column::Bool(vec![true, false]).retained_value_bytes(), 2);
+        assert_eq!(
+            Column::String(vec!["ASCII".to_owned(), "é".to_owned()]).retained_value_bytes(),
+            7
+        );
+
+        let mut table = Table::new(
+            "metrics".to_owned(),
+            vec![
+                ColumnDef {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ColumnDef {
+                    name: "score".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ColumnDef {
+                    name: "active".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ColumnDef {
+                    name: "label".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+        )
+        .expect("valid schema");
+        assert_eq!(table.retained_value_bytes(), 0);
+
+        table
+            .insert_rows(vec![
+                vec![
+                    Value::Int64(1),
+                    Value::Float64(1.5),
+                    Value::Bool(true),
+                    Value::String("é".to_owned()),
+                ],
+                vec![
+                    Value::Int64(2),
+                    Value::Float64(2.5),
+                    Value::Bool(false),
+                    Value::String("rust".to_owned()),
+                ],
+            ])
+            .expect("valid rows");
+        assert_eq!(table.retained_value_bytes(), 40);
+
+        table.delete_rows(&[0]).expect("valid deletion");
+        assert_eq!(table.retained_value_bytes(), 21);
+
+        assert_eq!(table.truncate(), 1);
+        assert_eq!(table.retained_value_bytes(), 0);
     }
 
     #[test]

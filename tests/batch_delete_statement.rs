@@ -527,6 +527,7 @@ fn shared_database_executes_delete_under_its_write_lock() {
             table_count: 1,
             column_count: 2,
             retained_row_count: 1,
+            retained_value_bytes: 12,
         })
     );
     assert_eq!(
