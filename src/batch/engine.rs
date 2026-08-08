@@ -11,8 +11,8 @@ use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, AlterUpdateValue,
     ComparisonOperator, CrossJoin, CurrentDatabaseSelect, DeleteComparisonPredicate, Having,
-    HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
-    VersionSelect,
+    HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, SUPPORTED_FUNCTION_NAMES, Select,
+    SelectItem, Statement, VersionSelect,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
@@ -781,6 +781,7 @@ impl Database {
                             "SELECT result bytes"
                             | "SHOW DATABASES result bytes"
                             | "SHOW SETTINGS result bytes"
+                            | "SHOW FUNCTIONS result bytes"
                             | "SHOW TABLES result bytes"
                             | "SHOW CREATE TABLE result bytes"
                             | "DESCRIBE TABLE result bytes"
@@ -874,6 +875,7 @@ impl Database {
                         "SELECT result bytes"
                         | "SHOW DATABASES result bytes"
                         | "SHOW SETTINGS result bytes"
+                        | "SHOW FUNCTIONS result bytes"
                         | "SHOW TABLES result bytes"
                         | "SHOW CREATE TABLE result bytes"
                         | "DESCRIBE TABLE result bytes"
@@ -1090,6 +1092,7 @@ impl Database {
             | Statement::UnionDistinct { .. }
             | Statement::ShowDatabases
             | Statement::ShowSettings
+            | Statement::ShowFunctions
             | Statement::ShowTables
             | Statement::ShowCreateTable { .. }
             | Statement::DescribeTable { .. }
@@ -1126,6 +1129,7 @@ impl Database {
             }
             Statement::ShowDatabases => self.execute_show_databases(query_result_limits),
             Statement::ShowSettings => self.execute_show_settings(query_result_limits),
+            Statement::ShowFunctions => self.execute_show_functions(query_result_limits),
             Statement::ShowTables => self.execute_show_tables(query_result_limits),
             Statement::ShowCreateTable { name } => {
                 self.execute_show_create_table(&name, query_result_limits)
@@ -1153,7 +1157,7 @@ impl Database {
             | Statement::DeleteConjunction { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
-                "read-only execution accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
+                "read-only execution accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
                     .to_owned(),
             )),
         }
@@ -1520,6 +1524,42 @@ impl Database {
             .collect();
 
         Ok(QueryResult { columns, rows })
+    }
+
+    fn execute_show_functions(
+        &self,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const RESULT_COLUMN_NAME: &str = "name";
+
+        let fixed_bytes = validate_result_shape_parts(
+            SUPPORTED_FUNCTION_NAMES.len(),
+            1,
+            1,
+            RESULT_COLUMN_NAME.len(),
+            query_result_limits,
+            SHOW_FUNCTIONS_RESULT_RESOURCES,
+        )?;
+        let function_name_bytes = SUPPORTED_FUNCTION_NAMES
+            .iter()
+            .map(|name| name.len())
+            .fold(0_usize, usize::saturating_add);
+        enforce_resource_limit(
+            SHOW_FUNCTIONS_RESULT_RESOURCES.bytes,
+            fixed_bytes.saturating_add(function_name_bytes),
+            query_result_limits.max_bytes,
+        )?;
+
+        Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: RESULT_COLUMN_NAME.to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: SUPPORTED_FUNCTION_NAMES
+                .iter()
+                .map(|name| vec![Value::String((*name).to_owned())])
+                .collect(),
+        })
     }
 
     fn execute_show_tables(&self, query_result_limits: QueryResultLimits) -> Result<QueryResult> {
@@ -1993,6 +2033,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::UnionDistinct { .. } => "SELECT",
         Statement::ShowDatabases => "SHOW DATABASES",
         Statement::ShowSettings => "SHOW SETTINGS",
+        Statement::ShowFunctions => "SHOW FUNCTIONS",
         Statement::ShowTables => "SHOW TABLES",
         Statement::ShowCreateTable { .. } => "SHOW CREATE TABLE",
         Statement::DescribeTable { .. } => "DESCRIBE TABLE",
@@ -3638,6 +3679,12 @@ const SHOW_SETTINGS_RESULT_RESOURCES: QueryResultResources = QueryResultResource
     rows: "SHOW SETTINGS result rows",
     values: "SHOW SETTINGS result values",
     bytes: "SHOW SETTINGS result bytes",
+};
+
+const SHOW_FUNCTIONS_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "SHOW FUNCTIONS result rows",
+    values: "SHOW FUNCTIONS result values",
+    bytes: "SHOW FUNCTIONS result bytes",
 };
 
 const SHOW_TABLES_RESULT_RESOURCES: QueryResultResources = QueryResultResources {

@@ -18,6 +18,31 @@ pub const DEFAULT_MAX_INSERT_VALUES: usize = 1_000_000;
 /// Maximum items stored in variable-length schema, INSERT-column, and query lists.
 pub const DEFAULT_MAX_AST_LIST_ITEMS: usize = 100_000;
 
+/// Canonical names of every function executable by the batch SQL engine.
+///
+/// Names are ordered by their ASCII case-insensitive spelling. This is the
+/// deterministic inventory returned by `SHOW FUNCTIONS`.
+pub const SUPPORTED_FUNCTION_NAMES: &[&str] = &[
+    "ABS",
+    "AVG",
+    "CAST",
+    "CEIL",
+    "COUNT",
+    "countIf",
+    "currentDatabase",
+    "FLOOR",
+    "LENGTH",
+    "lengthUTF8",
+    "LOWER",
+    "MAX",
+    "MIN",
+    "ROUND",
+    "ROW_NUMBER",
+    "SUM",
+    "UPPER",
+    "version",
+];
+
 /// Allocation limits applied while constructing a SQL batch AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchSqlLimits {
@@ -157,6 +182,8 @@ pub enum Statement {
     ShowDatabases,
     /// Exact metadata query exposing the configured query and table limits.
     ShowSettings,
+    /// Exact metadata query exposing every executable SQL function.
+    ShowFunctions,
     ShowTables,
     ShowCreateTable {
         name: String,
@@ -1178,6 +1205,13 @@ impl<'a> Parser<'a> {
                 return self.error("unexpected trailing input after SHOW SETTINGS");
             }
             return Ok(Statement::ShowSettings);
+        }
+
+        if self.eat_keyword("FUNCTIONS") {
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after SHOW FUNCTIONS");
+            }
+            return Ok(Statement::ShowFunctions);
         }
 
         self.expect_keyword("TABLES")?;
