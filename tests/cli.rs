@@ -82,6 +82,24 @@ fn json_cli_executes_conjoined_comparison_delete_silently() {
 }
 
 #[test]
+fn json_cli_executes_int64_alter_update_silently() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE events (id Int64, value Int64); \
+          INSERT INTO events VALUES (1, 10), (2, 20), (2, 30); \
+          ALTER TABLE events UPDATE value = -7 WHERE id = 2; \
+          SELECT id, value FROM events ORDER BY value;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"value\",\"type\":\"Int64\"}],\"rows\":[[2,-7],[2,-7],[1,10]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_exposes_typed_defaults_from_reordered_insert_subsets() {
     let output = run(
         &["--format", "json"],

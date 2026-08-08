@@ -497,7 +497,8 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         }),
         Statement::RenameColumn { .. }
         | Statement::AddColumn { .. }
-        | Statement::DropColumn { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
+        | Statement::DropColumn { .. }
+        | Statement::AlterUpdate { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "ALTER TABLE",
         }),
         Statement::TruncateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {

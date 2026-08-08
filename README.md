@@ -147,6 +147,20 @@ row count and configured row cap are unchanged. Missing tables or columns and
 attempts to remove a table's sole column fail before mutation. A trailing
 semicolon is optional.
 
+`ALTER TABLE <table> UPDATE <target> = <Int64 literal> WHERE <column> = <Int64
+literal>` provides one deliberately narrow ClickHouse-style mutation. The
+target and predicate must be existing `Int64` columns; table and column lookup
+are case-insensitive, and both literals support the complete optionally signed
+`Int64` range. The table and both columns are resolved and type-checked before
+the full source row count is checked against the configured scan limit. After
+that bounded scan, all matches from the original predicate column are passed
+to one atomic column replacement, including an empty replacement for zero
+matches. Invalid syntax, missing names, wrong types, and scan-limit failures
+leave the table unchanged. Expressions, additional assignments or predicates,
+other operators and types, and clauses such as `LIMIT` are not supported. A
+successful command reports its matched-row count through the library API and
+is silent in formatted CLI output.
+
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
 such as `-7`; `Float64` literals are optionally signed, finite decimal or
@@ -380,11 +394,12 @@ TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
 carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
 column names and strings use ClickHouse's backslash escapes.
-A table-backed `SELECT` or one- or two-comparison `DELETE` inspects at most
-1,000,000 source rows by default. This scanned-row limit is checked against the
-full source table before matching-row indices are allocated, so `WHERE`
-selectivity and `LIMIT` do not reduce it; each `UNION` operand and each `CROSS
-JOIN` input has its own source scan.
+A table-backed `SELECT`, one- or two-comparison `DELETE`, or `ALTER TABLE
+UPDATE` inspects at most 1,000,000 source rows by default. This scanned-row
+limit is checked against the full source table before matching-row indices or
+replacement values are allocated, so `WHERE` selectivity and `LIMIT` do not
+reduce it; each `UNION` operand and each `CROSS JOIN` input has its own source
+scan.
 It is distinct from the 10,000-row output limit, which applies after filtering,
 grouping, ordering, and `LIMIT`. Query output is also checked before cloning
 against a limit of 250,000 values and an estimated 16 MiB. Grouped queries

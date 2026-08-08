@@ -73,6 +73,15 @@ pub enum Statement {
         table: String,
         column: String,
     },
+    /// Exact Int64 mutation: `ALTER TABLE <table> UPDATE <target> = <literal>
+    /// WHERE <column> = <literal>`.
+    AlterUpdate {
+        table: String,
+        target_column: String,
+        value: i64,
+        predicate_column: String,
+        predicate_value: i64,
+    },
     TruncateTable {
         name: String,
     },
@@ -1165,6 +1174,33 @@ impl<'a> Parser<'a> {
                 table,
                 source,
                 destination,
+            });
+        }
+
+        if self.eat_keyword("UPDATE") {
+            let target_column = self.expect_identifier("target column name")?;
+            self.expect(
+                &TokenKind::Equal,
+                "'=' after ALTER TABLE UPDATE target column",
+            )?;
+            let value = self.parse_signed_int64_literal("ALTER TABLE UPDATE assignment")?;
+            self.expect_keyword("WHERE")?;
+            let predicate_column = self.expect_identifier("WHERE column name")?;
+            self.expect(
+                &TokenKind::Equal,
+                "'=' after ALTER TABLE UPDATE WHERE column",
+            )?;
+            let predicate_value =
+                self.parse_signed_int64_literal("ALTER TABLE UPDATE WHERE comparison")?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after ALTER TABLE UPDATE");
+            }
+            return Ok(Statement::AlterUpdate {
+                table,
+                target_column,
+                value,
+                predicate_column,
+                predicate_value,
             });
         }
 
