@@ -207,6 +207,31 @@ fn configured_and_retained_result_limits_are_enforced() {
 }
 
 #[test]
+fn qualified_show_tables_is_admitted_by_shared_read_only_apis() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE zebra (id Int64); CREATE TABLE Alpha (id Int64);")
+        .unwrap();
+    let expected = vec![
+        vec![Value::String("Alpha".to_owned())],
+        vec![Value::String("zebra".to_owned())],
+    ];
+
+    assert_eq!(
+        database.query("sHoW TaBlEs FrOm DeFaUlT;").unwrap().rows,
+        expected
+    );
+    assert_eq!(
+        database.try_query("SHOW TABLES IN default").unwrap().rows,
+        expected
+    );
+    assert!(matches!(
+        database.query("SHOW TABLES FROM analytics"),
+        Err(SharedDatabaseError::Sql(Error::Sql { position: 17, .. }))
+    ));
+}
+
+#[test]
 fn try_queries_succeed_and_preserve_sql_and_resource_errors() {
     let database = SharedDatabase::default();
     database

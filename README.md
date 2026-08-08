@@ -234,8 +234,12 @@ named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
 `UPPER`, and `version`. Arguments and trailing clauses are rejected. The result
 uses the normal query row, value, byte, retained-result, and formatted-output
 limits.
-`SHOW TABLES` returns the catalog's display names in deterministic,
-case-insensitive order as one `String` column.
+The case-insensitive forms `SHOW TABLES`, `SHOW TABLES FROM default`, and
+`SHOW TABLES IN default` return the catalog's display names in deterministic,
+case-insensitive order as one `String` column. RustHouse has no other logical
+database, so non-default database names and trailing clauses are rejected. All
+three forms use the normal query row, value, byte, retained-result, and
+formatted-output limits.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
 bounded `String`, preserving the stored table and column display names and
 schema order while normalizing type spellings.

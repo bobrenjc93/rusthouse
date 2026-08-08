@@ -184,6 +184,7 @@ pub enum Statement {
     ShowSettings,
     /// Exact metadata query exposing every executable SQL function.
     ShowFunctions,
+    /// `SHOW TABLES`, optionally qualified by `FROM default` or `IN default`.
     ShowTables,
     ShowCreateTable {
         name: String,
@@ -1215,6 +1216,25 @@ impl<'a> Parser<'a> {
         }
 
         self.expect_keyword("TABLES")?;
+        let qualifier = if self.eat_keyword("FROM") {
+            Some("FROM")
+        } else if self.eat_keyword("IN") {
+            Some("IN")
+        } else {
+            None
+        };
+        if let Some(qualifier) = qualifier {
+            let position = self.position();
+            let database = self.expect_identifier(&format!("database name after {qualifier}"))?;
+            if !database.eq_ignore_ascii_case("default") {
+                return Err(Error::Sql {
+                    position,
+                    message: format!(
+                        "SHOW TABLES supports only the default database; found '{database}'"
+                    ),
+                });
+            }
+        }
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error("unexpected trailing input after SHOW TABLES");
         }
@@ -2639,8 +2659,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_bounded_show_tables_with_an_optional_semicolon() {
-        for sql in ["SHOW TABLES", "show tables;"] {
+    fn parses_bounded_show_tables_with_an_optional_default_database() {
+        for sql in [
+            "SHOW TABLES",
+            "show tables;",
+            "SHOW TABLES FROM default",
+            "show tables in DEFAULT;",
+            "ShOw TaBlEs FrOm DeFaUlT",
+        ] {
             assert_eq!(
                 parse(sql).expect("valid SHOW TABLES"),
                 [Statement::ShowTables]
@@ -2658,11 +2684,44 @@ mod tests {
 
     #[test]
     fn show_tables_rejects_trailing_input_with_a_typed_sql_error() {
+        for (sql, position) in [
+            ("SHOW TABLES extra", 12),
+            ("SHOW TABLES FROM default LIMIT 1", 25),
+            ("SHOW TABLES IN default FROM default", 23),
+        ] {
+            assert_eq!(
+                parse(sql).expect_err("trailing input is not a SHOW TABLES clause"),
+                Error::Sql {
+                    position,
+                    message: "unexpected trailing input after SHOW TABLES".to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn show_tables_rejects_missing_and_non_default_database_names() {
         assert_eq!(
-            parse("SHOW TABLES extra").expect_err("trailing input is not a SHOW clause"),
+            parse("SHOW TABLES FROM analytics").expect_err("non-default database is rejected"),
             Error::Sql {
-                position: 12,
-                message: "unexpected trailing input after SHOW TABLES".to_owned(),
+                position: 17,
+                message: "SHOW TABLES supports only the default database; found 'analytics'"
+                    .to_owned(),
+            }
+        );
+        assert_eq!(
+            parse("SHOW TABLES IN system").expect_err("non-default database is rejected"),
+            Error::Sql {
+                position: 15,
+                message: "SHOW TABLES supports only the default database; found 'system'"
+                    .to_owned(),
+            }
+        );
+        assert_eq!(
+            parse("SHOW TABLES FROM").expect_err("database name is required"),
+            Error::Sql {
+                position: 16,
+                message: "expected database name after FROM".to_owned(),
             }
         );
     }

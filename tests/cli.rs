@@ -506,16 +506,40 @@ fn csv_batch_emits_typed_cross_join_in_left_major_order() {
 fn csv_batch_emits_show_tables_metadata_in_stable_display_order() {
     let output = run(
         &["--format", "csv"],
-        b"SHOW TABLES;
+        b"SHOW TABLES IN default;
           CREATE TABLE zebra (id Int64);
           CREATE TABLE Alpha (id Int64);
           CREATE TABLE beta (id Int64);
-          SHOW TABLES;",
+          sHoW TaBlEs FrOm DeFaUlT;",
     );
 
     assert!(output.status.success(), "{:?}", output.stderr);
     assert_eq!(output.stdout, b"name\nname\nAlpha\nbeta\nzebra\n");
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn csv_batch_rejects_non_default_and_trailing_show_tables_syntax() {
+    for (sql, expected_error) in [
+        (
+            "SHOW TABLES FROM analytics;",
+            "SHOW TABLES supports only the default database; found 'analytics'",
+        ),
+        (
+            "SHOW TABLES IN default LIMIT 1;",
+            "unexpected trailing input after SHOW TABLES",
+        ),
+    ] {
+        let output = run(&["--format", "csv"], sql.as_bytes());
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains(expected_error)
+        );
+    }
 }
 
 #[test]
