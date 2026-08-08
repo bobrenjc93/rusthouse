@@ -198,7 +198,7 @@ impl SharedDatabase {
     /// the database lock.
     ///
     /// Returns `None` when a read lock is not immediately available or when the
-    /// lock is poisoned. Cached catalog totals are read without scanning tables
+    /// lock is poisoned. Cached database totals are read without scanning tables
     /// or values, and the acquired read guard is released before this method
     /// returns.
     #[must_use]
@@ -207,12 +207,13 @@ impl SharedDatabase {
             Ok(database) => database,
             Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return None,
         };
-        let catalog = database.catalog();
+        let (table_count, column_count, retained_row_count, retained_value_bytes) =
+            database.retained_metrics();
         Some(DatabaseMetrics {
-            table_count: catalog.table_count(),
-            column_count: catalog.column_count(),
-            retained_row_count: catalog.retained_row_count(),
-            retained_value_bytes: catalog.retained_value_bytes(),
+            table_count,
+            column_count,
+            retained_row_count,
+            retained_value_bytes,
         })
     }
 

@@ -381,7 +381,9 @@ fn metrics_snapshot_tracks_retained_counts_and_value_bytes() {
 
     database
         .execute(
-            "CREATE TABLE events (id Int64, score Float64, active Bool, label String); \
+            "DROP TABLE IF EXISTS missing; \
+             CREATE TABLE events (id Int64, score Float64, active Bool, label String); \
+             CREATE TABLE IF NOT EXISTS events (ignored String); \
              CREATE TABLE flags (active Bool); \
              INSERT INTO events VALUES (1, 1.5, true, 'one'), (2, 2.5, false, 'two'); \
              INSERT INTO flags VALUES (true);",
@@ -411,7 +413,11 @@ fn metrics_snapshot_tracks_retained_counts_and_value_bytes() {
     );
 
     database
-        .execute("TRUNCATE TABLE events; DROP TABLE flags;")
+        .execute(
+            "TRUNCATE TABLE events; \
+             DROP TABLE IF EXISTS flags; \
+             DROP TABLE IF EXISTS flags;",
+        )
         .unwrap();
     assert_eq!(
         database.metrics_snapshot(),

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
 
 use crate::batch::error::{Error, Result};
 use crate::batch::storage::{
@@ -10,75 +9,6 @@ use crate::batch::storage::{
 #[derive(Debug, Default)]
 pub struct Catalog {
     tables: HashMap<String, Table>,
-    column_count: u128,
-    retained_row_count: u128,
-    retained_value_bytes: u128,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TableMeasurements {
-    column_count: u128,
-    retained_row_count: u128,
-    retained_value_bytes: u128,
-}
-
-impl TableMeasurements {
-    fn read(table: &Table) -> Self {
-        Self {
-            column_count: table.schema().len() as u128,
-            retained_row_count: table.row_count() as u128,
-            retained_value_bytes: table.retained_value_bytes_exact(),
-        }
-    }
-}
-
-/// Mutable access to one catalog table that reconciles cached metrics on drop.
-///
-/// This guard dereferences to [`Table`]. Keeping metric reconciliation in the
-/// guard ensures every table mutation path updates the catalog's constant-time
-/// totals, including direct callers of [`Catalog::table_mut`].
-#[derive(Debug)]
-pub struct TableMut<'a> {
-    table: &'a mut Table,
-    column_count: &'a mut u128,
-    retained_row_count: &'a mut u128,
-    retained_value_bytes: &'a mut u128,
-    before: TableMeasurements,
-}
-
-impl Deref for TableMut<'_> {
-    type Target = Table;
-
-    fn deref(&self) -> &Self::Target {
-        self.table
-    }
-}
-
-impl DerefMut for TableMut<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.table
-    }
-}
-
-impl Drop for TableMut<'_> {
-    fn drop(&mut self) {
-        let after = TableMeasurements::read(self.table);
-        replace_measurement(
-            self.column_count,
-            self.before.column_count,
-            after.column_count,
-        );
-        replace_measurement(
-            self.retained_row_count,
-            self.before.retained_row_count,
-            after.retained_row_count,
-        );
-        replace_measurement(
-            self.retained_value_bytes,
-            self.before.retained_value_bytes,
-            after.retained_value_bytes,
-        );
-    }
 }
 
 impl Catalog {
@@ -166,9 +96,7 @@ impl Catalog {
             return Err(Error::TableAlreadyExists(name));
         }
         let table = Table::with_limits(name, schema, limits)?;
-        let measurements = TableMeasurements::read(&table);
         self.tables.insert(key, table);
-        self.add_measurements(measurements);
         Ok(())
     }
 
@@ -186,11 +114,7 @@ impl Catalog {
     /// Returns `true` when a table was removed and `false` when the catalog was
     /// already missing that name.
     pub fn drop_table_if_exists(&mut self, name: &str) -> bool {
-        let Some(table) = self.tables.remove(&normalize(name)) else {
-            return false;
-        };
-        self.subtract_measurements(TableMeasurements::read(&table));
-        true
+        self.tables.remove(&normalize(name)).is_some()
     }
 
     /// Renames one table after validating the complete catalog change.
@@ -252,25 +176,10 @@ impl Catalog {
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
-    pub fn table_mut(&mut self, name: &str) -> Result<TableMut<'_>> {
-        let key = normalize(name);
-        let Self {
-            tables,
-            column_count,
-            retained_row_count,
-            retained_value_bytes,
-        } = self;
-        let table = tables
-            .get_mut(&key)
-            .ok_or_else(|| Error::TableNotFound(name.to_owned()))?;
-        let before = TableMeasurements::read(table);
-        Ok(TableMut {
-            table,
-            column_count,
-            retained_row_count,
-            retained_value_bytes,
-            before,
-        })
+    pub fn table_mut(&mut self, name: &str) -> Result<&mut Table> {
+        self.tables
+            .get_mut(&normalize(name))
+            .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
     /// Reports catalog membership using the same case-insensitive resolution
@@ -286,27 +195,37 @@ impl Catalog {
         self.tables.len()
     }
 
-    /// Returns the cached number of columns across all registered tables in
-    /// constant time.
+    /// Returns the number of columns retained across all registered tables.
     #[must_use]
     pub fn column_count(&self) -> usize {
-        saturating_usize(self.column_count)
+        self.tables
+            .values()
+            .map(|table| table.schema().len())
+            .fold(0_usize, usize::saturating_add)
     }
 
-    /// Returns the cached number of rows across all registered tables in
-    /// constant time.
+    /// Returns the number of rows retained across all registered tables.
     #[must_use]
     pub fn retained_row_count(&self) -> usize {
-        saturating_usize(self.retained_row_count)
+        self.tables
+            .values()
+            .map(Table::row_count)
+            .fold(0_usize, usize::saturating_add)
     }
 
-    /// Returns cached scalar payload bytes across all tables in constant time.
+    /// Returns scalar payload bytes retained across all tables without allocating.
     ///
-    /// The total is maintained during mutations, saturates at [`usize::MAX`],
-    /// and excludes container capacity, schema text, and allocation metadata.
+    /// Per-table totals are maintained during mutations, so this visits tables
+    /// but does not scan their values. The sum saturates at [`usize::MAX`] and
+    /// excludes container capacity, schema text, and allocation metadata.
     #[must_use]
     pub fn retained_value_bytes(&self) -> usize {
-        saturating_usize(self.retained_value_bytes)
+        saturating_usize(
+            self.tables
+                .values()
+                .map(Table::retained_value_bytes_exact)
+                .fold(0_u128, u128::saturating_add),
+        )
     }
 
     /// Returns the combined byte length of all display names without allocating.
@@ -325,30 +244,6 @@ impl Catalog {
         tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         tables.into_iter().map(|(_, table)| table.name()).collect()
     }
-
-    fn add_measurements(&mut self, measurements: TableMeasurements) {
-        self.column_count = self.column_count.saturating_add(measurements.column_count);
-        self.retained_row_count = self
-            .retained_row_count
-            .saturating_add(measurements.retained_row_count);
-        self.retained_value_bytes = self
-            .retained_value_bytes
-            .saturating_add(measurements.retained_value_bytes);
-    }
-
-    fn subtract_measurements(&mut self, measurements: TableMeasurements) {
-        self.column_count = self.column_count.saturating_sub(measurements.column_count);
-        self.retained_row_count = self
-            .retained_row_count
-            .saturating_sub(measurements.retained_row_count);
-        self.retained_value_bytes = self
-            .retained_value_bytes
-            .saturating_sub(measurements.retained_value_bytes);
-    }
-}
-
-fn replace_measurement(total: &mut u128, before: u128, after: u128) {
-    *total = total.saturating_sub(before).saturating_add(after);
 }
 
 fn saturating_usize(value: u128) -> usize {
@@ -477,7 +372,7 @@ mod tests {
         assert_eq!(catalog.retained_value_bytes(), 0);
 
         {
-            let mut numbers = catalog.table_mut("numbers").expect("numbers table");
+            let numbers: &mut Table = catalog.table_mut("numbers").expect("numbers table");
             numbers
                 .insert_row(vec![Value::Int64(7)])
                 .expect("insert number");

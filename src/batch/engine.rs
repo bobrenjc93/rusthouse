@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
@@ -143,14 +144,107 @@ impl Default for QueryResultLimits {
 #[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
+    measurements: DatabaseMeasurements,
     query_result_limits: QueryResultLimits,
     table_limits: TableLimits,
+}
+
+#[derive(Debug, Default)]
+struct DatabaseMeasurements {
+    column_count: u128,
+    retained_row_count: u128,
+    retained_value_bytes: u128,
+}
+
+impl DatabaseMeasurements {
+    fn add(&mut self, measurements: TableMeasurements) {
+        self.column_count = self.column_count.saturating_add(measurements.column_count);
+        self.retained_row_count = self
+            .retained_row_count
+            .saturating_add(measurements.retained_row_count);
+        self.retained_value_bytes = self
+            .retained_value_bytes
+            .saturating_add(measurements.retained_value_bytes);
+    }
+
+    fn subtract(&mut self, measurements: TableMeasurements) {
+        self.column_count = self.column_count.saturating_sub(measurements.column_count);
+        self.retained_row_count = self
+            .retained_row_count
+            .saturating_sub(measurements.retained_row_count);
+        self.retained_value_bytes = self
+            .retained_value_bytes
+            .saturating_sub(measurements.retained_value_bytes);
+    }
+
+    fn replace(&mut self, before: TableMeasurements, after: TableMeasurements) {
+        self.subtract(before);
+        self.add(after);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TableMeasurements {
+    column_count: u128,
+    retained_row_count: u128,
+    retained_value_bytes: u128,
+}
+
+impl TableMeasurements {
+    fn read(table: &Table) -> Self {
+        Self {
+            column_count: table.schema().len() as u128,
+            retained_row_count: table.row_count() as u128,
+            retained_value_bytes: table.retained_value_bytes_exact(),
+        }
+    }
+
+    fn empty(column_count: usize) -> Self {
+        Self {
+            column_count: column_count as u128,
+            retained_row_count: 0,
+            retained_value_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DatabaseTableMut<'a> {
+    table: &'a mut Table,
+    measurements: &'a mut DatabaseMeasurements,
+    before: TableMeasurements,
+}
+
+impl Deref for DatabaseTableMut<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Self::Target {
+        self.table
+    }
+}
+
+impl DerefMut for DatabaseTableMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.table
+    }
+}
+
+impl Drop for DatabaseTableMut<'_> {
+    fn drop(&mut self) {
+        self.measurements
+            .replace(self.before, TableMeasurements::read(self.table));
+    }
+}
+
+fn saturating_usize(value: u128) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 impl Default for Database {
     fn default() -> Self {
         Self {
             catalog: Catalog::new(),
+            measurements: DatabaseMeasurements::default(),
             query_result_limits: QueryResultLimits::default(),
             table_limits: TableLimits::default(),
         }
@@ -188,6 +282,7 @@ impl Database {
     pub fn with_query_result_limits(query_result_limits: QueryResultLimits) -> Self {
         Self {
             catalog: Catalog::new(),
+            measurements: DatabaseMeasurements::default(),
             query_result_limits,
             table_limits: TableLimits::default(),
         }
@@ -215,6 +310,30 @@ impl Database {
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    pub(crate) fn retained_metrics(&self) -> (usize, usize, usize, usize) {
+        (
+            self.catalog.table_count(),
+            saturating_usize(self.measurements.column_count),
+            saturating_usize(self.measurements.retained_row_count),
+            saturating_usize(self.measurements.retained_value_bytes),
+        )
+    }
+
+    fn table_mut(&mut self, name: &str) -> Result<DatabaseTableMut<'_>> {
+        let Self {
+            catalog,
+            measurements,
+            ..
+        } = self;
+        let table = catalog.table_mut(name)?;
+        let before = TableMeasurements::read(table);
+        Ok(DatabaseTableMut {
+            table,
+            measurements,
+            before,
+        })
     }
 
     #[must_use]
@@ -279,7 +398,7 @@ impl Database {
             csv::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
-        self.catalog.table_mut(table)?.insert_rows(rows)?;
+        self.table_mut(table)?.insert_rows(rows)?;
         Ok(affected_rows)
     }
 
@@ -325,7 +444,7 @@ impl Database {
             tsv::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
-        self.catalog.table_mut(table)?.insert_rows(rows)?;
+        self.table_mut(table)?.insert_rows(rows)?;
         Ok(affected_rows)
     }
 
@@ -444,8 +563,7 @@ impl Database {
         let mut results = Vec::with_capacity(prepared.len());
         for (table, rows) in prepared {
             let affected_rows = rows.len();
-            self.catalog
-                .table_mut(&table)
+            self.table_mut(&table)
                 .expect("preflight resolved every INSERT target")
                 .append_prepared_insert_rows(rows);
             results.push(StatementResult::Command {
@@ -510,33 +628,46 @@ impl Database {
     ) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
+                let measurements = TableMeasurements::empty(columns.len());
                 self.catalog
                     .create_table_with_limits(name, columns, self.table_limits)?;
+                self.measurements.add(measurements);
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
                 })
             }
             Statement::CreateTableIfNotExists { name, columns } => {
-                self.catalog.create_table_if_not_exists_with_limits(
+                let measurements = TableMeasurements::empty(columns.len());
+                let created = self.catalog.create_table_if_not_exists_with_limits(
                     name,
                     columns,
                     self.table_limits,
                 )?;
+                if created {
+                    self.measurements.add(measurements);
+                }
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
                 })
             }
             Statement::DropTable { name } => {
+                let measurements = TableMeasurements::read(self.catalog.table(&name)?);
                 self.catalog.drop_table(&name)?;
+                self.measurements.subtract(measurements);
                 Ok(StatementResult::Command {
                     tag: "DROP TABLE",
                     affected_rows: 0,
                 })
             }
             Statement::DropTableIfExists { name } => {
-                self.catalog.drop_table_if_exists(&name);
+                let measurements = self.catalog.table(&name).ok().map(TableMeasurements::read);
+                if self.catalog.drop_table_if_exists(&name) {
+                    self.measurements.subtract(
+                        measurements.expect("the conditionally dropped table was measured"),
+                    );
+                }
                 Ok(StatementResult::Command {
                     tag: "DROP TABLE",
                     affected_rows: 0,
@@ -564,21 +695,21 @@ impl Database {
                 })
             }
             Statement::AddColumn { table, column } => {
-                self.catalog.add_column(&table, column)?;
+                self.table_mut(&table)?.add_column(column)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",
                     affected_rows: 0,
                 })
             }
             Statement::DropColumn { table, column } => {
-                self.catalog.drop_column(&table, &column)?;
+                self.table_mut(&table)?.drop_column(&column)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",
                     affected_rows: 0,
                 })
             }
             Statement::TruncateTable { name } => {
-                let affected_rows = self.catalog.table_mut(&name)?.truncate();
+                let affected_rows = self.table_mut(&name)?.truncate();
                 Ok(StatementResult::Command {
                     tag: "TRUNCATE TABLE",
                     affected_rows,
@@ -701,9 +832,7 @@ impl Database {
             incoming_rows,
         )?;
         let affected_rows = rows.len();
-        self.catalog
-            .table_mut(&table)?
-            .append_prepared_insert_rows(rows);
+        self.table_mut(&table)?.append_prepared_insert_rows(rows);
         Ok(StatementResult::Command {
             tag: "INSERT",
             affected_rows,
@@ -726,7 +855,6 @@ impl Database {
         };
 
         let affected_rows = self
-            .catalog
             .table_mut(&table)
             .expect("DELETE target was resolved before its bounded scan")
             .delete_rows(&row_indexes)?;
