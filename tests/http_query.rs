@@ -1060,6 +1060,7 @@ fn every_query_route_returns_503_without_waiting_for_a_writer() {
             "X-ClickHouse-Format: CSVWithNames\r\n",
         ),
         b"GET /?query=SHOW+TABLES%3B HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        b"POST /?query=SHOW+TABLES%3B HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
     ];
     let (sender, receiver) = mpsc::channel();
     let worker_database = database.clone();
@@ -1109,6 +1110,7 @@ fn every_query_route_admits_a_concurrent_reader() {
         request_for_target("/", b"SELECT value FROM readings;"),
         request_for_target("/query", b"SELECT value FROM readings;"),
         b"GET /?query=SELECT+value+FROM+readings%3B HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        b"POST /?query=SELECT+value+FROM+readings%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n".to_vec(),
     ];
     let (sender, receiver) = mpsc::channel();
     let worker_database = database.clone();
@@ -1167,6 +1169,145 @@ fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
             r#"{"columns":[{"name":"label","type":"String"}],"rows":[["snow 雪"]]}"#,
         )
         .as_bytes(),
+    );
+}
+
+#[test]
+fn url_encoded_post_query_accepts_absent_or_zero_length_and_every_default_format() {
+    let database = SharedDatabase::default();
+    let cases: &[(&[u8], &str, &[u8])] = &[
+        (
+            b"POST /?default_format=JSON&query=SELECT+7+AS+value%3B&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "application/json",
+            br#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#,
+        ),
+        (
+            b"POST /?query=SELECT+7+AS+value%3B&default_format=CSVWithNames HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            "text/csv; charset=utf-8",
+            b"value\n7\n",
+        ),
+        (
+            b"POST /?database=default&default_format=TabSeparatedWithNames&query=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "text/tab-separated-values; charset=utf-8",
+            b"value\n7\n",
+        ),
+        (
+            b"POST /?default_format=JSONEachRow&query=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            "application/json",
+            b"{\"value\":7}\n",
+        ),
+        (
+            b"POST /?query=SELECT+7+AS+value%3B&default_format=JSONCompactEachRow HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "application/json",
+            b"[7]\n",
+        ),
+    ];
+
+    for (request, content_type, body) in cases {
+        assert_response_with_content_type(
+            &exchange(&database, request),
+            "HTTP/1.1 200 OK",
+            content_type,
+            body,
+        );
+    }
+}
+
+#[test]
+fn url_encoded_post_query_reuses_authentication_database_and_header_format() {
+    let database = SharedDatabase::default();
+    let missing_bearer = b"POST /?query=SELECT+7%3B&database=analytics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", missing_bearer),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let bearer = b"POST /?database=default&query=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\nX-ClickHouse-Database: default\r\nX-ClickHouse-Format: JSONEachRow\r\nContent-Length: 0\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", bearer),
+        "HTTP/1.1 200 OK",
+        "{\"value\":7}\n",
+    );
+
+    let key_response = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"POST /?query=SELECT+7+AS+value%3B&default_format=CSVWithNames HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+    );
+    assert_response_with_content_type(
+        &key_response,
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n7\n",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+}
+
+#[test]
+fn url_encoded_post_query_rejects_bodies_conflicts_and_invalid_parameters() {
+    let database = SharedDatabase::default();
+    let body_request =
+        b"POST /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
+    let mut input = Cursor::new(body_request);
+    let mut response = Vec::new();
+    handle_http_query(&database, &mut input, &mut response).unwrap();
+    assert_eq!(input.position(), (body_request.len() - 1) as u64);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"POST /?query= does not accept a request body"}"#,
+    );
+
+    let errors: &[(&[u8], &str)] = &[
+        (
+            b"POST /?query=SELECT+1%3B&default_format=JSONEachRow HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Format: CSVWithNames\r\n\r\n",
+            r#"{"error":"default_format parameter cannot be combined with X-ClickHouse-Format header"}"#,
+        ),
+        (
+            b"POST /?database=analytics&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"database query parameter must be default"}"#,
+        ),
+        (
+            b"POST /?query=SELECT+1%3B&default_format=XML HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            r#"{"error":"unsupported default_format parameter"}"#,
+        ),
+        (
+            b"POST /?query=SELECT+1%3B&format=JSON HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"POST query target contains an unknown parameter"}"#,
+        ),
+        (
+            b"POST /?database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"POST query target must contain exactly one query parameter"}"#,
+        ),
+        (
+            b"POST /?query= HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"POST query parameters must have nonempty names and values"}"#,
+        ),
+    ];
+    for (request, expected_body) in errors {
+        assert_response(
+            &exchange(&database, request),
+            "HTTP/1.1 400 Bad Request",
+            expected_body,
+        );
+    }
+
+    let mut limited_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(b"POST /?query=SELECT+10%3B HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice()),
+        &mut limited_response,
+        HttpQueryLimits {
+            max_sql_bytes: b"SELECT 10;".len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_response(
+        &limited_response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"SQL query exceeds configured byte limit"}"#,
     );
 }
 
@@ -3031,10 +3172,10 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
     assert_response(
         &exchange(
             &database,
-            b"POST /?query HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            b"PUT /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
         ),
-        "HTTP/1.1 404 Not Found",
-        r#"{"error":"request target must be / or /query"}"#,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be GET or POST for /?query="}"#,
     );
 
     let ping_method = exchange(
@@ -3395,6 +3536,14 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
         &exchange(
             &database,
             b"GET /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"POST /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 400 Bad Request",
         r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,

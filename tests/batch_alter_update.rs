@@ -23,8 +23,17 @@ fn bool_column(database: &Database, table: &str, column: &str) -> Vec<bool> {
     values.clone()
 }
 
+fn float64_column(database: &Database, table: &str, column: &str) -> Vec<f64> {
+    let table = database.catalog().table(table).expect("table exists");
+    let index = table.column_index(column).expect("column exists");
+    let Column::Float64(values) = &table.columns()[index] else {
+        panic!("column is Float64");
+    };
+    values.clone()
+}
+
 #[test]
-fn parses_the_exact_int64_alter_update_shape_and_extrema() {
+fn parses_int64_bool_and_finite_float64_alter_update_literals() {
     assert_eq!(
         parse(
             "aLtEr TaBlE Events UpDaTe Value = -9223372036854775808 \
@@ -46,6 +55,36 @@ fn parses_the_exact_int64_alter_update_shape_and_extrema() {
             value: AlterUpdateLiteral::Bool(true),
             predicate_column: "Selected".to_owned(),
             predicate_value: AlterUpdateLiteral::Bool(false),
+        }])
+    );
+
+    let parsed = parse(
+        "ALTER TABLE Events UPDATE Score = -0.0 \
+         WHERE Selector = +1.7976931348623157e308",
+    )
+    .expect("finite Float64 extrema parse");
+    let [
+        Statement::AlterUpdateTyped {
+            value: AlterUpdateLiteral::Float64(value),
+            predicate_value: AlterUpdateLiteral::Float64(predicate_value),
+            ..
+        },
+    ] = parsed.as_slice()
+    else {
+        panic!("decimal and scientific literals use the typed update shape");
+    };
+    assert_eq!(*value, 0.0);
+    assert!(value.is_sign_negative());
+    assert_eq!(*predicate_value, f64::MAX);
+
+    assert_eq!(
+        parse("ALTER TABLE Events UPDATE Score = 2.5e-1 WHERE Active = TRUE"),
+        Ok(vec![Statement::AlterUpdateTyped {
+            table: "Events".to_owned(),
+            target_column: "Score".to_owned(),
+            value: AlterUpdateLiteral::Float64(0.25),
+            predicate_column: "Active".to_owned(),
+            predicate_value: AlterUpdateLiteral::Bool(true),
         }])
     );
 }
@@ -88,14 +127,15 @@ fn rejects_non_exact_alter_update_syntax_and_unsupported_literals() {
         "ALTER TABLE events UPDATE value = 1 WHERE selector != 2",
         "ALTER TABLE events UPDATE value = 1 WHERE selector = 2 AND value = 0",
         "ALTER TABLE events UPDATE value = 1 WHERE selector = 2 LIMIT 1",
-        "ALTER TABLE events UPDATE value = 1.0 WHERE selector = 2",
         "ALTER TABLE events UPDATE value = '1' WHERE selector = 2",
-        "ALTER TABLE events UPDATE value = 1 WHERE selector = 2.0",
         "ALTER TABLE events UPDATE value = 1 WHERE selector = NULL",
         "ALTER TABLE events UPDATE value = +true WHERE selector = 2",
         "ALTER TABLE events UPDATE value = true WHERE selector = 'false'",
         "ALTER TABLE events UPDATE value = 9223372036854775808 WHERE selector = 2",
         "ALTER TABLE events UPDATE value = 1 WHERE selector = -9223372036854775809",
+        "ALTER TABLE events UPDATE value = 1e309 WHERE selector = 2",
+        "ALTER TABLE events UPDATE value = 1.0 WHERE selector = -1e309",
+        "ALTER TABLE events UPDATE value = 1e WHERE selector = 2",
     ] {
         assert!(parse(sql).is_err(), "{sql:?} must be rejected");
     }
@@ -141,6 +181,80 @@ fn bool_targets_and_predicates_support_zero_all_and_mixed_type_matches() {
         }])
     );
     assert_eq!(bool_column(&database, "flags", "active"), vec![true; 3]);
+}
+
+#[test]
+fn float64_targets_and_predicates_compose_with_int64_and_bool() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE metrics (id Int64, score Float64, selector Float64, selected Bool, active Bool, revision Int64); \
+             INSERT INTO metrics VALUES \
+                 (1, 10.5, -0.0, true, false, 0), \
+                 (2, 20.5, +0.0, false, false, 0), \
+                 (3, 30.5, 2.5e-1, false, false, 0), \
+                 (4, 40.5, 1.7976931348623157e308, false, false, 0);",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database.execute("ALTER TABLE metrics UPDATE score = -0.0 WHERE id = 1;"),
+        Ok(vec![StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 1,
+        }])
+    );
+    let scores = float64_column(&database, "metrics", "score");
+    assert_eq!(scores[0], 0.0);
+    assert!(scores[0].is_sign_negative());
+
+    assert_eq!(
+        database.execute(
+            "ALTER TABLE metrics UPDATE revision = -7 WHERE selector = 2.5e-1; \
+             ALTER TABLE metrics UPDATE active = true WHERE selector = -0.0; \
+             ALTER TABLE metrics UPDATE score = -1.7976931348623157e308 WHERE active = true; \
+             ALTER TABLE metrics UPDATE score = +1.7976931348623157e308 WHERE id = 4; \
+             ALTER TABLE metrics UPDATE selected = true WHERE selector = 1.7976931348623157e308;"
+        ),
+        Ok(vec![
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 1,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 2,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 2,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 1,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 1,
+            },
+        ])
+    );
+    assert_eq!(
+        int64_column(&database, "metrics", "revision"),
+        vec![0, 0, -7, 0]
+    );
+    assert_eq!(
+        bool_column(&database, "metrics", "active"),
+        vec![true, true, false, false]
+    );
+    assert_eq!(
+        bool_column(&database, "metrics", "selected"),
+        vec![true, false, false, true]
+    );
+    assert_eq!(
+        float64_column(&database, "metrics", "score"),
+        vec![-f64::MAX, -f64::MAX, 30.5, f64::MAX]
+    );
 }
 
 #[test]
@@ -286,12 +400,45 @@ fn missing_names_and_literal_type_mismatches_fail_without_changes() {
             column: "absent".to_owned(),
         })
     );
+    assert_eq!(
+        database.execute("ALTER TABLE events UPDATE value = 1.0 WHERE id = 1;"),
+        Err(Error::TypeMismatch {
+            context: "ALTER TABLE UPDATE target column 'events.value'".to_owned(),
+            expected: "Float64".to_owned(),
+            actual: "Int64".to_owned(),
+        })
+    );
+    assert_eq!(
+        database.execute("ALTER TABLE events UPDATE score = true WHERE id = 1;"),
+        Err(Error::TypeMismatch {
+            context: "ALTER TABLE UPDATE target column 'events.score'".to_owned(),
+            expected: "Bool".to_owned(),
+            actual: "Float64".to_owned(),
+        })
+    );
+    assert_eq!(
+        database.execute("ALTER TABLE events UPDATE score = 1.0 WHERE id = 1.0;"),
+        Err(Error::TypeMismatch {
+            context: "ALTER TABLE UPDATE WHERE column 'events.id'".to_owned(),
+            expected: "Float64".to_owned(),
+            actual: "Int64".to_owned(),
+        })
+    );
+    assert_eq!(
+        database.execute("ALTER TABLE events UPDATE score = 1.0 WHERE selected = 1.0;"),
+        Err(Error::TypeMismatch {
+            context: "ALTER TABLE UPDATE WHERE column 'events.selected'".to_owned(),
+            expected: "Float64".to_owned(),
+            actual: "Bool".to_owned(),
+        })
+    );
 
     assert_eq!(int64_column(&database, "events", "value"), vec![10, 20]);
     assert_eq!(
         bool_column(&database, "events", "active"),
         vec![false, true]
     );
+    assert_eq!(float64_column(&database, "events", "score"), vec![1.5, 2.5]);
 }
 
 #[test]
@@ -303,11 +450,11 @@ fn full_table_scan_limit_is_checked_after_names_and_types_and_before_mutation() 
     let mut database = Database::with_query_result_limits(limits);
     database
         .execute(
-            "CREATE TABLE events (id Int64, value Int64, active Bool, selected Bool, label String); \
+            "CREATE TABLE events (id Int64, value Int64, active Bool, selected Bool, label String, score Float64); \
              INSERT INTO events VALUES \
-                 (1, 10, false, false, 'one'), \
-                 (2, 20, false, true, 'two'), \
-                 (3, 30, false, true, 'three');",
+                 (1, 10, false, false, 'one', 1.5), \
+                 (2, 20, false, true, 'two', 2.5), \
+                 (3, 30, false, true, 'three', 3.5);",
         )
         .expect("setup is not subject to scan limits");
 
@@ -330,6 +477,48 @@ fn full_table_scan_limit_is_checked_after_names_and_types_and_before_mutation() 
         })
     );
     assert_eq!(bool_column(&database, "events", "active"), vec![false; 3]);
+
+    assert_eq!(
+        database.execute("ALTER TABLE events UPDATE score = 0.5 WHERE score = 3.5;"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "ALTER TABLE UPDATE scanned rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+    assert_eq!(
+        float64_column(&database, "events", "score"),
+        vec![1.5, 2.5, 3.5]
+    );
+
+    assert_eq!(
+        database.execute_statement(Statement::AlterUpdateTyped {
+            table: "events".to_owned(),
+            target_column: "score".to_owned(),
+            value: AlterUpdateLiteral::Float64(f64::INFINITY),
+            predicate_column: "id".to_owned(),
+            predicate_value: AlterUpdateLiteral::Int64(1),
+        }),
+        Err(Error::InvalidQuery(
+            "ALTER TABLE UPDATE assignment Float64 literal must be finite".to_owned()
+        ))
+    );
+    assert_eq!(
+        database.execute_statement(Statement::AlterUpdateTyped {
+            table: "events".to_owned(),
+            target_column: "score".to_owned(),
+            value: AlterUpdateLiteral::Float64(0.0),
+            predicate_column: "score".to_owned(),
+            predicate_value: AlterUpdateLiteral::Float64(f64::NAN),
+        }),
+        Err(Error::InvalidQuery(
+            "ALTER TABLE UPDATE WHERE Float64 literal must be finite".to_owned()
+        ))
+    );
+    assert_eq!(
+        float64_column(&database, "events", "score"),
+        vec![1.5, 2.5, 3.5]
+    );
 
     assert!(matches!(
         database.execute("ALTER TABLE events UPDATE missing = 0 WHERE id = 3;"),

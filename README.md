@@ -155,19 +155,21 @@ semicolon is optional.
 
 `ALTER TABLE <table> UPDATE <target> = <literal> WHERE <column> = <literal>`
 provides one deliberately narrow ClickHouse-style mutation. The target and
-predicate may independently be existing `Int64` or `Bool` columns, and each
-literal must have its corresponding column's type. `Int64` literals support
-the complete optionally signed range, while Boolean literals are
-case-insensitive `TRUE` or `FALSE`. Table and column lookup is case-insensitive.
-The table and both columns are resolved and type-checked before the full source
-row count is checked against the configured scan limit. After that bounded
-scan, all matches from the original predicate column are passed to one atomic
-column replacement, including an empty replacement for zero matches. Invalid
-syntax, missing names, wrong types, and scan-limit failures leave the table
-unchanged. Expressions, additional assignments or predicates, other operators
-and physical types, and clauses such as `LIMIT` are not supported. A successful
-command reports its matched-row count through the library API and is silent in
-formatted CLI output.
+predicate may independently be existing `Int64`, `Float64`, or `Bool` columns,
+and each literal must have its corresponding column's type. `Int64` literals
+support the complete optionally signed range. `Float64` literals use finite,
+optionally signed decimal or scientific notation; a decimal point or exponent
+distinguishes them from `Int64` literals. Boolean literals are case-insensitive
+`TRUE` or `FALSE`. Table and column lookup is case-insensitive. The table and
+both columns are resolved, type-checked, and checked for finite Float64 literals
+before the full source row count is checked against the configured scan limit.
+After that bounded scan, all matches from the original predicate column are
+passed to one atomic column replacement, including an empty replacement for
+zero matches. Invalid syntax, missing names, wrong types, non-finite values, and
+scan-limit failures leave the table unchanged. Expressions, additional
+assignments or predicates, other operators, `String` operands, and clauses such
+as `LIMIT` are not supported. A successful command reports its matched-row
+count through the library API and is silent in formatted CLI output.
 
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
@@ -552,11 +554,13 @@ whose sender may be awaiting an interim response.
 
 `POST /` and `POST /query` are equivalent query routes. Each requires one
 decimal `Content-Length` and sends its UTF-8 SQL body through
-`SharedDatabase::try_query`. The standard ClickHouse-style
-`GET /?query=<percent-encoded SQL>` form does the same with no body
-(`Content-Length` may be omitted or be zero). It also accepts one optional
-`database=default` parameter and one optional `default_format` parameter in any
-order with `query`, including percent-encoded parameter names and values. All
+`SharedDatabase::try_query`. The standard ClickHouse-style parameterized forms,
+`GET /?query=<percent-encoded SQL>` and
+`POST /?query=<percent-encoded SQL>`, do the same with no body
+(`Content-Length` may be omitted or be zero). A nonzero `Content-Length` is
+rejected. Both forms also accept one optional `database=default` parameter and
+one optional `default_format` parameter in any order with `query`, including
+percent-encoded parameter names and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
 `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, and
@@ -583,8 +587,9 @@ values return `400 Bad Request`. Database-header validation runs after either
 configured authentication mode, so credential failures retain precedence, but
 before a POST body is read or any database lock is attempted. Omitting the
 header retains the existing single-database behavior.
-For GET queries, the header and `database=default` query parameter may coexist;
-each is validated independently against the same single database.
+For parameterized GET and POST queries, the header and `database=default` query
+parameter may coexist; each is validated independently against the same single
+database.
 
 The bearer- and `X-ClickHouse-Key`-authenticated handlers additionally expose
 exact `POST /insert`. It requires one decimal `Content-Length`, applies the
@@ -657,12 +662,12 @@ one positional JSON array per row, each followed by a line feed; column
 metadata is omitted and an empty result has an empty body. Header names are
 case-insensitive, but format values are case-sensitive and must use one of
 those exact spellings. Duplicate format headers and all other format values
-receive deterministic `400 Bad Request` JSON errors. A GET request cannot
-combine this header with `default_format`; the independently valid selectors
-also receive a deterministic `400 Bad Request` after authentication and before
-database access. When neither selector is present, the existing JSON response
-shape is unchanged. Every selected writer remains subject to the complete HTTP
-response cap.
+receive deterministic `400 Bad Request` JSON errors. A parameterized GET or
+POST request cannot combine this header with `default_format`; the independently
+valid selectors also receive a deterministic `400 Bad Request` after
+authentication and before database access. When neither selector is present,
+the existing JSON response shape is unchanged. Every selected writer remains
+subject to the complete HTTP response cap.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`

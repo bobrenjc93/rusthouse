@@ -136,6 +136,24 @@ fn json_cli_executes_bool_alter_update_silently() {
 }
 
 #[test]
+fn json_cli_executes_float64_alter_update_silently() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE metrics (id Int64, score Float64, selector Float64); \
+          INSERT INTO metrics VALUES (1, 1.5, 0.25), (2, 2.5, 0.5); \
+          ALTER TABLE metrics UPDATE score = -1.25e2 WHERE selector = 2.5e-1; \
+          SELECT id, score FROM metrics ORDER BY id;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"score\",\"type\":\"Float64\"}],\"rows\":[[1,-125.0],[2,2.5]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_exposes_typed_defaults_from_reordered_insert_subsets() {
     let output = run(
         &["--format", "json"],
