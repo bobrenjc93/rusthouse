@@ -427,8 +427,8 @@ impl Table {
     /// are rejected. Omitted columns receive their type's non-null default:
     /// `0`, `0.0`, `false`, or an empty String when the prepared rows are
     /// committed. After column and row-width validation, `capacity_rows` is
-    /// checked before supplied values are type-checked. Atomic callers pass
-    /// the cumulative rows for this table.
+    /// checked before supplied values are type-checked in schema order. Atomic
+    /// callers pass the cumulative rows for this table.
     pub(crate) fn prepare_insert_rows(
         &self,
         insert_columns: Option<&[String]>,
@@ -461,8 +461,7 @@ impl Table {
             .collect::<HashMap<_, _>>();
         let mut schema_indexes = Vec::with_capacity(insert_columns.len());
         let mut seen = vec![false; self.schema.len()];
-        let mut input_indexes_by_schema = vec![None; self.schema.len()];
-        for (input_index, name) in insert_columns.iter().enumerate() {
+        for name in insert_columns {
             let Some(&schema_index) = schema_indexes_by_name.get(&name.to_ascii_lowercase()) else {
                 return Err(Error::ColumnNotFound {
                     table: self.name.clone(),
@@ -473,7 +472,6 @@ impl Table {
                 return Err(Error::DuplicateColumn(name.clone()));
             }
             schema_indexes.push(schema_index);
-            input_indexes_by_schema[schema_index] = Some(input_index);
         }
 
         for row in &rows {
@@ -481,6 +479,57 @@ impl Table {
                 return Err(Error::RowLength {
                     table: self.name.clone(),
                     expected: insert_columns.len(),
+                    actual: row.len(),
+                });
+            }
+        }
+
+        self.prepare_projected_rows_with_capacity(schema_indexes, rows, capacity_rows)
+    }
+
+    /// Validates projected input and retains omitted columns for defaulting at commit.
+    ///
+    /// `schema_indexes` maps each input field to its physical schema column.
+    /// Callers must resolve a unique, nonempty set of indexes before calling
+    /// this helper. Supplied values are validated in physical schema order,
+    /// independent of their input order.
+    pub(crate) fn prepare_projected_rows(
+        &self,
+        schema_indexes: Vec<usize>,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<PreparedInsertRows> {
+        let capacity_rows = rows.len();
+        self.prepare_projected_rows_with_capacity(schema_indexes, rows, capacity_rows)
+    }
+
+    fn prepare_projected_rows_with_capacity(
+        &self,
+        schema_indexes: Vec<usize>,
+        rows: Vec<Vec<Value>>,
+        capacity_rows: usize,
+    ) -> Result<PreparedInsertRows> {
+        debug_assert!(!schema_indexes.is_empty());
+        debug_assert!(
+            schema_indexes
+                .iter()
+                .all(|index| *index < self.schema.len())
+        );
+        debug_assert!({
+            let mut sorted = schema_indexes.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted.len() == schema_indexes.len()
+        });
+        let mut input_indexes_by_schema = vec![None; self.schema.len()];
+        for (input_index, &schema_index) in schema_indexes.iter().enumerate() {
+            input_indexes_by_schema[schema_index] = Some(input_index);
+        }
+
+        for row in &rows {
+            if row.len() != schema_indexes.len() {
+                return Err(Error::RowLength {
+                    table: self.name.clone(),
+                    expected: schema_indexes.len(),
                     actual: row.len(),
                 });
             }
@@ -496,7 +545,7 @@ impl Table {
             }
         }
 
-        let schema_indexes = (insert_columns.len() != self.schema.len()
+        let schema_indexes = (schema_indexes.len() != self.schema.len()
             || !schema_indexes.iter().copied().eq(0..self.schema.len()))
         .then_some(schema_indexes);
         Ok(PreparedInsertRows {

@@ -100,6 +100,37 @@ fn try_ingest_reordered_header_uses_selected_types_and_schema_order() {
 }
 
 #[test]
+fn synchronized_ingest_accepts_a_quoted_subset_and_fills_typed_defaults() {
+    let database = metrics_database(2);
+    let input = b"label,id\n\"shared, \"\"quoted\"\"\",\"7\"\nplain,8\n";
+
+    assert_eq!(
+        database.ingest_csv_with_names("metrics", input, CsvIngestLimits::new(input.len(), 2, 4),),
+        Ok(2),
+    );
+    assert_eq!(
+        database
+            .query("SELECT id, score, active, label FROM metrics ORDER BY id;")
+            .unwrap()
+            .rows,
+        [
+            vec![
+                Value::Int64(7),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String("shared, \"quoted\"".to_owned()),
+            ],
+            vec![
+                Value::Int64(8),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String("plain".to_owned()),
+            ],
+        ],
+    );
+}
+
+#[test]
 fn try_ingest_late_csv_error_is_typed_and_rolls_back_every_parsed_row() {
     let database = metrics_database(3);
     database

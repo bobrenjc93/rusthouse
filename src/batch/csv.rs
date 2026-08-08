@@ -3,7 +3,9 @@
 //! Data fields may be double-quoted. Commas and LF or CRLF line endings in a
 //! quoted field are data, and a double quote is decoded from `""` before the
 //! field is parsed according to the type selected by its header. Headers must
-//! contain every schema name exactly once, in any order, and remain unquoted.
+//! contain a nonempty, exact-case subset of schema names without duplicates;
+//! names may appear in any order and must remain unquoted. Omitted columns use
+//! the same typed defaults as an explicit-column SQL `INSERT`.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -11,7 +13,7 @@ use std::fmt;
 use std::str::Utf8Error;
 
 use super::error::Error;
-use super::storage::Table;
+use super::storage::{PreparedInsertRows, Table};
 use super::value::{DataType, Value};
 
 /// Default maximum size of one typed CSV input, including its header.
@@ -69,7 +71,7 @@ pub enum CsvIngestError {
     MissingHeader { line: usize },
     /// A bare carriage return was used instead of LF or CRLF.
     InvalidLineEnding { line: usize },
-    /// The header does not have the same number of columns as the table.
+    /// The header has more fields than the table has schema columns.
     HeaderColumnCount { expected: usize, actual: usize },
     /// A header field differs in case from an otherwise matching schema name.
     HeaderMismatch { column: usize, expected: String },
@@ -129,7 +131,7 @@ impl fmt::Display for CsvIngestError {
             ),
             Self::HeaderColumnCount { expected, actual } => write!(
                 formatter,
-                "CSV header has {actual} columns; expected {expected}"
+                "CSV header has {actual} columns; table has only {expected} schema columns"
             ),
             Self::HeaderMismatch { column, expected } => write!(
                 formatter,
@@ -207,7 +209,7 @@ pub(crate) fn parse_rows(
     table: &Table,
     input: &[u8],
     limits: CsvIngestLimits,
-) -> Result<Vec<Vec<Value>>, CsvIngestError> {
+) -> Result<PreparedInsertRows, CsvIngestError> {
     if input.len() > limits.max_bytes {
         return Err(CsvIngestError::ByteLimitExceeded {
             bytes: input.len(),
@@ -224,7 +226,7 @@ pub(crate) fn parse_rows(
     let header = line_contents(raw_header, 1)?;
     let header_plan = validate_header(table, header)?;
 
-    let expected_columns = table.schema().len();
+    let expected_columns = header_plan.schema_indexes.len();
     let mut rows = Vec::new();
     let mut value_count = 0_usize;
     for record in DataRecords::new(&input[raw_header.len()..], 2) {
@@ -271,12 +273,13 @@ pub(crate) fn parse_rows(
             }
             Ok(())
         })?;
-        header_plan.reorder_row(&mut row);
         value_count = next_value_count;
         rows.push(row);
     }
 
-    Ok(rows)
+    table
+        .prepare_projected_rows(header_plan.schema_indexes, rows)
+        .map_err(Into::into)
 }
 
 /// Produces logical data records while retaining line endings inside quoted
@@ -387,21 +390,15 @@ fn line_contents(line: &str, line_number: usize) -> Result<&str, CsvIngestError>
 
 struct HeaderPlan {
     schema_indexes: Vec<usize>,
-    row_swaps: Vec<(usize, usize)>,
-}
-
-impl HeaderPlan {
-    fn reorder_row(&self, row: &mut [Value]) {
-        for &(left, right) in &self.row_swaps {
-            row.swap(left, right);
-        }
-    }
 }
 
 fn validate_header(table: &Table, header: &str) -> Result<HeaderPlan, CsvIngestError> {
+    if header.is_empty() {
+        return Err(CsvIngestError::MissingHeader { line: 1 });
+    }
     let expected_columns = table.schema().len();
     let actual_columns = field_count(header);
-    if actual_columns != expected_columns {
+    if actual_columns > expected_columns {
         return Err(CsvIngestError::HeaderColumnCount {
             expected: expected_columns,
             actual: actual_columns,
@@ -415,7 +412,7 @@ fn validate_header(table: &Table, header: &str) -> Result<HeaderPlan, CsvIngestE
         .map(|(index, definition)| (definition.name.as_str(), index))
         .collect::<HashMap<_, _>>();
     let mut seen = vec![false; expected_columns];
-    let mut schema_indexes = Vec::with_capacity(expected_columns);
+    let mut schema_indexes = Vec::with_capacity(actual_columns);
     for (column, field) in header.split(',').enumerate() {
         let column = column + 1;
         reject_quoting(field, 1, column)?;
@@ -444,21 +441,7 @@ fn validate_header(table: &Table, header: &str) -> Result<HeaderPlan, CsvIngestE
         schema_indexes.push(schema_index);
     }
 
-    debug_assert!(seen.into_iter().all(|was_seen| was_seen));
-    let mut destinations = schema_indexes.clone();
-    let mut row_swaps = Vec::with_capacity(expected_columns.saturating_sub(1));
-    for input_index in 0..expected_columns {
-        while destinations[input_index] != input_index {
-            let destination = destinations[input_index];
-            destinations.swap(input_index, destination);
-            row_swaps.push((input_index, destination));
-        }
-    }
-
-    Ok(HeaderPlan {
-        schema_indexes,
-        row_swaps,
-    })
+    Ok(HeaderPlan { schema_indexes })
 }
 
 fn field_count(record: &str) -> usize {
