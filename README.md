@@ -324,9 +324,12 @@ accepts the same optional alias, `WHERE`, expression-or-alias ordering, and
 ClickHouse spelling `lengthUTF8(<column>)`. Evaluation and ordering scan the
 UTF-8 text without creating a transformed `String`; ungrouped ordering by only
 this key caches one scalar count per filtered row before bounded selection.
-The cache is linear in the filtered row count, and result bounds charge only
-the fixed-size `Int64` output. Non-`String` arguments and grouped query shapes
-are rejected with typed errors.
+The cache is linear in the filtered row count and has a separate 16 MiB
+ordering-state limit by default. Each entry is charged as two `usize` values
+(the source row and scalar count), and the complete cache is rejected before
+allocation when it exceeds that limit; `LIMIT` and `OFFSET` do not reduce the
+charge. Result bounds charge only the fixed-size `Int64` output. Non-`String`
+arguments and grouped query shapes are rejected with typed errors.
 `LOWER(string_column)` is an ungrouped scalar projection that lowercases ASCII
 letters while leaving every non-ASCII UTF-8 byte unchanged. Because this
 transformation preserves byte length, its owned `String` results are charged
@@ -463,8 +466,10 @@ additionally allow 100,000 groups and bound grouped keys to 500,000 cells and
 an estimated 32 MiB. Their
 grouped-key accounting includes the reusable lookup probe for tuples wider
 than two columns. Aggregate working state has separate 500,000-cell and
-estimated 32 MiB limits, including cloned string extrema. The collecting
-library API separately caps all retained query results at an estimated 64 MiB.
+estimated 32 MiB limits, including cloned string extrema. Single-key
+`lengthUTF8` ordering has a separate 16 MiB cache limit, charged before
+allocation over all rows retained by `WHERE`. The collecting library API
+separately caps all retained query results at an estimated 64 MiB.
 Typed batch tables also retain at most 1,000,000 rows, 1,024 physical columns,
 and 4,000,000 physical scalar cells each by default. The cell count is the
 current row count multiplied by the schema width, so repeated `ADD COLUMN` and
