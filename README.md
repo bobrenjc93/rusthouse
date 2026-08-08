@@ -322,9 +322,11 @@ count as their own scalar values. The function is case-insensitive in SQL and
 accepts the same optional alias, `WHERE`, expression-or-alias ordering, and
 `LIMIT`/`OFFSET` behavior as `LENGTH`; its default result name uses the
 ClickHouse spelling `lengthUTF8(<column>)`. Evaluation and ordering scan the
-UTF-8 text without creating a transformed `String`, and result bounds charge
-only the fixed-size `Int64` output. Non-`String` arguments and grouped query
-shapes are rejected with typed errors.
+UTF-8 text without creating a transformed `String`; ungrouped ordering by only
+this key caches one scalar count per filtered row before bounded selection.
+The cache is linear in the filtered row count, and result bounds charge only
+the fixed-size `Int64` output. Non-`String` arguments and grouped query shapes
+are rejected with typed errors.
 `LOWER(string_column)` is an ungrouped scalar projection that lowercases ASCII
 letters while leaving every non-ASCII UTF-8 byte unchanged. Because this
 transformation preserves byte length, its owned `String` results are charged

@@ -3957,6 +3957,13 @@ fn order_source_rows(
         return Ok(());
     }
 
+    if let [order] = ordering {
+        if let ResolvedItem::StringLengthUtf8 { source } = items[order.output] {
+            order_source_rows_by_length_utf8(rows, table, source, order.descending, limit);
+            return Ok(());
+        }
+    }
+
     // A String-to-number ordering key must have valid numeric syntax for every
     // candidate row. Values outside the target range can still participate in
     // numeric ordering, so overflow remains deferred until LIMIT/OFFSET have
@@ -4103,6 +4110,44 @@ fn order_source_rows(
         left.cmp(&right)
     });
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedLengthUtf8Order {
+    row: usize,
+    scalar_count: usize,
+}
+
+fn order_source_rows_by_length_utf8(
+    rows: &mut Vec<usize>,
+    table: &Table,
+    source: usize,
+    descending: bool,
+    limit: Option<usize>,
+) {
+    // Keep one scalar count per filtered row so bounded selection never has to
+    // rescan either String operand. The cache remains linear in the filtered
+    // input and is discarded before projection.
+    let mut cached = rows
+        .iter()
+        .copied()
+        .map(|row| CachedLengthUtf8Order {
+            row,
+            scalar_count: string_at(table, source, row).chars().count(),
+        })
+        .collect::<Vec<_>>();
+    sort_and_limit_by(&mut cached, limit, |left, right| {
+        let comparison = left.scalar_count.cmp(&right.scalar_count);
+        let comparison = if descending {
+            comparison.reverse()
+        } else {
+            comparison
+        };
+        comparison.then_with(|| left.row.cmp(&right.row))
+    });
+
+    rows.clear();
+    rows.extend(cached.into_iter().map(|cached| cached.row));
 }
 
 fn order_grouped_rows(
@@ -4502,15 +4547,23 @@ fn sort_and_limit(
     limit: Option<usize>,
     compare: impl Fn(usize, usize) -> Ordering,
 ) {
+    sort_and_limit_by(indices, limit, |left, right| compare(*left, *right));
+}
+
+fn sort_and_limit_by<T>(
+    values: &mut Vec<T>,
+    limit: Option<usize>,
+    compare: impl Fn(&T, &T) -> Ordering,
+) {
     if let Some(0) = limit {
-        indices.clear();
+        values.clear();
         return;
     }
-    if let Some(limit) = limit.filter(|limit| *limit < indices.len()) {
-        indices.select_nth_unstable_by(limit, |left, right| compare(*left, *right));
-        indices.truncate(limit);
+    if let Some(limit) = limit.filter(|limit| *limit < values.len()) {
+        values.select_nth_unstable_by(limit, &compare);
+        values.truncate(limit);
     }
-    indices.sort_unstable_by(|left, right| compare(*left, *right));
+    values.sort_unstable_by(compare);
 }
 
 #[derive(Debug)]
