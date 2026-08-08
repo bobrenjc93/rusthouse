@@ -2,8 +2,11 @@
 //!
 //! Fields use the same ClickHouse-style backslash escapes as the TSV writer.
 //! Physical records may end in LF or CRLF; escaped line endings remain field
-//! data after decoding.
+//! data after decoding. Headers must contain every schema name exactly once,
+//! in any order. Each data field is parsed using the type selected by its
+//! header, then complete rows are restored to schema order.
 
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::str::Utf8Error;
@@ -67,8 +70,12 @@ pub enum TsvIngestError {
     InvalidLineEnding { line: usize },
     /// The header does not have the same number of columns as the table.
     HeaderColumnCount { expected: usize, actual: usize },
-    /// A decoded header field does not exactly equal its schema name.
+    /// A header field differs in case from an otherwise matching schema name.
     HeaderMismatch { column: usize, expected: String },
+    /// A decoded header field does not name any schema column.
+    UnknownHeaderColumn { column: usize, name: String },
+    /// A schema column is named more than once in the decoded header.
+    DuplicateHeaderColumn { column: usize, name: String },
     /// A row crosses the configured row bound.
     RowLimitExceeded {
         line: usize,
@@ -129,6 +136,14 @@ impl fmt::Display for TsvIngestError {
             Self::HeaderMismatch { column, expected } => write!(
                 formatter,
                 "TSV header column {column} does not exactly match schema column '{expected}'"
+            ),
+            Self::UnknownHeaderColumn { column, name } => write!(
+                formatter,
+                "TSV header column {column} names unknown schema column '{name}'"
+            ),
+            Self::DuplicateHeaderColumn { column, name } => write!(
+                formatter,
+                "TSV header column {column} duplicates schema column '{name}'"
             ),
             Self::RowLimitExceeded {
                 line,
@@ -205,7 +220,7 @@ pub(crate) fn parse_rows(
     let mut lines = input.split_inclusive('\n');
     let raw_header = lines.next().expect("non-empty input has a line");
     let header = line_contents(raw_header, 1)?;
-    validate_header(table, header)?;
+    let header_plan = validate_header(table, header)?;
 
     let expected_columns = table.schema().len();
     let mut rows = Vec::new();
@@ -248,13 +263,15 @@ pub(crate) fn parse_rows(
         for (offset, field) in record.split('\t').enumerate() {
             let column = offset.saturating_add(1);
             let decoded = decode_field(field, line, column)?;
+            let schema_index = header_plan.schema_indexes[offset];
             row.push(parse_value(
                 decoded,
-                table.schema()[offset].data_type,
+                table.schema()[schema_index].data_type,
                 line,
                 column,
             )?);
         }
+        header_plan.reorder_row(&mut row);
         value_count = next_value_count;
         rows.push(row);
     }
@@ -271,7 +288,20 @@ fn line_contents(raw_line: &str, line: usize) -> Result<&str, TsvIngestError> {
     Ok(contents)
 }
 
-fn validate_header(table: &Table, header: &str) -> Result<(), TsvIngestError> {
+struct HeaderPlan {
+    schema_indexes: Vec<usize>,
+    row_swaps: Vec<(usize, usize)>,
+}
+
+impl HeaderPlan {
+    fn reorder_row(&self, row: &mut [Value]) {
+        for &(left, right) in &self.row_swaps {
+            row.swap(left, right);
+        }
+    }
+}
+
+fn validate_header(table: &Table, header: &str) -> Result<HeaderPlan, TsvIngestError> {
     let field_count = header
         .as_bytes()
         .iter()
@@ -284,16 +314,59 @@ fn validate_header(table: &Table, header: &str) -> Result<(), TsvIngestError> {
             actual: field_count,
         });
     }
-    for (offset, (field, schema)) in header.split('\t').zip(table.schema()).enumerate() {
+
+    let expected_columns = table.schema().len();
+    let schema_indexes_by_name = table
+        .schema()
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| (definition.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut seen = vec![false; expected_columns];
+    let mut schema_indexes = Vec::with_capacity(expected_columns);
+    for (offset, field) in header.split('\t').enumerate() {
         let column = offset.saturating_add(1);
-        if decode_field(field, 1, column)? != schema.name {
-            return Err(TsvIngestError::HeaderMismatch {
+        let decoded = decode_field(field, 1, column)?;
+        let Some(&schema_index) = schema_indexes_by_name.get(decoded.as_str()) else {
+            if let Some(definition) = table
+                .schema()
+                .iter()
+                .find(|definition| definition.name.eq_ignore_ascii_case(&decoded))
+            {
+                return Err(TsvIngestError::HeaderMismatch {
+                    column,
+                    expected: definition.name.clone(),
+                });
+            }
+            return Err(TsvIngestError::UnknownHeaderColumn {
                 column,
-                expected: schema.name.clone(),
+                name: decoded,
+            });
+        };
+        if std::mem::replace(&mut seen[schema_index], true) {
+            return Err(TsvIngestError::DuplicateHeaderColumn {
+                column,
+                name: decoded,
             });
         }
+        schema_indexes.push(schema_index);
     }
-    Ok(())
+
+    debug_assert!(seen.into_iter().all(|was_seen| was_seen));
+    let mut destinations = schema_indexes.clone();
+    let mut row_swaps = Vec::with_capacity(expected_columns.saturating_sub(1));
+    for input_index in 0..expected_columns {
+        while destinations[input_index] != input_index {
+            let destination = destinations[input_index];
+            destinations.swap(input_index, destination);
+            row_swaps.push((input_index, destination));
+        }
+    }
+
+    Ok(HeaderPlan {
+        schema_indexes,
+        row_swaps,
+    })
 }
 
 fn decode_field(field: &str, line: usize, column: usize) -> Result<String, TsvIngestError> {

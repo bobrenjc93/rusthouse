@@ -285,10 +285,14 @@ impl Database {
 
     /// Atomically appends bounded, typed `TabSeparatedWithNames` input.
     ///
-    /// The decoded header must exactly match the target schema in order and
+    /// The decoded header must contain every target schema column exactly once,
+    /// in any order, with matching
     /// case. Fields use the TSV writer's ClickHouse-style escapes: `\\`, `\t`,
     /// `\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Values are parsed as `Int64`,
     /// finite `Float64`, `Bool`, or `String`; records may use LF or CRLF.
+    ///
+    /// Each field is parsed as the type selected by its header, and complete
+    /// rows are restored to schema order.
     ///
     /// Parsing, all configured limits, and remaining table capacity are
     /// validated before any physical column changes.

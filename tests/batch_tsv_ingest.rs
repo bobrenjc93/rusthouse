@@ -123,6 +123,58 @@ fn writer_output_round_trips_all_types_and_escapes_with_lf_and_crlf() {
 }
 
 #[test]
+fn every_header_permutation_selects_types_and_restores_schema_order() {
+    let names = ["id", "score", "active", "label"];
+    let encoded_fields = [
+        "-9223372036854775808",
+        "2.5",
+        "true",
+        "slash\\\\tab\\tcarriage\\rline\\nnull\\0back\\bform\\f\\' snow ☃",
+    ];
+    let expected = expected_result().rows.remove(0);
+
+    for first in 0..4 {
+        for second in 0..4 {
+            for third in 0..4 {
+                for fourth in 0..4 {
+                    let permutation = [first, second, third, fourth];
+                    if permutation
+                        .iter()
+                        .enumerate()
+                        .any(|(index, value)| permutation[..index].contains(value))
+                    {
+                        continue;
+                    }
+
+                    let header = permutation.map(|index| names[index]).join("\t");
+                    let values = permutation.map(|index| encoded_fields[index]).join("\t");
+                    let input = format!("{header}\n{values}\n");
+                    let mut database = database(1);
+                    assert_eq!(
+                        database.ingest_tsv_with_names(
+                            "metrics",
+                            input.as_bytes(),
+                            TsvIngestLimits::new(input.len(), 1, 4),
+                        ),
+                        Ok(1),
+                        "permutation: {header}"
+                    );
+                    assert_eq!(
+                        query(
+                            &mut database,
+                            "SELECT id, score, active, label FROM metrics;",
+                        )
+                        .rows,
+                        [expected.clone()],
+                        "permutation: {header}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn exact_byte_row_value_and_table_limits_succeed() {
     let input = b"id\tscore\tactive\tlabel\n1\t1.5\ttrue\tone\n2\t2.5\tfalse\ttwo\n";
     let mut database = database(2);
@@ -166,7 +218,7 @@ fn try_ingest_late_tsv_error_is_typed_and_rolls_back_every_parsed_row() {
     database
         .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
         .unwrap();
-    let input = b"id\tscore\tactive\tlabel\n1\t1.5\ttrue\tvalid\n2\tNaN\tfalse\tlate\n";
+    let input = b"label\tactive\tid\tscore\nvalid\ttrue\t1\t1.5\nlate\tfalse\t2\tNaN\n";
 
     assert_eq!(
         database.try_ingest_tsv_with_names(
@@ -177,7 +229,7 @@ fn try_ingest_late_tsv_error_is_typed_and_rolls_back_every_parsed_row() {
         Err(SharedDatabaseError::TsvIngest(
             TsvIngestError::InvalidValue {
                 line: 3,
-                column: 2,
+                column: 4,
                 expected: DataType::Float64,
             }
         ))
@@ -455,6 +507,20 @@ fn validates_header_utf8_line_endings_and_escape_grammar() {
             },
         ),
         (
+            b"id\tscore\tactive\tmystery\n".to_vec(),
+            TsvIngestError::UnknownHeaderColumn {
+                column: 4,
+                name: "mystery".to_owned(),
+            },
+        ),
+        (
+            b"id\tscore\tactive\tid\n".to_vec(),
+            TsvIngestError::DuplicateHeaderColumn {
+                column: 4,
+                name: "id".to_owned(),
+            },
+        ),
+        (
             b"id\tscore\tactive\tlabel\\\n".to_vec(),
             TsvIngestError::InvalidEscape { line: 1, column: 4 },
         ),
@@ -507,7 +573,7 @@ fn shared_database_ingests_under_the_write_lock_and_wraps_errors() {
     database
         .execute("CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);")
         .unwrap();
-    let input = b"id\tscore\tactive\tlabel\r\n1\t2.5\ttrue\tshared\\ntext\r\n";
+    let input = b"label\tactive\tid\tscore\r\nshared\\ntext\ttrue\t1\t2.5\r\n";
 
     assert_eq!(
         database
@@ -515,13 +581,13 @@ fn shared_database_ingests_under_the_write_lock_and_wraps_errors() {
             .unwrap(),
         1
     );
-    let bad = b"id\tscore\tactive\tlabel\n2\tNaN\tfalse\tbad\n";
+    let bad = b"active\tlabel\tscore\tid\nfalse\tbad\tNaN\t2\n";
     assert_eq!(
         database.ingest_tsv_with_names("metrics", bad, limits(bad)),
         Err(SharedDatabaseError::TsvIngest(
             TsvIngestError::InvalidValue {
                 line: 2,
-                column: 2,
+                column: 3,
                 expected: DataType::Float64,
             }
         ))
