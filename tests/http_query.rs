@@ -1272,6 +1272,18 @@ fn url_encoded_post_query_rejects_bodies_conflicts_and_invalid_parameters() {
             b"POST /?query=SELECT+1%3B&default_format=XML HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
             r#"{"error":"unsupported default_format parameter"}"#,
         ),
+        (
+            b"POST /?query=SELECT+1%3B&format=JSON HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"POST query target contains an unknown parameter"}"#,
+        ),
+        (
+            b"POST /?database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"POST query target must contain exactly one query parameter"}"#,
+        ),
+        (
+            b"POST /?query= HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"POST query parameters must have nonempty names and values"}"#,
+        ),
     ];
     for (request, expected_body) in errors {
         assert_response(

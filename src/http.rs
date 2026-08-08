@@ -734,7 +734,8 @@ fn read_request(
                 .into());
             }
 
-            let decoded = decode_query_parameters(&encoded_parameters, limits.max_sql_bytes)?;
+            let decoded =
+                decode_query_parameters(&encoded_parameters, method, limits.max_sql_bytes)?;
             let response_format = match (request.response_format, decoded.response_format) {
                 (Some(_), Some(_)) => {
                     return Err(RequestFailure::new(
@@ -983,6 +984,27 @@ impl ParameterizedQueryMethod {
         match self {
             Self::Get => "GET /?query= does not accept a request body",
             Self::Post => "POST /?query= does not accept a request body",
+        }
+    }
+
+    const fn empty_parameter_message(self) -> &'static str {
+        match self {
+            Self::Get => "GET query parameters must have nonempty names and values",
+            Self::Post => "POST query parameters must have nonempty names and values",
+        }
+    }
+
+    const fn unknown_parameter_message(self) -> &'static str {
+        match self {
+            Self::Get => "GET query target contains an unknown parameter",
+            Self::Post => "POST query target contains an unknown parameter",
+        }
+    }
+
+    const fn missing_query_message(self) -> &'static str {
+        match self {
+            Self::Get => "GET query target must contain exactly one query parameter",
+            Self::Post => "POST query target must contain exactly one query parameter",
         }
     }
 }
@@ -1378,6 +1400,7 @@ fn parse_table_insert_target(target: &[u8]) -> Option<&str> {
 
 fn decode_query_parameters(
     encoded_parameters: &[u8],
+    method: ParameterizedQueryMethod,
     max_sql_bytes: usize,
 ) -> Result<DecodedQuery, RequestReadError> {
     let mut query = None;
@@ -1386,20 +1409,16 @@ fn decode_query_parameters(
 
     for encoded_parameter in encoded_parameters.split(|byte| *byte == b'&') {
         let Some(equals) = encoded_parameter.iter().position(|byte| *byte == b'=') else {
-            return Err(RequestFailure::new(
-                Status::BAD_REQUEST,
-                "GET query parameters must have nonempty names and values",
-            )
-            .into());
+            return Err(
+                RequestFailure::new(Status::BAD_REQUEST, method.empty_parameter_message()).into(),
+            );
         };
         let encoded_name = &encoded_parameter[..equals];
         let encoded_value = &encoded_parameter[equals + 1..];
         if encoded_name.is_empty() || encoded_value.is_empty() {
-            return Err(RequestFailure::new(
-                Status::BAD_REQUEST,
-                "GET query parameters must have nonempty names and values",
-            )
-            .into());
+            return Err(
+                RequestFailure::new(Status::BAD_REQUEST, method.empty_parameter_message()).into(),
+            );
         }
 
         let name = decode_form_component(encoded_name, None)?;
@@ -1458,7 +1477,7 @@ fn decode_query_parameters(
             _ => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
-                    "GET query target contains an unknown parameter",
+                    method.unknown_parameter_message(),
                 )
                 .into());
             }
@@ -1468,7 +1487,7 @@ fn decode_query_parameters(
     let sql = query.ok_or_else(|| {
         RequestReadError::from(RequestFailure::new(
             Status::BAD_REQUEST,
-            "GET query target must contain exactly one query parameter",
+            method.missing_query_message(),
         ))
     })?;
     Ok(DecodedQuery {
