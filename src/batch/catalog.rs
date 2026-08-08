@@ -245,28 +245,37 @@ impl Catalog {
         tables.into_iter().map(|(_, table)| table.name()).collect()
     }
 
-    /// Returns owned display names and row counts in deterministic,
-    /// case-insensitive table-name order.
+    /// Returns owned display names, row counts, and cached retained-value byte
+    /// counts in deterministic, case-insensitive table-name order.
     #[must_use]
-    pub(crate) fn table_row_counts(&self) -> Vec<(String, usize)> {
+    pub(crate) fn table_metrics(&self) -> Vec<(String, usize, usize)> {
         let mut tables = self.tables.iter().collect::<Vec<_>>();
         tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         tables
             .into_iter()
-            .map(|(_, table)| (table.name().to_owned(), table.row_count()))
+            .map(|(_, table)| {
+                (
+                    table.name().to_owned(),
+                    table.row_count(),
+                    table.retained_value_bytes(),
+                )
+            })
             .collect()
     }
 
     /// Returns the variable bytes needed to encode every table display name
-    /// and decimal row count without allocating or sorting.
+    /// and decimal row and retained-value byte count without allocating or
+    /// sorting.
     #[must_use]
-    pub(crate) fn table_row_metric_variable_bytes(&self) -> (usize, usize) {
+    pub(crate) fn table_metric_variable_bytes(&self) -> (usize, usize, usize) {
         self.tables.values().fold(
-            (0_usize, 0_usize),
-            |(table_name_bytes, row_count_bytes), table| {
+            (0_usize, 0_usize, 0_usize),
+            |(table_name_bytes, row_count_bytes, retained_value_byte_count_bytes), table| {
                 (
                     table_name_bytes.saturating_add(table.name().len()),
                     row_count_bytes.saturating_add(usize_decimal_len(table.row_count())),
+                    retained_value_byte_count_bytes
+                        .saturating_add(usize_decimal_len(table.retained_value_bytes())),
                 )
             },
         )
@@ -336,13 +345,13 @@ mod tests {
         assert_eq!(catalog.retained_row_count(), 0);
         assert_eq!(catalog.table_name_bytes(), 14);
         assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
-        assert_eq!(catalog.table_row_metric_variable_bytes(), (14, 3));
+        assert_eq!(catalog.table_metric_variable_bytes(), (14, 3, 3));
         assert_eq!(
-            catalog.table_row_counts(),
+            catalog.table_metrics(),
             [
-                ("Alpha".to_owned(), 0),
-                ("beta".to_owned(), 0),
-                ("zebra".to_owned(), 0),
+                ("Alpha".to_owned(), 0, 0),
+                ("beta".to_owned(), 0, 0),
+                ("zebra".to_owned(), 0, 0),
             ]
         );
     }

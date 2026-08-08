@@ -165,7 +165,7 @@ fn metrics_body(
     columns: usize,
     retained_rows: usize,
     retained_value_bytes: usize,
-    table_rows: &[(&str, usize)],
+    table_metrics: &[(&str, usize, usize)],
 ) -> String {
     let mut body = format!(
         "# HELP rusthouse_tables Number of tables retained by the database.\n\
@@ -183,9 +183,18 @@ fn metrics_body(
          # HELP rusthouse_table_rows Number of rows retained by a table.\n\
          # TYPE rusthouse_table_rows gauge\n"
     );
-    for (table, rows) in table_rows {
+    for (table, rows, _) in table_metrics {
         body.push_str(&format!(
             "rusthouse_table_rows{{table=\"{table}\"}} {rows}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP rusthouse_table_retained_value_bytes Scalar payload bytes retained by a table.\n\
+         # TYPE rusthouse_table_retained_value_bytes gauge\n",
+    );
+    for (table, _, retained_value_bytes) in table_metrics {
+        body.push_str(&format!(
+            "rusthouse_table_retained_value_bytes{{table=\"{table}\"}} {retained_value_bytes}\n"
         ));
     }
     body
@@ -197,7 +206,7 @@ fn assert_ok_metrics_response(
     columns: usize,
     retained_rows: usize,
     retained_value_bytes: usize,
-    table_rows: &[(&str, usize)],
+    table_metrics: &[(&str, usize, usize)],
 ) {
     assert_response_with_content_type(
         response,
@@ -208,7 +217,7 @@ fn assert_ok_metrics_response(
             columns,
             retained_rows,
             retained_value_bytes,
-            table_rows,
+            table_metrics,
         )
         .as_bytes(),
     );
@@ -958,7 +967,7 @@ fn metrics_reports_state_changes_as_prometheus_gauges() {
         5,
         0,
         0,
-        &[("Alpha", 0), ("zebra", 0)],
+        &[("Alpha", 0, 0), ("zebra", 0, 0)],
     );
 
     database
@@ -973,7 +982,29 @@ fn metrics_reports_state_changes_as_prometheus_gauges() {
         5,
         3,
         41,
-        &[("Alpha", 1), ("zebra", 2)],
+        &[("Alpha", 1, 1), ("zebra", 2, 40)],
+    );
+
+    database
+        .execute("ALTER TABLE zebra UPDATE label = 'longer' WHERE id = 2;")
+        .unwrap();
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        2,
+        5,
+        3,
+        44,
+        &[("Alpha", 1, 1), ("zebra", 2, 43)],
+    );
+
+    database.execute("DELETE FROM zebra WHERE id = 1;").unwrap();
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        2,
+        5,
+        2,
+        24,
+        &[("Alpha", 1, 1), ("zebra", 1, 23)],
     );
 
     database.execute("TRUNCATE TABLE zebra;").unwrap();
@@ -983,11 +1014,18 @@ fn metrics_reports_state_changes_as_prometheus_gauges() {
         5,
         1,
         1,
-        &[("Alpha", 1), ("zebra", 0)],
+        &[("Alpha", 1, 1), ("zebra", 0, 0)],
     );
 
     database.execute("DROP TABLE Alpha;").unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 1, 4, 0, 0, &[("zebra", 0)]);
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        1,
+        4,
+        0,
+        0,
+        &[("zebra", 0, 0)],
+    );
 }
 
 #[test]
@@ -3426,7 +3464,7 @@ fn clickhouse_key_authentication_wires_query_insert_and_operational_routes() {
         key,
         b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
     );
-    assert_ok_metrics_response(&metrics_response, 1, 1, 1, 8, &[("events", 1)]);
+    assert_ok_metrics_response(&metrics_response, 1, 1, 1, 8, &[("events", 1, 8)]);
     assert_clickhouse_key_response_is_not_cacheable(&metrics_response);
 }
 
@@ -3489,14 +3527,14 @@ fn authenticated_read_only_modes_wire_queries_and_operational_routes() {
         1,
         1,
         8,
-        &[("events", 1)],
+        &[("events", 1, 8)],
     );
     let key_metrics = read_only_clickhouse_key_exchange(
         &database,
         "read-key",
         b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: read-key\r\n\r\n",
     );
-    assert_ok_metrics_response(&key_metrics, 1, 1, 1, 8, &[("events", 1)]);
+    assert_ok_metrics_response(&key_metrics, 1, 1, 1, 8, &[("events", 1, 8)]);
     assert_clickhouse_key_response_is_not_cacheable(&key_metrics);
 }
 
