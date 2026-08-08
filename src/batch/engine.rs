@@ -1802,6 +1802,9 @@ enum ResolvedItem {
     Int64Abs {
         source: usize,
     },
+    Float64Abs {
+        source: usize,
+    },
     Float64Round {
         source: usize,
     },
@@ -2103,24 +2106,28 @@ fn resolve_select_items(
             SelectItem::Abs { name, alias } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
-                if actual != DataType::Int64 {
-                    return Err(Error::TypeMismatch {
-                        context: format!("ABS argument '{name}'"),
-                        expected: DataType::Int64.to_string(),
-                        actual: actual.to_string(),
-                    });
-                }
+                let item = match actual {
+                    DataType::Int64 => ResolvedItem::Int64Abs { source },
+                    DataType::Float64 => ResolvedItem::Float64Abs { source },
+                    DataType::Bool | DataType::String => {
+                        return Err(Error::TypeMismatch {
+                            context: format!("ABS argument '{name}'"),
+                            expected: "Int64 or Float64".to_owned(),
+                            actual: actual.to_string(),
+                        });
+                    }
+                };
                 if has_aggregate || !group_columns.is_empty() {
                     return Err(Error::InvalidQuery(
                         "ABS projections are only supported in ungrouped SELECT queries".to_owned(),
                     ));
                 }
-                items.push(ResolvedItem::Int64Abs { source });
+                items.push(item);
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
                         .unwrap_or_else(|| format!("ABS({})", table.schema()[source].name)),
-                    data_type: DataType::Int64,
+                    data_type: actual,
                 });
             }
             SelectItem::Round { name, alias } => {
@@ -2405,6 +2412,9 @@ fn execute_projection(
                         ResolvedItem::Int64Abs { source } => {
                             Value::Int64(checked_int64_abs(int64_at(table, *source, *row))?)
                         }
+                        ResolvedItem::Float64Abs { source } => {
+                            Value::Float64(float64_at(table, *source, *row).abs())
+                        }
                         ResolvedItem::Float64Round { source } => {
                             Value::Float64(float64_at(table, *source, *row).round())
                         }
@@ -2544,6 +2554,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastBoolToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
+                | ResolvedItem::Float64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
                 | ResolvedItem::Float64Floor { .. }
                 | ResolvedItem::Float64Ceil { .. }
@@ -2625,6 +2636,9 @@ fn validate_grouped_result_limits(
                     unreachable!("UPPER projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Int64Abs { .. } => {
+                    unreachable!("ABS projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Abs { .. } => {
                     unreachable!("ABS projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Float64Round { .. } => {
@@ -3090,6 +3104,9 @@ impl GroupedData<'_> {
                         ResolvedItem::Int64Abs { .. } => {
                             unreachable!("ABS projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::Float64Abs { .. } => {
+                            unreachable!("ABS projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::Float64Round { .. } => {
                             unreachable!("ROUND projections are restricted to ungrouped queries")
                         }
@@ -3440,7 +3457,7 @@ fn resolved_expression_name(
         ResolvedItem::StringUpper { source } => {
             format!("UPPER({})", table.schema()[*source].name)
         }
-        ResolvedItem::Int64Abs { source } => {
+        ResolvedItem::Int64Abs { source } | ResolvedItem::Float64Abs { source } => {
             format!("ABS({})", table.schema()[*source].name)
         }
         ResolvedItem::Float64Round { source } => {
@@ -3528,6 +3545,11 @@ fn order_source_rows(
                 ResolvedItem::Int64Abs { source } => int64_at(table, source, left)
                     .unsigned_abs()
                     .cmp(&int64_at(table, source, right).unsigned_abs()),
+                ResolvedItem::Float64Abs { source } => {
+                    let left = ValueRef::Float64(float64_at(table, source, left).abs());
+                    let right = ValueRef::Float64(float64_at(table, source, right).abs());
+                    left.cmp(&right)
+                }
                 ResolvedItem::Float64Round { source } => {
                     let left = ValueRef::Float64(float64_at(table, source, left).round());
                     let right = ValueRef::Float64(float64_at(table, source, right).round());
@@ -3606,6 +3628,9 @@ fn order_grouped_rows(
                     unreachable!("UPPER projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Int64Abs { .. } => {
+                    unreachable!("ABS projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Abs { .. } => {
                     unreachable!("ABS projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Float64Round { .. } => {

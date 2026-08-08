@@ -262,11 +262,14 @@ input byte length. It supports an optional `AS alias`, `WHERE`, ordering by
 the unaliased expression or alias, and `LIMIT`/`OFFSET`; non-`String` arguments
 and grouped query shapes are rejected. Its owned `String` results are charged
 exactly against the result-byte cap before materialization.
-`ABS(int64_column)` is an ungrouped scalar projection that returns a checked
-`Int64` absolute value. It supports an optional `AS alias`, ordering by the
-unaliased expression or alias, `WHERE`, and `LIMIT`. Filtering and limiting
-select rows before output evaluation, so an excluded `i64::MIN` does not fail
-the query; a selected `i64::MIN` reports a typed numeric-overflow error.
+`ABS(numeric_column)` is an ungrouped scalar projection that returns an
+absolute value with the input column's type. `Int64` evaluation is checked;
+filtering and limiting select rows before output evaluation, so an excluded
+`i64::MIN` does not fail the query, while a selected `i64::MIN` reports a typed
+numeric-overflow error. Finite `Float64` inputs retain their magnitude, and
+either signed zero produces positive zero. It supports an optional `AS alias`,
+ordering by the unaliased expression or alias, `WHERE`, and `LIMIT`/`OFFSET`;
+non-numeric arguments are rejected with a typed error.
 `ROUND(float64_column)` is an ungrouped scalar projection that returns a
 `Float64` rounded to an integral value. Values exactly halfway between two
 integers are rounded away from zero. It supports an optional `AS alias`,
@@ -687,6 +690,12 @@ format remains unchanged for existing callers.
 self-describing format. It recovers the schema, nullability, row cap, and rows
 without caller-supplied table metadata, rejects non-regular and oversized files
 before decoding, and keeps open, read, envelope, and payload failures distinct.
+`restore_int64_table_payload_from_file_with_backup` tries that same bounded
+self-describing restore against a caller-supplied backup only after the primary
+fails. Success reports whether the primary or backup supplied the table; if
+neither is valid, the recovery error retains both typed
+`Int64TablePayloadFileRestoreError` values. The same envelope, column-name,
+row, and payload limits apply independently to both attempts.
 On Unix, `save_int64_table_payload_to_file` is the matching high-level save
 path. It encodes all table metadata and rows with `Int64TablePayloadCodec`, then
 atomically replaces a checksummed envelope. Its typed error separates payload

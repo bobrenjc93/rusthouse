@@ -1129,6 +1129,71 @@ impl fmt::Display for Int64TableFileRecoveryError {
 
 impl Error for Int64TableFileRecoveryError {}
 
+/// Identifies the snapshot file that produced a recovered self-describing table.
+///
+/// This is an alias of [`Int64TableFileRecoverySource`] because the source is
+/// independent of the payload format.
+pub type Int64TablePayloadFileRecoverySource = Int64TableFileRecoverySource;
+
+/// A self-describing table recovered from a primary or explicit backup file.
+///
+/// This is an alias of [`Int64TableFileRecovery`] because a successful recovery
+/// has the same table-and-source representation for both table payload formats.
+pub type Int64TablePayloadFileRecovery = Int64TableFileRecovery;
+
+/// An error produced when both self-describing table restoration attempts fail.
+#[derive(Debug)]
+pub enum Int64TablePayloadFileRecoveryError {
+    /// Both bounded self-describing file restoration attempts failed.
+    BothFailed {
+        /// The typed failure from the primary snapshot.
+        primary: Int64TablePayloadFileRestoreError,
+        /// The typed failure from the backup snapshot.
+        backup: Int64TablePayloadFileRestoreError,
+    },
+}
+
+impl Int64TablePayloadFileRecoveryError {
+    /// Returns the typed failure from the primary snapshot.
+    pub const fn primary_error(&self) -> &Int64TablePayloadFileRestoreError {
+        match self {
+            Self::BothFailed { primary, .. } => primary,
+        }
+    }
+
+    /// Returns the typed failure from the backup snapshot.
+    pub const fn backup_error(&self) -> &Int64TablePayloadFileRestoreError {
+        match self {
+            Self::BothFailed { backup, .. } => backup,
+        }
+    }
+
+    /// Consumes this error and returns both typed file restoration failures.
+    pub fn into_errors(
+        self,
+    ) -> (
+        Int64TablePayloadFileRestoreError,
+        Int64TablePayloadFileRestoreError,
+    ) {
+        match self {
+            Self::BothFailed { primary, backup } => (primary, backup),
+        }
+    }
+}
+
+impl fmt::Display for Int64TablePayloadFileRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BothFailed { primary, backup } => write!(
+                formatter,
+                "could not restore primary snapshot ({primary}) or backup snapshot ({backup})"
+            ),
+        }
+    }
+}
+
+impl Error for Int64TablePayloadFileRecoveryError {}
+
 /// Encodes and decodes bounded nullable `Int64` row payloads.
 ///
 /// The payload can be passed directly to [`SnapshotCodec::encode`]. Decoding
@@ -2456,6 +2521,40 @@ pub fn restore_int64_table_payload_from_file(
     payload_codec
         .decode(payload)
         .map_err(Int64TablePayloadFileRestoreError::Payload)
+}
+
+/// Restores a self-describing `Int64` table from a primary or explicit backup.
+///
+/// The primary is attempted first. A valid primary is returned immediately and
+/// the backup is not inspected. If the primary fails for any typed file,
+/// envelope, or table-payload reason, the backup is restored with the same
+/// bounds. A successful result reports which file supplied the table; if both
+/// attempts fail, both [`Int64TablePayloadFileRestoreError`] values are
+/// retained. Neither failure exposes a partially decoded table.
+pub fn restore_int64_table_payload_from_file_with_backup(
+    primary_path: impl AsRef<Path>,
+    backup_path: impl AsRef<Path>,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: Int64TablePayloadCodec,
+) -> Result<Int64TablePayloadFileRecovery, Int64TablePayloadFileRecoveryError> {
+    match restore_int64_table_payload_from_file(primary_path, snapshot_codec, payload_codec) {
+        Ok(table) => Ok(Int64TableFileRecovery {
+            table,
+            source: Int64TablePayloadFileRecoverySource::Primary,
+        }),
+        Err(primary) => {
+            match restore_int64_table_payload_from_file(backup_path, snapshot_codec, payload_codec)
+            {
+                Ok(table) => Ok(Int64TableFileRecovery {
+                    table,
+                    source: Int64TablePayloadFileRecoverySource::Backup,
+                }),
+                Err(backup) => {
+                    Err(Int64TablePayloadFileRecoveryError::BothFailed { primary, backup })
+                }
+            }
+        }
+    }
 }
 
 /// Restores one bounded `Int64` table from a snapshot envelope.

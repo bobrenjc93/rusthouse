@@ -5,8 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::snapshot::{INT64_TABLE_PAYLOAD_FIXED_LEN, SNAPSHOT_HEADER_LEN};
 use rusthouse::{
-    Int64Table, Int64TablePayloadCodec, Int64TablePayloadError, Int64TablePayloadFileRestoreError,
-    Schema, SnapshotCodec, SnapshotError, restore_int64_table_payload_from_file,
+    Int64Table, Int64TablePayloadCodec, Int64TablePayloadError, Int64TablePayloadFileRecoveryError,
+    Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError, Schema, SnapshotCodec,
+    SnapshotError, restore_int64_table_payload_from_file,
+    restore_int64_table_payload_from_file_with_backup,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -44,6 +46,17 @@ fn table(name: &str, nullable: bool, row_cap: usize, rows: &[Option<i64>]) -> In
     let mut table = Int64Table::new(Schema::int64(name, nullable), row_cap);
     table.append_batch(rows).unwrap();
     table
+}
+
+fn write_table_snapshot(
+    path: &Path,
+    table: &Int64Table,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: Int64TablePayloadCodec,
+) {
+    let payload = payload_codec.encode(table).unwrap();
+    let envelope = snapshot_codec.encode(&payload).unwrap();
+    fs::write(path, envelope).unwrap();
 }
 
 #[test]
@@ -97,6 +110,146 @@ fn atomic_replace_reopens_non_nullable_schema_and_unused_row_capacity() {
     assert_eq!(reopened.row_cap(), 5);
     assert_eq!(reopened.values(), &[Some(-7), Some(11)]);
     assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+
+#[test]
+fn valid_primary_takes_precedence_without_inspecting_the_backup() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let primary = table("primary", false, 2, &[Some(11)]);
+    let snapshot_codec = SnapshotCodec::new(128);
+    let payload_codec = Int64TablePayloadCodec::new(16, 2, 128);
+    write_table_snapshot(&primary_path, &primary, snapshot_codec, payload_codec);
+
+    let recovered = restore_int64_table_payload_from_file_with_backup(
+        primary_path,
+        directory.join("missing-backup.snapshot"),
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap();
+
+    assert_eq!(
+        recovered.source(),
+        Int64TablePayloadFileRecoverySource::Primary
+    );
+    assert_eq!(recovered.table(), &primary);
+}
+
+#[test]
+fn missing_primary_recovers_backup_at_every_exact_limit() {
+    let directory = TestDirectory::new();
+    let backup_path = directory.join("backup.snapshot");
+    let name = "métric";
+    let rows = [Some(i64::MIN), None, Some(i64::MAX)];
+    let backup = table(name, true, rows.len(), &rows);
+    let payload_len = INT64_TABLE_PAYLOAD_FIXED_LEN + name.len() + 19;
+    let payload_codec = Int64TablePayloadCodec::new(name.len(), rows.len(), payload_len);
+    let snapshot_codec = SnapshotCodec::new(payload_len);
+    write_table_snapshot(&backup_path, &backup, snapshot_codec, payload_codec);
+
+    let recovered = restore_int64_table_payload_from_file_with_backup(
+        directory.join("missing-primary.snapshot"),
+        &backup_path,
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap();
+
+    let (reopened, source) = recovered.into_parts();
+    assert_eq!(source, Int64TablePayloadFileRecoverySource::Backup);
+    assert_eq!(reopened, backup);
+    assert_eq!(reopened.schema(), &Schema::int64(name, true));
+    assert_eq!(reopened.row_cap(), rows.len());
+    assert_eq!(reopened.values(), rows);
+    assert_eq!(
+        fs::metadata(backup_path).unwrap().len() as usize,
+        SNAPSHOT_HEADER_LEN + payload_len
+    );
+}
+
+#[test]
+fn corrupt_primary_recovers_from_the_explicit_backup() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let backup_path = directory.join("backup.snapshot");
+    let primary = table("primary", false, 1, &[Some(11)]);
+    let backup = table("backup", true, 3, &[None, Some(22)]);
+    let snapshot_codec = SnapshotCodec::new(128);
+    let payload_codec = Int64TablePayloadCodec::new(16, 3, 128);
+    write_table_snapshot(&primary_path, &primary, snapshot_codec, payload_codec);
+    let mut corrupt_primary = fs::read(&primary_path).unwrap();
+    *corrupt_primary.last_mut().unwrap() ^= 1;
+    fs::write(&primary_path, corrupt_primary).unwrap();
+    write_table_snapshot(&backup_path, &backup, snapshot_codec, payload_codec);
+
+    let recovered = restore_int64_table_payload_from_file_with_backup(
+        primary_path,
+        backup_path,
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap();
+
+    assert_eq!(
+        recovered.source(),
+        Int64TablePayloadFileRecoverySource::Backup
+    );
+    assert_eq!(recovered.into_table(), backup);
+}
+
+#[test]
+fn dual_failure_preserves_both_typed_payload_file_errors() {
+    let directory = TestDirectory::new();
+    let backup_path = directory.join("corrupt-backup.snapshot");
+    let backup = table("backup", false, 1, &[Some(22)]);
+    let snapshot_codec = SnapshotCodec::new(128);
+    let payload_codec = Int64TablePayloadCodec::new(16, 1, 128);
+    let mut corrupt_payload = payload_codec.encode(&backup).unwrap();
+    corrupt_payload[0] ^= 1;
+    snapshot_codec
+        .create_new_file(&backup_path, &corrupt_payload)
+        .unwrap();
+
+    let error = restore_int64_table_payload_from_file_with_backup(
+        directory.join("missing-primary.snapshot"),
+        backup_path,
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        &error,
+        Int64TablePayloadFileRecoveryError::BothFailed {
+            primary: Int64TablePayloadFileRestoreError::Open(primary),
+            backup: Int64TablePayloadFileRestoreError::Payload(
+                Int64TablePayloadError::IncompatibleMagic { .. }
+            ),
+        } if primary.kind() == ErrorKind::NotFound
+    ));
+    assert!(matches!(
+        error.primary_error(),
+        Int64TablePayloadFileRestoreError::Open(source)
+            if source.kind() == ErrorKind::NotFound
+    ));
+    assert!(matches!(
+        error.backup_error(),
+        Int64TablePayloadFileRestoreError::Payload(
+            Int64TablePayloadError::IncompatibleMagic { .. }
+        )
+    ));
+    let (primary, backup) = error.into_errors();
+    assert!(matches!(
+        primary,
+        Int64TablePayloadFileRestoreError::Open(_)
+    ));
+    assert!(matches!(
+        backup,
+        Int64TablePayloadFileRestoreError::Payload(
+            Int64TablePayloadError::IncompatibleMagic { .. }
+        )
+    ));
 }
 
 #[test]
