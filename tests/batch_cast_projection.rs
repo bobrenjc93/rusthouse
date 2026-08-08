@@ -606,7 +606,7 @@ fn string_to_float64_filters_and_pages_before_conversion_with_numeric_ordering()
     assert_eq!(
         query(
             &mut database,
-            "SELECT CAST(reading AS Float64) FROM samples LIMIT 2 OFFSET 1",
+            "SELECT CAST(reading AS Float64) FROM samples LIMIT 1, 2",
         )
         .rows,
         [vec![Value::Float64(10.5)], vec![Value::Float64(2.0)]]
