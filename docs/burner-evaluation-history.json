@@ -1825,6 +1825,22 @@
         "eval_c88a7f3d": 70,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:610",
+      "recordedAt": "2026-08-08T13:36:32.333Z",
+      "label": "PR #610",
+      "kind": "composite",
+      "prNumber": 610,
+      "title": "YOLO generation 77: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 70,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
