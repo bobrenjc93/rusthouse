@@ -481,8 +481,8 @@ Those authenticated handlers also expose exact `POST /insert/<table>` for
 RustHouse SQL identifier; extra path segments, query strings, and
 percent-encoded names are not accepted. The request requires one decimal
 `Content-Length`, and its body starts with a header containing every target
-column name exactly once with matching case, followed by typed records. CSV
-headers may place those names in any order; TSV headers remain in schema order.
+column name exactly once with matching case, followed by typed records. CSV and
+TSV headers may place those names in any order.
 With no format header the body remains `CSVWithNames`, so `POST /insert/events`
 with `label,id\n"one, quoted",1\n` imports one CSV row. An exact,
 case-sensitive `X-ClickHouse-Format: TabSeparatedWithNames` selects TSV input;
