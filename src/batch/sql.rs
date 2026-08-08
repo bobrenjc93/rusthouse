@@ -1624,7 +1624,7 @@ impl<'a> Parser<'a> {
             }
 
             if name.eq_ignore_ascii_case("ABS") {
-                let name = self.expect_identifier("Int64 column in ABS")?;
+                let name = self.expect_identifier("numeric column in ABS")?;
                 self.expect(&TokenKind::RightParen, "')' after ABS expression")?;
                 let alias = self.parse_alias()?;
                 return Ok(SelectItem::Abs { name, alias });
@@ -1708,7 +1708,7 @@ impl<'a> Parser<'a> {
             )?;
             Ok(format!("UPPER({argument})"))
         } else if name.eq_ignore_ascii_case("ABS") && self.eat(&TokenKind::LeftParen) {
-            let argument = self.expect_identifier("Int64 column in ORDER BY ABS")?;
+            let argument = self.expect_identifier("numeric column in ORDER BY ABS")?;
             self.expect(&TokenKind::RightParen, "')' after ORDER BY ABS expression")?;
             Ok(format!("ABS({argument})"))
         } else if name.eq_ignore_ascii_case("ROUND") && self.eat(&TokenKind::LeftParen) {
