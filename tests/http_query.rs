@@ -4799,7 +4799,45 @@ fn authenticated_headerless_csv_insert_ingests_all_physical_types_in_schema_orde
 }
 
 #[test]
-fn headerless_csv_empty_input_is_a_no_op_and_named_csv_remains_the_default() {
+fn authenticated_headerless_tsv_insert_ingests_all_physical_types_and_escapes() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
+        .unwrap();
+    let tsv = concat!(
+        "-9223372036854775808\t2.5\ttrue\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\r\n",
+        "7\t-3e2\tfalse\tplain\n",
+    )
+    .as_bytes();
+    let (request, _) = request_with_authorization_for_target(
+        "/insert/typed_values",
+        tsv,
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Database: default\r\n\
+         X-ClickHouse-Format: TabSeparated\r\n",
+    );
+
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target(
+                "/query",
+                b"SELECT id, score, active, label FROM typed_values ORDER BY id;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"score","type":"Float64"},{"name":"active","type":"Bool"},{"name":"label","type":"String"}],"rows":[[-9223372036854775808,2.5,true,"slash\\tab\tcarriage\rline\nnul\u0000backspace\bformfeed\fapostrophe' snow 雪"],[7,-300.0,false,"plain"]]}"#,
+    );
+}
+
+#[test]
+fn headerless_csv_and_tsv_empty_input_are_no_ops_and_named_csv_remains_the_default() {
     let database = SharedDatabase::default();
     database
         .execute(
@@ -4807,21 +4845,22 @@ fn headerless_csv_empty_input_is_a_no_op_and_named_csv_remains_the_default() {
              INSERT INTO events VALUES (9, 'existing');",
         )
         .unwrap();
-    let empty = request_for_target_with_headers(
-        "/insert/events",
-        b"",
-        "X-ClickHouse-Key: correct key:42\r\n\
-         X-ClickHouse-Format: CSV\r\n",
-    );
+    for format in ["CSV", "TabSeparated"] {
+        let empty = request_for_target_with_headers(
+            "/insert/events",
+            b"",
+            &format!("X-ClickHouse-Key: correct key:42\r\nX-ClickHouse-Format: {format}\r\n"),
+        );
 
-    let response = clickhouse_key_exchange(&database, "correct key:42", &empty);
-    assert_response_with_content_type(
-        &response,
-        "HTTP/1.1 200 OK",
-        "text/plain; charset=utf-8",
-        b"",
-    );
-    assert_clickhouse_key_response_is_not_cacheable(&response);
+        let response = clickhouse_key_exchange(&database, "correct key:42", &empty);
+        assert_response_with_content_type(
+            &response,
+            "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8",
+            b"",
+        );
+        assert_clickhouse_key_response_is_not_cacheable(&response);
+    }
 
     let named = request_for_target_with_headers(
         "/insert/events",
@@ -4993,7 +5032,7 @@ fn table_insert_authentication_precedes_exact_format_validation_and_body_reads()
     let database = SharedDatabase::default();
     database.execute("CREATE TABLE events (id Int64);").unwrap();
     let malformed_tsv = b"id\ninvalid\\escape\n";
-    let invalid_format = "X-ClickHouse-Format: tabseparatedwithnames\r\n";
+    let invalid_format = "X-ClickHouse-Format: tabseparated\r\n";
 
     let (bearer_request, bearer_body_offset) =
         request_with_authorization_for_target("/insert/events", malformed_tsv, invalid_format);
@@ -5035,7 +5074,7 @@ fn table_insert_authentication_precedes_exact_format_validation_and_body_reads()
         "/insert/events",
         malformed_tsv,
         "Authorization: Bearer correct-token\r\n\
-         X-ClickHouse-Format: tabseparatedwithnames\r\n",
+         X-ClickHouse-Format: tabseparated\r\n",
     );
     let mut authorized_input = Cursor::new(authorized);
     let mut authorized_response = Vec::new();
@@ -5055,7 +5094,7 @@ fn table_insert_authentication_precedes_exact_format_validation_and_body_reads()
 }
 
 #[test]
-fn table_insert_rejects_nonexact_and_duplicate_headerless_csv_formats_before_body_reads() {
+fn table_insert_rejects_nonexact_and_duplicate_headerless_formats_before_body_reads() {
     let database = SharedDatabase::default();
     database.execute("CREATE TABLE events (id Int64);").unwrap();
 
@@ -5063,6 +5102,9 @@ fn table_insert_rejects_nonexact_and_duplicate_headerless_csv_formats_before_bod
         "X-ClickHouse-Format: csv\r\n",
         "X-ClickHouse-Format: Csv\r\n",
         "X-ClickHouse-Format: CSVWithnames\r\n",
+        "X-ClickHouse-Format: tabseparated\r\n",
+        "X-ClickHouse-Format: Tabseparated\r\n",
+        "X-ClickHouse-Format: TabSeparatedWithnames\r\n",
     ] {
         let headers = format!("Authorization: Bearer correct-token\r\n{format_headers}");
         let (request, body_offset) =
@@ -5084,8 +5126,8 @@ fn table_insert_rejects_nonexact_and_duplicate_headerless_csv_formats_before_bod
         "/insert/events",
         b"1\n",
         "Authorization: Bearer correct-token\r\n\
-         X-ClickHouse-Format: CSV\r\n\
-         x-clickhouse-format: CSV\r\n",
+         X-ClickHouse-Format: TabSeparated\r\n\
+         x-clickhouse-format: TabSeparated\r\n",
     );
     let mut input = Cursor::new(duplicate);
     let mut response = Vec::new();
@@ -5132,7 +5174,50 @@ fn tsv_insert_reports_late_malformed_input_and_rolls_back_every_row() {
 }
 
 #[test]
-fn table_insert_uses_independent_exact_csv_and_tsv_limits() {
+fn headerless_tsv_insert_reports_late_errors_and_rolls_back_every_row() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (9, 'existing');",
+        )
+        .unwrap();
+    let cases: &[(&[u8], &str)] = &[
+        (
+            b"1\tvalid\n2\tbad\\x\n",
+            r#"{"error":"database TSV ingestion failed: TSV field at line 2, column 2 contains an invalid backslash escape"}"#,
+        ),
+        (
+            b"1\tvalid\nwrong\tlate\n",
+            r#"{"error":"database TSV ingestion failed: TSV field at line 2, column 1 is not a valid Int64"}"#,
+        ),
+    ];
+
+    for (tsv, expected_body) in cases {
+        let (request, _) = request_with_authorization_for_target(
+            "/insert/events",
+            tsv,
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: TabSeparated\r\n",
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 400 Bad Request",
+            expected_body,
+        );
+    }
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id, label FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[9,"existing"]]}"#,
+    );
+}
+
+#[test]
+fn headerless_tsv_insert_preserves_exact_http_tsv_and_independent_csv_limits() {
     let database = SharedDatabase::default();
     database
         .execute(
@@ -5141,12 +5226,12 @@ fn table_insert_uses_independent_exact_csv_and_tsv_limits() {
              CREATE TABLE bounded_events (id Int64, label String);",
         )
         .unwrap();
-    let tsv = b"id\tlabel\n1\tone\n2\ttwo\n";
+    let tsv = b"1\tone\n2\ttwo\n";
     let (tsv_request, _) = request_with_authorization_for_target(
         "/insert/tsv_events",
         tsv,
         "Authorization: Bearer correct-token\r\n\
-         X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+         X-ClickHouse-Format: TabSeparated\r\n",
     );
     let mut response = Vec::new();
     handle_http_query_with_bearer_token_and_limits(
@@ -5155,6 +5240,7 @@ fn table_insert_uses_independent_exact_csv_and_tsv_limits() {
         Cursor::new(&tsv_request),
         &mut response,
         HttpQueryLimits {
+            max_sql_bytes: tsv.len(),
             csv_ingest_limits: CsvIngestLimits::new(0, 0, 0),
             tsv_ingest_limits: TsvIngestLimits::new(tsv.len(), 2, 4),
             ..HttpQueryLimits::default()
@@ -5198,8 +5284,29 @@ fn table_insert_uses_independent_exact_csv_and_tsv_limits() {
         "/insert/bounded_events",
         tsv,
         "Authorization: Bearer correct-token\r\n\
-         X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+         X-ClickHouse-Format: TabSeparated\r\n",
     );
+    let mut input = Cursor::new(&bounded_request);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        &mut input,
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: tsv.len() - 1,
+            tsv_ingest_limits: TsvIngestLimits::new(tsv.len(), 2, 4),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"request body exceeds configured byte limit"}"#,
+    );
+
     let mut input = Cursor::new(&bounded_request);
     let mut response = Vec::new();
     handle_http_query_with_bearer_token_and_limits(
@@ -5227,11 +5334,11 @@ fn table_insert_uses_independent_exact_csv_and_tsv_limits() {
     let limit_cases = [
         (
             TsvIngestLimits::new(tsv.len(), 1, 4),
-            r#"{"error":"database TSV ingestion failed: TSV record at line 3 raises the row count to 2, exceeding the limit of 1"}"#,
+            r#"{"error":"database TSV ingestion failed: TSV record at line 2 raises the row count to 2, exceeding the limit of 1"}"#,
         ),
         (
             TsvIngestLimits::new(tsv.len(), 2, 3),
-            r#"{"error":"database TSV ingestion failed: TSV record at line 3 raises the value count to 4, exceeding the limit of 3"}"#,
+            r#"{"error":"database TSV ingestion failed: TSV record at line 2 raises the value count to 4, exceeding the limit of 3"}"#,
         ),
     ];
     for (tsv_ingest_limits, expected_body) in limit_cases {
@@ -5277,7 +5384,7 @@ fn table_insert_uses_independent_exact_csv_and_tsv_limits() {
 }
 
 #[test]
-fn tsv_insert_returns_503_without_waiting_for_a_reader() {
+fn headerless_tsv_insert_returns_503_without_waiting_for_a_reader() {
     let mut initial = Database::new();
     initial.execute("CREATE TABLE events (id Int64);").unwrap();
     let inner = Arc::new(RwLock::new(initial));
@@ -5285,9 +5392,9 @@ fn tsv_insert_returns_503_without_waiting_for_a_reader() {
     let mut reader = Some(inner.read().unwrap());
     let (request, _) = request_with_authorization_for_target(
         "/insert/events",
-        b"id\n1\n",
+        b"1\n",
         "Authorization: Bearer correct-token\r\n\
-         X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+         X-ClickHouse-Format: TabSeparated\r\n",
     );
     let (sender, receiver) = mpsc::channel();
     let worker_database = database.clone();
