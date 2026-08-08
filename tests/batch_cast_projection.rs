@@ -490,6 +490,36 @@ fn string_to_int64_filters_and_pages_before_conversion_with_numeric_ordering() {
 }
 
 #[test]
+fn repeated_string_to_int64_items_do_not_rescan_large_source_values() {
+    const REPEATED_ITEMS: usize = 1_000;
+    let mut database = Database::new();
+    let large_zero = "0".repeat(1024 * 1024);
+    database
+        .execute(&format!(
+            "CREATE TABLE samples (reading String); \
+             INSERT INTO samples VALUES ('{large_zero}');"
+        ))
+        .expect("setup");
+
+    let projections = (0..REPEATED_ITEMS)
+        .map(|index| format!("CAST(reading AS Int64) AS c{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ordering = (0..REPEATED_ITEMS)
+        .map(|index| format!("c{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result = query(
+        &mut database,
+        &format!("SELECT {projections} FROM samples ORDER BY {ordering}"),
+    );
+
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].len(), REPEATED_ITEMS);
+    assert!(result.rows[0].iter().all(|value| *value == Value::Int64(0)));
+}
+
+#[test]
 fn projects_negative_values_and_integer_extremes_with_filters_aliases_and_limits() {
     let mut database = Database::new();
     database

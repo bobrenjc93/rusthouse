@@ -2623,10 +2623,15 @@ fn execute_projection(
     matching_rows: &[usize],
     items: &[ResolvedItem],
 ) -> Result<Vec<Vec<Value>>> {
+    let has_string_int64_cast = items
+        .iter()
+        .any(|item| matches!(item, ResolvedItem::CastStringToInt64 { .. }));
     matching_rows
         .iter()
         .enumerate()
         .map(|(row_number, row)| {
+            let mut string_int64_cache =
+                has_string_int64_cast.then(|| vec![None; table.columns().len()]);
             items
                 .iter()
                 .map(|item| {
@@ -2652,7 +2657,19 @@ fn execute_projection(
                             Value::Int64(if bool_at(table, *source, *row) { 1 } else { 0 })
                         }
                         ResolvedItem::CastStringToInt64 { source } => {
-                            Value::Int64(checked_string_to_int64(string_at(table, *source, *row))?)
+                            let cache = string_int64_cache
+                                .as_mut()
+                                .expect("String-to-Int64 projection cache is allocated");
+                            let converted = match cache[*source] {
+                                Some(converted) => converted,
+                                None => {
+                                    let converted =
+                                        checked_string_to_int64(string_at(table, *source, *row))?;
+                                    cache[*source] = Some(converted);
+                                    converted
+                                }
+                            };
+                            Value::Int64(converted)
                         }
                         ResolvedItem::CastInt64ToBool { source } => {
                             Value::Bool(int64_at(table, *source, *row) != 0)
@@ -3657,6 +3674,17 @@ struct ResolvedOrder {
     descending: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparedSourceOrder {
+    resolved: ResolvedOrder,
+    string_int64_cache: Option<usize>,
+}
+
+struct StringInt64OrderCache {
+    source: usize,
+    keys: Vec<DecimalText>,
+}
+
 fn resolve_ordering(
     table: &Table,
     items: &[ResolvedItem],
@@ -3793,21 +3821,57 @@ fn order_source_rows(
         return Ok(());
     }
 
-    // A String-to-Int64 ordering key must have valid decimal syntax for every
-    // candidate row. Values outside the Int64 range can still be ordered as
-    // mathematical integers, so overflow remains deferred until LIMIT/OFFSET
-    // have selected the rows that are actually converted.
+    let mut prepared_ordering = Vec::with_capacity(ordering.len());
+    let mut seen_outputs = vec![false; items.len()];
+    let mut string_int64_cache_by_source = vec![None; table.columns().len()];
+    let mut string_int64_caches = Vec::new();
     for order in ordering {
-        if let ResolvedItem::CastStringToInt64 { source } = items[order.output] {
-            for row in rows.iter().copied() {
-                decimal_text(string_at(table, source, row)).ok_or_else(invalid_string_cast)?;
+        // Repeating one output as an ORDER BY key cannot break a tie that the
+        // first occurrence did not break, even if the direction is reversed.
+        if seen_outputs[order.output] {
+            continue;
+        }
+        seen_outputs[order.output] = true;
+
+        let string_int64_cache = match items[order.output] {
+            ResolvedItem::CastStringToInt64 { source } => {
+                // Aliased copies of the same cast are also identical ordering
+                // keys. Retain only the first and scan each candidate string
+                // once to prepare its normalized decimal key.
+                if string_int64_cache_by_source[source].is_some() {
+                    continue;
+                }
+                let keys = rows
+                    .iter()
+                    .copied()
+                    .map(|row| {
+                        decimal_text(string_at(table, source, row)).ok_or_else(invalid_string_cast)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let cache = string_int64_caches.len();
+                string_int64_caches.push(StringInt64OrderCache { source, keys });
+                string_int64_cache_by_source[source] = Some(cache);
+                Some(cache)
             }
+            _ => None,
+        };
+        prepared_ordering.push(PreparedSourceOrder {
+            resolved: *order,
+            string_int64_cache,
+        });
+    }
+
+    let mut row_positions = Vec::new();
+    if !string_int64_caches.is_empty() {
+        row_positions.resize(table.row_count(), usize::MAX);
+        for (position, row) in rows.iter().copied().enumerate() {
+            row_positions[row] = position;
         }
     }
 
     sort_and_limit(rows, limit, |left, right| {
-        for order in ordering {
-            let comparison = match items[order.output] {
+        for order in &prepared_ordering {
+            let comparison = match items[order.resolved.output] {
                 ResolvedItem::Column { source, .. } => table.columns()[source].cmp_at(left, right),
                 // Subtracting one constant is monotonic over mathematical
                 // integers. Compare the source values so overflow is checked
@@ -3831,10 +3895,21 @@ fn order_source_rows(
                 ResolvedItem::CastBoolToInt64 { source } => {
                     bool_at(table, source, left).cmp(&bool_at(table, source, right))
                 }
-                ResolvedItem::CastStringToInt64 { source } => decimal_text_cmp(
-                    string_at(table, source, left),
-                    string_at(table, source, right),
-                ),
+                ResolvedItem::CastStringToInt64 { .. } => {
+                    let cache = &string_int64_caches[order
+                        .string_int64_cache
+                        .expect("String-to-Int64 order cache is prepared")];
+                    let left_position = row_positions[left];
+                    let right_position = row_positions[right];
+                    debug_assert_ne!(left_position, usize::MAX);
+                    debug_assert_ne!(right_position, usize::MAX);
+                    decimal_text_cmp(
+                        string_at(table, cache.source, left),
+                        cache.keys[left_position],
+                        string_at(table, cache.source, right),
+                        cache.keys[right_position],
+                    )
+                }
                 ResolvedItem::CastInt64ToBool { source } => {
                     (int64_at(table, source, left) != 0).cmp(&(int64_at(table, source, right) != 0))
                 }
@@ -3895,7 +3970,7 @@ fn order_source_rows(
                 }
             };
             if comparison != Ordering::Equal {
-                return if order.descending {
+                return if order.resolved.descending {
                     comparison.reverse()
                 } else {
                     comparison
@@ -4101,10 +4176,16 @@ fn checked_float64_to_int64(value: f64) -> Result<i64> {
 }
 
 fn checked_string_to_int64(value: &str) -> Result<i64> {
-    decimal_text(value).ok_or_else(invalid_string_cast)?;
-    value
-        .parse::<i64>()
-        .map_err(|_| Error::NumericOverflow("CAST(String AS Int64)".to_owned()))
+    value.parse::<i64>().map_err(|error| {
+        if matches!(
+            error.kind(),
+            std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
+        ) {
+            Error::NumericOverflow("CAST(String AS Int64)".to_owned())
+        } else {
+            invalid_string_cast()
+        }
+    })
 }
 
 fn invalid_string_cast() -> Error {
@@ -4115,46 +4196,50 @@ fn invalid_string_cast() -> Error {
 }
 
 #[derive(Clone, Copy)]
-struct DecimalText<'a> {
+struct DecimalText {
     negative: bool,
-    magnitude: &'a [u8],
+    magnitude_start: usize,
+    magnitude_len: usize,
 }
 
-fn decimal_text(value: &str) -> Option<DecimalText<'_>> {
+fn decimal_text(value: &str) -> Option<DecimalText> {
     let bytes = value.as_bytes();
-    let (negative, digits) = match bytes.first() {
-        Some(b'-') => (true, &bytes[1..]),
-        Some(b'+') => (false, &bytes[1..]),
-        Some(_) => (false, bytes),
+    let (negative, digits_start) = match bytes.first() {
+        Some(b'-') => (true, 1),
+        Some(b'+') => (false, 1),
+        Some(_) => (false, 0),
         None => return None,
     };
+    let digits = &bytes[digits_start..];
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
 
     let first_nonzero = digits.iter().position(|digit| *digit != b'0');
-    let magnitude = first_nonzero.map_or_else(
-        || &digits[digits.len() - 1..],
-        |first_nonzero| &digits[first_nonzero..],
-    );
+    let magnitude_start = first_nonzero.map_or(bytes.len() - 1, |offset| digits_start + offset);
     Some(DecimalText {
-        negative: negative && magnitude != b"0",
-        magnitude,
+        negative: negative && first_nonzero.is_some(),
+        magnitude_start,
+        magnitude_len: bytes.len() - magnitude_start,
     })
 }
 
-fn decimal_text_cmp(left: &str, right: &str) -> Ordering {
-    let left = decimal_text(left).expect("String-to-Int64 ordering values were validated");
-    let right = decimal_text(right).expect("String-to-Int64 ordering values were validated");
+fn decimal_text_cmp(
+    left_value: &str,
+    left: DecimalText,
+    right_value: &str,
+    right: DecimalText,
+) -> Ordering {
     match (left.negative, right.negative) {
         (true, false) => Ordering::Less,
         (false, true) => Ordering::Greater,
         (left_negative, _) => {
-            let magnitude_order = left
-                .magnitude
-                .len()
-                .cmp(&right.magnitude.len())
-                .then_with(|| left.magnitude.cmp(right.magnitude));
+            let magnitude_order = left.magnitude_len.cmp(&right.magnitude_len).then_with(|| {
+                let left_end = left.magnitude_start + left.magnitude_len;
+                let right_end = right.magnitude_start + right.magnitude_len;
+                left_value.as_bytes()[left.magnitude_start..left_end]
+                    .cmp(&right_value.as_bytes()[right.magnitude_start..right_end])
+            });
             if left_negative {
                 magnitude_order.reverse()
             } else {
