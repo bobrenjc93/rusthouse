@@ -43,10 +43,12 @@ negation; unary `NOT` remains available independently. Incompatible member
 types report the normal typed comparison error. String prefix, suffix, and
 containment predicates use the exact forms
 `column LIKE 'prefix%'`, `column LIKE '%suffix'`, and
-`column LIKE '%substring%'`. Matches are case-sensitive, and the bounded text
-may be empty or Unicode. Other placements of `%` and patterns with excess
-wildcards are rejected. The single-wildcard pattern `LIKE '%'` is the shared
-empty prefix/suffix form and matches every String.
+`column LIKE '%substring%'`. Each also accepts the infix `column NOT LIKE
+pattern` form, which negates the complete LIKE atom; unary `NOT` remains
+available independently. Matches are case-sensitive, and the bounded text may
+be empty or Unicode. Other placements of `%` and patterns with excess wildcards
+are rejected. The single-wildcard pattern `LIKE '%'` is the shared empty
+prefix/suffix form and matches every String, so `NOT LIKE '%'` matches none.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT <count> [OFFSET <offset>]`. Grouped results can be
 filtered by comparing a unique projected numeric aggregate alias to a finite
@@ -147,6 +149,20 @@ row count and configured row cap are unchanged. Missing tables or columns and
 attempts to remove a table's sole column fail before mutation. A trailing
 semicolon is optional.
 
+`ALTER TABLE <table> UPDATE <target> = <Int64 literal> WHERE <column> = <Int64
+literal>` provides one deliberately narrow ClickHouse-style mutation. The
+target and predicate must be existing `Int64` columns; table and column lookup
+are case-insensitive, and both literals support the complete optionally signed
+`Int64` range. The table and both columns are resolved and type-checked before
+the full source row count is checked against the configured scan limit. After
+that bounded scan, all matches from the original predicate column are passed
+to one atomic column replacement, including an empty replacement for zero
+matches. Invalid syntax, missing names, wrong types, and scan-limit failures
+leave the table unchanged. Expressions, additional assignments or predicates,
+other operators and types, and clauses such as `LIMIT` are not supported. A
+successful command reports its matched-row count through the library API and
+is silent in formatted CLI output.
+
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
 such as `-7`; `Float64` literals are optionally signed, finite decimal or
@@ -204,8 +220,8 @@ checked before result rows are materialized.
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n [OFFSET m]]`
 supports tuples of physical columns of any supported types and the same typed,
 composable comparison, inclusive `BETWEEN` and `NOT BETWEEN`, nonempty `IN` and
-`NOT IN`, prefix, suffix, and contains `LIKE` predicates, including unary `NOT`,
-as regular `SELECT`.
+`NOT IN`, and prefix, suffix, and contains `LIKE` and `NOT LIKE` predicates as
+regular `SELECT`, including independently applied unary `NOT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -349,7 +365,9 @@ one negation node around that existing tree. An `IN` atom is lowered to one
 equality per literal and a balanced set of joining `OR` nodes; every expanded
 node also counts toward that limit, while all leaves share one retained copy of
 the column identifier. `NOT IN` adds and charges exactly one negation node
-around that balanced tree.
+around that balanced tree. A `LIKE` pattern is one predicate node, and infix
+`NOT LIKE` adds and charges exactly one negation node around the same
+allocation-free matcher.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE
@@ -380,11 +398,12 @@ TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
 carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
 column names and strings use ClickHouse's backslash escapes.
-A table-backed `SELECT` or one- or two-comparison `DELETE` inspects at most
-1,000,000 source rows by default. This scanned-row limit is checked against the
-full source table before matching-row indices are allocated, so `WHERE`
-selectivity and `LIMIT` do not reduce it; each `UNION` operand and each `CROSS
-JOIN` input has its own source scan.
+A table-backed `SELECT`, one- or two-comparison `DELETE`, or `ALTER TABLE
+UPDATE` inspects at most 1,000,000 source rows by default. This scanned-row
+limit is checked against the full source table before matching-row indices or
+replacement values are allocated, so `WHERE` selectivity and `LIMIT` do not
+reduce it; each `UNION` operand and each `CROSS JOIN` input has its own source
+scan.
 It is distinct from the 10,000-row output limit, which applies after filtering,
 grouping, ordering, and `LIMIT`. Query output is also checked before cloning
 against a limit of 250,000 values and an estimated 16 MiB. Grouped queries

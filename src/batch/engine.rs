@@ -46,11 +46,13 @@ pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
 /// Resource limits for source scans, query-result materialization, and grouped working state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryResultLimits {
-    /// Maximum rows in the source table of one table-backed `SELECT` or `DELETE`.
+    /// Maximum rows in the source table of one table-backed `SELECT`, `DELETE`,
+    /// or `ALTER TABLE UPDATE`.
     ///
-    /// This is checked before row inspection and matching-row index allocation.
-    /// `WHERE` and `LIMIT` therefore cannot reduce the charged scan. Each
-    /// `UNION` operand and each `CROSS JOIN` input is checked independently.
+    /// This is checked before row inspection and matching-row or replacement
+    /// allocation. `WHERE` and `LIMIT` therefore cannot reduce the charged
+    /// scan. Each `UNION` operand and each `CROSS JOIN` input is checked
+    /// independently.
     pub max_scan_rows: usize,
     pub max_rows: usize,
     pub max_values: usize,
@@ -710,6 +712,20 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::AlterUpdate {
+                table,
+                target_column,
+                value,
+                predicate_column,
+                predicate_value,
+            } => self.execute_alter_update_statement(
+                table,
+                target_column,
+                value,
+                predicate_column,
+                predicate_value,
+                query_result_limits,
+            ),
             Statement::TruncateTable { name } => {
                 let affected_rows = self.table_mut(&name)?.truncate();
                 Ok(StatementResult::Command {
@@ -811,6 +827,7 @@ impl Database {
             | Statement::RenameColumn { .. }
             | Statement::AddColumn { .. }
             | Statement::DropColumn { .. }
+            | Statement::AlterUpdate { .. }
             | Statement::TruncateTable { .. }
             | Statement::Delete { .. }
             | Statement::DeleteComparison { .. }
@@ -864,6 +881,63 @@ impl Database {
             .delete_rows(&row_indexes)?;
         Ok(StatementResult::Command {
             tag: "DELETE",
+            affected_rows,
+        })
+    }
+
+    fn execute_alter_update_statement(
+        &mut self,
+        table: String,
+        target_column: String,
+        value: i64,
+        predicate_column: String,
+        predicate_value: i64,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<StatementResult> {
+        let replacements = {
+            let target = self.catalog.table(&table)?;
+            let target_index = target.column_index(&target_column)?;
+            let predicate_index = target.column_index(&predicate_column)?;
+            for (column, index, role) in [
+                (&target_column, target_index, "target"),
+                (&predicate_column, predicate_index, "WHERE"),
+            ] {
+                let actual = target.schema()[index].data_type;
+                if actual != DataType::Int64 {
+                    return Err(Error::TypeMismatch {
+                        context: format!(
+                            "ALTER TABLE UPDATE {role} column '{}.{column}'",
+                            target.name()
+                        ),
+                        expected: DataType::Int64.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+            }
+            enforce_scan_limit(
+                target,
+                query_result_limits,
+                "ALTER TABLE UPDATE scanned rows",
+            )?;
+
+            let Column::Int64(predicate_values) = &target.columns()[predicate_index] else {
+                unreachable!("the ALTER TABLE UPDATE WHERE column was validated as Int64");
+            };
+            predicate_values
+                .iter()
+                .enumerate()
+                .filter_map(|(row, current)| {
+                    (*current == predicate_value).then_some((row, Value::Int64(value)))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let affected_rows = self
+            .table_mut(&table)
+            .expect("ALTER TABLE UPDATE target was resolved before its bounded scan")
+            .replace_column_values(&target_column, replacements)?;
+        Ok(StatementResult::Command {
+            tag: "ALTER TABLE",
             affected_rows,
         })
     }
@@ -1363,7 +1437,8 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. }
         | Statement::AddColumn { .. }
-        | Statement::DropColumn { .. } => "ALTER TABLE",
+        | Statement::DropColumn { .. }
+        | Statement::AlterUpdate { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Delete { .. }
         | Statement::DeleteComparison { .. }
