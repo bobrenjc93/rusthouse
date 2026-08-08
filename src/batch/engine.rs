@@ -35,6 +35,8 @@ pub const DEFAULT_MAX_QUERY_RESULT_VALUES: usize = 250_000;
 pub const DEFAULT_MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum temporary ordering state retained by one `SELECT`.
 pub const DEFAULT_MAX_QUERY_ORDERING_STATE_BYTES: usize = 16 * 1024 * 1024;
+/// Bytes charged for each filtered row index ordered by `ROW_NUMBER`.
+pub const ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES: usize = std::mem::size_of::<usize>();
 /// Bytes charged for each cached single-key `lengthUTF8` ordering entry.
 pub const LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES: usize = 2 * std::mem::size_of::<usize>();
 /// Maximum groups retained while evaluating one grouped `SELECT`.
@@ -79,8 +81,9 @@ pub struct QueryResultLimits {
     /// Maximum estimated bytes retained in one query result and maximum cloned
     /// String payload materialized by one `ALTER TABLE UPDATE`.
     pub max_bytes: usize,
-    /// Maximum temporary bytes used to cache single-key `lengthUTF8` ordering
-    /// state. The complete filtered row set is charged before cache allocation.
+    /// Maximum temporary bytes used for ordered `ROW_NUMBER` row indices and
+    /// single-key `lengthUTF8` ordering state. Each operator charges its
+    /// complete filtered row set before allocating that state.
     pub max_ordering_state_bytes: usize,
     pub max_groups: usize,
     pub max_group_key_cells: usize,
@@ -1690,17 +1693,40 @@ impl Database {
         // both are evaluated only after the executor has admitted the full
         // source scan. Check before allocating the matching-row index vector.
         enforce_select_scan_limit(table, query_result_limits)?;
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-        if items
+        let row_matches = |row| {
+            predicate
+                .as_ref()
+                .is_none_or(|predicate| predicate.evaluate(table, row))
+        };
+        let has_row_number = items
             .iter()
-            .any(|item| matches!(item, ResolvedItem::RowNumber))
-        {
+            .any(|item| matches!(item, ResolvedItem::RowNumber));
+        let mut matching_rows = if window_ordering.is_some() {
+            // Ordered ROW_NUMBER needs every filtered source index to produce
+            // deterministic ties. Count without retaining indices so the
+            // complete state can be rejected before its first allocation.
+            let matching_row_count = (0..table.row_count())
+                .filter(|row| row_matches(*row))
+                .count();
+            validate_row_number_count(matching_row_count)?;
+            let ordering_state_bytes =
+                matching_row_count.saturating_mul(ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES);
+            enforce_resource_limit(
+                "SELECT ordering state bytes",
+                ordering_state_bytes,
+                query_result_limits.max_ordering_state_bytes,
+            )?;
+
+            let mut rows = Vec::with_capacity(matching_row_count);
+            rows.extend((0..table.row_count()).filter(|row| row_matches(*row)));
+            debug_assert_eq!(rows.len(), matching_row_count);
+            rows
+        } else {
+            (0..table.row_count())
+                .filter(|row| row_matches(*row))
+                .collect::<Vec<_>>()
+        };
+        if has_row_number && window_ordering.is_none() {
             validate_row_number_count(matching_rows.len())?;
         }
         if let Some(ordering) = window_ordering {
