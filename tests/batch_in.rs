@@ -89,7 +89,14 @@ fn lowers_nonempty_in_lists_to_balanced_equality_or_trees() {
             predicate(&format!(
                 "SELECT {projection} FROM events WHERE id IN (1, 2, 3, 4)"
             )),
-            expected,
+            expected.clone(),
+            "{projection}",
+        );
+        assert_eq!(
+            predicate(&format!(
+                "SELECT {projection} FROM events WHERE id NOT IN (1, 2, 3, 4)"
+            )),
+            Predicate::Not(Box::new(expected.clone())),
             "{projection}",
         );
     }
@@ -98,6 +105,11 @@ fn lowers_nonempty_in_lists_to_balanced_equality_or_trees() {
         predicate("SELECT id FROM events WHERE id IN (7)"),
         comparison("id", Value::Int64(7)),
         "a one-literal IN lowers directly to equality",
+    );
+    assert_eq!(
+        predicate("SELECT id FROM events WHERE id NOT IN (7)"),
+        Predicate::Not(Box::new(comparison("id", Value::Int64(7)))),
+        "a one-literal NOT IN adds exactly one negation",
     );
 
     let sql = format!(
@@ -182,10 +194,63 @@ fn executes_in_for_all_types_and_numeric_comparison_compatibility() {
             vec![Value::String("omega".to_owned())],
         ],
     );
+
+    for (column, members, regular, distinct) in [
+        (
+            "i",
+            "1, 3",
+            vec![vec![Value::Int64(2)], vec![Value::Int64(4)]],
+            vec![vec![Value::Int64(2)], vec![Value::Int64(4)]],
+        ),
+        (
+            "f",
+            "2.5, 4",
+            vec![vec![Value::Float64(1.0)], vec![Value::Float64(5.0)]],
+            vec![vec![Value::Float64(1.0)], vec![Value::Float64(5.0)]],
+        ),
+        (
+            "b",
+            "false",
+            vec![vec![Value::Bool(true)], vec![Value::Bool(true)]],
+            vec![vec![Value::Bool(true)]],
+        ),
+        (
+            "s",
+            "'omega', 'beta', 'omega'",
+            vec![
+                vec![Value::String("alpha".to_owned())],
+                vec![Value::String("gamma".to_owned())],
+            ],
+            vec![
+                vec![Value::String("alpha".to_owned())],
+                vec![Value::String("gamma".to_owned())],
+            ],
+        ),
+    ] {
+        let where_clause = format!("{column} NOT IN ({members})");
+        assert_eq!(
+            query(
+                &mut database,
+                &format!("SELECT {column} FROM samples WHERE {where_clause}"),
+            )
+            .rows,
+            regular,
+            "regular WHERE {where_clause}",
+        );
+        assert_eq!(
+            query(
+                &mut database,
+                &format!("SELECT DISTINCT {column} FROM samples WHERE {where_clause}"),
+            )
+            .rows,
+            distinct,
+            "DISTINCT WHERE {where_clause}",
+        );
+    }
 }
 
 #[test]
-fn unary_not_and_boolean_precedence_apply_to_in_atoms() {
+fn infix_not_in_and_unary_not_obey_boolean_precedence() {
     let mut database = Database::new();
     database
         .execute(
@@ -195,7 +260,7 @@ fn unary_not_and_boolean_precedence_apply_to_in_atoms() {
         )
         .expect("setup");
 
-    let where_clause = "NOT id IN (2, 3) AND active = true OR id IN (5)";
+    let where_clause = "id NOT IN (2, 3) AND active = true OR id IN (5)";
     assert_eq!(
         query(
             &mut database,
@@ -217,11 +282,28 @@ fn unary_not_and_boolean_precedence_apply_to_in_atoms() {
         .rows,
         [vec![Value::Bool(false)], vec![Value::Bool(true)]],
     );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id FROM events WHERE NOT id NOT IN (2, 3)",
+        )
+        .rows,
+        [vec![Value::Int64(2)], vec![Value::Int64(3)]],
+        "unary NOT remains available above a NOT IN atom",
+    );
 
     assert!(matches!(
         predicate("SELECT not FROM events WHERE not IN (1, 2)"),
         Predicate::Or(_, _)
     ));
+    assert_eq!(
+        predicate("SELECT not FROM events WHERE not NOT IN (1, 2)"),
+        Predicate::Not(Box::new(Predicate::Or(
+            Box::new(comparison("not", Value::Int64(1))),
+            Box::new(comparison("not", Value::Int64(2))),
+        ))),
+        "a column named 'not' remains the infix left operand",
+    );
     assert_eq!(
         predicate("SELECT in FROM events WHERE NOT in = 1"),
         Predicate::Not(Box::new(comparison("in", Value::Int64(1)))),
@@ -244,8 +326,21 @@ fn rejects_empty_malformed_and_nonliteral_in_lists() {
             "i IN (NULL)",
             "i IN (1 + 2)",
             "1 IN (1, 2)",
-            "i NOT IN (1, 2)",
             "i IN (1) i = 2",
+            "i NOT",
+            "i NOT IN",
+            "i NOT IN 1",
+            "i NOT IN ()",
+            "i NOT IN (1",
+            "i NOT IN (,1)",
+            "i NOT IN (1,)",
+            "i NOT IN (1,,2)",
+            "i NOT IN (other)",
+            "i NOT IN ((1))",
+            "i NOT IN (NULL)",
+            "i NOT IN (1 + 2)",
+            "1 NOT IN (1, 2)",
+            "i NOT IN (1) i = 2",
         ] {
             let sql = format!("SELECT {projection} FROM samples WHERE {malformed}");
             assert!(
@@ -311,27 +406,38 @@ fn in_query(prefix: &str, literals: usize, not_count: usize) -> String {
     )
 }
 
+fn not_in_query(prefix: &str, literals: usize) -> String {
+    format!(
+        "{prefix}id NOT IN ({})",
+        (0..literals)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 #[test]
 fn in_literals_and_every_expanded_node_obey_exact_ast_limits() {
     for prefix in [
         "SELECT id FROM events WHERE ",
         "SELECT DISTINCT id FROM events WHERE ",
     ] {
-        let exact_nodes = in_query(prefix, 128, 1);
+        let exact_nodes = not_in_query(prefix, 128);
         parse(&exact_nodes).unwrap_or_else(|error| {
             panic!("exact {PREDICATE_NODE_CAP}-node predicate must parse: {error}")
         });
 
-        let too_many_nodes = in_query(prefix, 129, 0);
-        assert!(matches!(
-            parse(&too_many_nodes),
-            Err(Error::Sql { message, .. })
-                if message == format!(
-                    "predicate is too complex; maximum {PREDICATE_NODE_CAP} expression nodes"
-                )
-        ));
+        for too_many_nodes in [in_query(prefix, 129, 0), not_in_query(prefix, 129)] {
+            assert!(matches!(
+                parse(&too_many_nodes),
+                Err(Error::Sql { message, .. })
+                    if message == format!(
+                        "predicate is too complex; maximum {PREDICATE_NODE_CAP} expression nodes"
+                    )
+            ));
+        }
 
-        let three_literals = in_query(prefix, 3, 0);
+        let three_literals = not_in_query(prefix, 3);
         parse_with_limits(
             &three_literals,
             BatchSqlLimits {
@@ -356,8 +462,8 @@ fn in_literals_and_every_expanded_node_obey_exact_ast_limits() {
         );
     }
 
-    let cumulative = "SELECT id FROM events WHERE id IN (1); \
-                      SELECT id FROM events WHERE id IN (2)";
+    let cumulative = "SELECT id FROM events WHERE id NOT IN (1); \
+                      SELECT id FROM events WHERE id NOT IN (2)";
     assert_eq!(
         parse_with_limits(
             cumulative,
