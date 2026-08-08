@@ -771,17 +771,19 @@ bounded to exactly the current catalog table count; it never creates series for
 dropped tables or for values outside the catalog. A scrape that cannot fit all
 current-table samples within the configured complete-response cap fails with
 the existing bounded response-limit error instead of returning a partial metric
-family. The byte gauge counts each `Int64` and `Float64` value as 8 bytes, each
-`Bool` as 1 byte, and each `String` by its UTF-8 payload length; it excludes
-container capacity, schema text, and allocation metadata and saturates at the
-platform's maximum `usize`. The response uses Prometheus text format version
-0.0.4. Table and database totals are maintained during mutations, so a scrape
-reads cached counters instead of scanning retained values. Capturing the
-per-table samples copies and sorts the current catalog names and row counts
-under one database read-lock attempt, then releases the lock before formatting
-or writing the response. It never waits for a writer; lock contention and
-poisoning return the same deterministic `503 Service Unavailable` response as
-`/ready`.
+family. An allocation-free catalog pass accounts for the table count, display
+name bytes, decimal row-count bytes, and complete HTTP envelope before any name
+is cloned or sorted. The byte gauge counts each `Int64` and `Float64` value as 8
+bytes, each `Bool` as 1 byte, and each `String` by its UTF-8 payload length; it
+excludes container capacity, schema text, and allocation metadata and saturates
+at the platform's maximum `usize`. The response uses Prometheus text format
+version 0.0.4. Table and database totals are maintained during mutations, so a
+scrape reads cached counters instead of scanning retained values. When the
+preflight succeeds, capturing the per-table samples copies and sorts the current
+catalog names and row counts under the same database read-lock attempt, then
+releases the lock before formatting or writing the response. It never waits for
+a writer; lock contention and poisoning return the same deterministic
+`503 Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a
 POST body or decoded GET SQL, and 16 MiB for the complete response including

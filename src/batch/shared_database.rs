@@ -35,6 +35,12 @@ pub(crate) struct DatabaseMetricsWithTableRows {
     pub(crate) table_rows: Vec<(String, usize)>,
 }
 
+pub(crate) enum DatabaseMetricsSnapshot {
+    Available(DatabaseMetricsWithTableRows),
+    ResponseLimitExceeded,
+    Unavailable,
+}
+
 /// An error produced while accessing a [`SharedDatabase`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedDatabaseError {
@@ -230,26 +236,35 @@ impl SharedDatabase {
     /// Captures database totals plus owned per-table row counts under one
     /// nonblocking read-lock attempt.
     ///
-    /// The table entries are sorted by case-insensitive name and the read guard
-    /// is released before the owned snapshot is returned for response writing.
-    pub(crate) fn metrics_snapshot_with_table_rows(&self) -> Option<DatabaseMetricsWithTableRows> {
+    /// The allocation-free sizing callback runs before table names are sorted
+    /// or cloned. The table entries are sorted by case-insensitive name and the
+    /// read guard is released before the owned snapshot is returned for
+    /// response writing.
+    pub(crate) fn metrics_snapshot_with_table_rows(
+        &self,
+        response_fits: impl FnOnce(DatabaseMetrics, usize, usize) -> bool,
+    ) -> DatabaseMetricsSnapshot {
         let database = match self.inner.try_read() {
             Ok(database) => database,
-            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return None,
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+                return DatabaseMetricsSnapshot::Unavailable;
+            }
         };
         let (table_count, column_count, retained_row_count, retained_value_bytes) =
             database.retained_metrics();
+        let totals = DatabaseMetrics {
+            table_count,
+            column_count,
+            retained_row_count,
+            retained_value_bytes,
+        };
+        let (table_name_bytes, row_count_bytes) = database.table_row_metric_variable_bytes();
+        if !response_fits(totals, table_name_bytes, row_count_bytes) {
+            return DatabaseMetricsSnapshot::ResponseLimitExceeded;
+        }
         let table_rows = database.table_row_counts();
         drop(database);
-        Some(DatabaseMetricsWithTableRows {
-            totals: DatabaseMetrics {
-                table_count,
-                column_count,
-                retained_row_count,
-                retained_value_bytes,
-            },
-            table_rows,
-        })
+        DatabaseMetricsSnapshot::Available(DatabaseMetricsWithTableRows { totals, table_rows })
     }
 
     /// Parses and executes a complete SQL batch under one database lock.
@@ -681,5 +696,41 @@ impl From<Database> for SharedDatabase {
 impl From<Arc<RwLock<Database>>> for SharedDatabase {
     fn from(database: Arc<RwLock<Database>>) -> Self {
         Self::from_arc(database)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_row_snapshot_preflight_rejects_before_materializing_names() {
+        let database = SharedDatabase::default();
+        database
+            .execute(
+                "CREATE TABLE Alpha (id Int64); \
+                 CREATE TABLE longer_name (id Int64); \
+                 INSERT INTO Alpha VALUES \
+                     (1), (2), (3), (4), (5), (6), \
+                     (7), (8), (9), (10), (11), (12);",
+            )
+            .unwrap();
+
+        let snapshot = database.metrics_snapshot_with_table_rows(
+            |totals, table_name_bytes, row_count_bytes| {
+                assert_eq!(totals.table_count, 2);
+                assert_eq!(table_name_bytes, "Alpha".len() + "longer_name".len());
+                assert_eq!(row_count_bytes, 3);
+                false
+            },
+        );
+
+        assert!(matches!(
+            snapshot,
+            DatabaseMetricsSnapshot::ResponseLimitExceeded
+        ));
+        database
+            .execute("DROP TABLE Alpha; DROP TABLE longer_name;")
+            .expect("the rejected snapshot released its read lock");
     }
 }

@@ -3996,10 +3996,15 @@ fn ready_honors_exact_header_and_complete_response_byte_limits() {
 }
 
 #[test]
-fn metrics_honors_the_complete_response_byte_limit() {
+fn metrics_preflights_the_complete_response_limit_before_materializing_samples() {
     let database = SharedDatabase::default();
     database
-        .execute("CREATE TABLE Observed (id Int64); INSERT INTO Observed VALUES (1), (2);")
+        .execute(
+            "CREATE TABLE Observed (id Int64); \
+             INSERT INTO Observed VALUES \
+                 (1), (2), (3), (4), (5), (6), \
+                 (7), (8), (9), (10), (11), (12);",
+        )
         .unwrap();
     let request = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let expected_response = exchange(&database, request);
