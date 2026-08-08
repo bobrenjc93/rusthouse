@@ -1,5 +1,6 @@
 use rusthouse::batch::engine::{
-    Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
+    DEFAULT_MAX_QUERY_ORDERING_STATE_BYTES, Database, LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES,
+    QueryResult, QueryResultLimits, ResultColumn, StatementResult,
 };
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{BatchSqlLimits, SelectItem, Statement, parse, parse_with_limits};
@@ -254,6 +255,108 @@ fn cached_order_matches_full_stable_sort_for_unicode_ties_and_pagination_boundar
             );
         }
     }
+}
+
+#[test]
+fn length_utf8_ordering_cache_enforces_exact_filtered_byte_boundaries() {
+    let setup = "CREATE TABLE samples (label String, keep Bool); \
+                 INSERT INTO samples VALUES \
+                 ('é', true), ('discarded', false), ('Z', true), ('東京', true);";
+    let filtered_cache_bytes = 3 * LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES;
+    assert_eq!(
+        QueryResultLimits::default().max_ordering_state_bytes,
+        DEFAULT_MAX_QUERY_ORDERING_STATE_BYTES
+    );
+
+    let limits = QueryResultLimits {
+        max_ordering_state_bytes: filtered_cache_bytes,
+        ..QueryResultLimits::default()
+    };
+    let mut exact = Database::with_query_result_limits(limits);
+    exact.execute(setup).expect("setup");
+
+    assert_eq!(
+        query(
+            &mut exact,
+            "SELECT label, lengthUTF8(label) AS scalars FROM samples \
+             WHERE keep = true ORDER BY scalars ASC LIMIT 2 OFFSET 1"
+        )
+        .rows,
+        [
+            vec![Value::String("Z".to_owned()), Value::Int64(1)],
+            vec![Value::String("東京".to_owned()), Value::Int64(2)],
+        ]
+    );
+    assert_eq!(
+        query(
+            &mut exact,
+            "SELECT label, lengthUTF8(label) AS scalars FROM samples \
+             WHERE keep = true ORDER BY scalars DESC LIMIT 2 OFFSET 1"
+        )
+        .rows,
+        [
+            vec![Value::String("é".to_owned()), Value::Int64(1)],
+            vec![Value::String("Z".to_owned()), Value::Int64(1)],
+        ]
+    );
+
+    assert_eq!(
+        exact.execute("SELECT lengthUTF8(label) AS scalars FROM samples ORDER BY scalars LIMIT 1"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: 4 * LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES,
+            max: filtered_cache_bytes,
+        })
+    );
+
+    let mut one_byte_short = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: filtered_cache_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_byte_short.execute(setup).expect("setup");
+    assert_eq!(
+        one_byte_short.execute(
+            "SELECT lengthUTF8(label) AS scalars FROM samples \
+             WHERE keep = true ORDER BY scalars LIMIT 1 OFFSET 1"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: filtered_cache_bytes,
+            max: filtered_cache_bytes - 1,
+        })
+    );
+}
+
+#[test]
+fn length_utf8_limit_zero_still_charges_filtered_ordering_state() {
+    let setup = "CREATE TABLE samples (label String, keep Bool); \
+                 INSERT INTO samples VALUES ('é', true), ('discarded', false);";
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    database.execute(setup).expect("setup");
+
+    assert_eq!(
+        database.execute(
+            "SELECT lengthUTF8(label) AS scalars FROM samples \
+             WHERE keep = true ORDER BY scalars LIMIT 0"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES,
+            max: 0,
+        })
+    );
+    assert!(
+        query(
+            &mut database,
+            "SELECT lengthUTF8(label) AS scalars FROM samples \
+             WHERE label = 'missing' ORDER BY scalars LIMIT 0"
+        )
+        .rows
+        .is_empty()
+    );
 }
 
 #[test]

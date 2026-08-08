@@ -80,6 +80,63 @@ fn ingests_all_four_types_with_lf_and_crlf_and_selects_them_back() {
 }
 
 #[test]
+fn header_subsets_in_any_order_fill_every_typed_default_and_preserve_quoting() {
+    let mut database = database(3);
+    let label_and_id = concat!(
+        "label,id\n",
+        "\"comma, \"\"quoted\"\"\",\"7\"\n",
+        "\"two\nlines\",8\n",
+    )
+    .as_bytes();
+    let active_and_score = b"active,score\n\"true\",\"-0.125\"\n";
+
+    assert_eq!(
+        database.ingest_csv_with_names(
+            "metrics",
+            label_and_id,
+            CsvIngestLimits::new(label_and_id.len(), 2, 4),
+        ),
+        Ok(2),
+    );
+    assert_eq!(
+        database.ingest_csv_with_names(
+            "metrics",
+            active_and_score,
+            CsvIngestLimits::new(active_and_score.len(), 1, 2),
+        ),
+        Ok(1),
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id, score, active, label FROM metrics ORDER BY id;",
+        )
+        .rows,
+        [
+            vec![
+                Value::Int64(0),
+                Value::Float64(-0.125),
+                Value::Bool(true),
+                Value::String(String::new()),
+            ],
+            vec![
+                Value::Int64(7),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String("comma, \"quoted\"".to_owned()),
+            ],
+            vec![
+                Value::Int64(8),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String("two\nlines".to_owned()),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn accepts_every_header_permutation_and_reorders_quoted_typed_fields() {
     let fields = [
         ("id", "\"-7\""),
@@ -513,7 +570,7 @@ fn exceeded_byte_row_and_value_limits_leave_the_table_empty() {
 
 #[test]
 fn exact_table_capacity_succeeds_and_exceeded_capacity_rolls_back() {
-    let input = b"label,id,active,score\ntwo,2,false,2.0\nthree,3,true,3.0\n";
+    let input = b"label,id\ntwo,2\nthree,3\n";
     let mut exact = database(3);
     exact
         .execute("INSERT INTO metrics VALUES (1, 1.0, true, 'one');")
@@ -767,16 +824,13 @@ fn validates_utf8_line_endings_header_and_table_before_mutation() {
         Err(CsvIngestError::MissingHeader { line: 1 })
     );
 
-    let short_header = b"id,score,active\n";
+    let blank_header = b"\n";
     assert_eq!(
-        database.ingest_csv_with_names("metrics", short_header, generous_limits(short_header)),
-        Err(CsvIngestError::HeaderColumnCount {
-            expected: 4,
-            actual: 3,
-        })
+        database.ingest_csv_with_names("metrics", blank_header, generous_limits(blank_header)),
+        Err(CsvIngestError::MissingHeader { line: 1 })
     );
 
-    let header_mismatch = b"label,score,active,ID\none,1.0,true,1\n";
+    let header_mismatch = b"label,ID\none,1\n";
     assert_eq!(
         database.ingest_csv_with_names(
             "metrics",
@@ -784,7 +838,7 @@ fn validates_utf8_line_endings_header_and_table_before_mutation() {
             generous_limits(header_mismatch),
         ),
         Err(CsvIngestError::HeaderMismatch {
-            column: 4,
+            column: 2,
             expected: "id".to_owned(),
         })
     );
@@ -828,27 +882,43 @@ fn validates_utf8_line_endings_header_and_table_before_mutation() {
 }
 
 #[test]
-fn duplicate_missing_and_unknown_header_names_preserve_existing_rows() {
+fn duplicate_unknown_overwide_and_wrong_width_subsets_preserve_existing_rows() {
     let cases = [
         (
-            b"label,id,score,id\none,1,1.0,1\n".as_slice(),
+            b"id,id\n1,1\n".as_slice(),
             CsvIngestError::DuplicateHeaderColumn {
-                column: 4,
+                column: 2,
                 name: "id".to_owned(),
             },
         ),
         (
-            b"label,id,score\none,1,1.0\n".as_slice(),
+            b"id,score,active,label,id\n1,1.0,true,one,1\n".as_slice(),
             CsvIngestError::HeaderColumnCount {
                 expected: 4,
-                actual: 3,
+                actual: 5,
             },
         ),
         (
-            b"label,id,mystery,score\none,1,true,1.0\n".as_slice(),
+            b"id,mystery\n1,true\n".as_slice(),
             CsvIngestError::UnknownHeaderColumn {
-                column: 3,
+                column: 2,
                 name: "mystery".to_owned(),
+            },
+        ),
+        (
+            b"label,id\none\n".as_slice(),
+            CsvIngestError::WrongColumnCount {
+                line: 2,
+                expected: 2,
+                actual: 1,
+            },
+        ),
+        (
+            b"label,id\none,not-an-int\n".as_slice(),
+            CsvIngestError::InvalidValue {
+                line: 2,
+                column: 2,
+                expected: DataType::Int64,
             },
         ),
     ];

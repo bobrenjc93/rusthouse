@@ -30,6 +30,10 @@ pub const DEFAULT_MAX_QUERY_RESULT_ROWS: usize = 10_000;
 pub const DEFAULT_MAX_QUERY_RESULT_VALUES: usize = 250_000;
 /// Maximum estimated heap materialized by one `SELECT`.
 pub const DEFAULT_MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum temporary ordering state retained by one `SELECT`.
+pub const DEFAULT_MAX_QUERY_ORDERING_STATE_BYTES: usize = 16 * 1024 * 1024;
+/// Bytes charged for each cached single-key `lengthUTF8` ordering entry.
+pub const LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES: usize = 2 * std::mem::size_of::<usize>();
 /// Maximum groups retained while evaluating one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_GROUPS: usize = 100_000;
 /// Maximum grouped-key scalar cells retained while evaluating one grouped `SELECT`.
@@ -43,7 +47,8 @@ pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS: usize = 500_000;
 /// Maximum estimated aggregate state heap retained by one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Resource limits for source scans, query-result materialization, and grouped working state.
+/// Resource limits for source scans, query-result materialization, ordering,
+/// and grouped working state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryResultLimits {
     /// Maximum rows in the source table of one table-backed `SELECT`, `DELETE`,
@@ -57,6 +62,9 @@ pub struct QueryResultLimits {
     pub max_rows: usize,
     pub max_values: usize,
     pub max_bytes: usize,
+    /// Maximum temporary bytes used to cache single-key `lengthUTF8` ordering
+    /// state. The complete filtered row set is charged before cache allocation.
+    pub max_ordering_state_bytes: usize,
     pub max_groups: usize,
     pub max_group_key_cells: usize,
     pub max_group_key_bytes: usize,
@@ -71,6 +79,7 @@ impl Default for QueryResultLimits {
             max_rows: DEFAULT_MAX_QUERY_RESULT_ROWS,
             max_values: DEFAULT_MAX_QUERY_RESULT_VALUES,
             max_bytes: DEFAULT_MAX_QUERY_RESULT_BYTES,
+            max_ordering_state_bytes: DEFAULT_MAX_QUERY_ORDERING_STATE_BYTES,
             max_groups: DEFAULT_MAX_QUERY_GROUPS,
             max_group_key_cells: DEFAULT_MAX_QUERY_GROUP_KEY_CELLS,
             max_group_key_bytes: DEFAULT_MAX_QUERY_GROUP_KEY_BYTES,
@@ -358,10 +367,11 @@ impl Database {
 
     /// Atomically appends a bounded, typed `CSVWithNames` input.
     ///
-    /// The header must contain every target column name exactly once, with
-    /// exact case, but may place those names in any order. Each data field is
-    /// parsed using the `Int64`, finite `Float64`, `Bool`, or `String` type
-    /// selected by its header, then complete rows are restored to schema order.
+    /// The header must contain a nonempty subset of target column names without
+    /// duplicates, using exact case, but may place those names in any order.
+    /// Each data field is parsed using the `Int64`, finite `Float64`, `Bool`, or
+    /// `String` type selected by its header. Omitted columns receive the same
+    /// typed defaults as SQL `INSERT`: `0`, `0.0`, `false`, or an empty string.
     /// Data fields may be double-quoted, allowing commas, LF or CRLF line
     /// endings, and doubled (`""`) quote escapes; decoded contents use the same
     /// type rules. Headers must remain unquoted. Only LF and CRLF line endings
@@ -381,11 +391,11 @@ impl Database {
     /// database.execute(
     ///     "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);",
     /// )?;
-    /// let input = b"label,active,score,id\nalpha,true,2.5,1\n";
+    /// let input = b"label,id\nalpha,1\n";
     /// let rows = database.ingest_csv_with_names(
     ///     "metrics",
     ///     input,
-    ///     CsvIngestLimits::new(input.len(), 1, 4),
+    ///     CsvIngestLimits::new(input.len(), 1, 2),
     /// )?;
     /// assert_eq!(rows, 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -401,7 +411,7 @@ impl Database {
             csv::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
-        self.table_mut(table)?.insert_rows(rows)?;
+        self.table_mut(table)?.append_prepared_insert_rows(rows);
         Ok(affected_rows)
     }
 
@@ -1401,6 +1411,7 @@ impl Database {
                 &items,
                 &ordering,
                 selection_limit,
+                query_result_limits.max_ordering_state_bytes,
             )?;
             apply_offset(&mut matching_rows, select.offset.unwrap_or(0));
             validate_projection_result_limits(
@@ -3945,6 +3956,7 @@ fn order_source_rows(
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
+    max_ordering_state_bytes: usize,
 ) -> Result<()> {
     if ordering.is_empty() {
         if let Some(limit) = limit {
@@ -3952,16 +3964,23 @@ fn order_source_rows(
         }
         return Ok(());
     }
-    if limit == Some(0) {
-        rows.clear();
-        return Ok(());
-    }
 
     if let [order] = ordering {
         if let ResolvedItem::StringLengthUtf8 { source } = items[order.output] {
-            order_source_rows_by_length_utf8(rows, table, source, order.descending, limit);
+            order_source_rows_by_length_utf8(
+                rows,
+                table,
+                source,
+                order.descending,
+                limit,
+                max_ordering_state_bytes,
+            )?;
             return Ok(());
         }
+    }
+    if limit == Some(0) {
+        rows.clear();
+        return Ok(());
     }
 
     // A String-to-number ordering key must have valid numeric syntax for every
@@ -4124,18 +4143,33 @@ fn order_source_rows_by_length_utf8(
     source: usize,
     descending: bool,
     limit: Option<usize>,
-) {
+    max_ordering_state_bytes: usize,
+) -> Result<()> {
     // Keep one scalar count per filtered row so bounded selection never has to
-    // rescan either String operand. The cache remains linear in the filtered
-    // input and is discarded before projection.
-    let mut cached = rows
-        .iter()
-        .copied()
-        .map(|row| CachedLengthUtf8Order {
-            row,
-            scalar_count: string_at(table, source, row).chars().count(),
-        })
-        .collect::<Vec<_>>();
+    // rescan either String operand. Charge the complete cache before allocating
+    // it; LIMIT and OFFSET cannot reduce this single-key working state.
+    debug_assert_eq!(
+        std::mem::size_of::<CachedLengthUtf8Order>(),
+        LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES
+    );
+    let ordering_state_bytes = rows
+        .len()
+        .saturating_mul(LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES);
+    enforce_resource_limit(
+        "SELECT ordering state bytes",
+        ordering_state_bytes,
+        max_ordering_state_bytes,
+    )?;
+    if limit == Some(0) {
+        rows.clear();
+        return Ok(());
+    }
+
+    let mut cached = Vec::with_capacity(rows.len());
+    cached.extend(rows.iter().copied().map(|row| CachedLengthUtf8Order {
+        row,
+        scalar_count: string_at(table, source, row).chars().count(),
+    }));
     sort_and_limit_by(&mut cached, limit, |left, right| {
         let comparison = left.scalar_count.cmp(&right.scalar_count);
         let comparison = if descending {
@@ -4148,6 +4182,7 @@ fn order_source_rows_by_length_utf8(
 
     rows.clear();
     rows.extend(cached.into_iter().map(|cached| cached.row));
+    Ok(())
 }
 
 fn order_grouped_rows(

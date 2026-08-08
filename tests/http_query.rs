@@ -3841,6 +3841,43 @@ fn authenticated_csv_insert_ingests_all_physical_types_quoting_and_is_query_visi
 }
 
 #[test]
+fn authenticated_csv_insert_accepts_subsets_and_fills_every_typed_default() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
+        .unwrap();
+
+    for csv in [
+        b"label,id\n\"HTTP, \"\"quoted\"\"\",\"7\"\n".as_slice(),
+        b"active,score\n\"true\",\"-0.125\"\n".as_slice(),
+    ] {
+        let (request, _) = request_with_authorization_for_target(
+            "/insert/typed_values",
+            csv,
+            "Authorization: Bearer correct-token\r\n",
+        );
+        assert_response_with_content_type(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8",
+            b"",
+        );
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target(
+                "/query",
+                b"SELECT id, score, active, label FROM typed_values ORDER BY id;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"score","type":"Float64"},{"name":"active","type":"Bool"},{"name":"label","type":"String"}],"rows":[[0,-0.125,true,""],[7,0.0,false,"HTTP, \"quoted\""]]}"#,
+    );
+}
+
+#[test]
 fn clickhouse_key_csv_insert_uses_the_same_authenticated_route() {
     let database = SharedDatabase::default();
     database

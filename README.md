@@ -324,9 +324,12 @@ accepts the same optional alias, `WHERE`, expression-or-alias ordering, and
 ClickHouse spelling `lengthUTF8(<column>)`. Evaluation and ordering scan the
 UTF-8 text without creating a transformed `String`; ungrouped ordering by only
 this key caches one scalar count per filtered row before bounded selection.
-The cache is linear in the filtered row count, and result bounds charge only
-the fixed-size `Int64` output. Non-`String` arguments and grouped query shapes
-are rejected with typed errors.
+The cache is linear in the filtered row count and has a separate 16 MiB
+ordering-state limit by default. Each entry is charged as two `usize` values
+(the source row and scalar count), and the complete cache is rejected before
+allocation when it exceeds that limit; `LIMIT` and `OFFSET` do not reduce the
+charge. Result bounds charge only the fixed-size `Int64` output. Non-`String`
+arguments and grouped query shapes are rejected with typed errors.
 `LOWER(string_column)` is an ungrouped scalar projection that lowercases ASCII
 letters while leaving every non-ASCII UTF-8 byte unchanged. Because this
 transformation preserves byte length, its owned `String` results are charged
@@ -463,8 +466,10 @@ additionally allow 100,000 groups and bound grouped keys to 500,000 cells and
 an estimated 32 MiB. Their
 grouped-key accounting includes the reusable lookup probe for tuples wider
 than two columns. Aggregate working state has separate 500,000-cell and
-estimated 32 MiB limits, including cloned string extrema. The collecting
-library API separately caps all retained query results at an estimated 64 MiB.
+estimated 32 MiB limits, including cloned string extrema. Single-key
+`lengthUTF8` ordering has a separate 16 MiB cache limit, charged before
+allocation over all rows retained by `WHERE`. The collecting library API
+separately caps all retained query results at an estimated 64 MiB.
 Typed batch tables also retain at most 1,000,000 rows, 1,024 physical columns,
 and 4,000,000 physical scalar cells each by default. The cell count is the
 current row count multiplied by the schema width, so repeated `ADD COLUMN` and
@@ -596,9 +601,11 @@ Those authenticated handlers also expose exact `POST /insert/<table>` for
 `CSVWithNames` or `TabSeparatedWithNames` ingestion. `<table>` is one literal
 RustHouse SQL identifier; extra path segments, query strings, and
 percent-encoded names are not accepted. The request requires one decimal
-`Content-Length`, and its body starts with a header containing every target
-column name exactly once with matching case, followed by typed records. CSV and
-TSV headers may place those names in any order.
+`Content-Length`, and its body starts with a matching-case column-name header,
+followed by typed records. A CSV header may contain any nonempty target-column
+subset without duplicates and in any order; omitted columns receive `0`, `0.0`,
+`false`, or an empty string according to their schema type. A TSV header must
+still contain every target column exactly once, but may place them in any order.
 With no format header the body remains `CSVWithNames`, so `POST /insert/events`
 with `label,id\n"one, quoted",1\n` imports one CSV row. An exact,
 case-sensitive `X-ClickHouse-Format: TabSeparatedWithNames` selects TSV input;
@@ -754,19 +761,23 @@ makes exactly one immediate write-lock attempt before table lookup or input
 access. It returns the typed `DatabaseBusy` error instead of waiting for an
 active reader or writer; poisoning and typed CSV, limit, and table-capacity
 failures remain distinct, and every failure leaves existing rows unchanged.
-The header must contain every schema column exactly once with matching case,
-but may list those names in any order. Each data field parses as the table type
-selected by its header, and complete rows are restored to schema order before
-the atomic append. Supported types are `Int64`, finite `Float64`, `Bool`, and
-`String`, and callers provide complete-input byte, row, and total-value limits.
+The header must contain a nonempty, duplicate-free subset of schema columns
+with matching case, and may list those names in any order. Each data field
+parses as the table type selected by its header. Omitted fields use the same
+typed defaults as an explicit-column SQL `INSERT`: `0` for `Int64`, `0.0` for
+`Float64`, `false` for `Bool`, and an empty `String`. Supported input types are
+`Int64`, finite `Float64`, `Bool`, and `String`, and callers provide
+complete-input byte, row, and total supplied-value limits. Full physical rows
+remain subject to the table's row and cell capacity limits.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. Any data field may be double-quoted so it can contain
 commas and LF or CRLF line endings, and doubled quotes inside it decode to one
 quote (for example, `"say ""hello"""`). Decoded contents use the same schema
 type rules as unquoted fields, and embedded line endings are retained exactly.
-Headers must remain unquoted; missing, duplicate, unknown, differently cased,
-or quoted column names and malformed data quoting are rejected. Any input,
-schema, value, limit, or remaining-capacity failure leaves the table unchanged.
+Headers must remain unquoted; empty, duplicate, unknown, differently cased,
+over-wide, or quoted headers and malformed data quoting are rejected. Every
+record must match the selected header width. Any input, schema, value, limit,
+or remaining-capacity failure leaves the table unchanged.
 
 `Database::ingest_tsv_with_names` provides the corresponding bounded,
 multi-column `TabSeparatedWithNames` importer, with
