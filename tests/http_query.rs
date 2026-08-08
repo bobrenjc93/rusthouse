@@ -404,6 +404,60 @@ fn bool_to_int64_cast_is_visible_in_every_http_query_format() {
 }
 
 #[test]
+fn bool_to_float64_cast_is_visible_in_every_http_query_format() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE flags (enabled Bool); \
+             INSERT INTO flags VALUES (true), (false);",
+        )
+        .expect("setup");
+    let sql = b"SELECT CAST(enabled AS Float64) AS enabled_f64 FROM flags ORDER BY enabled_f64;";
+
+    assert_response(
+        &exchange(&database, &request(sql)),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"enabled_f64","type":"Float64"}],"rows":[[0.0],[1.0]]}"#,
+    );
+
+    let csv =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+    assert_response_with_content_type(
+        &exchange(&database, &csv),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"enabled_f64\n0.0\n1.0\n",
+    );
+
+    let tsv = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &exchange(&database, &tsv),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"enabled_f64\n0.0\n1.0\n",
+    );
+
+    for (format, expected) in [
+        (
+            "JSONEachRow",
+            "{\"enabled_f64\":0.0}\n{\"enabled_f64\":1.0}\n",
+        ),
+        ("JSONCompactEachRow", "[0.0]\n[1.0]\n"),
+    ] {
+        let request = request_for_target_with_headers(
+            "/query",
+            sql,
+            &format!("X-ClickHouse-Format: {format}\r\n"),
+        );
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
 fn bool_to_string_cast_is_visible_in_every_http_query_format() {
     let database = SharedDatabase::default();
     database
