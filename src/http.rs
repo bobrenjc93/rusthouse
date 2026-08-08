@@ -37,7 +37,8 @@ pub struct HttpQueryLimits {
     pub max_header_count: usize,
     /// Maximum bytes in a POST body or decoded URL SQL query parameter.
     pub max_sql_bytes: usize,
-    /// Byte, row, and value limits for one `POST /insert/<table>` CSV body.
+    /// Byte, row, and value limits for one `POST /insert/<table>` `CSV` or
+    /// `CSVWithNames` body.
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub csv_ingest_limits: CsvIngestLimits,
@@ -144,11 +145,12 @@ impl StdError for HttpQueryError {
 /// atomically executes a nonempty `INSERT`-only batch after one nonblocking
 /// write-lock attempt. Exact
 /// `POST /insert/<table>` requests treat the bounded body as `CSVWithNames` by
-/// default. An exact `X-ClickHouse-Format: TabSeparatedWithNames` header selects
-/// TSV input instead; `CSVWithNames` may also be selected explicitly. The
-/// corresponding independent ingestion limits and nonblocking
-/// [`SharedDatabase`] importer are used. Success returns an empty `200 OK`
-/// response. The unauthenticated handlers do not expose either route. The
+/// default. An exact `X-ClickHouse-Format: CSV` header selects headerless CSV
+/// input in physical schema order, while `TabSeparatedWithNames` selects TSV;
+/// `CSVWithNames` may also be selected explicitly. The corresponding
+/// independent ingestion limits and nonblocking [`SharedDatabase`] importer
+/// are used. Success returns an empty `200 OK` response. The unauthenticated
+/// handlers do not expose either route. The
 /// insertion-capable `X-ClickHouse-Key`-authenticated handlers expose the same
 /// route set. Both authenticated insert forms accept the same optional
 /// `X-ClickHouse-Database: default` header as the query forms. The
@@ -719,6 +721,9 @@ fn handle_http_query_exchange(
                 }
             };
             let result = match input_format {
+                TableInsertFormat::Csv => {
+                    database.try_ingest_csv(&table, body, limits.csv_ingest_limits)
+                }
                 TableInsertFormat::CsvWithNames => {
                     database.try_ingest_csv_with_names(&table, body, limits.csv_ingest_limits)
                 }
@@ -888,7 +893,7 @@ fn read_request(
         }
         RequestKind::TableInsert(table) => {
             let body = match request.table_insert_format {
-                TableInsertFormat::CsvWithNames => read_csv_body(
+                TableInsertFormat::Csv | TableInsertFormat::CsvWithNames => read_csv_body(
                     input,
                     request.content_length,
                     limits.max_sql_bytes,
@@ -1180,6 +1185,7 @@ enum RequestKind {
 
 #[derive(Clone, Copy)]
 enum TableInsertFormat {
+    Csv,
     CsvWithNames,
     TabSeparatedWithNames,
 }
@@ -1434,6 +1440,7 @@ fn parse_headers(
         }
         match clickhouse_format {
             None | Some(b"CSVWithNames") => TableInsertFormat::CsvWithNames,
+            Some(b"CSV") => TableInsertFormat::Csv,
             Some(b"TabSeparatedWithNames") => TableInsertFormat::TabSeparatedWithNames,
             Some(_) => {
                 return Err(RequestFailure::new(
