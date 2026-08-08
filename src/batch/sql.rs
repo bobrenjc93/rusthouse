@@ -1855,9 +1855,9 @@ impl<'a> Parser<'a> {
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
         // `not` remains a valid column name, so a following predicate operator
         // makes this token the left operand rather than unary syntax. This
-        // includes the two-token `NOT IN` operator. `like` is also a valid
-        // column name; only `NOT LIKE <String pattern>` is the infix form with
-        // a column named `not`.
+        // includes the two-token `NOT IN` and `NOT BETWEEN` operators. `like`
+        // is also a valid column name; only `NOT LIKE <String pattern>` is the
+        // infix form with a column named `not`.
         if !self.at_keyword("NOT") || self.next_token_is_predicate_operator() {
             return self.parse_predicate_atom();
         }
@@ -1896,10 +1896,16 @@ impl<'a> Parser<'a> {
                 matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
             }
             TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("NOT") => {
-                matches!(
-                    Self::next_or_invalid(&mut lexer).kind,
-                    TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("IN")
-                ) && matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
+                match Self::next_or_invalid(&mut lexer).kind {
+                    TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("IN") => {
+                        matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
+                    }
+                    TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("BETWEEN") => {
+                        let lower_bound = Self::next_or_invalid(&mut lexer);
+                        Self::token_can_start_literal(&lower_bound.kind)
+                    }
+                    _ => false,
+                }
             }
             _ => false,
         }
@@ -1922,36 +1928,14 @@ impl<'a> Parser<'a> {
 
         let left = self.parse_operand()?;
         if self.eat_keyword("BETWEEN") {
-            let Operand::Column(column) = left else {
-                return self.error("BETWEEN left operand must be a column");
-            };
-            let lower = self.parse_literal()?;
-            self.expect_keyword("AND")?;
-            let upper = self.parse_literal()?;
-
-            // BETWEEN is one syntactic predicate atom, but its lowered form has
-            // two comparisons and one AND. Charge every executable AST node
-            // before allocating the expanded tree.
-            self.record_predicate_node()?;
-            self.record_predicate_node()?;
-            self.record_predicate_node()?;
-
-            return Ok(Predicate::And(
-                Box::new(Predicate::Comparison {
-                    left: Operand::Column(column.clone()),
-                    operator: ComparisonOperator::GreaterOrEqual,
-                    right: Operand::Literal(lower),
-                }),
-                Box::new(Predicate::Comparison {
-                    left: Operand::Column(column),
-                    operator: ComparisonOperator::LessOrEqual,
-                    right: Operand::Literal(upper),
-                }),
-            ));
+            return self.parse_between_predicate(left, false);
         }
         let negated_in = if self.eat_keyword("IN") {
             Some(false)
         } else if self.eat_keyword("NOT") {
+            if self.eat_keyword("BETWEEN") {
+                return self.parse_between_predicate(left, true);
+            }
             self.expect_keyword("IN")?;
             Some(true)
         } else {
@@ -2056,6 +2040,44 @@ impl<'a> Parser<'a> {
             left,
             operator,
             right,
+        })
+    }
+
+    fn parse_between_predicate(&mut self, left: Operand, negated: bool) -> Result<Predicate> {
+        let Operand::Column(column) = left else {
+            return self.error("BETWEEN left operand must be a column");
+        };
+        let lower = self.parse_literal()?;
+        self.expect_keyword("AND")?;
+        let upper = self.parse_literal()?;
+
+        // BETWEEN is one syntactic predicate atom, but its lowered form has
+        // two comparisons and one AND. Infix NOT BETWEEN adds exactly one
+        // negation around that existing tree. Charge every executable AST
+        // node before allocating the expanded tree.
+        self.record_predicate_node()?;
+        self.record_predicate_node()?;
+        self.record_predicate_node()?;
+        if negated {
+            self.record_predicate_node()?;
+        }
+
+        let predicate = Predicate::And(
+            Box::new(Predicate::Comparison {
+                left: Operand::Column(column.clone()),
+                operator: ComparisonOperator::GreaterOrEqual,
+                right: Operand::Literal(lower),
+            }),
+            Box::new(Predicate::Comparison {
+                left: Operand::Column(column),
+                operator: ComparisonOperator::LessOrEqual,
+                right: Operand::Literal(upper),
+            }),
+        );
+        Ok(if negated {
+            Predicate::Not(Box::new(predicate))
+        } else {
+            predicate
         })
     }
 

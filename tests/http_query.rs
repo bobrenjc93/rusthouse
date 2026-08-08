@@ -242,6 +242,30 @@ fn query_executes_inclusive_between_over_http() {
 }
 
 #[test]
+fn query_executes_not_between_for_distinct_where_over_http() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, score Float64); \
+             INSERT INTO readings VALUES \
+             (1, 1.0), (2, 2.5), (3, 4.0), (4, 5.0), (4, 5.0);",
+        )
+        .expect("setup");
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(
+                b"SELECT DISTINCT id FROM readings \
+                  WHERE score NOT BETWEEN 2.5 AND 4 ORDER BY id;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[1],[4]]}"#,
+    );
+}
+
+#[test]
 fn query_pages_ordered_distinct_typed_in_results_over_http() {
     let database = SharedDatabase::default();
     database
