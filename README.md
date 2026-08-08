@@ -74,10 +74,13 @@ and all other aggregates remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
-`DELETE FROM <table> WHERE <comparison> [AND <comparison>]` removes rows
-matching one typed column-to-literal comparison or the conjunction of exactly
-two such comparisons. Each comparison has the form `<column> <operator>
-<literal>`. Supported operators are `=`, `!=`, `<>`, `<`, `<=`, `>`, and `>=`;
+`DELETE FROM <table> WHERE <comparison> [AND <comparison>]` and its ClickHouse
+mutation spelling, `ALTER TABLE <table> DELETE WHERE <comparison> [AND
+<comparison>]`, remove rows matching one typed column-to-literal comparison or
+the conjunction of exactly two such comparisons. Both spellings lower to the
+same bounded atomic deletion path. Each comparison has the form `<column>
+<operator> <literal>`. Supported operators are `=`, `!=`, `<>`, `<`, `<=`,
+`>`, and `>=`;
 `!=` and `<>` are equivalent. The two comparisons may reference different
 typed columns. Table and column lookup are case-insensitive, and literals
 accept the same finite `Int64`, `Float64`, `Bool`, and `String` forms as
@@ -500,13 +503,14 @@ TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
 carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
 column names and strings use ClickHouse's backslash escapes.
-A table-backed `SELECT`, one- or two-comparison `DELETE`, or `ALTER TABLE
-UPDATE` inspects at most 1,000,000 source rows by default. This scanned-row
-limit is checked against the full source table before matching-row indices or
-replacement values are allocated, so `WHERE` selectivity and `LIMIT` do not
-reduce it; each `UNION` operand and each `CROSS JOIN` input has its own source
-scan. String assignments additionally bound their matched replacement payload
-to 16 MiB by default before cloning any replacement values.
+A table-backed `SELECT`, one- or two-comparison `DELETE` (including `ALTER
+TABLE DELETE`), or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
+by default. This scanned-row limit is checked against the full source table
+before matching-row indices or replacement values are allocated, so `WHERE`
+selectivity and `LIMIT` do not reduce it; each `UNION` operand and each `CROSS
+JOIN` input has its own source scan. String assignments additionally bound
+their matched replacement payload to 16 MiB by default before cloning any
+replacement values.
 It is distinct from the 10,000-row output limit, which applies after filtering,
 grouping, ordering, and `LIMIT`. Query output is also checked before cloning
 against a limit of 250,000 values and an estimated 16 MiB. Grouped queries

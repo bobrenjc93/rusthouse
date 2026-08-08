@@ -106,6 +106,30 @@ fn parses_exactly_two_delete_comparisons_joined_by_and() {
 }
 
 #[test]
+fn alter_table_delete_lowers_to_the_existing_delete_statement_shapes() {
+    for (alter, delete) in [
+        (
+            "ALTER TABLE Events DELETE WHERE id = -7;",
+            "DELETE FROM Events WHERE id = -7;",
+        ),
+        (
+            "alter table Events delete where score > +2.5e1;",
+            "delete from Events where score > +2.5e1;",
+        ),
+        (
+            "ALTER TABLE Events DELETE WHERE active = true AND label <> 'skip';",
+            "DELETE FROM Events WHERE active = true AND label <> 'skip';",
+        ),
+    ] {
+        assert_eq!(
+            parse(alter),
+            parse(delete),
+            "both spellings must lower to one deletion AST: {alter}"
+        );
+    }
+}
+
+#[test]
 fn rejects_every_non_exact_delete_shape() {
     for sql in [
         "DELETE events WHERE id = 1",
@@ -139,6 +163,56 @@ fn rejects_malformed_or_extra_delete_predicates() {
     ] {
         assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
     }
+}
+
+#[test]
+fn rejects_malformed_alter_table_delete_shapes() {
+    for sql in [
+        "ALTER TABLE events DELETE",
+        "ALTER TABLE events DELETE id = 1",
+        "ALTER TABLE events DELETE WHERE",
+        "ALTER TABLE events DELETE WHERE id",
+        "ALTER TABLE events DELETE WHERE 1 = id",
+        "ALTER TABLE events DELETE WHERE id = NULL",
+        "ALTER TABLE events DELETE WHERE id = 1 OR active = true",
+        "ALTER TABLE events DELETE WHERE id = 1 AND active = true AND label = 'x'",
+        "ALTER TABLE events DELETE WHERE id = 1 LIMIT 1",
+    ] {
+        assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
+    }
+}
+
+#[test]
+fn alter_table_delete_executes_equivalently_to_delete_from() {
+    let setup = "CREATE TABLE Events (id Int64, active Bool, label String); \
+                 INSERT INTO Events VALUES \
+                    (1, true, 'keep'), (2, true, 'remove'), (3, false, 'remove');";
+    let mut alter_database = Database::new();
+    let mut delete_database = Database::new();
+    alter_database.execute(setup).expect("setup succeeds");
+    delete_database.execute(setup).expect("setup succeeds");
+
+    let alter_result =
+        alter_database.execute("ALTER TABLE events DELETE WHERE id >= 2 AND label = 'remove';");
+    let delete_result =
+        delete_database.execute("DELETE FROM events WHERE id >= 2 AND label = 'remove';");
+
+    assert_eq!(alter_result, delete_result);
+    assert_eq!(ids(&alter_database, "events"), [1]);
+    let altered = alter_database
+        .catalog()
+        .table("events")
+        .expect("altered table remains");
+    let deleted = delete_database
+        .catalog()
+        .table("events")
+        .expect("deleted table remains");
+    assert_eq!(altered.schema(), deleted.schema());
+    assert_eq!(altered.row_count(), deleted.row_count());
+    assert_eq!(
+        alter_database.execute("SELECT id, active, label FROM events;"),
+        delete_database.execute("SELECT id, active, label FROM events;")
+    );
 }
 
 #[test]
@@ -458,6 +532,36 @@ fn conjunction_validation_and_scan_failures_never_delete_rows() {
         Err(Error::Sql { .. })
     ));
     assert_eq!(ids(&database, "events"), [1, 2, 3]);
+}
+
+#[test]
+fn alter_table_delete_scan_limit_failure_leaves_every_row_unchanged() {
+    let limits = QueryResultLimits {
+        max_scan_rows: 2,
+        ..QueryResultLimits::default()
+    };
+    let mut database = Database::with_query_result_limits(limits);
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (1, 'keep'), (2, 'remove'), (3, 'remove');",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database.execute("ALTER TABLE events DELETE WHERE id >= 2 AND label = 'remove';"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "DELETE scanned rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+    assert_eq!(ids(&database, "events"), [1, 2, 3]);
+    let table = database.catalog().table("events").expect("table remains");
+    assert!(matches!(
+        &table.columns()[1],
+        Column::String(values) if values == &["keep", "remove", "remove"]
+    ));
 }
 
 #[test]

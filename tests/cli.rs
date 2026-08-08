@@ -82,6 +82,24 @@ fn json_cli_executes_conjoined_comparison_delete_silently() {
 }
 
 #[test]
+fn json_cli_executes_alter_table_delete_silently() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE events (id Int64, label String); \
+          INSERT INTO events VALUES (1, 'keep'), (2, 'remove'), (3, 'remove'); \
+          ALTER TABLE events DELETE WHERE id >= 2 AND label = 'remove'; \
+          SELECT id, label FROM events;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[1,\"keep\"]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_outputs_mixed_case_string_to_bool_casts() {
     let output = run(
         &["--format", "json"],
