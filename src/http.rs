@@ -39,12 +39,13 @@ pub struct HttpQueryLimits {
     /// Maximum bytes in a POST body or decoded URL SQL query parameter.
     pub max_sql_bytes: usize,
     /// Byte, row, and value limits for one `POST /insert/<table>` `CSV` or
-    /// `CSVWithNames` body.
+    /// `CSVWithNames` body, including parameterized `CSVWithNames` insertion.
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub csv_ingest_limits: CsvIngestLimits,
     /// Byte, row, and value limits for one `POST /insert/<table>`
-    /// `TabSeparated` or `TabSeparatedWithNames` body.
+    /// `TabSeparated` or `TabSeparatedWithNames` body, including parameterized
+    /// `TabSeparated` insertion.
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub tsv_ingest_limits: TsvIngestLimits,
@@ -113,11 +114,13 @@ impl StdError for HttpQueryError {
 /// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, and `+` becomes a space. An
-/// insertion-capable authenticated `POST` additionally accepts a nonempty
+/// insertion-capable authenticated `POST` additionally accepts either a
 /// `CSVWithNames` body when the decoded SQL is exactly `INSERT INTO <table>
-/// FORMAT CSVWithNames`; it routes the body through the same bounded, atomic,
-/// nonblocking importer as `POST /insert/<table>`. All other parameterized
-/// queries require an absent or zero `Content-Length`. Empty, duplicate,
+/// FORMAT CSVWithNames` or a headerless TSV body when it is exactly `INSERT
+/// INTO <table> FORMAT TabSeparated`; it routes the body through the same
+/// bounded, atomic, nonblocking importer as `POST /insert/<table>`. All other
+/// parameterized queries require an absent or zero `Content-Length`. Empty,
+/// duplicate,
 /// unknown, and unsupported parameters are rejected after authentication and
 /// before database access. A
 /// `default_format` parameter cannot be combined with an
@@ -940,22 +943,12 @@ fn read_request(
             Ok(HttpRequest::Insert { sql })
         }
         RequestKind::TableInsert(table) => {
-            let body = match request.table_insert_format {
-                TableInsertFormat::Csv | TableInsertFormat::CsvWithNames => read_csv_body(
-                    input,
-                    request.content_length,
-                    limits.max_sql_bytes,
-                    limits.csv_ingest_limits,
-                )?,
-                TableInsertFormat::TabSeparated | TableInsertFormat::TabSeparatedWithNames => {
-                    read_tsv_body(
-                        input,
-                        request.content_length,
-                        limits.max_sql_bytes,
-                        limits.tsv_ingest_limits,
-                    )?
-                }
-            };
+            let body = read_table_insert_body(
+                input,
+                request.content_length,
+                request.table_insert_format,
+                limits,
+            )?;
             Ok(HttpRequest::TableInsert {
                 table,
                 body,
@@ -989,24 +982,24 @@ fn read_request(
             })?;
 
             if matches!(method, ParameterizedQueryMethod::Post) && access.allows_insert() {
-                if let Some(table) = parse_csv_with_names_insert(&sql) {
+                if let Some((table, input_format)) = parse_parameterized_table_insert(&sql) {
                     if output_format_selected {
                         return Err(RequestFailure::new(
                             Status::BAD_REQUEST,
-                            "CSVWithNames INSERT does not accept an output format selector",
+                            input_format.output_selector_rejection_message(),
                         )
                         .into());
                     }
-                    let body = read_csv_body(
+                    let body = read_table_insert_body(
                         input,
                         request.content_length,
-                        limits.max_sql_bytes,
-                        limits.csv_ingest_limits,
+                        input_format,
+                        limits,
                     )?;
                     return Ok(HttpRequest::TableInsert {
                         table,
                         body,
-                        input_format: TableInsertFormat::CsvWithNames,
+                        input_format,
                     });
                 }
             }
@@ -1030,7 +1023,7 @@ fn read_request(
     }
 }
 
-fn parse_csv_with_names_insert(sql: &str) -> Option<String> {
+fn parse_parameterized_table_insert(sql: &str) -> Option<(String, TableInsertFormat)> {
     let sql = sql.trim();
     let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
     let mut tokens = sql.split_whitespace();
@@ -1038,17 +1031,23 @@ fn parse_csv_with_names_insert(sql: &str) -> Option<String> {
     let into = tokens.next()?;
     let table = tokens.next()?;
     let format = tokens.next()?;
-    let csv_with_names = tokens.next()?;
+    let input_format = tokens.next()?;
     if tokens.next().is_some()
         || !insert.eq_ignore_ascii_case("INSERT")
         || !into.eq_ignore_ascii_case("INTO")
         || !format.eq_ignore_ascii_case("FORMAT")
-        || !csv_with_names.eq_ignore_ascii_case("CSVWithNames")
         || validate_table_name(table).is_err()
     {
         return None;
     }
-    Some(table.to_owned())
+    let input_format = if input_format.eq_ignore_ascii_case("CSVWithNames") {
+        TableInsertFormat::CsvWithNames
+    } else if input_format.eq_ignore_ascii_case("TabSeparated") {
+        TableInsertFormat::TabSeparated
+    } else {
+        return None;
+    };
+    Some((table.to_owned(), input_format))
 }
 
 fn classify_standard_query_request(
@@ -1237,6 +1236,30 @@ fn read_bounded_body(
 ) -> Result<Vec<u8>, RequestReadError> {
     let content_length = bounded_body_length(content_length, max_body_bytes)?;
     read_body_with_length(input, content_length)
+}
+
+fn read_table_insert_body(
+    input: &mut impl Read,
+    content_length: Option<usize>,
+    input_format: TableInsertFormat,
+    limits: HttpQueryLimits,
+) -> Result<Vec<u8>, RequestReadError> {
+    match input_format {
+        TableInsertFormat::Csv | TableInsertFormat::CsvWithNames => read_csv_body(
+            input,
+            content_length,
+            limits.max_sql_bytes,
+            limits.csv_ingest_limits,
+        ),
+        TableInsertFormat::TabSeparated | TableInsertFormat::TabSeparatedWithNames => {
+            read_tsv_body(
+                input,
+                content_length,
+                limits.max_sql_bytes,
+                limits.tsv_ingest_limits,
+            )
+        }
+    }
 }
 
 fn read_csv_body(
@@ -1428,6 +1451,18 @@ enum TableInsertFormat {
     CsvWithNames,
     TabSeparated,
     TabSeparatedWithNames,
+}
+
+impl TableInsertFormat {
+    const fn output_selector_rejection_message(self) -> &'static str {
+        match self {
+            Self::CsvWithNames => "CSVWithNames INSERT does not accept an output format selector",
+            Self::TabSeparated => "TabSeparated INSERT does not accept an output format selector",
+            Self::Csv | Self::TabSeparatedWithNames => {
+                "parameterized INSERT does not accept an output format selector"
+            }
+        }
+    }
 }
 
 enum QuerySource {
