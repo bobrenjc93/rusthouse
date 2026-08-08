@@ -322,9 +322,11 @@ count as their own scalar values. The function is case-insensitive in SQL and
 accepts the same optional alias, `WHERE`, expression-or-alias ordering, and
 `LIMIT`/`OFFSET` behavior as `LENGTH`; its default result name uses the
 ClickHouse spelling `lengthUTF8(<column>)`. Evaluation and ordering scan the
-UTF-8 text without creating a transformed `String`, and result bounds charge
-only the fixed-size `Int64` output. Non-`String` arguments and grouped query
-shapes are rejected with typed errors.
+UTF-8 text without creating a transformed `String`; ungrouped ordering by only
+this key caches one scalar count per filtered row before bounded selection.
+The cache is linear in the filtered row count, and result bounds charge only
+the fixed-size `Int64` output. Non-`String` arguments and grouped query shapes
+are rejected with typed errors.
 `LOWER(string_column)` is an ungrouped scalar projection that lowercases ASCII
 letters while leaving every non-ASCII UTF-8 byte unchanged. Because this
 transformation preserves byte length, its owned `String` results are charged
@@ -548,13 +550,17 @@ decimal `Content-Length` and sends its UTF-8 SQL body through
 `SharedDatabase::try_query`. The standard ClickHouse-style
 `GET /?query=<percent-encoded SQL>` form does the same with no body
 (`Content-Length` may be omitted or be zero). It also accepts one optional
-`database=default` parameter before or after `query`, including percent-encoded
-parameter names and values. All names and values use form-style decoding: each
-`%HH` escape becomes one byte and `+` becomes a space. The decoded SQL then
-undergoes strict UTF-8 validation and is subject to the same SQL byte limit as
-a POST body; the database parameter does not count toward that limit. Empty
-parameters or values, duplicate `query` or `database` parameters, unknown
-parameters, malformed escapes, non-default database values, and invalid SQL
+`database=default` parameter and one optional `default_format` parameter in any
+order with `query`, including percent-encoded parameter names and values. All
+names and values use form-style decoding: each `%HH` escape becomes one byte and
+`+` becomes a space. `default_format` accepts the exact case-sensitive values
+`JSON`, `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, and
+`JSONCompactEachRow`, selecting the corresponding existing response writer.
+The decoded SQL then undergoes strict UTF-8 validation and is subject to the
+same SQL byte limit as a POST body; the database and format parameters do not
+count toward that limit. Empty parameters or values, duplicate `query`,
+`database`, or `default_format` parameters, unknown parameters, malformed
+escapes, non-default database values, unsupported formats, and invalid SQL
 UTF-8 are rejected. Parameter validation follows configured authentication and
 precedes database access. All query forms use the read-only,
 exactly-one-statement `SharedDatabase::try_query` path. Successful responses use
@@ -644,8 +650,12 @@ one positional JSON array per row, each followed by a line feed; column
 metadata is omitted and an empty result has an empty body. Header names are
 case-insensitive, but format values are case-sensitive and must use one of
 those exact spellings. Duplicate format headers and all other format values
-receive deterministic `400 Bad Request` JSON errors. When the header is absent,
-the existing JSON response shape is unchanged.
+receive deterministic `400 Bad Request` JSON errors. A GET request cannot
+combine this header with `default_format`; the independently valid selectors
+also receive a deterministic `400 Bad Request` after authentication and before
+database access. When neither selector is present, the existing JSON response
+shape is unchanged. Every selected writer remains subject to the complete HTTP
+response cap.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`

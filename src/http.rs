@@ -105,16 +105,21 @@ impl StdError for HttpQueryError {
 /// `POST /` and `POST /query` require exactly one decimal `Content-Length` and
 /// carry UTF-8 SQL in their body. `GET /?query=<percent-encoded SQL>` carries
 /// the same SQL in a required form-style query parameter and optionally accepts
-/// one `database=default` parameter in either order. Parameter names and values
-/// are percent-decoded, `+` becomes a space, and no request body is accepted.
-/// Empty, duplicate, unknown, and non-default parameters are rejected after
-/// authentication and before database access. All three forms pass the SQL to
+/// one `database=default` parameter and one `default_format` parameter in any
+/// order. `default_format` accepts `JSON`, `CSVWithNames`,
+/// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
+/// names and values are percent-decoded, `+` becomes a space, and no request
+/// body is accepted. Empty, duplicate, unknown, and unsupported parameters are
+/// rejected after authentication and before database access. A
+/// `default_format` parameter cannot be combined with an
+/// `X-ClickHouse-Format` header. All three forms pass the SQL to
 /// [`SharedDatabase::try_query`], which accepts exactly one read-only statement
 /// and makes one nonblocking read-lock attempt. Writer contention returns
 /// `503 Service Unavailable`; lock poisoning remains a `500 Internal Server Error`.
 /// A successful query response uses the same JSON result shape as the batch
-/// JSON formatter unless exactly one
-/// `X-ClickHouse-Format` header requests `CSVWithNames`,
+/// JSON formatter unless one format selector requests a streaming format. GET
+/// `default_format` additionally accepts an explicit `JSON`; the
+/// `X-ClickHouse-Format` header accepts `CSVWithNames`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. CSV, TSV,
 /// and row-oriented JSON responses use the corresponding batch writers;
 /// positional JSON responses contain arrays separated by line feeds.
@@ -687,7 +692,7 @@ fn read_request(
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
             Ok(HttpRequest::Query {
                 sql,
-                response_format: request.response_format,
+                response_format: request.response_format.unwrap_or(QueryResponseFormat::Json),
             })
         }
         RequestKind::Insert => {
@@ -724,11 +729,22 @@ fn read_request(
                 .into());
             }
 
-            let sql = decode_get_query_parameters(&encoded_parameters, limits.max_sql_bytes)?;
-            String::from_utf8(sql)
+            let decoded = decode_get_query_parameters(&encoded_parameters, limits.max_sql_bytes)?;
+            let response_format = match (request.response_format, decoded.response_format) {
+                (Some(_), Some(_)) => {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "default_format parameter cannot be combined with X-ClickHouse-Format header",
+                    )
+                    .into());
+                }
+                (Some(format), None) | (None, Some(format)) => format,
+                (None, None) => QueryResponseFormat::Json,
+            };
+            String::from_utf8(decoded.sql)
                 .map(|sql| HttpRequest::Query {
                     sql,
-                    response_format: request.response_format,
+                    response_format,
                 })
                 .map_err(|_| {
                     RequestFailure::new(Status::BAD_REQUEST, "SQL query is not valid UTF-8").into()
@@ -897,7 +913,7 @@ fn read_header_block(
 struct ParsedRequest {
     kind: RequestKind,
     content_length: Option<usize>,
-    response_format: QueryResponseFormat,
+    response_format: Option<QueryResponseFormat>,
     table_insert_format: TableInsertFormat,
 }
 
@@ -946,6 +962,11 @@ enum TableInsertFormat {
 enum QuerySource {
     Body,
     UrlEncodedParameters(Vec<u8>),
+}
+
+struct DecodedGetQuery {
+    sql: Vec<u8>,
+    response_format: Option<QueryResponseFormat>,
 }
 
 fn parse_headers(
@@ -1112,11 +1133,11 @@ fn parse_headers(
             .into());
         }
         match clickhouse_format {
-            None => QueryResponseFormat::Json,
-            Some(b"CSVWithNames") => QueryResponseFormat::CsvWithNames,
-            Some(b"TabSeparatedWithNames") => QueryResponseFormat::TabSeparatedWithNames,
-            Some(b"JSONEachRow") => QueryResponseFormat::JsonEachRow,
-            Some(b"JSONCompactEachRow") => QueryResponseFormat::JsonCompactEachRow,
+            None => None,
+            Some(b"CSVWithNames") => Some(QueryResponseFormat::CsvWithNames),
+            Some(b"TabSeparatedWithNames") => Some(QueryResponseFormat::TabSeparatedWithNames),
+            Some(b"JSONEachRow") => Some(QueryResponseFormat::JsonEachRow),
+            Some(b"JSONCompactEachRow") => Some(QueryResponseFormat::JsonCompactEachRow),
             Some(_) => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
@@ -1126,7 +1147,7 @@ fn parse_headers(
             }
         }
     } else {
-        QueryResponseFormat::Json
+        None
     };
     let table_insert_format = if matches!(&kind, RequestKind::TableInsert(_)) {
         if duplicate_clickhouse_format {
@@ -1254,7 +1275,11 @@ fn parse_request_line(
             &[b"Allow: POST\r\n"],
         )
         .into()),
-        (_, target) if target.starts_with(b"/?query=") || target.starts_with(b"/?database=") => {
+        (_, target)
+            if target.starts_with(b"/?query=")
+                || target.starts_with(b"/?database=")
+                || target.starts_with(b"/?default_format=") =>
+        {
             Err(RequestFailure::with_headers(
                 Status::METHOD_NOT_ALLOWED,
                 "method must be GET for /?query=",
@@ -1322,9 +1347,10 @@ fn parse_table_insert_target(target: &[u8]) -> Option<&str> {
 fn decode_get_query_parameters(
     encoded_parameters: &[u8],
     max_sql_bytes: usize,
-) -> Result<Vec<u8>, RequestReadError> {
+) -> Result<DecodedGetQuery, RequestReadError> {
     let mut query = None;
     let mut database_seen = false;
+    let mut response_format = None;
 
     for encoded_parameter in encoded_parameters.split(|byte| *byte == b'&') {
         let Some(equals) = encoded_parameter.iter().position(|byte| *byte == b'=') else {
@@ -1373,6 +1399,30 @@ fn decode_get_query_parameters(
                     .into());
                 }
             }
+            b"default_format" => {
+                if response_format.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate default_format parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                response_format = Some(match value.as_slice() {
+                    b"JSON" => QueryResponseFormat::Json,
+                    b"CSVWithNames" => QueryResponseFormat::CsvWithNames,
+                    b"TabSeparatedWithNames" => QueryResponseFormat::TabSeparatedWithNames,
+                    b"JSONEachRow" => QueryResponseFormat::JsonEachRow,
+                    b"JSONCompactEachRow" => QueryResponseFormat::JsonCompactEachRow,
+                    _ => {
+                        return Err(RequestFailure::new(
+                            Status::BAD_REQUEST,
+                            "unsupported default_format parameter",
+                        )
+                        .into());
+                    }
+                });
+            }
             _ => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
@@ -1383,11 +1433,15 @@ fn decode_get_query_parameters(
         }
     }
 
-    query.ok_or_else(|| {
+    let sql = query.ok_or_else(|| {
         RequestReadError::from(RequestFailure::new(
             Status::BAD_REQUEST,
             "GET query target must contain exactly one query parameter",
         ))
+    })?;
+    Ok(DecodedGetQuery {
+        sql,
+        response_format,
     })
 }
 

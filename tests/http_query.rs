@@ -1185,6 +1185,47 @@ fn get_query_accepts_percent_decoded_default_database_in_either_order() {
 }
 
 #[test]
+fn get_default_format_selects_every_writer_with_encoded_parameters_in_any_order() {
+    let database = SharedDatabase::default();
+    let cases: &[(&[u8], &str, &[u8])] = &[
+        (
+            b"GET /?default_format=JSON&query=SELECT+7+AS+value%3B&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "application/json",
+            br#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#,
+        ),
+        (
+            b"GET /?query=SELECT+7+AS+value%3B&default_format=CSVWithNames&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "text/csv; charset=utf-8",
+            b"value\n7\n",
+        ),
+        (
+            b"GET /?database=default&query=SELECT+7+AS+value%3B&default_format=TabSeparatedWithNames HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "text/tab-separated-values; charset=utf-8",
+            b"value\n7\n",
+        ),
+        (
+            b"GET /?default%5Fformat=JSON%45achRow&database=def%61ult&%71uery=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "application/json",
+            b"{\"value\":7}\n",
+        ),
+        (
+            b"GET /?%71uery=SELECT+7+AS+value%3B&database=default&%64efault_format=JSONCompact%45achRow HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "application/json",
+            b"[7]\n",
+        ),
+    ];
+
+    for (request, content_type, body) in cases {
+        assert_response_with_content_type(
+            &exchange(&database, request),
+            "HTTP/1.1 200 OK",
+            content_type,
+            body,
+        );
+    }
+}
+
+#[test]
 fn get_default_database_parameter_executes_length_utf8_projection() {
     let database = SharedDatabase::default();
     database
@@ -1297,9 +1338,71 @@ fn get_parameter_validation_follows_authentication_and_precedes_database_access(
 }
 
 #[test]
-fn get_database_parameter_does_not_count_toward_the_decoded_sql_limit() {
+fn get_default_format_rejection_follows_authentication_and_precedes_database_access() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let unsupported_without_bearer =
+        b"GET /?query=SELECT+1%3B&default_format=XML HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", unsupported_without_bearer),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let conflicting_without_key = b"GET /?query=SELECT+1%3B&default_format=JSON HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Format: CSVWithNames\r\n\r\n";
+    let missing_key_response =
+        clickhouse_key_exchange(&database, "correct-key", conflicting_without_key);
+    assert_response(
+        &missing_key_response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&missing_key_response);
+
+    let invalid_bearer_requests: &[(&[u8], &str)] = &[
+        (
+            b"GET /?query=SELECT+1%3B&default_format=JSON&default%5Fformat=JSONEachRow HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"duplicate default_format parameter"}"#,
+        ),
+        (
+            b"GET /?default_format=%58ML&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"unsupported default_format parameter"}"#,
+        ),
+        (
+            b"GET /?default_format=JSON&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\nX-ClickHouse-Format: JSONEachRow\r\n\r\n",
+            r#"{"error":"default_format parameter cannot be combined with X-ClickHouse-Format header"}"#,
+        ),
+    ];
+
+    for (request, expected_body) in invalid_bearer_requests {
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", request),
+            "HTTP/1.1 400 Bad Request",
+            expected_body,
+        );
+    }
+
+    let duplicate_with_key = b"GET /?default_format=JSONEachRow&query=SELECT+1%3B&%64efault_format=JSON HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n";
+    let duplicate_key_response =
+        clickhouse_key_exchange(&database, "correct-key", duplicate_with_key);
+    assert_response(
+        &duplicate_key_response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"duplicate default_format parameter"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&duplicate_key_response);
+}
+
+#[test]
+fn get_database_and_default_format_do_not_count_toward_the_decoded_sql_limit() {
     let database = SharedDatabase::default();
-    let request = b"GET /?database=def%61ult&query=SELECT+7%3B HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let request = b"GET /?database=def%61ult&default_format=JSON&query=SELECT+7%3B HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let mut response = Vec::new();
     handle_http_query_with_limits(
         &database,
@@ -1572,10 +1675,10 @@ fn url_encoded_get_query_rejects_malformed_encoding_utf8_parameters_and_bodies()
 }
 
 #[test]
-fn url_encoded_get_query_retains_the_complete_response_limit() {
+fn get_default_format_retains_the_complete_response_limit() {
     let database = SharedDatabase::default();
     let request = format!(
-        "GET /?query=SELECT+%27{}%27+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /?query=SELECT+%27{}%27+AS+value%3B&default_format=JSONCompactEachRow HTTP/1.1\r\nHost: localhost\r\n\r\n",
         "x".repeat(1_000),
     );
     let limits = HttpQueryLimits {
