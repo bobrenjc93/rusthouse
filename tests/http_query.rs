@@ -1205,6 +1205,201 @@ fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
 }
 
 #[test]
+fn terminal_csv_with_names_format_wires_get_and_post_with_escaped_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE samples (label String); \
+             INSERT INTO samples VALUES ('comma, \"quoted\"\nline');",
+        )
+        .unwrap();
+
+    assert_response_with_content_type(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+label+FROM+samples+FORMAT+CSVWithNames%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"label\n\"comma, \"\"quoted\"\"\nline\"\n",
+    );
+
+    assert_response_with_content_type(
+        &exchange(
+            &database,
+            &request(b"SELECT label FROM samples WHERE label = 'missing' FORMAT CSVWithNames;"),
+        ),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"label\n",
+    );
+
+    assert_response_with_content_type(
+        &exchange(
+            &database,
+            b"POST /?query=SELECT+7+AS+value+format+csvwithnames HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n7\n",
+    );
+}
+
+#[test]
+fn terminal_csv_with_names_format_works_with_both_authentication_modes() {
+    let database = SharedDatabase::default();
+    let bearer = request_for_target_with_headers(
+        "/query",
+        b"SELECT 7 AS value FORMAT CSVWithNames;",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &bearer),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n7\n",
+    );
+
+    let key_response = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"GET /?query=SELECT+8+AS+value+FORMAT+CSVWithNames HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+    );
+    assert_response_with_content_type(
+        &key_response,
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n8\n",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+}
+
+#[test]
+fn terminal_csv_with_names_format_rejects_metadata_conflicts_after_authentication() {
+    let database = SharedDatabase::default();
+    let conflict_error = r#"{"error":"FORMAT CSVWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter"}"#;
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target_with_headers(
+                "/query",
+                b"SELECT 1 FORMAT CSVWithNames;",
+                "X-ClickHouse-Format: CSVWithNames\r\n",
+            ),
+        ),
+        "HTTP/1.1 400 Bad Request",
+        conflict_error,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+1+FORMAT+CSVWithNames&default_format=CSVWithNames HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        conflict_error,
+    );
+
+    let unauthorized = b"GET /?query=SELECT+1+FORMAT+CSVWithNames&default_format=CSVWithNames HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", unauthorized),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    let missing_key_response = clickhouse_key_exchange(&database, "correct-key", unauthorized);
+    assert_response(
+        &missing_key_response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&missing_key_response);
+}
+
+#[test]
+fn terminal_csv_with_names_format_ignores_quoted_and_commented_text() {
+    let database = SharedDatabase::default();
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT 'FORMAT CSVWithNames' AS value;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"String"}],"rows":[["FORMAT CSVWithNames"]]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT 1 AS value; -- FORMAT CSVWithNames"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[1]]}"#,
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+%27escaped+%27%27FORMAT+CSVWithNames%27%27%27+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"String"}],"rows":[["escaped 'FORMAT CSVWithNames'"]]}"#,
+    );
+}
+
+#[test]
+fn terminal_csv_with_names_format_preserves_single_read_only_query_and_response_limits() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT 1; SELECT 2 FORMAT CSVWithNames;"),
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query requires exactly one statement; found 2"}"#,
+    );
+    let authenticated_insert = request_for_target_with_headers(
+        "/query",
+        b"INSERT INTO events VALUES (1) FORMAT CSVWithNames;",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &authenticated_insert),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+    assert_response(
+        &exchange(&database, &request(b"SELECT id FROM events;")),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+
+    let sql = format!(
+        "SELECT '{}' AS value FORMAT CSVWithNames;",
+        "x".repeat(1_000)
+    );
+    let limits = HttpQueryLimits {
+        max_response_bytes: 512,
+        ..HttpQueryLimits::default()
+    };
+    let mut response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request(sql.as_bytes())),
+        &mut response,
+        limits,
+    )
+    .unwrap();
+    assert!(response.len() <= limits.max_response_bytes);
+    assert_response(
+        &response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
 fn url_encoded_post_query_accepts_absent_or_zero_length_and_every_default_format() {
     let database = SharedDatabase::default();
     let cases: &[(&[u8], &str, &[u8])] = &[

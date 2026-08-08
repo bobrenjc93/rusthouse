@@ -120,7 +120,12 @@ impl StdError for HttpQueryError {
 /// unknown, and unsupported parameters are rejected after authentication and
 /// before database access. A
 /// `default_format` parameter cannot be combined with an
-/// `X-ClickHouse-Format` header. GET requests and every request made through a
+/// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
+/// may instead end in the case-insensitive SQL clause `FORMAT CSVWithNames`,
+/// with an optional trailing semicolon. The clause selects the existing named
+/// CSV writer and cannot be combined with either HTTP format selector. Quoted
+/// strings and line comments are not interpreted as format clauses. GET
+/// requests and every request made through a
 /// read-only handler pass the SQL to [`SharedDatabase::try_query`], which
 /// accepts exactly one read-only statement and makes one nonblocking read-lock
 /// attempt. POST requests made through the insertion-capable handlers without an
@@ -901,11 +906,11 @@ fn read_request(
         RequestKind::Query(QuerySource::Body) => {
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
             let output_format_selected = request.response_format.is_some();
-            Ok(classify_standard_query_request(
+            classify_standard_query_request(
                 sql,
-                request.response_format.unwrap_or(QueryResponseFormat::Json),
+                request.response_format,
                 access.allows_insert() && !output_format_selected,
-            ))
+            )
         }
         RequestKind::Insert => {
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
@@ -950,8 +955,8 @@ fn read_request(
                     )
                     .into());
                 }
-                (Some(format), None) | (None, Some(format)) => format,
-                (None, None) => QueryResponseFormat::Json,
+                (Some(format), None) | (None, Some(format)) => Some(format),
+                (None, None) => None,
             };
             let sql = String::from_utf8(decoded.sql).map_err(|_| {
                 RequestReadError::from(RequestFailure::new(
@@ -991,13 +996,13 @@ fn read_request(
                 .into());
             }
 
-            Ok(classify_standard_query_request(
+            classify_standard_query_request(
                 sql,
                 response_format,
                 access.allows_insert()
                     && matches!(method, ParameterizedQueryMethod::Post)
                     && !output_format_selected,
-            ))
+            )
         }
     }
 }
@@ -1024,14 +1029,29 @@ fn parse_csv_with_names_insert(sql: &str) -> Option<String> {
 }
 
 fn classify_standard_query_request(
-    sql: String,
-    response_format: QueryResponseFormat,
+    mut sql: String,
+    response_format: Option<QueryResponseFormat>,
     insert_enabled: bool,
-) -> HttpRequest {
+) -> Result<HttpRequest, RequestReadError> {
+    let sql_format_selected = take_terminal_csv_with_names_format(&mut sql);
+    if sql_format_selected && response_format.is_some() {
+        return Err(RequestFailure::new(
+            Status::BAD_REQUEST,
+            "FORMAT CSVWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter",
+        )
+        .into());
+    }
+    let response_format = if sql_format_selected {
+        QueryResponseFormat::CsvWithNames
+    } else {
+        response_format.unwrap_or(QueryResponseFormat::Json)
+    };
+
     // Route mixed batches through the insert-only executor too, so its
     // authoritative all-statement validation and transaction semantics decide
     // the error without risking an earlier partial INSERT.
     let contains_insert = insert_enabled
+        && !sql_format_selected
         && sql::parse(&sql).is_ok_and(|statements| {
             statements.iter().any(|statement| {
                 matches!(
@@ -1041,13 +1061,140 @@ fn classify_standard_query_request(
             })
         });
     if contains_insert {
-        HttpRequest::Insert { sql }
+        Ok(HttpRequest::Insert { sql })
     } else {
-        HttpRequest::Query {
+        Ok(HttpRequest::Query {
             sql,
             response_format,
-        }
+        })
     }
+}
+
+/// Removes one terminal, unquoted `FORMAT CSVWithNames` clause.
+///
+/// The SQL parser deliberately does not own transport output formats, so the
+/// HTTP adapter recognizes this one ClickHouse-compatible clause before using
+/// the unchanged read-only query API. This scanner follows the SQL lexer's
+/// single-quote, doubled-quote, whitespace, and line-comment rules without
+/// retaining tokens proportional to the bounded request size.
+fn take_terminal_csv_with_names_format(sql: &mut String) -> bool {
+    let Some(format_start) = terminal_csv_with_names_format_start(sql) else {
+        return false;
+    };
+    sql.truncate(format_start);
+    true
+}
+
+fn terminal_csv_with_names_format_start(sql: &str) -> Option<usize> {
+    #[derive(Clone, Copy)]
+    struct Token<'a> {
+        text: &'a str,
+        start: usize,
+        has_previous: bool,
+        separated_by_semicolon: bool,
+    }
+
+    fn record_token<'a>(
+        token: Token<'a>,
+        previous: &mut Option<Token<'a>>,
+        last: &mut Option<Token<'a>>,
+    ) {
+        *previous = *last;
+        *last = Some(token);
+    }
+
+    let mut index = 0_usize;
+    let mut previous = None;
+    let mut last = None;
+    let mut semicolons_since_token = 0_usize;
+
+    while index < sql.len() {
+        let rest = &sql[index..];
+        let character = rest
+            .chars()
+            .next()
+            .expect("the byte index remains on a character boundary");
+
+        if character.is_whitespace() {
+            index += character.len_utf8();
+            continue;
+        }
+        if rest.starts_with("--") {
+            while index < sql.len() {
+                let character = sql[index..]
+                    .chars()
+                    .next()
+                    .expect("the byte index remains on a character boundary");
+                index += character.len_utf8();
+                if character == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == ';' {
+            semicolons_since_token = semicolons_since_token.saturating_add(1);
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        if character == '\'' {
+            index += 1;
+            let mut terminated = false;
+            while index < sql.len() {
+                let character = sql[index..]
+                    .chars()
+                    .next()
+                    .expect("the byte index remains on a character boundary");
+                index += character.len_utf8();
+                if character == '\'' {
+                    if sql[index..].starts_with('\'') {
+                        index += 1;
+                    } else {
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+            if !terminated {
+                return None;
+            }
+        } else if character.is_ascii_alphabetic() || character == '_' {
+            index += 1;
+            while index < sql.len() {
+                let character = sql[index..]
+                    .chars()
+                    .next()
+                    .expect("the byte index remains on a character boundary");
+                if !character.is_ascii_alphanumeric() && character != '_' {
+                    break;
+                }
+                index += character.len_utf8();
+            }
+        } else {
+            index += character.len_utf8();
+        }
+
+        let token = Token {
+            text: &sql[start..index],
+            start,
+            has_previous: last.is_some(),
+            separated_by_semicolon: semicolons_since_token != 0,
+        };
+        record_token(token, &mut previous, &mut last);
+        semicolons_since_token = 0;
+    }
+
+    let format = previous?;
+    let csv_with_names = last?;
+    (format.has_previous
+        && !format.separated_by_semicolon
+        && !csv_with_names.separated_by_semicolon
+        && semicolons_since_token <= 1
+        && format.text.eq_ignore_ascii_case("FORMAT")
+        && csv_with_names.text.eq_ignore_ascii_case("CSVWithNames"))
+    .then_some(format.start)
 }
 
 fn read_sql_body(
