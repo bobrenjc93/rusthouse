@@ -1864,9 +1864,9 @@ impl<'a> Parser<'a> {
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
         // `not` remains a valid column name, so a following predicate operator
         // makes this token the left operand rather than unary syntax. This
-        // includes the two-token `NOT IN` and `NOT BETWEEN` operators. `like`
-        // is also a valid column name; only `NOT LIKE <String pattern>` is the
-        // infix form with a column named `not`.
+        // includes the two-token `NOT IN`, `NOT BETWEEN`, and `NOT LIKE`
+        // operators. `like` is also a valid column name; the pattern lookahead
+        // keeps unary `NOT like ...` distinct from a column named `not`.
         if !self.at_keyword("NOT") || self.next_token_is_predicate_operator() {
             return self.parse_predicate_atom();
         }
@@ -1913,6 +1913,9 @@ impl<'a> Parser<'a> {
                         let lower_bound = Self::next_or_invalid(&mut lexer);
                         Self::token_can_start_literal(&lower_bound.kind)
                     }
+                    TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("LIKE") => {
+                        matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::String(_))
+                    }
                     _ => false,
                 }
             }
@@ -1936,21 +1939,11 @@ impl<'a> Parser<'a> {
         }
 
         let left = self.parse_operand()?;
+        let infix_negated = self.eat_keyword("NOT");
         if self.eat_keyword("BETWEEN") {
-            return self.parse_between_predicate(left, false);
+            return self.parse_between_predicate(left, infix_negated);
         }
-        let negated_in = if self.eat_keyword("IN") {
-            Some(false)
-        } else if self.eat_keyword("NOT") {
-            if self.eat_keyword("BETWEEN") {
-                return self.parse_between_predicate(left, true);
-            }
-            self.expect_keyword("IN")?;
-            Some(true)
-        } else {
-            None
-        };
-        if let Some(negated) = negated_in {
+        if self.eat_keyword("IN") {
             let Operand::Column(column) = left else {
                 return self.error("IN left operand must be a column");
             };
@@ -1979,68 +1972,21 @@ impl<'a> Parser<'a> {
             // Infix NOT IN is exactly one negation around the existing
             // balanced IN predicate. Charge that executable node before
             // allocating either lowered tree.
-            if negated {
+            if infix_negated {
                 self.record_predicate_node()?;
             }
             let predicate = lower_in_predicate(column, literals);
-            return Ok(if negated {
+            return Ok(if infix_negated {
                 Predicate::Not(Box::new(predicate))
             } else {
                 predicate
             });
         }
         if self.eat_keyword("LIKE") {
-            let Operand::Column(column) = left else {
-                return self.error("LIKE left operand must be a column");
-            };
-            let pattern_position = self.position();
-            let TokenKind::String(mut pattern) = self.take_kind() else {
-                return Err(Error::Sql {
-                    position: pattern_position,
-                    message: "LIKE pattern must be a String literal of the form 'prefix%', '%suffix', or '%substring%'"
-                        .to_owned(),
-                });
-            };
-            let wildcard_count = pattern.bytes().filter(|byte| *byte == b'%').count();
-            let starts_with_wildcard = pattern.starts_with('%');
-            let ends_with_wildcard = pattern.ends_with('%');
-            let predicate = match (
-                wildcard_count,
-                starts_with_wildcard,
-                ends_with_wildcard,
-            ) {
-                // Retain the existing interpretation of the single wildcard
-                // as an empty prefix. It is also semantically an empty suffix.
-                (1, _, true) => {
-                    pattern.pop();
-                    Ok(Predicate::LikePrefix {
-                        column,
-                        prefix: pattern,
-                    })
-                }
-                (1, true, false) => {
-                    pattern.remove(0);
-                    Ok(Predicate::LikeSuffix {
-                        column,
-                        suffix: pattern,
-                    })
-                }
-                (2, true, true) => {
-                    pattern.pop();
-                    pattern.remove(0);
-                    Ok(Predicate::LikeContains {
-                        column,
-                        substring: pattern,
-                    })
-                }
-                _ => Err(Error::Sql {
-                    position: pattern_position,
-                    message: "LIKE pattern must have the exact form 'prefix%', '%suffix', or '%substring%'"
-                        .to_owned(),
-                }),
-            }?;
-            self.record_predicate_node()?;
-            return Ok(predicate);
+            return self.parse_like_predicate(left, infix_negated);
+        }
+        if infix_negated {
+            return self.error("expected keyword BETWEEN, IN, or LIKE after NOT");
         }
         let operator = self.parse_comparison_operator()?;
         let right = self.parse_operand()?;
@@ -2050,6 +1996,66 @@ impl<'a> Parser<'a> {
             operator,
             right,
         })
+    }
+
+    fn parse_like_predicate(&mut self, left: Operand, negated: bool) -> Result<Predicate> {
+        let Operand::Column(column) = left else {
+            return self.error("LIKE left operand must be a column");
+        };
+        let pattern_position = self.position();
+        let TokenKind::String(mut pattern) = self.take_kind() else {
+            return Err(Error::Sql {
+                position: pattern_position,
+                message: "LIKE pattern must be a String literal of the form 'prefix%', '%suffix', or '%substring%'"
+                    .to_owned(),
+            });
+        };
+        let wildcard_count = pattern.bytes().filter(|byte| *byte == b'%').count();
+        let starts_with_wildcard = pattern.starts_with('%');
+        let ends_with_wildcard = pattern.ends_with('%');
+        let predicate = match (wildcard_count, starts_with_wildcard, ends_with_wildcard) {
+            // Retain the existing interpretation of the single wildcard as an
+            // empty prefix. It is also semantically an empty suffix.
+            (1, _, true) => {
+                pattern.pop();
+                Ok(Predicate::LikePrefix {
+                    column,
+                    prefix: pattern,
+                })
+            }
+            (1, true, false) => {
+                pattern.remove(0);
+                Ok(Predicate::LikeSuffix {
+                    column,
+                    suffix: pattern,
+                })
+            }
+            (2, true, true) => {
+                pattern.pop();
+                pattern.remove(0);
+                Ok(Predicate::LikeContains {
+                    column,
+                    substring: pattern,
+                })
+            }
+            _ => Err(Error::Sql {
+                position: pattern_position,
+                message:
+                    "LIKE pattern must have the exact form 'prefix%', '%suffix', or '%substring%'"
+                        .to_owned(),
+            }),
+        }?;
+
+        // Infix NOT LIKE is exactly one negation around the existing LIKE
+        // atom. The compiler folds that node into the matcher's polarity bit,
+        // retaining the allocation-free per-row String checks.
+        self.record_predicate_node()?;
+        if negated {
+            self.record_predicate_node()?;
+            Ok(Predicate::Not(Box::new(predicate)))
+        } else {
+            Ok(predicate)
+        }
     }
 
     fn parse_between_predicate(&mut self, left: Operand, negated: bool) -> Result<Predicate> {

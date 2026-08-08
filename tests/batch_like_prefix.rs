@@ -126,6 +126,113 @@ fn parses_regular_and_distinct_suffix_like_without_the_leading_wildcard() {
 }
 
 #[test]
+fn lowers_infix_not_like_to_one_negation_for_every_pattern() {
+    let cases = [
+        (
+            "東京%",
+            Predicate::LikePrefix {
+                column: "label".to_owned(),
+                prefix: "東京".to_owned(),
+            },
+        ),
+        (
+            "%東京",
+            Predicate::LikeSuffix {
+                column: "label".to_owned(),
+                suffix: "東京".to_owned(),
+            },
+        ),
+        (
+            "%東京%",
+            Predicate::LikeContains {
+                column: "label".to_owned(),
+                substring: "東京".to_owned(),
+            },
+        ),
+        (
+            "%",
+            Predicate::LikePrefix {
+                column: "label".to_owned(),
+                prefix: String::new(),
+            },
+        ),
+        (
+            "%%",
+            Predicate::LikeContains {
+                column: "label".to_owned(),
+                substring: String::new(),
+            },
+        ),
+    ];
+
+    for projection in ["label", "DISTINCT label"] {
+        for (pattern, like) in &cases {
+            assert_eq!(
+                predicate(&format!(
+                    "SELECT {projection} FROM samples WHERE label NOT LIKE '{pattern}'"
+                )),
+                Predicate::Not(Box::new(like.clone())),
+                "{projection} NOT LIKE {pattern:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn infix_not_like_preserves_unary_not_precedence_and_contextual_identifiers() {
+    assert_eq!(
+        predicate("SELECT not FROM samples WHERE not NOT LIKE 'yes%'"),
+        Predicate::Not(Box::new(Predicate::LikePrefix {
+            column: "not".to_owned(),
+            prefix: "yes".to_owned(),
+        })),
+        "not remains a column name before infix NOT LIKE",
+    );
+    assert_eq!(
+        predicate("SELECT not FROM samples WHERE NOT NOT LIKE 'yes%'"),
+        Predicate::Not(Box::new(Predicate::LikePrefix {
+            column: "NOT".to_owned(),
+            prefix: "yes".to_owned(),
+        })),
+        "the contextual not column remains unambiguous",
+    );
+    assert_eq!(
+        predicate("SELECT like FROM samples WHERE NOT like NOT LIKE '%yes%'"),
+        Predicate::Not(Box::new(Predicate::Not(Box::new(
+            Predicate::LikeContains {
+                column: "like".to_owned(),
+                substring: "yes".to_owned(),
+            },
+        )))),
+        "unary NOT binds above the complete infix NOT LIKE atom",
+    );
+
+    assert_eq!(
+        predicate(
+            "SELECT label FROM samples WHERE \
+             label NOT LIKE 'a%' AND active = true OR label NOT LIKE '%京'",
+        ),
+        Predicate::Or(
+            Box::new(Predicate::And(
+                Box::new(Predicate::Not(Box::new(Predicate::LikePrefix {
+                    column: "label".to_owned(),
+                    prefix: "a".to_owned(),
+                }))),
+                Box::new(Predicate::Comparison {
+                    left: Operand::Column("active".to_owned()),
+                    operator: ComparisonOperator::Equal,
+                    right: Operand::Literal(Value::Bool(true)),
+                }),
+            )),
+            Box::new(Predicate::Not(Box::new(Predicate::LikeSuffix {
+                column: "label".to_owned(),
+                suffix: "京".to_owned(),
+            }))),
+        ),
+    );
+}
+
+#[test]
 fn contextual_not_and_like_columns_remain_unambiguous() {
     let mut database = Database::new();
     database
@@ -295,6 +402,44 @@ fn executes_case_sensitive_empty_and_unicode_suffixes() {
 }
 
 #[test]
+fn executes_unicode_not_like_patterns_in_regular_and_distinct_queries() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, label String); \
+             INSERT INTO samples VALUES \
+             (1, '東京駅'), (2, '西東京'), (3, '東京'), \
+             (4, 'alpha'), (5, 'éclair'), (6, '東京');",
+        )
+        .expect("setup");
+
+    let cases = [
+        ("label NOT LIKE '東京%'", &[2, 4, 5][..]),
+        ("label NOT LIKE '%東京'", &[1, 4, 5][..]),
+        ("label NOT LIKE '%京%'", &[4, 5][..]),
+        ("label NOT LIKE '%'", &[][..]),
+        ("label NOT LIKE '%%'", &[][..]),
+    ];
+    for (where_clause, expected) in cases {
+        let expected = expected
+            .iter()
+            .map(|value| vec![Value::Int64(*value)])
+            .collect::<Vec<_>>();
+        for projection in ["id", "DISTINCT id"] {
+            assert_eq!(
+                query(
+                    &mut database,
+                    &format!("SELECT {projection} FROM samples WHERE {where_clause} ORDER BY id"),
+                )
+                .rows,
+                expected,
+                "{projection} WHERE {where_clause}",
+            );
+        }
+    }
+}
+
+#[test]
 fn composes_like_with_not_and_or_in_regular_and_distinct_queries() {
     let mut database = Database::new();
     database
@@ -402,6 +547,27 @@ fn rejects_unsupported_and_invalid_like_patterns() {
             "{sql:?} must return a typed SQL error",
         );
     }
+
+    for projection in ["label", "DISTINCT label"] {
+        for malformed in [
+            "label NOT LIKE",
+            "label NOT LIKE other",
+            "label NOT LIKE 1",
+            "label NOT LIKE ''",
+            "label NOT LIKE 'alpha'",
+            "label NOT LIKE 'al%pha%'",
+            "'alpha' NOT LIKE 'alpha%'",
+            "label NOT LIKE LIKE 'alpha%'",
+            "label NOT NOT LIKE 'alpha%'",
+            "label NOT LIKE 'alpha%' extra",
+        ] {
+            let sql = format!("SELECT {projection} FROM samples WHERE {malformed}");
+            assert!(
+                matches!(parse(&sql), Err(Error::Sql { .. })),
+                "{sql:?} must return a typed SQL error",
+            );
+        }
+    }
 }
 
 #[test]
@@ -433,6 +599,16 @@ fn reports_non_string_like_columns_as_typed_errors() {
             actual: DataType::Bool.to_string(),
         }
     );
+    assert_eq!(
+        database
+            .execute("SELECT id FROM samples WHERE id NOT LIKE '1%'")
+            .expect_err("NOT LIKE retains the String input requirement"),
+        Error::TypeMismatch {
+            context: "WHERE LIKE column 'id'".to_owned(),
+            expected: DataType::String.to_string(),
+            actual: DataType::Int64.to_string(),
+        }
+    );
 }
 
 #[test]
@@ -449,6 +625,22 @@ fn like_atoms_retain_the_predicate_complexity_limit() {
         Err(Error::Sql { message, .. })
             if message == "predicate is too complex; maximum 256 expression nodes"
     ));
+
+    for projection in ["label", "DISTINCT label"] {
+        let exact = std::iter::once("label NOT LIKE '%a'".to_owned())
+            .chain(std::iter::repeat_n("label LIKE '%a'".to_owned(), 127))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        parse(&format!("SELECT {projection} FROM samples WHERE {exact}"))
+            .expect("one infix negation exactly fills the 256-node cap");
+
+        let too_complex = format!("SELECT {projection} FROM samples WHERE NOT {exact}");
+        assert!(matches!(
+            parse(&too_complex),
+            Err(Error::Sql { message, .. })
+                if message == "predicate is too complex; maximum 256 expression nodes"
+        ));
+    }
 }
 
 #[test]
@@ -462,8 +654,8 @@ fn like_queries_retain_scan_and_result_limits() {
     scan_limited.execute(setup).expect("setup");
     assert_eq!(
         scan_limited
-            .execute("SELECT label FROM samples WHERE label LIKE '%alpha' LIMIT 0")
-            .expect_err("LIKE and LIMIT cannot bypass the full source scan"),
+            .execute("SELECT label FROM samples WHERE label NOT LIKE '%alpha' LIMIT 0")
+            .expect_err("NOT LIKE and LIMIT cannot bypass the full source scan"),
         Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 3,
@@ -479,14 +671,14 @@ fn like_queries_retain_scan_and_result_limits() {
     assert_eq!(
         query(
             &mut result_limited,
-            "SELECT label FROM samples WHERE label LIKE '%alpha' LIMIT 1",
+            "SELECT label FROM samples WHERE label NOT LIKE 'a%' LIMIT 1",
         )
         .rows,
-        [vec![Value::String("alpha".to_owned())]],
+        [vec![Value::String("xxalpha".to_owned())]],
     );
     assert_eq!(
         result_limited
-            .execute("SELECT label FROM samples WHERE label LIKE '%alpha'")
+            .execute("SELECT label FROM samples WHERE label NOT LIKE 'a%'")
             .expect_err("both matches exceed the result row cap"),
         Error::ResourceLimitExceeded {
             resource: "SELECT result rows",
