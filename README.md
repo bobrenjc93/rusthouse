@@ -507,6 +507,16 @@ positional-row shape as `--format json`; protocol and query failures return
 deterministic JSON error objects with an appropriate HTTP status. All other
 targets and query-string shapes are rejected.
 
+Every query route and both authenticated insert routes accept one optional
+`X-ClickHouse-Database: default` header for ClickHouse client compatibility.
+The header name is case-insensitive, surrounding optional whitespace is
+ignored, and the value itself must be the exact case-sensitive string
+`default`, RustHouse's only logical database. Empty, duplicate, and other
+values return `400 Bad Request`. Database-header validation runs after either
+configured authentication mode, so credential failures retain precedence, but
+before a POST body is read or any database lock is attempted. Omitting the
+header retains the existing single-database behavior.
+
 The bearer- and `X-ClickHouse-Key`-authenticated handlers additionally expose
 exact `POST /insert`. It requires one decimal `Content-Length`, applies the
 same UTF-8 SQL body and request limits as `POST /query`, and executes a
@@ -537,22 +547,23 @@ response as the SQL insert route. The unauthenticated handlers do not recognize
 it.
 
 HTTP query admission never waits for the database lock. After request parsing,
-authentication, SQL decoding, and read-only statement validation, each query
-makes one immediate shared read-lock attempt. Concurrent readers are admitted;
-an active writer returns `503 Service Unavailable` with the deterministic JSON
-body `{"error":"database is unavailable"}`. A poisoned lock remains a `500
-Internal Server Error`, and SQL errors remain `400 Bad Request`. Authentication,
-format negotiation, SQL/result resource limits, and the complete HTTP response
-limit retain their existing ordering and behavior.
+authentication, optional database-header validation, SQL decoding, and
+read-only statement validation, each query makes one immediate shared
+read-lock attempt. Concurrent readers are admitted; an active writer returns
+`503 Service Unavailable` with the deterministic JSON body
+`{"error":"database is unavailable"}`. A poisoned lock remains a `500 Internal
+Server Error`, and SQL errors remain `400 Bad Request`. Authentication, database
+and format header validation, SQL/result resource limits, and the complete HTTP
+response limit retain their documented ordering and behavior.
 
-HTTP insert admission likewise never waits. After authentication and bounded
-body reading, the SQL route completes SQL parsing before its immediate
-write-lock attempt; the CSV and TSV routes pass their bounded bytes to the
-selected ingestion API, which attempts the lock before table lookup or parsing.
-Any active reader or writer returns the same deterministic `503 Service
-Unavailable`; a poisoned lock returns `500 Internal Server Error`. Validation
-and commit occur under the acquired write lock so concurrent work cannot expose
-or cause a partial batch.
+HTTP insert admission likewise never waits. After authentication and optional
+database-header validation, the bounded body is read. The SQL route completes
+SQL parsing before its immediate write-lock attempt; the CSV and TSV routes
+pass their bounded bytes to the selected ingestion API, which attempts the lock
+before table lookup or parsing. Any active reader or writer returns the same
+deterministic `503 Service Unavailable`; a poisoned lock returns `500 Internal
+Server Error`. Validation and commit occur under the acquired write lock so
+concurrent work cannot expose or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, or

@@ -115,6 +115,11 @@ impl StdError for HttpQueryError {
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. CSV, TSV,
 /// and row-oriented JSON responses use the corresponding batch writers;
 /// positional JSON responses contain arrays separated by line feeds.
+/// Every query form also accepts at most one case-insensitive
+/// `X-ClickHouse-Database` header whose value is exactly `default`, matching
+/// RustHouse's single logical database. Empty, duplicate, and other values are
+/// rejected after authentication and before a request body is read or the
+/// database is accessed.
 ///
 /// The bearer-authenticated handlers additionally accept exact `POST /insert`
 /// requests with the same body framing and limits. They pass the SQL to
@@ -127,7 +132,8 @@ impl StdError for HttpQueryError {
 /// [`SharedDatabase`] importer are used. Success returns an empty `200 OK`
 /// response. The unauthenticated handlers do not expose either route. The
 /// `X-ClickHouse-Key`-authenticated handlers expose the same authenticated
-/// route set.
+/// route set. Both authenticated insert forms accept the same optional
+/// `X-ClickHouse-Database: default` header as the query forms.
 ///
 /// `GET /metrics` accepts no request body and returns four Prometheus gauges
 /// for retained tables, columns, rows, and scalar payload bytes. The byte gauge
@@ -965,6 +971,8 @@ fn parse_headers(
     let mut duplicate_clickhouse_key = false;
     let mut clickhouse_format = None;
     let mut duplicate_clickhouse_format = false;
+    let mut clickhouse_database = None;
+    let mut duplicate_clickhouse_database = false;
     while let Some(raw_line) = lines.next() {
         let line = strict_header_line(raw_line, lines.peek().is_some())?;
         header_count = header_count.saturating_add(1);
@@ -1019,6 +1027,10 @@ fn parse_headers(
             && clickhouse_format.replace(value).is_some()
         {
             duplicate_clickhouse_format = true;
+        } else if name.eq_ignore_ascii_case(b"x-clickhouse-database")
+            && clickhouse_database.replace(value).is_some()
+        {
+            duplicate_clickhouse_database = true;
         }
     }
 
@@ -1050,6 +1062,26 @@ fn parse_headers(
                 )
                 .into());
             }
+        }
+    }
+
+    if matches!(
+        &kind,
+        RequestKind::Query(_) | RequestKind::Insert | RequestKind::TableInsert(_)
+    ) {
+        if duplicate_clickhouse_database {
+            return Err(RequestFailure::new(
+                Status::BAD_REQUEST,
+                "duplicate X-ClickHouse-Database header",
+            )
+            .into());
+        }
+        if clickhouse_database.is_some_and(|database| database != b"default") {
+            return Err(RequestFailure::new(
+                Status::BAD_REQUEST,
+                "X-ClickHouse-Database header must be default",
+            )
+            .into());
         }
     }
 
