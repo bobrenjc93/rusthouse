@@ -54,18 +54,25 @@ pub const ESTIMATED_GROUP_KEY_CELL_BYTES: usize = std::mem::size_of::<ValueRef<'
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS: usize = 500_000;
 /// Maximum estimated aggregate state heap retained by one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
-/// Minimum matched rows that a global `countIf(Bool)` evaluates sequentially.
+/// Minimum matched rows that a supported global aggregate evaluates sequentially.
 ///
 /// Parallel evaluation is considered only when the matched row count is
 /// strictly greater than this threshold.
-pub const COUNT_IF_PARALLEL_ROW_THRESHOLD: usize = 256 * 1024;
-/// Target matched rows per global `countIf(Bool)` computation lane.
-pub const COUNT_IF_PARALLEL_ROWS_PER_WORKER: usize = 128 * 1024;
-/// Maximum computation lanes used by one global `countIf(Bool)`.
+pub const GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD: usize = 256 * 1024;
+/// Target matched rows per supported global aggregate computation lane.
+pub const GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER: usize = 128 * 1024;
+/// Maximum computation lanes used by one supported global aggregate.
 ///
 /// The executor also caps this value by [`std::thread::available_parallelism`]
 /// and admits helper threads through one process-wide budget.
-pub const MAX_COUNT_IF_PARALLEL_WORKERS: usize = 16;
+pub const MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS: usize = 16;
+
+/// Backwards-compatible name for [`GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD`].
+pub const COUNT_IF_PARALLEL_ROW_THRESHOLD: usize = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD;
+/// Backwards-compatible name for [`GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER`].
+pub const COUNT_IF_PARALLEL_ROWS_PER_WORKER: usize = GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER;
+/// Backwards-compatible name for [`MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS`].
+pub const MAX_COUNT_IF_PARALLEL_WORKERS: usize = MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS;
 
 /// Resource limits for source scans, query-result and mutation materialization,
 /// ordering, and grouped working state.
@@ -183,67 +190,67 @@ pub struct Database {
     measurements: DatabaseMeasurements,
     query_result_limits: QueryResultLimits,
     table_limits: TableLimits,
-    count_if_parallelism: CountIfParallelism,
+    global_aggregate_parallelism: GlobalAggregateParallelism,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum CountIfParallelism {
+enum GlobalAggregateParallelism {
     System,
     #[cfg(test)]
     Fixed(usize),
     #[cfg(test)]
-    Budgeted(&'static CountIfWorkerBudget),
+    Budgeted(&'static GlobalAggregateWorkerBudget),
 }
 
-impl CountIfParallelism {
+impl GlobalAggregateParallelism {
     fn worker_count(self, matched_rows: usize) -> usize {
-        if matched_rows <= COUNT_IF_PARALLEL_ROW_THRESHOLD {
+        if matched_rows <= GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD {
             return 1;
         }
 
         let worker_limit = match self {
-            Self::System => global_count_if_worker_budget().worker_limit(),
+            Self::System => global_aggregate_worker_budget().worker_limit(),
             #[cfg(test)]
             Self::Fixed(workers) => workers,
             #[cfg(test)]
             Self::Budgeted(budget) => budget.worker_limit(),
         };
-        let useful_workers = matched_rows.div_ceil(COUNT_IF_PARALLEL_ROWS_PER_WORKER);
+        let useful_workers = matched_rows.div_ceil(GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER);
         worker_limit
-            .clamp(1, MAX_COUNT_IF_PARALLEL_WORKERS)
+            .clamp(1, MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS)
             .min(useful_workers)
             .min(matched_rows)
     }
 
-    fn try_admit(self, matched_rows: usize) -> Option<CountIfWorkerAdmission> {
+    fn try_admit(self, matched_rows: usize) -> Option<GlobalAggregateWorkerAdmission> {
         let helper_threads = self.worker_count(matched_rows).saturating_sub(1);
         if helper_threads == 0 {
             return None;
         }
 
         match self {
-            Self::System => global_count_if_worker_budget()
+            Self::System => global_aggregate_worker_budget()
                 .try_acquire(helper_threads)
-                .map(CountIfWorkerAdmission::Budgeted),
+                .map(GlobalAggregateWorkerAdmission::Budgeted),
             #[cfg(test)]
-            Self::Fixed(_) => Some(CountIfWorkerAdmission::Fixed(helper_threads)),
+            Self::Fixed(_) => Some(GlobalAggregateWorkerAdmission::Fixed(helper_threads)),
             #[cfg(test)]
             Self::Budgeted(budget) => budget
                 .try_acquire(helper_threads)
-                .map(CountIfWorkerAdmission::Budgeted),
+                .map(GlobalAggregateWorkerAdmission::Budgeted),
         }
     }
 }
 
 #[derive(Debug)]
-struct CountIfWorkerBudget {
+struct GlobalAggregateWorkerBudget {
     helper_limit: usize,
     helpers_in_use: AtomicUsize,
     #[cfg(test)]
     peak_helpers_in_use: AtomicUsize,
 }
 
-impl CountIfWorkerBudget {
+impl GlobalAggregateWorkerBudget {
     const fn new(helper_limit: usize) -> Self {
         Self {
             helper_limit,
@@ -257,7 +264,7 @@ impl CountIfWorkerBudget {
         self.helper_limit.saturating_add(1)
     }
 
-    fn try_acquire(&'static self, requested: usize) -> Option<CountIfWorkerPermit> {
+    fn try_acquire(&'static self, requested: usize) -> Option<GlobalAggregateWorkerPermit> {
         let mut in_use = self.helpers_in_use.load(AtomicOrdering::Acquire);
         loop {
             let acquired = requested.min(self.helper_limit.saturating_sub(in_use));
@@ -275,7 +282,7 @@ impl CountIfWorkerBudget {
                     #[cfg(test)]
                     self.peak_helpers_in_use
                         .fetch_max(next, AtomicOrdering::Relaxed);
-                    return Some(CountIfWorkerPermit {
+                    return Some(GlobalAggregateWorkerPermit {
                         budget: self,
                         helper_threads: acquired,
                     });
@@ -293,12 +300,12 @@ impl CountIfWorkerBudget {
 }
 
 #[derive(Debug)]
-struct CountIfWorkerPermit {
-    budget: &'static CountIfWorkerBudget,
+struct GlobalAggregateWorkerPermit {
+    budget: &'static GlobalAggregateWorkerBudget,
     helper_threads: usize,
 }
 
-impl Drop for CountIfWorkerPermit {
+impl Drop for GlobalAggregateWorkerPermit {
     fn drop(&mut self) {
         let previous = self
             .budget
@@ -309,13 +316,13 @@ impl Drop for CountIfWorkerPermit {
 }
 
 #[derive(Debug)]
-enum CountIfWorkerAdmission {
-    Budgeted(CountIfWorkerPermit),
+enum GlobalAggregateWorkerAdmission {
+    Budgeted(GlobalAggregateWorkerPermit),
     #[cfg(test)]
     Fixed(usize),
 }
 
-impl CountIfWorkerAdmission {
+impl GlobalAggregateWorkerAdmission {
     fn helper_threads(&self) -> usize {
         match self {
             Self::Budgeted(permit) => permit.helper_threads,
@@ -325,13 +332,13 @@ impl CountIfWorkerAdmission {
     }
 }
 
-fn global_count_if_worker_budget() -> &'static CountIfWorkerBudget {
-    static BUDGET: OnceLock<CountIfWorkerBudget> = OnceLock::new();
+fn global_aggregate_worker_budget() -> &'static GlobalAggregateWorkerBudget {
+    static BUDGET: OnceLock<GlobalAggregateWorkerBudget> = OnceLock::new();
     BUDGET.get_or_init(|| {
         let worker_limit = std::thread::available_parallelism()
             .map_or(1, |value| value.get())
-            .min(MAX_COUNT_IF_PARALLEL_WORKERS);
-        CountIfWorkerBudget::new(worker_limit.saturating_sub(1))
+            .min(MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS);
+        GlobalAggregateWorkerBudget::new(worker_limit.saturating_sub(1))
     })
 }
 
@@ -433,7 +440,7 @@ impl Default for Database {
             measurements: DatabaseMeasurements::default(),
             query_result_limits: QueryResultLimits::default(),
             table_limits: TableLimits::default(),
-            count_if_parallelism: CountIfParallelism::System,
+            global_aggregate_parallelism: GlobalAggregateParallelism::System,
         }
     }
 }
@@ -472,7 +479,7 @@ impl Database {
             measurements: DatabaseMeasurements::default(),
             query_result_limits,
             table_limits: TableLimits::default(),
-            count_if_parallelism: CountIfParallelism::System,
+            global_aggregate_parallelism: GlobalAggregateParallelism::System,
         }
     }
 
@@ -1837,7 +1844,7 @@ impl Database {
                 &group_columns,
                 &aggregate_specs,
                 query_result_limits,
-                self.count_if_parallelism,
+                self.global_aggregate_parallelism,
             )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             if let Some(having) = having {
@@ -3758,7 +3765,7 @@ fn execute_grouped<'a>(
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
     limits: QueryResultLimits,
-    count_if_parallelism: CountIfParallelism,
+    parallelism: GlobalAggregateParallelism,
 ) -> Result<GroupedData<'a>> {
     let planned_group_count = if group_columns.is_empty() {
         enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
@@ -3824,6 +3831,15 @@ fn execute_grouped<'a>(
             states
         })
         .collect::<Vec<_>>();
+    let sole_global_sum_int = group_columns.is_empty()
+        && matches!(
+            aggregate_specs,
+            [AggregateSpec {
+                function: AggregateFunction::Sum,
+                input_type: Some(DataType::Int64),
+                ..
+            }]
+        );
 
     if group_columns.is_empty() {
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -3832,8 +3848,10 @@ fn execute_grouped<'a>(
                     table,
                     matching_rows,
                     spec,
-                    count_if_parallelism,
+                    parallelism,
                 )?);
+            } else if sole_global_sum_int {
+                states[0] = sum_global_int64(table, matching_rows, spec, parallelism)?;
             }
         }
     }
@@ -3871,7 +3889,9 @@ fn execute_grouped<'a>(
         debug_assert!(!inserted || group + 1 == group_count);
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            if group_columns.is_empty() && spec.function == AggregateFunction::CountIf {
+            if group_columns.is_empty()
+                && (spec.function == AggregateFunction::CountIf || sole_global_sum_int)
+            {
                 continue;
             }
             states[group].update(
@@ -3902,7 +3922,7 @@ fn count_global_count_if(
     table: &Table,
     matching_rows: &[usize],
     spec: &AggregateSpec,
-    parallelism: CountIfParallelism,
+    parallelism: GlobalAggregateParallelism,
 ) -> Result<i64> {
     debug_assert_eq!(spec.function, AggregateFunction::CountIf);
     let Column::Bool(values) = &table.columns()[spec.argument.expect("countIf argument")] else {
@@ -3932,7 +3952,7 @@ fn try_parallel_count_if(
         let mut handles = Vec::with_capacity(helper_threads);
         let mut worker_failed = false;
         for chunk_index in 1..worker_count {
-            let rows = count_if_partition(matching_rows, worker_count, chunk_index);
+            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
             let spawn = std::thread::Builder::new()
                 .name(format!("rusthouse-count-if-{chunk_index}"))
                 .spawn_scoped(scope, move || count_if_chunk(values, rows));
@@ -3948,7 +3968,7 @@ fn try_parallel_count_if(
         let mut partial_results = Vec::with_capacity(worker_count);
         partial_results.push(count_if_chunk(
             values,
-            count_if_partition(matching_rows, worker_count, 0),
+            parallel_aggregate_partition(matching_rows, worker_count, 0),
         ));
         for handle in handles {
             match handle.join() {
@@ -3969,7 +3989,7 @@ fn try_parallel_count_if(
     })
 }
 
-fn count_if_partition(
+fn parallel_aggregate_partition(
     matching_rows: &[usize],
     worker_count: usize,
     worker_index: usize,
@@ -4001,6 +4021,129 @@ fn reduce_count_if_counts(partial_counts: Vec<i64>) -> Result<i64> {
             .checked_add(count)
             .ok_or_else(|| Error::NumericOverflow("countIf".to_owned()))
     })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SumIntPartial {
+    sum: i128,
+    count: u64,
+}
+
+fn sum_global_int64(
+    table: &Table,
+    matching_rows: &[usize],
+    spec: &AggregateSpec,
+    parallelism: GlobalAggregateParallelism,
+) -> Result<AggregateState> {
+    debug_assert_eq!(spec.function, AggregateFunction::Sum);
+    debug_assert_eq!(spec.input_type, Some(DataType::Int64));
+    let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")] else {
+        unreachable!("SUM input type is resolved")
+    };
+    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
+        return sum_int64_chunk(values, matching_rows).map(SumIntPartial::into_state);
+    };
+
+    // As with countIf, every lane receives a deterministic contiguous slice
+    // of the filtered row indices. Partials are reduced in that same order.
+    // A worker failure discards all partials and repeats the complete sum on
+    // the query thread after releasing its process-wide admission.
+    let parallel_result = try_parallel_sum_int64(values, matching_rows, admission.helper_threads());
+    drop(admission);
+    parallel_result
+        .unwrap_or_else(|| sum_int64_chunk(values, matching_rows))
+        .map(SumIntPartial::into_state)
+}
+
+fn try_parallel_sum_int64(
+    values: &[i64],
+    matching_rows: &[usize],
+    helper_threads: usize,
+) -> Option<Result<SumIntPartial>> {
+    debug_assert!(helper_threads > 0);
+    let worker_count = helper_threads.saturating_add(1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(helper_threads);
+        let mut worker_failed = false;
+        for chunk_index in 1..worker_count {
+            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
+            let spawn = std::thread::Builder::new()
+                .name(format!("rusthouse-sum-int64-{chunk_index}"))
+                .spawn_scoped(scope, move || sum_int64_chunk(values, rows));
+            match spawn {
+                Ok(handle) => handles.push(handle),
+                Err(_) => {
+                    worker_failed = true;
+                    break;
+                }
+            }
+        }
+
+        let mut partial_results = Vec::with_capacity(worker_count);
+        partial_results.push(sum_int64_chunk(
+            values,
+            parallel_aggregate_partition(matching_rows, worker_count, 0),
+        ));
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => partial_results.push(result),
+                Err(_) => worker_failed = true,
+            }
+        }
+        if worker_failed {
+            return None;
+        }
+
+        Some(
+            partial_results
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .and_then(reduce_sum_int64_partials),
+        )
+    })
+}
+
+fn sum_int64_chunk(values: &[i64], matching_rows: &[usize]) -> Result<SumIntPartial> {
+    matching_rows
+        .iter()
+        .try_fold(SumIntPartial::default(), |partial, row| {
+            Ok(SumIntPartial {
+                sum: partial
+                    .sum
+                    .checked_add(i128::from(values[*row]))
+                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?,
+                count: partial
+                    .count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?,
+            })
+        })
+}
+
+fn reduce_sum_int64_partials(partials: Vec<SumIntPartial>) -> Result<SumIntPartial> {
+    partials
+        .into_iter()
+        .try_fold(SumIntPartial::default(), |total, partial| {
+            Ok(SumIntPartial {
+                sum: total
+                    .sum
+                    .checked_add(partial.sum)
+                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?,
+                count: total
+                    .count
+                    .checked_add(partial.count)
+                    .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?,
+            })
+        })
+}
+
+impl SumIntPartial {
+    fn into_state(self) -> AggregateState {
+        AggregateState::SumInt {
+            sum: self.sum,
+            count: self.count,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -5602,14 +5745,47 @@ mod tests {
         database
     }
 
-    fn force_count_if_workers(database: &mut Database, workers: usize, sql: &str) -> QueryResult {
-        database.count_if_parallelism = CountIfParallelism::Fixed(workers);
+    fn sum_int64_database(row_count: usize, row_values: impl Fn(usize) -> (i64, bool)) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE empty_values (value Int64); \
+                 CREATE TABLE values_to_sum (id Int64, value Int64, included Bool);",
+            )
+            .expect("SUM(Int64) differential setup");
+        if row_count > 0 {
+            for first_id in (1..=row_count).step_by(50_000) {
+                let last_id = first_id.saturating_add(49_999).min(row_count);
+                let rows = (first_id..=last_id)
+                    .map(|id| {
+                        let (value, included) = row_values(id);
+                        format!("({id}, {value}, {included})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                database
+                    .execute(&format!("INSERT INTO values_to_sum VALUES {rows}"))
+                    .expect("SUM(Int64) differential rows");
+            }
+        }
+        database
+    }
+
+    fn force_global_aggregate_workers(
+        database: &mut Database,
+        workers: usize,
+        sql: &str,
+    ) -> QueryResult {
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::Fixed(workers);
         query(database, sql)
     }
 
-    fn assert_count_if_worker_differential(database: &mut Database, sql: &str) -> QueryResult {
-        let single_worker = force_count_if_workers(database, 1, sql);
-        let multi_worker = force_count_if_workers(database, 4, sql);
+    fn assert_global_aggregate_worker_differential(
+        database: &mut Database,
+        sql: &str,
+    ) -> QueryResult {
+        let single_worker = force_global_aggregate_workers(database, 1, sql);
+        let multi_worker = force_global_aggregate_workers(database, 4, sql);
         assert_eq!(single_worker, multi_worker, "worker differential for {sql}");
         multi_worker
     }
@@ -5696,7 +5872,7 @@ mod tests {
     #[test]
     fn global_count_if_forced_workers_match_for_empty_input() {
         let mut database = count_if_database(0);
-        let result = assert_count_if_worker_differential(
+        let result = assert_global_aggregate_worker_differential(
             &mut database,
             "SELECT countIf(active) FROM empty_events",
         );
@@ -5709,7 +5885,7 @@ mod tests {
             .saturating_add(COUNT_IF_PARALLEL_ROW_THRESHOLD / 2)
             .saturating_add(3);
         let mut database = count_if_database(row_count);
-        let result = assert_count_if_worker_differential(
+        let result = assert_global_aggregate_worker_differential(
             &mut database,
             "SELECT countIf(active) FROM events WHERE included = true",
         );
@@ -5727,7 +5903,7 @@ mod tests {
             COUNT_IF_PARALLEL_ROW_THRESHOLD,
             COUNT_IF_PARALLEL_ROW_THRESHOLD + 1,
         ] {
-            let result = assert_count_if_worker_differential(
+            let result = assert_global_aggregate_worker_differential(
                 &mut database,
                 &format!("SELECT countIf(active) FROM events WHERE id <= {matched_rows}"),
             );
@@ -5739,7 +5915,7 @@ mod tests {
     fn global_count_if_forced_workers_match_with_pagination() {
         let matched_rows = COUNT_IF_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = count_if_database(matched_rows);
-        let first_page = assert_count_if_worker_differential(
+        let first_page = assert_global_aggregate_worker_differential(
             &mut database,
             &format!(
                 "SELECT COUNT(*) AS rows, countIf(active) AS matches FROM events \
@@ -5754,7 +5930,7 @@ mod tests {
             ]]
         );
 
-        let second_page = assert_count_if_worker_differential(
+        let second_page = assert_global_aggregate_worker_differential(
             &mut database,
             &format!(
                 "SELECT COUNT(*) AS rows, countIf(active) AS matches FROM events \
@@ -5765,14 +5941,142 @@ mod tests {
     }
 
     #[test]
-    fn global_count_if_worker_selection_and_reduction_are_bounded_and_checked() {
+    fn global_sum_int64_forced_workers_match_empty_null_and_pagination() {
+        let mut database = sum_int64_database(0, |_| unreachable!("empty input"));
+        let first_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT SUM(value) AS total FROM empty_values \
+             HAVING total IS NULL ORDER BY total LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(first_page.rows, [vec![Value::Null(DataType::Int64)]]);
+
+        let second_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT SUM(value) AS total FROM empty_values \
+             HAVING total IS NULL ORDER BY total LIMIT 1 OFFSET 1",
+        );
+        assert!(second_page.rows.is_empty());
+    }
+
+    #[test]
+    fn global_sum_int64_forced_workers_match_after_filtering_and_having() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+            .saturating_add(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD / 2)
+            .saturating_add(3);
+        let value_for = |id: usize| i64::try_from(id % 97).unwrap() - 48;
+        let mut database = sum_int64_database(row_count, |id| (value_for(id), id % 3 != 0));
+        let expected = (1..=row_count)
+            .filter(|id| id % 3 != 0)
+            .map(value_for)
+            .sum::<i64>();
+        let result = assert_global_aggregate_worker_differential(
+            &mut database,
+            &format!(
+                "SELECT SUM(value) AS total FROM values_to_sum WHERE included = true \
+                 HAVING total = {expected} ORDER BY total DESC LIMIT 1 OFFSET 0"
+            ),
+        );
+        assert_eq!(result.rows, [vec![Value::Int64(expected)]]);
+    }
+
+    #[test]
+    fn global_sum_int64_forced_workers_match_at_parallel_boundary() {
+        static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::new(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = sum_int64_database(row_count, |_| (1, true));
+        for matched_rows in [
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD,
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1,
+        ] {
+            let result = assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!("SELECT SUM(value) FROM values_to_sum WHERE id <= {matched_rows}"),
+            );
+            assert_eq!(
+                result.rows,
+                [vec![Value::Int64(i64::try_from(matched_rows).unwrap())]]
+            );
+        }
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::Budgeted(&UNAVAILABLE_BUDGET);
+        assert_eq!(
+            query(&mut database, "SELECT SUM(value) FROM values_to_sum").rows,
+            [vec![Value::Int64(i64::try_from(row_count).unwrap())]],
+            "an unavailable helper budget falls back to the query thread"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::Budgeted(&OBSERVED_BUDGET);
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT SUM(value), COUNT(*) FROM values_to_sum"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "SUM(Int64) in a multi-aggregate projection stays sequential"
+        );
+    }
+
+    #[test]
+    fn global_sum_int64_forced_workers_match_at_limit_and_overflow() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 2;
+        let mut database = sum_int64_database(row_count, |id| {
+            let value = if id == 1 {
+                i64::MAX
+            } else if id == row_count {
+                1
+            } else {
+                0
+            };
+            (value, id != row_count)
+        });
+        let boundary = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT SUM(value) FROM values_to_sum WHERE included = true",
+        );
+        assert_eq!(boundary.rows, [vec![Value::Int64(i64::MAX)]]);
+
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::Fixed(1);
+        let single_worker = database.execute("SELECT SUM(value) FROM values_to_sum");
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::Fixed(4);
+        let multi_worker = database.execute("SELECT SUM(value) FROM values_to_sum");
+        assert_eq!(single_worker, multi_worker, "overflow worker differential");
+        assert_eq!(
+            multi_worker,
+            Err(Error::NumericOverflow("SUM(Int64)".to_owned()))
+        );
+    }
+
+    #[test]
+    fn global_aggregate_worker_selection_partitioning_and_reduction_are_checked() {
         let boundary = COUNT_IF_PARALLEL_ROW_THRESHOLD;
-        assert_eq!(CountIfParallelism::Fixed(4).worker_count(boundary), 1);
-        assert_eq!(CountIfParallelism::Fixed(4).worker_count(boundary + 1), 3);
+        assert_eq!(
+            GlobalAggregateParallelism::Fixed(4).worker_count(boundary),
+            1
+        );
+        assert_eq!(
+            GlobalAggregateParallelism::Fixed(4).worker_count(boundary + 1),
+            3
+        );
         let enough_rows_for_every_worker =
             COUNT_IF_PARALLEL_ROWS_PER_WORKER.saturating_mul(MAX_COUNT_IF_PARALLEL_WORKERS + 1);
         assert_eq!(
-            CountIfParallelism::Fixed(MAX_COUNT_IF_PARALLEL_WORKERS + 1)
+            GlobalAggregateParallelism::Fixed(MAX_COUNT_IF_PARALLEL_WORKERS + 1)
                 .worker_count(enough_rows_for_every_worker),
             MAX_COUNT_IF_PARALLEL_WORKERS
         );
@@ -5780,13 +6084,27 @@ mod tests {
             reduce_count_if_counts(vec![i64::MAX, 1]),
             Err(Error::NumericOverflow("countIf".to_owned()))
         );
+        assert_eq!(
+            reduce_sum_int64_partials(vec![
+                SumIntPartial {
+                    sum: i128::MAX,
+                    count: 1,
+                },
+                SumIntPartial { sum: 1, count: 1 },
+            ]),
+            Err(Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))
+        );
+        let rows = [2, 4, 6, 8, 10, 12, 14];
+        assert_eq!(parallel_aggregate_partition(&rows, 3, 0), [2, 4, 6]);
+        assert_eq!(parallel_aggregate_partition(&rows, 3, 1), [8, 10]);
+        assert_eq!(parallel_aggregate_partition(&rows, 3, 2), [12, 14]);
     }
 
     #[test]
     fn global_count_if_budget_caps_concurrent_admission() {
         use std::sync::{Arc, Barrier};
 
-        static BUDGET: CountIfWorkerBudget = CountIfWorkerBudget::new(3);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
         BUDGET.reset_peak();
         let thread_count = 8;
         let started = Arc::new(Barrier::new(thread_count + 1));
@@ -5826,12 +6144,12 @@ mod tests {
         use crate::batch::shared_database::SharedDatabase;
         use std::sync::{Arc, Barrier};
 
-        static BUDGET: CountIfWorkerBudget = CountIfWorkerBudget::new(3);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
         BUDGET.reset_peak();
         let row_count =
             COUNT_IF_PARALLEL_ROW_THRESHOLD.saturating_add(COUNT_IF_PARALLEL_ROWS_PER_WORKER);
         let mut database = count_if_database(row_count);
-        database.count_if_parallelism = CountIfParallelism::Budgeted(&BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::Budgeted(&BUDGET);
         let database = SharedDatabase::new(database);
         let query_count = 8;
         let started = Arc::new(Barrier::new(query_count));
