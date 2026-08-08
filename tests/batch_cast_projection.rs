@@ -94,6 +94,25 @@ fn parses_cast_as_a_bounded_select_item_with_an_optional_alias() {
     assert!(select.order_by[0].descending);
 
     let statements = parse(
+        "SELECT CAST(enabled AS Float64) AS probability FROM samples \
+         ORDER BY cast(enabled as float64) DESC",
+    )
+    .expect("valid Bool-to-Float64 CAST with expression ordering");
+    let Statement::Select(select) = &statements[0] else {
+        panic!("expected SELECT");
+    };
+    assert_eq!(
+        select.items,
+        [SelectItem::Cast {
+            name: "enabled".to_owned(),
+            target_type: DataType::Float64,
+            alias: Some("probability".to_owned()),
+        }]
+    );
+    assert_eq!(select.order_by[0].name, "CAST(enabled AS Float64)");
+    assert!(select.order_by[0].descending);
+
+    let statements = parse(
         "SELECT CAST(enabled AS String) AS text FROM samples \
          ORDER BY cast(enabled as string)",
     )
@@ -775,6 +794,80 @@ fn bool_to_int64_maps_both_values_after_filtering_ordering_and_pagination() {
 }
 
 #[test]
+fn bool_to_float64_maps_both_values_after_filtering_ordering_and_pagination() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, enabled Bool); \
+             INSERT INTO samples VALUES \
+             (1, true), (2, false), (3, true), (4, false), (5, true);",
+        )
+        .expect("setup");
+
+    let all = query(
+        &mut database,
+        "SELECT CAST(enabled AS Float64) FROM samples",
+    );
+    assert_eq!(
+        all.columns,
+        [ResultColumn {
+            name: "CAST(enabled AS Float64)".to_owned(),
+            data_type: DataType::Float64,
+        }]
+    );
+    assert_eq!(
+        all.rows,
+        [
+            vec![Value::Float64(1.0)],
+            vec![Value::Float64(0.0)],
+            vec![Value::Float64(1.0)],
+            vec![Value::Float64(0.0)],
+            vec![Value::Float64(1.0)],
+        ]
+    );
+
+    let aliased = query(
+        &mut database,
+        "SELECT id, CAST(enabled AS Float64) AS enabled_f64 FROM samples \
+         WHERE id >= 2 ORDER BY enabled_f64, id DESC LIMIT 2 OFFSET 1",
+    );
+    assert_eq!(
+        aliased.columns,
+        [
+            ResultColumn {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "enabled_f64".to_owned(),
+                data_type: DataType::Float64,
+            },
+        ]
+    );
+    assert_eq!(
+        aliased.rows,
+        [
+            vec![Value::Int64(2), Value::Float64(0.0)],
+            vec![Value::Int64(5), Value::Float64(1.0)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id, CAST(enabled AS Float64) FROM samples \
+             ORDER BY CAST(enabled AS Float64) DESC, id LIMIT 3",
+        )
+        .rows,
+        [
+            vec![Value::Int64(1), Value::Float64(1.0)],
+            vec![Value::Int64(3), Value::Float64(1.0)],
+            vec![Value::Int64(5), Value::Float64(1.0)],
+        ]
+    );
+}
+
+#[test]
 fn bool_to_string_maps_both_values_after_filtering_ordering_and_pagination() {
     let mut database = Database::new();
     database
@@ -860,16 +953,12 @@ fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
         })
     );
 
-    for (name, actual) in [
-        ("f", DataType::Float64),
-        ("b", DataType::Bool),
-        ("s", DataType::String),
-    ] {
+    for (name, actual) in [("f", DataType::Float64), ("s", DataType::String)] {
         assert_eq!(
             database.execute(&format!("SELECT CAST({name} AS Float64) FROM samples")),
             Err(Error::TypeMismatch {
                 context: format!("CAST argument '{name}'"),
-                expected: "Int64".to_owned(),
+                expected: "Int64 or Bool".to_owned(),
                 actual: actual.to_string(),
             }),
             "column {name}"
@@ -1164,6 +1253,79 @@ fn bool_to_int64_cast_obeys_result_caps() {
 }
 
 #[test]
+fn bool_to_float64_cast_obeys_result_caps() {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 2,
+        max_values: 2,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE samples (enabled Bool); \
+             INSERT INTO samples VALUES (false), (true), (false);",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(enabled AS Float64) FROM samples LIMIT 2",
+        )
+        .rows,
+        [vec![Value::Float64(0.0)], vec![Value::Float64(1.0)]]
+    );
+    assert_eq!(
+        database.execute("SELECT CAST(enabled AS Float64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+
+    let mut value_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 3,
+        max_values: 5,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    value_limited
+        .execute(
+            "CREATE TABLE samples (enabled Bool); \
+             INSERT INTO samples VALUES (false), (true), (false);",
+        )
+        .expect("setup");
+    assert_eq!(
+        value_limited
+            .execute("SELECT CAST(enabled AS Float64), CAST(enabled AS Float64) FROM samples",),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result values",
+            actual: 6,
+            max: 5,
+        })
+    );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    byte_limited
+        .execute("CREATE TABLE samples (enabled Bool); INSERT INTO samples VALUES (false);")
+        .expect("setup");
+    assert!(matches!(
+        byte_limited.execute("SELECT CAST(enabled AS Float64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            max: 0,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn bool_to_string_cast_accounts_for_each_payload_before_allocation() {
     let result_name = "text";
     let fixed_bytes = std::mem::size_of::<ResultColumn>()
@@ -1348,6 +1510,12 @@ fn cast_remains_an_ordinary_projection() {
     );
     assert_eq!(
         database.execute("SELECT CAST(enabled AS Int64), COUNT(*) FROM samples GROUP BY enabled"),
+        Err(Error::InvalidQuery(
+            "CAST projections are only supported in ungrouped SELECT queries".to_owned()
+        ))
+    );
+    assert_eq!(
+        database.execute("SELECT CAST(enabled AS Float64), COUNT(*) FROM samples GROUP BY enabled"),
         Err(Error::InvalidQuery(
             "CAST projections are only supported in ungrouped SELECT queries".to_owned()
         ))
@@ -1556,6 +1724,64 @@ fn emits_bool_to_int64_in_all_cli_formats() {
     assert_eq!(
         String::from_utf8(json_compact_each_row).unwrap(),
         "[0]\n[1]\n[1]\n"
+    );
+}
+
+#[test]
+fn emits_bool_to_float64_in_all_cli_formats() {
+    let sql = "CREATE TABLE samples (enabled Bool); \
+               INSERT INTO samples VALUES (true), (false), (true); \
+               SELECT CAST(enabled AS Float64) AS enabled_f64 \
+               FROM samples ORDER BY enabled_f64;";
+
+    let mut table = Vec::new();
+    run_table_batch(sql.as_bytes(), &mut table).expect("table batch succeeds");
+    assert_eq!(
+        String::from_utf8(table).unwrap(),
+        "+-------------+\n\
+         | enabled_f64 |\n\
+         +-------------+\n\
+         | 0.0         |\n\
+         | 1.0         |\n\
+         | 1.0         |\n\
+         +-------------+\n"
+    );
+
+    let mut csv = Vec::new();
+    run_csv_batch(sql.as_bytes(), &mut csv).expect("CSV batch succeeds");
+    assert_eq!(
+        String::from_utf8(csv).unwrap(),
+        "enabled_f64\n0.0\n1.0\n1.0\n"
+    );
+
+    let mut tsv = Vec::new();
+    run_tsv_batch(sql.as_bytes(), &mut tsv).expect("TSV batch succeeds");
+    assert_eq!(
+        String::from_utf8(tsv).unwrap(),
+        "enabled_f64\n0.0\n1.0\n1.0\n"
+    );
+
+    let mut json = Vec::new();
+    run_json_batch(sql.as_bytes(), &mut json).expect("JSON batch succeeds");
+    assert_eq!(
+        String::from_utf8(json).unwrap(),
+        "{\"columns\":[{\"name\":\"enabled_f64\",\"type\":\"Float64\"}],\"rows\":[[0.0],[1.0],[1.0]]}\n"
+    );
+
+    let mut json_each_row = Vec::new();
+    run_json_each_row_batch(sql.as_bytes(), &mut json_each_row)
+        .expect("JSONEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_each_row).unwrap(),
+        "{\"enabled_f64\":0.0}\n{\"enabled_f64\":1.0}\n{\"enabled_f64\":1.0}\n"
+    );
+
+    let mut json_compact_each_row = Vec::new();
+    run_json_compact_each_row_batch(sql.as_bytes(), &mut json_compact_each_row)
+        .expect("JSONCompactEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_compact_each_row).unwrap(),
+        "[0.0]\n[1.0]\n[1.0]\n"
     );
 }
 

@@ -404,6 +404,60 @@ fn bool_to_int64_cast_is_visible_in_every_http_query_format() {
 }
 
 #[test]
+fn bool_to_float64_cast_is_visible_in_every_http_query_format() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE flags (enabled Bool); \
+             INSERT INTO flags VALUES (true), (false);",
+        )
+        .expect("setup");
+    let sql = b"SELECT CAST(enabled AS Float64) AS enabled_f64 FROM flags ORDER BY enabled_f64;";
+
+    assert_response(
+        &exchange(&database, &request(sql)),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"enabled_f64","type":"Float64"}],"rows":[[0.0],[1.0]]}"#,
+    );
+
+    let csv =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+    assert_response_with_content_type(
+        &exchange(&database, &csv),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"enabled_f64\n0.0\n1.0\n",
+    );
+
+    let tsv = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &exchange(&database, &tsv),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"enabled_f64\n0.0\n1.0\n",
+    );
+
+    for (format, expected) in [
+        (
+            "JSONEachRow",
+            "{\"enabled_f64\":0.0}\n{\"enabled_f64\":1.0}\n",
+        ),
+        ("JSONCompactEachRow", "[0.0]\n[1.0]\n"),
+    ] {
+        let request = request_for_target_with_headers(
+            "/query",
+            sql,
+            &format!("X-ClickHouse-Format: {format}\r\n"),
+        );
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
 fn bool_to_string_cast_is_visible_in_every_http_query_format() {
     let database = SharedDatabase::default();
     database
@@ -984,6 +1038,161 @@ fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
             r#"{"columns":[{"name":"label","type":"String"}],"rows":[["snow 雪"]]}"#,
         )
         .as_bytes(),
+    );
+}
+
+#[test]
+fn default_database_header_wires_every_query_form_and_both_authentication_modes() {
+    let database = SharedDatabase::default();
+    let expected = r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#;
+
+    let root_post = request_for_target_with_headers(
+        "/",
+        b"SELECT 7 AS value;",
+        "x-cLiCkHoUsE-dAtAbAsE:\tdefault \r\n",
+    );
+    assert_response(
+        &exchange(&database, &root_post),
+        "HTTP/1.1 200 OK",
+        expected,
+    );
+
+    let (bearer_post, _) = request_with_authorization_for_target(
+        "/query",
+        b"SELECT 7 AS value;",
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Database: default\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &bearer_post),
+        "HTTP/1.1 200 OK",
+        expected,
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Database: default\r\n\r\n",
+        ),
+        "HTTP/1.1 200 OK",
+        expected,
+    );
+
+    let key_response = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"GET /?query=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\nx-clickhouse-database: default\r\n\r\n",
+    );
+    assert_response(&key_response, "HTTP/1.1 200 OK", expected);
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+}
+
+#[test]
+fn database_header_rejects_empty_duplicate_and_non_default_query_values() {
+    let database = SharedDatabase::default();
+    let cases: &[(&[u8], &str)] = &[
+        (
+            b"GET /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Database:\r\n\r\n",
+            r#"{"error":"X-ClickHouse-Database header must be default"}"#,
+        ),
+        (
+            b"POST /query HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Database: analytics\r\nContent-Length: 9\r\n\r\nSELECT 1;",
+            r#"{"error":"X-ClickHouse-Database header must be default"}"#,
+        ),
+        (
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Database: DEFAULT\r\nContent-Length: 9\r\n\r\nSELECT 1;",
+            r#"{"error":"X-ClickHouse-Database header must be default"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Database: default\r\nx-clickhouse-database: default\r\n\r\n",
+            r#"{"error":"duplicate X-ClickHouse-Database header"}"#,
+        ),
+    ];
+
+    for (request, expected_body) in cases {
+        assert_response(
+            &exchange(&database, request),
+            "HTTP/1.1 400 Bad Request",
+            expected_body,
+        );
+    }
+}
+
+#[test]
+fn database_header_validation_follows_both_authentication_modes() {
+    let database = SharedDatabase::default();
+    let invalid_database = "X-ClickHouse-Database: analytics\r\n";
+
+    let (bearer_request, bearer_body_offset) =
+        request_with_authorization_for_target("/query", b"SELECT 1;", invalid_database);
+    let mut bearer_input = Cursor::new(bearer_request);
+    let mut bearer_response = Vec::new();
+    handle_http_query_with_bearer_token(
+        &database,
+        "correct-token",
+        &mut bearer_input,
+        &mut bearer_response,
+    )
+    .unwrap();
+    assert_eq!(bearer_input.position(), bearer_body_offset);
+    assert_response(
+        &bearer_response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let (key_request, key_body_offset) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO events VALUES (1);",
+        "X-ClickHouse-Key: incorrect\r\n\
+         X-ClickHouse-Database: default\r\n\
+         x-clickhouse-database: default\r\n",
+    );
+    let mut key_input = Cursor::new(key_request);
+    let mut key_response = Vec::new();
+    handle_http_query_with_clickhouse_key(
+        &database,
+        "correct-key",
+        &mut key_input,
+        &mut key_response,
+    )
+    .unwrap();
+    assert_eq!(key_input.position(), key_body_offset);
+    assert_response(
+        &key_response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+}
+
+#[test]
+fn database_header_rejection_precedes_format_body_and_database_access() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let (request, body_offset) = request_with_authorization_for_target(
+        "/insert/events",
+        b"id\n1\n",
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Database: analytics\r\n\
+         X-ClickHouse-Format: unsupported\r\n",
+    );
+    let mut input = Cursor::new(request);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"X-ClickHouse-Database header must be default"}"#,
     );
 }
 
@@ -2798,6 +3007,51 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
         &exchange(&database, &request(b"SELECT value FROM retained;")),
         "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#,
+    );
+}
+
+#[test]
+fn default_database_header_wires_both_authenticated_insert_routes() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .unwrap();
+
+    let (sql_insert, _) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO events VALUES (1, 'sql');",
+        "Authorization: Bearer correct-token\r\n\
+         x-clickhouse-database: default\r\n",
+    );
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &sql_insert),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+
+    let csv_insert = request_for_target_with_headers(
+        "/insert/events",
+        b"id,label\n2,csv\n",
+        "X-ClickHouse-Key: correct-key\r\n\
+         X-ClickHouse-Database: default\r\n",
+    );
+    let csv_response = clickhouse_key_exchange(&database, "correct-key", &csv_insert);
+    assert_response_with_content_type(
+        &csv_response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&csv_response);
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id, label FROM events ORDER BY id;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"sql"],[2,"csv"]]}"#,
     );
 }
 
