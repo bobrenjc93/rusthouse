@@ -153,13 +153,13 @@ fn csv_batch_pages_filtered_ordered_rows_with_limit_offset() {
 }
 
 #[test]
-fn json_cli_executes_contains_like_for_regular_and_distinct_where() {
+fn json_cli_executes_contains_like_and_infix_not_like() {
     let output = run(
         &["--format", "json"],
         "CREATE TABLE events (id Int64, label String); \
          INSERT INTO events VALUES (1, '東京'), (2, '東京駅'), (3, 'Alpha'), (4, 'alpha'), (5, '東京'); \
          SELECT id FROM events WHERE label LIKE '%京%' ORDER BY id LIMIT 2; \
-         SELECT DISTINCT label FROM events WHERE NOT label LIKE '%lph%' ORDER BY label;"
+         SELECT DISTINCT label FROM events WHERE label NOT LIKE '%lph%' ORDER BY label;"
             .as_bytes(),
     );
 

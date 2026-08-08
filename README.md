@@ -43,10 +43,12 @@ negation; unary `NOT` remains available independently. Incompatible member
 types report the normal typed comparison error. String prefix, suffix, and
 containment predicates use the exact forms
 `column LIKE 'prefix%'`, `column LIKE '%suffix'`, and
-`column LIKE '%substring%'`. Matches are case-sensitive, and the bounded text
-may be empty or Unicode. Other placements of `%` and patterns with excess
-wildcards are rejected. The single-wildcard pattern `LIKE '%'` is the shared
-empty prefix/suffix form and matches every String.
+`column LIKE '%substring%'`. Each also accepts the infix `column NOT LIKE
+pattern` form, which negates the complete LIKE atom; unary `NOT` remains
+available independently. Matches are case-sensitive, and the bounded text may
+be empty or Unicode. Other placements of `%` and patterns with excess wildcards
+are rejected. The single-wildcard pattern `LIKE '%'` is the shared empty
+prefix/suffix form and matches every String, so `NOT LIKE '%'` matches none.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT <count> [OFFSET <offset>]`. Grouped results can be
 filtered by comparing a unique projected numeric aggregate alias to a finite
@@ -218,8 +220,8 @@ checked before result rows are materialized.
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n [OFFSET m]]`
 supports tuples of physical columns of any supported types and the same typed,
 composable comparison, inclusive `BETWEEN` and `NOT BETWEEN`, nonempty `IN` and
-`NOT IN`, prefix, suffix, and contains `LIKE` predicates, including unary `NOT`,
-as regular `SELECT`.
+`NOT IN`, and prefix, suffix, and contains `LIKE` and `NOT LIKE` predicates as
+regular `SELECT`, including independently applied unary `NOT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -363,7 +365,9 @@ one negation node around that existing tree. An `IN` atom is lowered to one
 equality per literal and a balanced set of joining `OR` nodes; every expanded
 node also counts toward that limit, while all leaves share one retained copy of
 the column identifier. `NOT IN` adds and charges exactly one negation node
-around that balanced tree.
+around that balanced tree. A `LIKE` pattern is one predicate node, and infix
+`NOT LIKE` adds and charges exactly one negation node around the same
+allocation-free matcher.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW DATABASES`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE
