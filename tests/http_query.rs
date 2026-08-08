@@ -1364,6 +1364,14 @@ fn parameterized_get_and_post_tighten_result_rows_and_preserve_other_parameters(
         "HTTP/1.1 400 Bad Request",
         r#"{"error":"SELECT result rows requires at least 3, exceeding the limit of 2"}"#,
     );
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?max_result_rows=0&query=SELECT+value+FROM+samples+ORDER+BY+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"SELECT result rows requires at least 3, exceeding the limit of 2"}"#,
+    );
 }
 
 #[test]
@@ -1379,18 +1387,18 @@ fn parameterized_max_result_rows_accepts_zero_and_the_numeric_boundary() {
     assert_response(
         &exchange(
             &database,
-            b"GET /?query=SELECT+value+FROM+samples+WHERE+value+%3D+99%3B&max_result_rows=0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET /?query=SELECT+value+FROM+samples%3B&max_result_rows=0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 200 OK",
-        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[]}"#,
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[1]]}"#,
     );
     assert_response(
         &exchange(
             &database,
             b"POST /?max_result_rows=0&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
-        "HTTP/1.1 400 Bad Request",
-        r#"{"error":"SELECT result rows requires at least 1, exceeding the limit of 0"}"#,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"1","type":"Int64"}],"rows":[[1]]}"#,
     );
 
     let largest = format!(

@@ -585,8 +585,9 @@ impl SharedDatabase {
     /// Attempts one read-only query with an explicit result-row limit.
     ///
     /// Parsing and read-only validation finish before the single nonblocking
-    /// read-lock attempt. The supplied limit can tighten, but cannot relax, the
-    /// database's configured result-row limit.
+    /// read-lock attempt. A nonzero supplied limit can tighten, but cannot
+    /// relax, the database's configured result-row limit. Zero retains the
+    /// configured limit.
     pub(crate) fn try_query_with_result_row_limit(
         &self,
         input: &str,

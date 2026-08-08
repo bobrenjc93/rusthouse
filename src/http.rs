@@ -111,9 +111,10 @@ impl StdError for HttpQueryError {
 /// `POST /?query=<percent-encoded SQL>` carry the same SQL in a required
 /// form-style query parameter and optionally accept one `database=default`
 /// parameter, one decimal `max_result_rows` parameter, and one `default_format`
-/// parameter in any order. `max_result_rows` can tighten but never relax the
-/// database's configured result-row limit. `default_format` accepts `JSON`,
-/// `CSV`, `CSVWithNames`, `TabSeparated`,
+/// parameter in any order. A nonzero `max_result_rows` can tighten but never
+/// relax the database's configured result-row limit; zero disables the
+/// request-level limit while retaining the configured cap. `default_format`
+/// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, and `+` becomes a space. An
 /// insertion-capable authenticated `POST` additionally accepts a headerless CSV

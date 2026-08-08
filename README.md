@@ -629,10 +629,11 @@ names and values use form-style decoding: each `%HH` escape becomes one byte and
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
 `JSONEachRow`, and `JSONCompactEachRow`, selecting the corresponding existing
 response writer.
-`max_result_rows` accepts ASCII decimal digits, including zero, and tightens the
-database's configured query-result row limit for that request. A larger value
-never relaxes the configured limit. The effective row limit is checked with the
-other query-result shape limits before result rows are materialized.
+`max_result_rows` accepts ASCII decimal digits. A nonzero value tightens the
+database's configured query-result row limit for that request, while zero
+disables the request-level limit and retains the configured cap. A larger value
+never relaxes the configured limit. The effective row limit is checked with
+the other query-result shape limits before result rows are materialized.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
 same SQL byte limit as a POST body; the database, row-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
