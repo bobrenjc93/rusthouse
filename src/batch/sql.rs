@@ -223,6 +223,10 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
+    LengthUtf8 {
+        name: String,
+        alias: Option<String>,
+    },
     Lower {
         name: String,
         alias: Option<String>,
@@ -1693,6 +1697,13 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::Length { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("lengthUTF8") {
+                let name = self.expect_identifier("String column in lengthUTF8")?;
+                self.expect(&TokenKind::RightParen, "')' after lengthUTF8 expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::LengthUtf8 { name, alias });
+            }
+
             if name.eq_ignore_ascii_case("LOWER") {
                 let name = self.expect_identifier("String column in LOWER")?;
                 self.expect(&TokenKind::RightParen, "')' after LOWER expression")?;
@@ -1777,6 +1788,13 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY LENGTH expression",
             )?;
             Ok(format!("LENGTH({argument})"))
+        } else if name.eq_ignore_ascii_case("lengthUTF8") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("String column in ORDER BY lengthUTF8")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY lengthUTF8 expression",
+            )?;
+            Ok(format!("lengthUTF8({argument})"))
         } else if name.eq_ignore_ascii_case("LOWER") && self.eat(&TokenKind::LeftParen) {
             let argument = self.expect_identifier("String column in ORDER BY LOWER")?;
             self.expect(

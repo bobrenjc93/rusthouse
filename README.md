@@ -301,7 +301,7 @@ aggregate projections or `GROUP BY`. Generated `String` payload bytes—four or
 five for booleans, one through twenty for integers, and one through 327 for
 finite floats—are charged exactly against the result-byte limit before
 materialization. No other source/target type pairs are accepted.
-`LENGTH(string_column)` is another ungrouped scalar projection and returns the
+`LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
 `LENGTH(<column>)`. `WHERE` filters source rows before evaluation, and the
@@ -309,6 +309,16 @@ unaliased expression can be ordered with `ORDER BY LENGTH(<column>)`; aliased
 projections can be ordered by their alias. Both forms support `LIMIT`.
 Non-`String` arguments and byte lengths outside the `Int64` range are reported
 as typed errors.
+`lengthUTF8(string_column)` is the Unicode counterpart: it returns the number
+of Unicode scalar values as `Int64`. For a column containing `é`, it returns
+one while `LENGTH` returns two bytes. Combining marks and zero-width joiners
+count as their own scalar values. The function is case-insensitive in SQL and
+accepts the same optional alias, `WHERE`, expression-or-alias ordering, and
+`LIMIT`/`OFFSET` behavior as `LENGTH`; its default result name uses the
+ClickHouse spelling `lengthUTF8(<column>)`. Evaluation and ordering scan the
+UTF-8 text without creating a transformed `String`, and result bounds charge
+only the fixed-size `Int64` output. Non-`String` arguments and grouped query
+shapes are rejected with typed errors.
 `LOWER(string_column)` is an ungrouped scalar projection that lowercases ASCII
 letters while leaving every non-ASCII UTF-8 byte unchanged. Because this
 transformation preserves byte length, its owned `String` results are charged
