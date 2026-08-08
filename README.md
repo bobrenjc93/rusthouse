@@ -629,10 +629,9 @@ Those insertion-capable handlers also expose exact `POST /insert/<table>` for
 RustHouse SQL identifier; extra path segments, query strings, and
 percent-encoded names are not accepted. The request requires one decimal
 `Content-Length`, and its body starts with a matching-case column-name header,
-followed by typed records. A CSV header may contain any nonempty target-column
-subset without duplicates and in any order; omitted columns receive `0`, `0.0`,
-`false`, or an empty string according to their schema type. A TSV header must
-still contain every target column exactly once, but may place them in any order.
+followed by typed records. CSV and TSV headers may contain any nonempty
+target-column subset without duplicates and in any order; omitted columns
+receive `0`, `0.0`, `false`, or an empty string according to their schema type.
 With no format header the body remains `CSVWithNames`, so `POST /insert/events`
 with `label,id\n"one, quoted",1\n` imports one CSV row. An exact,
 case-sensitive `X-ClickHouse-Format: TabSeparatedWithNames` selects TSV input;
@@ -839,11 +838,14 @@ one immediate write-lock attempt before table lookup or input access and returns
 the typed `DatabaseBusy` error rather than waiting for an active reader or
 writer. Lock poisoning and typed TSV, limit, and table-capacity failures remain
 distinct, and every failure preserves all existing rows.
-The decoded header must contain every schema column exactly once with matching
-case, but may list those names in any order. Missing, duplicate, unknown, and
-differently cased header names are rejected. Each data field parses as the
-table type selected by its header, and complete rows are restored to schema
-order before the atomic append.
+The decoded header must contain a nonempty, duplicate-free subset of schema
+columns with matching case, and may list those names in any order. Missing,
+duplicate, unknown, over-wide, and differently cased header names are rejected.
+Each supplied data field parses as the table type selected by its header;
+omitted `Int64`, `Float64`, `Bool`, and `String` fields receive `0`, `0.0`,
+`false`, and an empty string, respectively. Parsing and the total-value limit
+charge only supplied fields, while projected rows still undergo the existing
+full physical row and cell-capacity preflight before the atomic append.
 Data rows accept the same `Int64`, finite `Float64`, exact lowercase `Bool`, and
 `String` types, with LF or CRLF record endings. Fields decode the escape
 sequences emitted by RustHouse's TSV writer: `\\`, `\t`, `\r`, `\n`, `\0`,

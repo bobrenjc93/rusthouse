@@ -4752,32 +4752,36 @@ fn clickhouse_key_csv_insert_uses_the_same_authenticated_route() {
 }
 
 #[test]
-fn bearer_authenticated_tsv_insert_accepts_reordered_all_type_fields_and_escapes() {
+fn bearer_authenticated_tsv_insert_accepts_subsets_and_fills_every_typed_default() {
     let database = SharedDatabase::default();
     database
         .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
         .unwrap();
-    let reordered_tsv = concat!(
-        "label\tactive\tscore\tid\n",
-        "slash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\ttrue\t1.5\t-9223372036854775808\n",
-    )
-    .as_bytes();
-    let (request, _) = request_with_authorization_for_target(
-        "/insert/typed_values",
-        reordered_tsv,
-        "Authorization: Bearer correct-token\r\n\
-         X-ClickHouse-Format: TabSeparatedWithNames\r\n",
-    );
 
-    assert_response_with_content_type(
-        &authenticated_exchange(&database, "correct-token", &request),
-        "HTTP/1.1 200 OK",
-        "text/plain; charset=utf-8",
-        b"",
-    );
+    for tsv in [
+        concat!(
+            "label\tid\n",
+            "slash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\t7\n",
+        )
+        .as_bytes(),
+        b"active\tscore\ntrue\t-0.125\n".as_slice(),
+    ] {
+        let (request, _) = request_with_authorization_for_target(
+            "/insert/typed_values",
+            tsv,
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8",
+            b"",
+        );
+    }
     let query = request_for_target_with_headers(
         "/query",
-        b"SELECT id, score, active, label FROM typed_values;",
+        b"SELECT id, score, active, label FROM typed_values ORDER BY id;",
         "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
     );
     assert_response_with_content_type(
@@ -4786,7 +4790,8 @@ fn bearer_authenticated_tsv_insert_accepts_reordered_all_type_fields_and_escapes
         "text/tab-separated-values; charset=utf-8",
         concat!(
             "id\tscore\tactive\tlabel\n",
-            "-9223372036854775808\t1.5\ttrue\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\n",
+            "0\t-0.125\ttrue\t\n",
+            "7\t0.0\tfalse\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\n",
         )
         .as_bytes(),
     );

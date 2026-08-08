@@ -586,14 +586,14 @@ impl Database {
 
     /// Atomically appends bounded, typed `TabSeparatedWithNames` input.
     ///
-    /// The decoded header must contain every target schema column exactly once,
-    /// in any order, with matching
-    /// case. Fields use the TSV writer's ClickHouse-style escapes: `\\`, `\t`,
-    /// `\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Values are parsed as `Int64`,
-    /// finite `Float64`, `Bool`, or `String`; records may use LF or CRLF.
+    /// The decoded header must contain a nonempty, duplicate-free subset of
+    /// target schema columns in any order, with matching case. Omitted columns
+    /// receive their typed defaults. Fields use the TSV writer's ClickHouse-style
+    /// escapes: `\\`, `\t`, `\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Values are
+    /// parsed as `Int64`, finite `Float64`, `Bool`, or `String`; records may use
+    /// LF or CRLF.
     ///
-    /// Each field is parsed as the type selected by its header, and complete
-    /// rows are restored to schema order.
+    /// Each supplied field is parsed as the type selected by its header.
     ///
     /// Parsing, all configured limits, and remaining table capacity are
     /// validated before any physical column changes.
@@ -606,11 +606,11 @@ impl Database {
     ///
     /// let mut database = Database::new();
     /// database.execute("CREATE TABLE notes (id Int64, text String);")?;
-    /// let input = b"id\ttext\n1\tline\\nwith\\ttab\n";
+    /// let input = b"text\nline\\nwith\\ttab\n";
     /// let rows = database.ingest_tsv_with_names(
     ///     "notes",
     ///     input,
-    ///     TsvIngestLimits::new(input.len(), 1, 2),
+    ///     TsvIngestLimits::new(input.len(), 1, 1),
     /// )?;
     /// assert_eq!(rows, 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -626,7 +626,7 @@ impl Database {
             tsv::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
-        self.table_mut(table)?.insert_rows(rows)?;
+        self.table_mut(table)?.append_prepared_insert_rows(rows);
         Ok(affected_rows)
     }
 
