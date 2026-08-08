@@ -374,6 +374,60 @@ fn float64_to_bool_cast_is_visible_in_every_http_query_format() {
 }
 
 #[test]
+fn string_to_bool_cast_is_visible_in_every_http_query_format() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE flags (text String); \
+             INSERT INTO flags VALUES ('TRUE'), ('false'), ('FaLsE'), ('tRuE');",
+        )
+        .expect("setup");
+    let sql = b"SELECT CAST(text AS Bool) AS enabled FROM flags ORDER BY enabled;";
+
+    assert_response(
+        &exchange(&database, &request(sql)),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"enabled","type":"Bool"}],"rows":[[false],[false],[true],[true]]}"#,
+    );
+
+    let csv =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+    assert_response_with_content_type(
+        &exchange(&database, &csv),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"enabled\nfalse\nfalse\ntrue\ntrue\n",
+    );
+
+    let tsv = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &exchange(&database, &tsv),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"enabled\nfalse\nfalse\ntrue\ntrue\n",
+    );
+
+    for (format, expected) in [
+        (
+            "JSONEachRow",
+            "{\"enabled\":false}\n{\"enabled\":false}\n{\"enabled\":true}\n{\"enabled\":true}\n",
+        ),
+        ("JSONCompactEachRow", "[false]\n[false]\n[true]\n[true]\n"),
+    ] {
+        let request = request_for_target_with_headers(
+            "/query",
+            sql,
+            &format!("X-ClickHouse-Format: {format}\r\n"),
+        );
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
 fn bool_to_int64_cast_is_visible_in_every_http_query_format() {
     let database = SharedDatabase::default();
     database

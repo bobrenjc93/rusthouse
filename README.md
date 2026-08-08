@@ -256,7 +256,8 @@ not fail the query. A selected overflow or non-`Int64` argument is a typed error
 `CAST(bool_column AS Float64)`, `CAST(string_column AS Float64)`,
 `CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`,
 `CAST(string_column AS Int64)`,
-`CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`, and
+`CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`,
+`CAST(string_column AS Bool)`, and
 `CAST(int64_column AS String)`, `CAST(float64_column AS String)`, and
 `CAST(bool_column AS String)`. Integer-to-String casts use canonical base-10
 text: zero is `0`, positive values have no leading plus sign or zeroes, and
@@ -273,7 +274,10 @@ lexicographically. Boolean-to-String casts produce the exact lowercase values
 `true`. For `Float64`, positive and negative zero become `false`, while every
 finite nonzero value becomes `true`. Float-to-integer casts truncate finite
 values toward zero and report typed numeric-overflow errors outside the
-`Int64` range. String-to-integer casts accept nonempty, trim-free ASCII
+`Int64` range. String-to-Boolean casts accept the trim-free words `true` and
+`false` case-insensitively and return a typed invalid-cast error for every
+other value. Boolean ordering places `false` before `true`.
+String-to-integer casts accept nonempty, trim-free ASCII
 base-10 digits with one optional leading `+` or `-`; leading zeroes are
 accepted, and both `Int64` extrema are exact. Empty, whitespace-padded, or
 otherwise malformed text returns a typed invalid-cast error, while values

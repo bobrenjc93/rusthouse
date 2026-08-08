@@ -2071,6 +2071,9 @@ enum ResolvedItem {
     CastFloat64ToBool {
         source: usize,
     },
+    CastStringToBool {
+        source: usize,
+    },
     CastInt64ToString {
         source: usize,
     },
@@ -2298,6 +2301,9 @@ fn resolve_select_items(
                     (DataType::Float64, DataType::Bool) => {
                         Some(ResolvedItem::CastFloat64ToBool { source })
                     }
+                    (DataType::String, DataType::Bool) => {
+                        Some(ResolvedItem::CastStringToBool { source })
+                    }
                     (DataType::Int64, DataType::String) => {
                         Some(ResolvedItem::CastInt64ToString { source })
                     }
@@ -2312,7 +2318,7 @@ fn resolve_select_items(
                 let Some(resolved) = resolved else {
                     let expected = match target_type {
                         DataType::Float64 => "Int64, Bool, or String",
-                        DataType::Bool => "Int64 or Float64",
+                        DataType::Bool => "Int64, Float64, or String",
                         DataType::Int64 => "Float64, Bool, or String",
                         DataType::String => "Int64, Float64, or Bool",
                     };
@@ -2744,6 +2750,9 @@ fn execute_projection(
                         ResolvedItem::CastFloat64ToBool { source } => {
                             Value::Bool(float64_at(table, *source, *row) != 0.0)
                         }
+                        ResolvedItem::CastStringToBool { source } => {
+                            Value::Bool(checked_string_to_bool(string_at(table, *source, *row))?)
+                        }
                         ResolvedItem::CastInt64ToString { source } => {
                             Value::String(int64_at(table, *source, *row).to_string())
                         }
@@ -2909,6 +2918,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastStringToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastStringToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. }
@@ -2989,6 +2999,7 @@ fn validate_grouped_result_limits(
                 | ResolvedItem::CastStringToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastStringToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
@@ -3468,6 +3479,7 @@ impl GroupedData<'_> {
                         | ResolvedItem::CastStringToInt64 { .. }
                         | ResolvedItem::CastInt64ToBool { .. }
                         | ResolvedItem::CastFloat64ToBool { .. }
+                        | ResolvedItem::CastStringToBool { .. }
                         | ResolvedItem::CastInt64ToString { .. }
                         | ResolvedItem::CastFloat64ToString { .. }
                         | ResolvedItem::CastBoolToString { .. } => {
@@ -3850,7 +3862,9 @@ fn resolved_expression_name(
         | ResolvedItem::CastStringToInt64 { source } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
-        ResolvedItem::CastInt64ToBool { source } | ResolvedItem::CastFloat64ToBool { source } => {
+        ResolvedItem::CastInt64ToBool { source }
+        | ResolvedItem::CastFloat64ToBool { source }
+        | ResolvedItem::CastStringToBool { source } => {
             format!("CAST({} AS Bool)", table.schema()[*source].name)
         }
         ResolvedItem::CastInt64ToString { source }
@@ -3931,6 +3945,13 @@ fn order_source_rows(
                         .ok_or_else(invalid_string_to_float64_cast)?;
                 }
             }
+            ResolvedItem::CastStringToBool { source } => {
+                for row in rows.iter().copied() {
+                    bool_text(string_at(table, source, row))
+                        .map(|_| ())
+                        .ok_or_else(invalid_string_to_bool_cast)?;
+                }
+            }
             _ => {}
         }
     }
@@ -3976,6 +3997,13 @@ fn order_source_rows(
                 ResolvedItem::CastFloat64ToBool { source } => (float64_at(table, source, left)
                     != 0.0)
                     .cmp(&(float64_at(table, source, right) != 0.0)),
+                ResolvedItem::CastStringToBool { source } => {
+                    let left = bool_text(string_at(table, source, left))
+                        .expect("String-to-Bool ordering syntax is validated");
+                    let right = bool_text(string_at(table, source, right))
+                        .expect("String-to-Bool ordering syntax is validated");
+                    left.cmp(&right)
+                }
                 ResolvedItem::CastInt64ToString { source } => int64_text_cmp(
                     int64_at(table, source, left),
                     int64_at(table, source, right),
@@ -4079,6 +4107,7 @@ fn order_grouped_rows(
                 | ResolvedItem::CastStringToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastStringToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
@@ -4274,6 +4303,27 @@ fn invalid_string_to_float64_cast() -> Error {
     Error::InvalidCast {
         source_type: DataType::String,
         target_type: DataType::Float64,
+    }
+}
+
+fn checked_string_to_bool(value: &str) -> Result<bool> {
+    bool_text(value).ok_or_else(invalid_string_to_bool_cast)
+}
+
+fn invalid_string_to_bool_cast() -> Error {
+    Error::InvalidCast {
+        source_type: DataType::String,
+        target_type: DataType::Bool,
+    }
+}
+
+fn bool_text(value: &str) -> Option<bool> {
+    if value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
