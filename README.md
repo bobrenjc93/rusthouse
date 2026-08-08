@@ -43,15 +43,16 @@ may be empty or Unicode. Other placements of `%` and patterns with excess
 wildcards are rejected. The single-wildcard pattern `LIKE '%'` is the shared
 empty prefix/suffix form and matches every String.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
-`ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
-projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
-in `HAVING`. This includes `COUNT`, numeric `SUM`, numeric `MIN` and `MAX`, and
-`AVG`. `HAVING aggregate_alias IS NULL` and `IS NOT NULL` test the finalized
-value of any projected aggregate, including `String` or `Bool` `MIN` and `MAX`.
-HAVING filtering happens before `ORDER BY` and `LIMIT`. Empty `SUM`, `MIN`,
-`MAX`, and `AVG` results are typed `NULL` values: they satisfy `IS NULL`, do
-not satisfy `IS NOT NULL`, and remain unknown (and therefore excluded) in a
-numeric HAVING comparison. `COUNT` is always non-`NULL`.
+`ORDER BY`, and `LIMIT <count> [OFFSET <offset>]`. Grouped results can be
+filtered by comparing a unique projected numeric aggregate alias to a finite
+`Int64` or `Float64` threshold in `HAVING`. This includes `COUNT`, numeric
+`SUM`, numeric `MIN` and `MAX`, and `AVG`. `HAVING aggregate_alias IS NULL` and
+`IS NOT NULL` test the finalized value of any projected aggregate, including
+`String` or `Bool` `MIN` and `MAX`. HAVING filtering happens before `ORDER BY`,
+`LIMIT`, and `OFFSET`. Empty `SUM`, `MIN`, `MAX`, and `AVG` results are typed
+`NULL` values: they satisfy `IS NULL`, do not satisfy `IS NOT NULL`, and remain
+unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` is
+always non-`NULL`.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
@@ -86,16 +87,19 @@ materialized one row at a time only after the complete batch passes preflight,
 so any failure rolls back the batch without retaining expanded rows. Ordinary
 inserts likewise check current table capacity before materializing defaults.
 
-Regular ungrouped, non-window projections support
-`LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`. `WHERE` filtering
-and `ORDER BY` happen before rows are skipped. Ordered pagination uses the
-existing bounded top-k selection with a checked `count + offset` bound, and
-scalar projections are evaluated only for returned rows. Both values are
-nonnegative `usize` integers. Physical-column `SELECT DISTINCT` supports the
-same pagination form: `WHERE`, unique-row selection, and `ORDER BY` happen
-before rows are skipped, while all unique rows still count toward the grouped
-working-state caps. `OFFSET` requires `LIMIT` and is deliberately not supported
-for aggregate or grouped queries, `ROW_NUMBER`, literal selects, or cross joins.
+Regular non-window projections, including grouped and global-aggregate
+queries, support `LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`.
+`WHERE` filtering and `ORDER BY` happen before rows are skipped. Ordered
+pagination uses the existing bounded top-k selection with a checked
+`count + offset` bound, and scalar projections are evaluated only for returned
+rows. Both values are nonnegative `usize` integers. Physical-column
+`SELECT DISTINCT` supports the same pagination form: `WHERE`, unique-row
+selection, and `ORDER BY` happen before rows are skipped, while all unique rows
+still count toward the grouped working-state caps. Grouped queries likewise
+build every group under the full group and aggregate-state caps before
+applying `HAVING`, ordering, `LIMIT`, and `OFFSET`. `OFFSET` requires `LIMIT`
+and is deliberately not supported for `ROW_NUMBER`, literal selects, or cross
+joins.
 
 `CREATE TABLE IF NOT EXISTS <name> (...)` creates the table normally when its
 case-insensitive name is absent. If that name is already registered, it returns

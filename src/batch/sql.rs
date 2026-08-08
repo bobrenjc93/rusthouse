@@ -176,8 +176,9 @@ pub struct Select {
     pub having: Option<Having>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
-    /// Rows skipped after filtering, DISTINCT processing, and ordering. This
-    /// is only populated for supported `LIMIT <count> OFFSET <offset>` shapes.
+    /// Rows skipped after filtering, grouping or DISTINCT processing, HAVING,
+    /// and ordering. This is only populated for supported
+    /// `LIMIT <count> OFFSET <offset>` shapes.
     pub offset: Option<usize>,
 }
 
@@ -410,19 +411,14 @@ fn validate_offset_shape(select: &Select, position: usize) -> Result<()> {
         return Ok(());
     }
 
-    let unsupported = !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.items.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::Aggregate { .. } | SelectItem::RowNumber { .. }
-            )
-        });
+    let unsupported = select
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::RowNumber { .. }));
     if unsupported {
         return Err(Error::Sql {
             position,
-            message: "OFFSET is only supported for ungrouped or physical-column DISTINCT, non-window SELECT projections"
-                .to_owned(),
+            message: "OFFSET is not supported for ROW_NUMBER projections".to_owned(),
         });
     }
 

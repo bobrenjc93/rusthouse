@@ -1065,7 +1065,6 @@ impl Database {
                         selection_limit,
                     );
                 }
-                apply_offset(&mut selected_groups, select.offset.unwrap_or(0));
             } else {
                 order_grouped_rows(
                     &mut selected_groups,
@@ -1075,6 +1074,7 @@ impl Database {
                     selection_limit,
                 );
             }
+            apply_offset(&mut selected_groups, select.offset.unwrap_or(0));
             validate_grouped_result_limits(
                 &grouped,
                 &selected_groups,
@@ -1591,18 +1591,13 @@ fn validate_offset_shape(select: &Select) -> Result<()> {
             "OFFSET requires LIMIT <count>".to_owned(),
         ));
     }
-    if !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.items.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::Aggregate { .. } | SelectItem::RowNumber { .. }
-            )
-        })
+    if select
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::RowNumber { .. }))
     {
         return Err(Error::InvalidQuery(
-            "OFFSET is only supported for ungrouped or physical-column DISTINCT, non-window SELECT projections"
-                .to_owned(),
+            "OFFSET is not supported for ROW_NUMBER projections".to_owned(),
         ));
     }
     Ok(())
