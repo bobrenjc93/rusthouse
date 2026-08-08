@@ -1065,7 +1065,6 @@ impl Database {
                         selection_limit,
                     );
                 }
-                apply_offset(&mut selected_groups, select.offset.unwrap_or(0));
             } else {
                 order_grouped_rows(
                     &mut selected_groups,
@@ -1075,6 +1074,7 @@ impl Database {
                     selection_limit,
                 );
             }
+            apply_offset(&mut selected_groups, select.offset.unwrap_or(0));
             validate_grouped_result_limits(
                 &grouped,
                 &selected_groups,
@@ -1591,18 +1591,13 @@ fn validate_offset_shape(select: &Select) -> Result<()> {
             "OFFSET requires LIMIT <count>".to_owned(),
         ));
     }
-    if !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.items.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::Aggregate { .. } | SelectItem::RowNumber { .. }
-            )
-        })
+    if select
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::RowNumber { .. }))
     {
         return Err(Error::InvalidQuery(
-            "OFFSET is only supported for ungrouped or physical-column DISTINCT, non-window SELECT projections"
-                .to_owned(),
+            "OFFSET is not supported for ROW_NUMBER projections".to_owned(),
         ));
     }
     Ok(())
@@ -3768,6 +3763,11 @@ enum CompiledPredicate {
         prefix: String,
         negated: bool,
     },
+    LikeSuffix {
+        column: usize,
+        suffix: String,
+        negated: bool,
+    },
     LikeContains {
         column: usize,
         substring: String,
@@ -3804,6 +3804,11 @@ impl CompiledPredicate {
                 prefix,
                 negated,
             } => string_at(table, *column, row).starts_with(prefix.as_str()) != *negated,
+            Self::LikeSuffix {
+                column,
+                suffix,
+                negated,
+            } => string_at(table, *column, row).ends_with(suffix.as_str()) != *negated,
             Self::LikeContains {
                 column,
                 substring,
@@ -3884,6 +3889,22 @@ fn compile_predicate_with_polarity(
             Ok(CompiledPredicate::LikePrefix {
                 column: column_index,
                 prefix: prefix.clone(),
+                negated,
+            })
+        }
+        Predicate::LikeSuffix { column, suffix } => {
+            let column_index = table.column_index(column)?;
+            let actual = table.schema()[column_index].data_type;
+            if actual != DataType::String {
+                return Err(Error::TypeMismatch {
+                    context: format!("WHERE LIKE column '{column}'"),
+                    expected: DataType::String.to_string(),
+                    actual: actual.to_string(),
+                });
+            }
+            Ok(CompiledPredicate::LikeSuffix {
+                column: column_index,
+                suffix: suffix.clone(),
                 negated,
             })
         }

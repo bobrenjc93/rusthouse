@@ -176,8 +176,9 @@ pub struct Select {
     pub having: Option<Having>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
-    /// Rows skipped after filtering, DISTINCT processing, and ordering. This
-    /// is only populated for supported `LIMIT <count> OFFSET <offset>` shapes.
+    /// Rows skipped after filtering, grouping or DISTINCT processing, HAVING,
+    /// and ordering. This is only populated for supported
+    /// `LIMIT <count> OFFSET <offset>` shapes.
     pub offset: Option<usize>,
 }
 
@@ -290,6 +291,11 @@ pub enum Predicate {
     LikePrefix {
         column: String,
         prefix: String,
+    },
+    /// A case-sensitive String suffix match parsed from `column LIKE '%suffix'`.
+    LikeSuffix {
+        column: String,
+        suffix: String,
     },
     /// A case-sensitive String containment match parsed from
     /// `column LIKE '%substring%'`.
@@ -405,19 +411,14 @@ fn validate_offset_shape(select: &Select, position: usize) -> Result<()> {
         return Ok(());
     }
 
-    let unsupported = !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.items.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::Aggregate { .. } | SelectItem::RowNumber { .. }
-            )
-        });
+    let unsupported = select
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::RowNumber { .. }));
     if unsupported {
         return Err(Error::Sql {
             position,
-            message: "OFFSET is only supported for ungrouped or physical-column DISTINCT, non-window SELECT projections"
-                .to_owned(),
+            message: "OFFSET is not supported for ROW_NUMBER projections".to_owned(),
         });
     }
 
@@ -1977,41 +1978,50 @@ impl<'a> Parser<'a> {
             let TokenKind::String(mut pattern) = self.take_kind() else {
                 return Err(Error::Sql {
                     position: pattern_position,
-                    message: "LIKE pattern must be a String literal of the form 'prefix%' or '%substring%'"
+                    message: "LIKE pattern must be a String literal of the form 'prefix%', '%suffix', or '%substring%'"
                         .to_owned(),
                 });
             };
-            if !pattern.ends_with('%') {
-                return Err(Error::Sql {
+            let wildcard_count = pattern.bytes().filter(|byte| *byte == b'%').count();
+            let starts_with_wildcard = pattern.starts_with('%');
+            let ends_with_wildcard = pattern.ends_with('%');
+            let predicate = match (
+                wildcard_count,
+                starts_with_wildcard,
+                ends_with_wildcard,
+            ) {
+                // Retain the existing interpretation of the single wildcard
+                // as an empty prefix. It is also semantically an empty suffix.
+                (1, _, true) => {
+                    pattern.pop();
+                    Ok(Predicate::LikePrefix {
+                        column,
+                        prefix: pattern,
+                    })
+                }
+                (1, true, false) => {
+                    pattern.remove(0);
+                    Ok(Predicate::LikeSuffix {
+                        column,
+                        suffix: pattern,
+                    })
+                }
+                (2, true, true) => {
+                    pattern.pop();
+                    pattern.remove(0);
+                    Ok(Predicate::LikeContains {
+                        column,
+                        substring: pattern,
+                    })
+                }
+                _ => Err(Error::Sql {
                     position: pattern_position,
-                    message: "LIKE pattern must have the exact form 'prefix%' or '%substring%'"
+                    message: "LIKE pattern must have the exact form 'prefix%', '%suffix', or '%substring%'"
                         .to_owned(),
-                });
-            }
-            pattern.pop();
-            let contains = pattern.starts_with('%');
-            if contains {
-                pattern.remove(0);
-            }
-            if pattern.contains('%') {
-                return Err(Error::Sql {
-                    position: pattern_position,
-                    message: "LIKE pattern must have the exact form 'prefix%' or '%substring%'"
-                        .to_owned(),
-                });
-            }
+                }),
+            }?;
             self.record_predicate_node()?;
-            return if contains {
-                Ok(Predicate::LikeContains {
-                    column,
-                    substring: pattern,
-                })
-            } else {
-                Ok(Predicate::LikePrefix {
-                    column,
-                    prefix: pattern,
-                })
-            };
+            return Ok(predicate);
         }
         let operator = self.parse_comparison_operator()?;
         let right = self.parse_operand()?;

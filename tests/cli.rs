@@ -155,6 +155,26 @@ fn json_cli_executes_contains_like_for_regular_and_distinct_where() {
 }
 
 #[test]
+fn json_cli_executes_unicode_suffix_like_for_regular_and_distinct_where() {
+    let output = run(
+        &["--format", "json"],
+        "CREATE TABLE events (id Int64, label String); \
+         INSERT INTO events VALUES (1, '東京'), (2, '西東京'), (3, '東京駅'), (4, 'Alpha'), (5, 'alpha'), (6, '東京'); \
+         SELECT id FROM events WHERE label LIKE '%東京' ORDER BY id LIMIT 2; \
+         SELECT DISTINCT label FROM events WHERE NOT label LIKE '%lpha' ORDER BY label;"
+            .as_bytes(),
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[1],[2]]}\n\
+         {\"columns\":[{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[\"東京\"],[\"東京駅\"],[\"西東京\"]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_executes_inclusive_between_for_distinct_where() {
     let output = run(
         &["--format", "json"],
