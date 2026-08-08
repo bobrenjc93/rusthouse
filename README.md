@@ -638,6 +638,19 @@ return an empty `200 OK` plain-text response.
 Protocol and SQL failures return deterministic JSON error objects with an
 appropriate HTTP status. All other targets and query-string shapes are rejected.
 
+As a SQL-level alternative to HTTP format metadata, every query form recognizes
+a terminal `FORMAT CSVWithNames` clause on exactly one read-only query. `FORMAT`
+and `CSVWithNames` are case-insensitive, one trailing semicolon is optional, and
+the response uses the same named CSV writer and content type described below.
+Single-quoted text (including doubled quote escapes) and `--` line comments are
+scanned using the SQL lexer rules and are never mistaken for the clause. A real
+clause cannot be combined with `X-ClickHouse-Format` or `default_format`; the
+conflict is rejected after configured authentication and before database
+access. The decoded or body SQL limit still covers the clause, and the complete
+formatted response remains bounded by the HTTP response limit. This is an HTTP
+compatibility feature only: the database and CLI SQL execution APIs remain
+unchanged.
+
 Every query route and both authenticated insert routes accept one optional
 `X-ClickHouse-Database: default` header for ClickHouse client compatibility.
 The header name is case-insensitive, surrounding optional whitespace is
