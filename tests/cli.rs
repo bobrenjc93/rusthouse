@@ -100,7 +100,7 @@ fn json_cli_exposes_typed_defaults_from_reordered_insert_subsets() {
 }
 
 #[test]
-fn csv_batch_filters_orders_and_limits_distinct_tuples() {
+fn csv_batch_pages_filtered_ordered_distinct_tuples() {
     let output = run(
         &["--format", "csv"],
         b"CREATE TABLE events (kind String, rank Int64, score Float64, active Bool); \
@@ -112,11 +112,11 @@ fn csv_batch_filters_orders_and_limits_distinct_tuples() {
               ('gamma', 3, 5.0, true); \
           SELECT DISTINCT kind, active FROM events \
           WHERE (active = true AND score >= 2.5) OR rank = 7 \
-          ORDER BY active ASC, kind DESC LIMIT 2;",
+          ORDER BY active ASC, kind DESC LIMIT 2 OFFSET 1;",
     );
 
     assert!(output.status.success(), "{:?}", output.stderr);
-    assert_eq!(output.stdout, b"kind,active\nalpha,false\ngamma,true\n");
+    assert_eq!(output.stdout, b"kind,active\ngamma,true\nbeta,true\n");
     assert!(output.stderr.is_empty());
 }
 

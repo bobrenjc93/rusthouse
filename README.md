@@ -89,9 +89,11 @@ Regular ungrouped, non-window projections support
 and `ORDER BY` happen before rows are skipped. Ordered pagination uses the
 existing bounded top-k selection with a checked `count + offset` bound, and
 scalar projections are evaluated only for returned rows. Both values are
-nonnegative `usize` integers. `OFFSET` requires `LIMIT` and is deliberately not
-supported for aggregate or grouped queries, `DISTINCT`, `ROW_NUMBER`, literal
-selects, or cross joins.
+nonnegative `usize` integers. Physical-column `SELECT DISTINCT` supports the
+same pagination form: `WHERE`, unique-row selection, and `ORDER BY` happen
+before rows are skipped, while all unique rows still count toward the grouped
+working-state caps. `OFFSET` requires `LIMIT` and is deliberately not supported
+for aggregate or grouped queries, `ROW_NUMBER`, literal selects, or cross joins.
 
 `CREATE TABLE IF NOT EXISTS <name> (...)` creates the table normally when its
 case-insensitive name is absent. If that name is already registered, it returns
@@ -184,7 +186,7 @@ not accept projections, predicates, aliases, or additional joins. The
 LIMIT-reduced Cartesian row, scalar-value, and estimated byte counts are all
 checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
-`[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n]`
+`[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n [OFFSET m]]`
 supports tuples of physical columns of any supported types and the same typed,
 composable comparison, inclusive `BETWEEN`, nonempty `IN`, prefix `LIKE`, and
 contains `LIKE` predicates, including unary `NOT`, as regular `SELECT`.
@@ -192,9 +194,11 @@ contains `LIKE` predicates, including unary `NOT`, as regular `SELECT`.
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
 columns, supports multiple independently directed keys, and sorts the unique
-tuples before `LIMIT`. Distinct tuples are collected under the grouped-query cap
-before ordering and `LIMIT`, and the limited output remains subject to the
-normal result caps.
+tuples before pagination. Without ordering, pagination retains deterministic
+first-seen order. Distinct tuples are collected under the grouped-query cap
+before ordering, `LIMIT`, and `OFFSET`, and the paged output remains subject to
+the normal result caps. Each operand of a union applies its own DISTINCT
+pagination clauses before the union combines the operand results.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 

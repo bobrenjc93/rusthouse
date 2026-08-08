@@ -220,7 +220,7 @@ fn query_executes_inclusive_between_over_http() {
 }
 
 #[test]
-fn query_executes_typed_in_over_http() {
+fn query_pages_ordered_distinct_typed_in_results_over_http() {
     let database = SharedDatabase::default();
     database
         .execute(
@@ -233,10 +233,13 @@ fn query_executes_typed_in_over_http() {
     assert_response(
         &exchange(
             &database,
-            &request(b"SELECT DISTINCT label FROM readings WHERE id IN (2, 3, 4) ORDER BY label;"),
+            &request(
+                b"SELECT DISTINCT label FROM readings WHERE id IN (2, 3, 4) \
+                  ORDER BY label LIMIT 1 OFFSET 1;",
+            ),
         ),
         "HTTP/1.1 200 OK",
-        r#"{"columns":[{"name":"label","type":"String"}],"rows":[["hot"],["warm"]]}"#,
+        r#"{"columns":[{"name":"label","type":"String"}],"rows":[["warm"]]}"#,
     );
 }
 

@@ -51,6 +51,49 @@ fn parses_exact_union_distinct_between_two_complete_selects() {
 }
 
 #[test]
+fn pages_physical_column_distinct_union_operands_before_combining_them() {
+    let statements = parse(
+        "SELECT DISTINCT n FROM older ORDER BY n LIMIT 2 OFFSET 1 \
+         UNION DISTINCT \
+         SELECT DISTINCT n FROM newer LIMIT 2 OFFSET 1",
+    )
+    .expect("paginated DISTINCT operands parse");
+    let [Statement::UnionDistinct { left, right }] = statements.as_slice() else {
+        panic!("expected one UNION DISTINCT statement");
+    };
+    assert!(left.distinct);
+    assert_eq!((left.limit, left.offset), (Some(2), Some(1)));
+    assert!(right.distinct);
+    assert_eq!((right.limit, right.offset), (Some(2), Some(1)));
+
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE older (n Int64); \
+             CREATE TABLE newer (n Int64); \
+             INSERT INTO older VALUES (3), (1), (3), (2); \
+             INSERT INTO newer VALUES (3), (4), (4), (5);",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT n FROM older ORDER BY n LIMIT 2 OFFSET 1 \
+             UNION DISTINCT \
+             SELECT DISTINCT n FROM newer LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+            vec![Value::Int64(5)],
+        ]
+    );
+}
+
+#[test]
 fn rejects_plain_incomplete_nested_and_outer_union_distinct_syntax() {
     for sql in [
         "SELECT n FROM l UNION SELECT n FROM r",
