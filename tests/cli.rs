@@ -201,7 +201,7 @@ fn json_cli_executes_typed_in_for_regular_and_distinct_where() {
           (1, 'one', true), (2, 'two', false), (3, 'three', true), (4, 'two', true); \
           SELECT id FROM events WHERE id IN (1, 3) ORDER BY id; \
           SELECT DISTINCT label FROM events \
-          WHERE NOT active IN (false) AND label IN ('two', 'three') ORDER BY label;",
+          WHERE active NOT IN (false) AND label IN ('two', 'three') ORDER BY label;",
     );
 
     assert!(output.status.success(), "{:?}", output.stderr);

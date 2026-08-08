@@ -34,9 +34,11 @@ String membership uses the nonempty form `column IN (literal [, ...])`; the
 same form also supports every other physical column type. Every member
 accepts the same finite typed literals and numeric compatibility as equality;
 the list binds as one predicate atom and is lowered to a balanced tree of
-equalities joined by `OR`. Incompatible member types report the normal typed
-comparison error. String prefix, suffix, and containment predicates use the
-exact forms
+equalities joined by `OR`. The standard infix form
+`column NOT IN (literal [, ...])` wraps that balanced predicate in exactly one
+negation; unary `NOT` remains available independently. Incompatible member
+types report the normal typed comparison error. String prefix, suffix, and
+containment predicates use the exact forms
 `column LIKE 'prefix%'`, `column LIKE '%suffix'`, and
 `column LIKE '%substring%'`. Matches are case-sensitive, and the bounded text
 may be empty or Unicode. Other placements of `%` and patterns with excess
@@ -194,8 +196,9 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n [OFFSET m]]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison, inclusive `BETWEEN`, nonempty `IN`, prefix, suffix, and
-contains `LIKE` predicates, including unary `NOT`, as regular `SELECT`.
+composable comparison, inclusive `BETWEEN`, nonempty `IN` and `NOT IN`, prefix,
+suffix, and contains `LIKE` predicates, including unary `NOT`, as regular
+`SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -328,7 +331,8 @@ lowered to two inclusive comparisons joined by `AND`, and all three expanded
 nodes count toward the 256-node limit. An `IN` atom is lowered to one equality
 per literal and a balanced set of joining `OR` nodes; every expanded node also
 counts toward that limit, while all leaves share one retained copy of the
-column identifier.
+column identifier. `NOT IN` adds and charges exactly one negation node around
+that balanced tree.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS

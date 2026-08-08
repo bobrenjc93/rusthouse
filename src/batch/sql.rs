@@ -1854,9 +1854,10 @@ impl<'a> Parser<'a> {
 
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
         // `not` remains a valid column name, so a following predicate operator
-        // makes this token the left operand rather than unary syntax. `like` is
-        // also a valid column name; only `NOT LIKE <String pattern>` is the
-        // infix form with a column named `not`.
+        // makes this token the left operand rather than unary syntax. This
+        // includes the two-token `NOT IN` operator. `like` is also a valid
+        // column name; only `NOT LIKE <String pattern>` is the infix form with
+        // a column named `not`.
         if !self.at_keyword("NOT") || self.next_token_is_predicate_operator() {
             return self.parse_predicate_atom();
         }
@@ -1893,6 +1894,12 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("IN") => {
                 matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
+            }
+            TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("NOT") => {
+                matches!(
+                    Self::next_or_invalid(&mut lexer).kind,
+                    TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("IN")
+                ) && matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
             }
             _ => false,
         }
@@ -1942,7 +1949,15 @@ impl<'a> Parser<'a> {
                 }),
             ));
         }
-        if self.eat_keyword("IN") {
+        let negated_in = if self.eat_keyword("IN") {
+            Some(false)
+        } else if self.eat_keyword("NOT") {
+            self.expect_keyword("IN")?;
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(negated) = negated_in {
             let Operand::Column(column) = left else {
                 return self.error("IN left operand must be a column");
             };
@@ -1968,7 +1983,18 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokenKind::RightParen, "')' after IN list")?;
 
-            return Ok(lower_in_predicate(column, literals));
+            // Infix NOT IN is exactly one negation around the existing
+            // balanced IN predicate. Charge that executable node before
+            // allocating either lowered tree.
+            if negated {
+                self.record_predicate_node()?;
+            }
+            let predicate = lower_in_predicate(column, literals);
+            return Ok(if negated {
+                Predicate::Not(Box::new(predicate))
+            } else {
+                predicate
+            });
         }
         if self.eat_keyword("LIKE") {
             let Operand::Column(column) = left else {
