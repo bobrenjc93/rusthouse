@@ -1117,6 +1117,153 @@ fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
 }
 
 #[test]
+fn get_query_accepts_percent_decoded_default_database_in_either_order() {
+    let database = SharedDatabase::default();
+    let expected = r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#;
+    let requests: &[&[u8]] = &[
+        b"GET /?query=SELECT+7+AS+value%3B&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"GET /?data%62ase=def%61ult&%71uery=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ];
+
+    for request in requests {
+        assert_response(&exchange(&database, request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
+fn get_database_parameter_coexists_with_headers_and_both_authentication_modes() {
+    let database = SharedDatabase::default();
+    let bearer_request = b"GET /?query=SELECT+7+AS+value%3B&database=default HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\nX-ClickHouse-Database: default\r\nX-ClickHouse-Format: CSVWithNames\r\n\r\n";
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", bearer_request),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n7\n",
+    );
+
+    let key_response = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"GET /?database=default&query=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\nX-ClickHouse-Database: default\r\n\r\n",
+    );
+    assert_response(
+        &key_response,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+}
+
+#[test]
+fn get_parameter_validation_follows_authentication_and_precedes_database_access() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let missing_bearer =
+        b"GET /?query=SELECT+1%3B&database=analytics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", missing_bearer),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    let missing_key = b"GET /?unknown=value&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let missing_key_response = clickhouse_key_exchange(&database, "correct-key", missing_key);
+    assert_response(
+        &missing_key_response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&missing_key_response);
+
+    let invalid_parameters: &[(&[u8], &str)] = &[
+        (
+            b"GET /?query=SELECT+1%3B&database= HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"GET query parameters must have nonempty names and values"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%3B&&database=default HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"GET query parameters must have nonempty names and values"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%3B&database=default&data%62ase=default HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"duplicate database parameter"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%3B&%71uery=SELECT+2%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"duplicate query parameter"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%3B&format=CSV HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"GET query target contains an unknown parameter"}"#,
+        ),
+        (
+            b"GET /?database=analytics&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"database query parameter must be default"}"#,
+        ),
+        (
+            b"GET /?database=default HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"GET query target must contain exactly one query parameter"}"#,
+        ),
+        (
+            b"GET /?query=&database=default HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+            r#"{"error":"GET query parameters must have nonempty names and values"}"#,
+        ),
+    ];
+
+    for (request, expected_body) in invalid_parameters {
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", request),
+            "HTTP/1.1 400 Bad Request",
+            expected_body,
+        );
+    }
+}
+
+#[test]
+fn get_database_parameter_does_not_count_toward_the_decoded_sql_limit() {
+    let database = SharedDatabase::default();
+    let request = b"GET /?database=def%61ult&query=SELECT+7%3B HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let mut response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: b"SELECT 7;".len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_response(
+        &response,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"7","type":"Int64"}],"rows":[[7]]}"#,
+    );
+
+    response.clear();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: b"SELECT 7;".len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"SQL query exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
 fn default_database_header_wires_every_query_form_and_both_authentication_modes() {
     let database = SharedDatabase::default();
     let expected = r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#;
@@ -1331,7 +1478,11 @@ fn url_encoded_get_query_rejects_malformed_encoding_utf8_parameters_and_bodies()
         ),
         (
             b"GET /?query=SELECT+1%3B&format=CSV HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            r#"{"error":"GET query target must contain exactly one query parameter"}"#,
+            r#"{"error":"GET query target contains an unknown parameter"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%3B&database=def%GGault HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"query parameter contains malformed percent encoding"}"#,
         ),
         (
             b"GET /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
