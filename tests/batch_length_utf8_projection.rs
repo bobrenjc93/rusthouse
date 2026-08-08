@@ -174,6 +174,89 @@ fn filters_orders_and_pages_by_expression_or_alias() {
 }
 
 #[test]
+fn cached_order_matches_full_stable_sort_for_unicode_ties_and_pagination_boundaries() {
+    let source_rows = [
+        ("discarded", false),
+        ("é", true),
+        ("東京", true),
+        ("é", true),
+        ("🦀", true),
+        ("", true),
+        ("👨‍👩‍👧‍👦", true),
+        ("abc", true),
+        ("🙂🙂", true),
+        ("Z", true),
+        ("also discarded", false),
+    ];
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (label String, keep Bool); \
+             INSERT INTO samples VALUES \
+             ('discarded', false), ('é', true), ('東京', true), ('é', true), \
+             ('🦀', true), ('', true), ('👨‍👩‍👧‍👦', true), ('abc', true), \
+             ('🙂🙂', true), ('Z', true), ('also discarded', false);",
+        )
+        .expect("setup");
+
+    let matching_count = source_rows.iter().filter(|(_, keep)| *keep).count();
+    let pages = [
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (2, 1),
+        (3, 2),
+        (1, matching_count - 1),
+        (2, matching_count),
+        (matching_count, 0),
+        (matching_count + 2, 1),
+    ];
+
+    for (direction, descending) in [("ASC", false), ("DESC", true)] {
+        let mut full_order = source_rows
+            .iter()
+            .filter(|(_, keep)| *keep)
+            .map(|(label, _)| *label)
+            .collect::<Vec<_>>();
+        full_order.sort_by(|left, right| {
+            let comparison = left.chars().count().cmp(&right.chars().count());
+            if descending {
+                comparison.reverse()
+            } else {
+                comparison
+            }
+        });
+
+        for (limit, offset) in pages {
+            let expected = full_order
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|label| {
+                    vec![
+                        Value::String((*label).to_owned()),
+                        Value::Int64(i64::try_from(label.chars().count()).unwrap()),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let actual = query(
+                &mut database,
+                &format!(
+                    "SELECT label, lengthUTF8(label) AS scalars FROM samples \
+                     WHERE keep = true ORDER BY scalars {direction} \
+                     LIMIT {limit} OFFSET {offset}"
+                ),
+            );
+
+            assert_eq!(
+                actual.rows, expected,
+                "{direction} LIMIT {limit} OFFSET {offset}"
+            );
+        }
+    }
+}
+
+#[test]
 fn rejects_unknown_non_string_and_grouped_length_utf8_inputs_with_typed_errors() {
     let mut database = Database::new();
     database
