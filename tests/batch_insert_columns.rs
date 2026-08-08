@@ -1,4 +1,6 @@
-use rusthouse::batch::engine::{Database, StatementResult};
+use std::fmt::Write as _;
+
+use rusthouse::batch::engine::{DEFAULT_MAX_CELLS_PER_TABLE, Database, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::Statement;
 use rusthouse::batch::value::Value;
@@ -233,6 +235,49 @@ fn named_insert_batches_preflight_cumulative_capacity_before_defaulted_rows_comm
         })
     );
     assert_eq!(database.catalog().table("events").unwrap().row_count(), 0);
+}
+
+#[test]
+fn wide_subsets_reject_capacity_before_ordinary_or_atomic_default_expansion() {
+    const COLUMN_COUNT: usize = 1_024;
+    const ROW_COUNT: usize = 100_000;
+
+    let mut create = String::from("CREATE TABLE wide (");
+    for index in 0..COLUMN_COUNT {
+        if index != 0 {
+            create.push_str(", ");
+        }
+        write!(create, "c{index} Int64").unwrap();
+    }
+    create.push_str(");");
+
+    let insert = |row_count: usize| {
+        let mut sql = String::with_capacity(35 + row_count.saturating_mul(4));
+        sql.push_str("INSERT INTO wide (c0) VALUES ");
+        for row in 0..row_count {
+            if row != 0 {
+                sql.push(',');
+            }
+            sql.push_str("(1)");
+        }
+        sql.push(';');
+        sql
+    };
+
+    let mut database = Database::new();
+    database.execute(&create).expect("create wide target");
+    let expected = Error::ResourceLimitExceeded {
+        resource: "table cells",
+        actual: ROW_COUNT * COLUMN_COUNT,
+        max: DEFAULT_MAX_CELLS_PER_TABLE,
+    };
+
+    assert_eq!(database.execute(&insert(ROW_COUNT)), Err(expected.clone()));
+    assert_eq!(database.catalog().table("wide").unwrap().row_count(), 0);
+
+    let atomic = format!("{}{}", insert(1), insert(ROW_COUNT - 1),);
+    assert_eq!(database.execute_insert_batch(&atomic), Err(expected));
+    assert_eq!(database.catalog().table("wide").unwrap().row_count(), 0);
 }
 
 #[test]

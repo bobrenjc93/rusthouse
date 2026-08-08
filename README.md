@@ -78,8 +78,10 @@ order before typed validation and columnar storage; omitted `Int64`, `Float64`,
 respectively. Duplicate or unknown names, wrong-width rows, and mistyped values
 are errors. A complete explicit list and positional `INSERT INTO <table>
 VALUES ...` retain their existing behavior. The atomic insert-only APIs resolve,
-expand, and validate every statement plus cumulative table capacity during
-preflight, so any failure rolls back the complete batch.
+validate column mappings and row widths, and check cumulative table capacity
+before expanding defaults during preflight, so any failure rolls back the
+complete batch. Ordinary inserts likewise check current table capacity before
+materializing omitted fields.
 
 Regular ungrouped, non-window projections support
 `LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`. `WHERE` filtering
@@ -353,7 +355,8 @@ Typed batch tables also retain at most 1,000,000 rows, 1,024 physical columns,
 and 4,000,000 physical scalar cells each by default. The cell count is the
 current row count multiplied by the schema width, so repeated `ADD COLUMN` and
 `INSERT` calls cannot grow storage without a cumulative bound. CREATE, INSERT,
-and ADD COLUMN reject an exceeded cap before changing table state; DROP COLUMN,
+and ADD COLUMN reject an exceeded cap before changing table state; INSERT also
+does so before materializing typed defaults for omitted fields. DROP COLUMN,
 TRUNCATE TABLE, and DELETE restore reusable cell capacity.
 `Database::with_query_result_limits` and the matching `SharedDatabase`
 constructor configure the scan and output limits.

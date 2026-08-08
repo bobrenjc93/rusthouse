@@ -327,13 +327,17 @@ impl Table {
     ///
     /// Explicit names resolve case-insensitively. Unknown and duplicate names
     /// are rejected. Omitted columns receive their type's non-null default:
-    /// `0`, `0.0`, `false`, or an empty String.
+    /// `0`, `0.0`, `false`, or an empty String. After column and row-width
+    /// validation, `capacity_rows` is checked before those defaults are
+    /// materialized. Atomic callers pass the cumulative rows for this table.
     pub(crate) fn prepare_insert_rows(
         &self,
         insert_columns: Option<&[String]>,
         mut rows: Vec<Vec<Value>>,
+        capacity_rows: usize,
     ) -> Result<Vec<Vec<Value>>> {
         let Some(insert_columns) = insert_columns else {
+            self.validate_row_capacity(capacity_rows)?;
             return Ok(rows);
         };
 
@@ -374,6 +378,8 @@ impl Table {
                 });
             }
         }
+
+        self.validate_row_capacity(capacity_rows)?;
 
         if insert_columns.len() == self.schema.len()
             && schema_indexes.iter().copied().eq(0..self.schema.len())
