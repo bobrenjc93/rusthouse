@@ -70,14 +70,16 @@ and bare `NULL` are not supported by this narrow form. A successful command
 reports its deleted-row count through the library API and is silent in
 formatted CLI output.
 
-`INSERT INTO <table> (<columns>) VALUES ...` accepts a complete explicit
-column list in any order. Names resolve case-insensitively, every schema column
-must appear exactly once, and each row is reordered into schema order before
-typed validation and columnar storage. Duplicate, omitted, or unknown columns
-are errors; partial lists are not defaults, and positional `INSERT INTO
-<table> VALUES ...` remains supported. The atomic insert-only APIs validate
-and reorder every statement during preflight, so a named-column failure rolls
-back the complete batch.
+`INSERT INTO <table> (<columns>) VALUES ...` accepts any nonempty explicit
+column subset in any order. Names resolve case-insensitively, and each row must
+contain exactly one value per listed column. Rows are expanded into schema
+order before typed validation and columnar storage; omitted `Int64`, `Float64`,
+`Bool`, and `String` fields receive `0`, `0.0`, `false`, and an empty String,
+respectively. Duplicate or unknown names, wrong-width rows, and mistyped values
+are errors. A complete explicit list and positional `INSERT INTO <table>
+VALUES ...` retain their existing behavior. The atomic insert-only APIs resolve,
+expand, and validate every statement plus cumulative table capacity during
+preflight, so any failure rolls back the complete batch.
 
 Regular ungrouped, non-window projections support
 `LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`. `WHERE` filtering
@@ -105,12 +107,13 @@ physical column. Existing rows are backfilled with the ClickHouse-style
 non-null default for that type: `0`, `0.0`, `false`, or an empty String.
 Table and collision lookup are case-insensitive; the stored column spelling is
 preserved. Invalid, reserved, or already-used names and missing tables fail
-before mutation, leaving schema, data, row count, and row cap unchanged. New
-inserts must provide a value for the extended schema under the existing
-complete-row rules. Default expressions, nullable storage, placement clauses,
-and `IF NOT EXISTS` are not supported. Each addition is preflighted against the
-table's persistent column and physical-cell caps before its default vector is
-allocated. A trailing semicolon is optional.
+before mutation, leaving schema, data, row count, and row cap unchanged. A
+positional insert or complete explicit list must include the new field, while
+an explicit subset may omit it and receive its typed default. Default
+expressions, nullable storage, placement clauses, and `IF NOT EXISTS` are not
+supported. Each addition is preflighted against the table's persistent column
+and physical-cell caps before its default vector is allocated. A trailing
+semicolon is optional.
 
 `ALTER TABLE <table> RENAME COLUMN <source> TO <destination>` changes only the
 stored column display name. Table, source-column, destination-collision, and
@@ -350,8 +353,8 @@ Typed batch tables also retain at most 1,000,000 rows, 1,024 physical columns,
 and 4,000,000 physical scalar cells each by default. The cell count is the
 current row count multiplied by the schema width, so repeated `ADD COLUMN` and
 `INSERT` calls cannot grow storage without a cumulative bound. CREATE, INSERT,
-and ADD COLUMN reject an exceeded cap before allocating or changing table
-state; DROP COLUMN, TRUNCATE TABLE, and DELETE restore reusable cell capacity.
+and ADD COLUMN reject an exceeded cap before changing table state; DROP COLUMN,
+TRUNCATE TABLE, and DELETE restore reusable cell capacity.
 `Database::with_query_result_limits` and the matching `SharedDatabase`
 constructor configure the scan and output limits.
 `Database::with_max_rows_per_table` and its shared counterpart configure the
@@ -371,7 +374,7 @@ their existing exact-match behavior.
 ```bash
 printf '%s\n' \
   "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);" \
-  "INSERT INTO metrics VALUES (1, 2.5, true, 'alpha'), (2, 4.0, false, 'beta');" \
+  "INSERT INTO metrics (label, id, score) VALUES ('alpha', 1, 2.5), ('beta', 2, 4.0);" \
   "SELECT COUNT(*) AS rows, AVG(score) AS mean FROM metrics;" |
   cargo run -- --format json
 ```
@@ -401,9 +404,10 @@ passed to `execute` retain one write lock for the entire batch and cannot
 interleave.
 For transactional ingestion, `Database::execute_insert_batch` and the matching
 `SharedDatabase` method accept a nonempty `INSERT`-only batch, preflight every
-statement and cumulative per-table row cap, then commit in statement order.
-Any validation or resource failure leaves all tables unchanged; the shared
-form retains one write lock across preflight and commit.
+statement (including explicit-subset expansion) and cumulative per-table row
+cap, then commit in statement order. Any validation or resource failure leaves
+all tables unchanged; the shared form retains one write lock across preflight
+and commit.
 `SharedDatabase::try_execute_insert_batch` performs the same parsing and atomic
 execution after one nonblocking write-lock attempt. An active reader or writer
 returns the typed `DatabaseBusy` error without applying any rows, while lock

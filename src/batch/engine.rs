@@ -335,10 +335,12 @@ impl Database {
 
     /// Atomically executes a nonempty SQL batch containing only `INSERT` statements.
     ///
-    /// Every target table, row shape, value type, finite floating-point value,
-    /// and cumulative per-table row count is validated before any row is
-    /// appended. A failure therefore leaves every table unchanged. Successful
-    /// statements are committed and reported in input order.
+    /// Every target table, explicit-column mapping, row shape, value type,
+    /// finite floating-point value, and cumulative per-table row count is
+    /// validated before any row is appended. Omitted explicit columns are
+    /// expanded to typed defaults during that preflight. A failure therefore
+    /// leaves every table unchanged. Successful statements are committed and
+    /// reported in input order.
     pub fn execute_insert_batch(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         let statements = sql::parse(sql)?;
         self.execute_insert_statements(statements)
