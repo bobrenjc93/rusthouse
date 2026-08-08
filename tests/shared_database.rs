@@ -367,7 +367,7 @@ fn shared_queries_enforce_the_scan_limit_before_where_and_limit() {
 }
 
 #[test]
-fn metrics_snapshot_tracks_retained_tables_columns_and_rows() {
+fn metrics_snapshot_tracks_retained_counts_and_value_bytes() {
     let database = SharedDatabase::default();
     assert_eq!(
         database.metrics_snapshot(),
@@ -375,14 +375,17 @@ fn metrics_snapshot_tracks_retained_tables_columns_and_rows() {
             table_count: 0,
             column_count: 0,
             retained_row_count: 0,
+            retained_value_bytes: 0,
         })
     );
 
     database
         .execute(
-            "CREATE TABLE events (id Int64, label String); \
+            "DROP TABLE IF EXISTS missing; \
+             CREATE TABLE events (id Int64, score Float64, active Bool, label String); \
+             CREATE TABLE IF NOT EXISTS events (ignored String); \
              CREATE TABLE flags (active Bool); \
-             INSERT INTO events VALUES (1, 'one'), (2, 'two'); \
+             INSERT INTO events VALUES (1, 1.5, true, 'one'), (2, 2.5, false, 'two'); \
              INSERT INTO flags VALUES (true);",
         )
         .unwrap();
@@ -390,20 +393,39 @@ fn metrics_snapshot_tracks_retained_tables_columns_and_rows() {
         database.metrics_snapshot(),
         Some(DatabaseMetrics {
             table_count: 2,
-            column_count: 3,
+            column_count: 5,
             retained_row_count: 3,
+            retained_value_bytes: 41,
         })
     );
 
     database
-        .execute("TRUNCATE TABLE events; DROP TABLE flags;")
+        .execute("DELETE FROM events WHERE id = 2;")
+        .unwrap();
+    assert_eq!(
+        database.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 2,
+            column_count: 5,
+            retained_row_count: 2,
+            retained_value_bytes: 21,
+        })
+    );
+
+    database
+        .execute(
+            "TRUNCATE TABLE events; \
+             DROP TABLE IF EXISTS flags; \
+             DROP TABLE IF EXISTS flags;",
+        )
         .unwrap();
     assert_eq!(
         database.metrics_snapshot(),
         Some(DatabaseMetrics {
             table_count: 1,
-            column_count: 2,
+            column_count: 4,
             retained_row_count: 0,
+            retained_value_bytes: 0,
         })
     );
 }

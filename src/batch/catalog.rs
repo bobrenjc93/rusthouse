@@ -213,6 +213,21 @@ impl Catalog {
             .fold(0_usize, usize::saturating_add)
     }
 
+    /// Returns scalar payload bytes retained across all tables without allocating.
+    ///
+    /// Per-table totals are maintained during mutations, so this visits tables
+    /// but does not scan their values. The sum saturates at [`usize::MAX`] and
+    /// excludes container capacity, schema text, and allocation metadata.
+    #[must_use]
+    pub fn retained_value_bytes(&self) -> usize {
+        saturating_usize(
+            self.tables
+                .values()
+                .map(Table::retained_value_bytes_exact)
+                .fold(0_u128, u128::saturating_add),
+        )
+    }
+
     /// Returns the combined byte length of all display names without allocating.
     #[must_use]
     pub fn table_name_bytes(&self) -> usize {
@@ -231,6 +246,10 @@ impl Catalog {
     }
 }
 
+fn saturating_usize(value: u128) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 fn normalize(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
 }
@@ -238,7 +257,7 @@ fn normalize(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch::value::DataType;
+    use crate::batch::value::{DataType, Value};
 
     #[test]
     fn table_lookup_is_case_insensitive() {
@@ -325,5 +344,87 @@ mod tests {
         assert!(catalog.drop_table_if_exists("eVeNtS"));
         assert!(!catalog.drop_table_if_exists("EVENTS"));
         assert_eq!(catalog.table_count(), 0);
+    }
+
+    #[test]
+    fn retained_value_bytes_aggregate_tables_and_drop_with_them() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "numbers".to_owned(),
+                vec![ColumnDef {
+                    name: "value".to_owned(),
+                    data_type: DataType::Int64,
+                }],
+            )
+            .expect("create numbers");
+        catalog
+            .create_table(
+                "labels".to_owned(),
+                vec![ColumnDef {
+                    name: "value".to_owned(),
+                    data_type: DataType::String,
+                }],
+            )
+            .expect("create labels");
+        assert_eq!(catalog.column_count(), 2);
+        assert_eq!(catalog.retained_row_count(), 0);
+        assert_eq!(catalog.retained_value_bytes(), 0);
+
+        {
+            let numbers: &mut Table = catalog.table_mut("numbers").expect("numbers table");
+            numbers
+                .insert_row(vec![Value::Int64(7)])
+                .expect("insert number");
+        }
+        catalog
+            .table_mut("labels")
+            .expect("labels table")
+            .insert_row(vec![Value::String("é".to_owned())])
+            .expect("insert label");
+
+        assert_eq!(catalog.column_count(), 2);
+        assert_eq!(catalog.retained_row_count(), 2);
+        assert_eq!(catalog.retained_value_bytes(), 10);
+        assert!(
+            catalog
+                .table_mut("numbers")
+                .expect("numbers table")
+                .insert_row(vec![Value::String("wrong".to_owned())])
+                .is_err()
+        );
+        assert_eq!(catalog.column_count(), 2);
+        assert_eq!(catalog.retained_row_count(), 2);
+        assert_eq!(catalog.retained_value_bytes(), 10);
+
+        catalog
+            .add_column(
+                "numbers",
+                ColumnDef {
+                    name: "active".to_owned(),
+                    data_type: DataType::Bool,
+                },
+            )
+            .expect("add defaulted bool column");
+        assert_eq!(catalog.column_count(), 3);
+        assert_eq!(catalog.retained_row_count(), 2);
+        assert_eq!(catalog.retained_value_bytes(), 11);
+
+        catalog
+            .table_mut("labels")
+            .expect("labels table")
+            .delete_rows(&[0])
+            .expect("delete label");
+        assert_eq!(catalog.retained_row_count(), 1);
+        assert_eq!(catalog.retained_value_bytes(), 9);
+
+        catalog.drop_table("NUMBERS").expect("drop numbers");
+        assert_eq!(catalog.column_count(), 1);
+        assert_eq!(catalog.retained_row_count(), 0);
+        assert_eq!(catalog.retained_value_bytes(), 0);
+        catalog.drop_table("labels").expect("drop labels");
+        assert_eq!(catalog.column_count(), 0);
+        assert_eq!(catalog.retained_row_count(), 0);
+        assert_eq!(catalog.retained_value_bytes(), 0);
     }
 }
