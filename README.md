@@ -579,15 +579,16 @@ count toward that limit. Empty parameters or values, duplicate `query`,
 `database`, or `default_format` parameters, unknown parameters, malformed
 escapes, non-default database values, unsupported formats, and invalid SQL
 UTF-8 are rejected. Parameter validation follows configured authentication and
-precedes database access. GET requests and every request handled by the
-unauthenticated APIs use the read-only, exactly-one-statement
-`SharedDatabase::try_query` path. An authenticated POST without an explicit
-output-format selector additionally accepts a nonempty `INSERT`-only batch and
-uses the atomic `SharedDatabase::try_execute_insert_batch` path. Mixed batches,
-other mutations, and INSERT requests carrying `X-ClickHouse-Format` or
-`default_format` are rejected without mutation. Successful queries use the same
-compact JSON column metadata and positional-row shape as `--format json`;
-successful INSERT batches return an empty `200 OK` plain-text response.
+precedes database access. GET requests and every request handled by any
+read-only API use the read-only, exactly-one-statement
+`SharedDatabase::try_query` path. A POST through an insertion-capable
+authenticated handler without an explicit output-format selector additionally
+accepts a nonempty `INSERT`-only batch and uses the atomic
+`SharedDatabase::try_execute_insert_batch` path. Mixed batches, other mutations,
+and INSERT requests carrying `X-ClickHouse-Format` or `default_format` are
+rejected without mutation. Successful queries use the same compact JSON column
+metadata and positional-row shape as `--format json`; successful INSERT batches
+return an empty `200 OK` plain-text response.
 Protocol and SQL failures return deterministic JSON error objects with an
 appropriate HTTP status. All other targets and query-string shapes are rejected.
 
@@ -604,8 +605,8 @@ For parameterized GET and POST queries, the header and `database=default` query
 parameter may coexist; each is validated independently against the same single
 database.
 
-The bearer- and `X-ClickHouse-Key`-authenticated handlers also expose exact
-`POST /insert` as an explicit write route. It requires one decimal
+The insertion-capable bearer- and `X-ClickHouse-Key`-authenticated handlers also
+expose exact `POST /insert` as an explicit write route. It requires one decimal
 `Content-Length`, applies the same UTF-8 SQL body and request limits as
 `POST /query`, and executes the same nonempty `INSERT`-only transaction as an
 authenticated standard POST. The database preflights the entire batch before
@@ -614,7 +615,7 @@ mixed-statement failures return `400 Bad Request` without applying any rows.
 Success returns `200 OK` with an empty plain-text body. The route is not
 recognized by `handle_http_query` or `handle_http_query_with_limits`.
 
-Those authenticated handlers also expose exact `POST /insert/<table>` for
+Those insertion-capable handlers also expose exact `POST /insert/<table>` for
 `CSVWithNames` or `TabSeparatedWithNames` ingestion. `<table>` is one literal
 RustHouse SQL identifier; extra path segments, query strings, and
 percent-encoded names are not accepted. The request requires one decimal
@@ -747,6 +748,17 @@ tokens are rejected before any request input is read. The original
 in-process read-only embeddings: standard routes stay read-only and neither
 explicit insertion route is exposed.
 
+For credential-protected least-privilege access, use
+`handle_http_query_read_only_with_bearer_token` or its
+`_and_limits` variant. These handlers authenticate query, `/ping`, `/ready`,
+and `/metrics` requests exactly like the existing bearer handlers, but never
+enable INSERT on standard POST routes. Authenticated `POST /insert` and
+`POST /insert/<table>` requests receive `404 Not Found` before their body is
+read or any database lock is attempted. Authentication retains precedence, so
+missing or invalid credentials still receive the indistinguishable bounded
+`401 Unauthorized` response first. The existing bearer handlers remain
+insertion-capable for backward compatibility.
+
 For ClickHouse HTTP credential compatibility, embedders can instead call
 `handle_http_query_with_clickhouse_key`, or
 `handle_http_query_with_clickhouse_key_and_limits` for explicit resource
@@ -767,6 +779,14 @@ finishes before a SQL body is read or any database lock is attempted.
 Supplying `X-ClickHouse-Key` to a bearer handler does not replace
 `Authorization`, and supplying `Authorization` to a key handler does not
 replace `X-ClickHouse-Key`.
+
+The corresponding least-privilege key APIs are
+`handle_http_query_read_only_with_clickhouse_key` and its `_and_limits`
+variant. They preserve `X-ClickHouse-Key` authentication, response limits, and
+`Cache-Control: private, no-store` on query and operational responses while
+applying the same authenticated, pre-body insertion-route rejection as the
+read-only bearer APIs. Use these read-only variants for query or monitoring
+credentials that do not require ingestion authority.
 
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before
