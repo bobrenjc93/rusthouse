@@ -234,8 +234,12 @@ named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
 `UPPER`, and `version`. Arguments and trailing clauses are rejected. The result
 uses the normal query row, value, byte, retained-result, and formatted-output
 limits.
-`SHOW TABLES` returns the catalog's display names in deterministic,
-case-insensitive order as one `String` column.
+The case-insensitive forms `SHOW TABLES`, `SHOW TABLES FROM default`, and
+`SHOW TABLES IN default` return the catalog's display names in deterministic,
+case-insensitive order as one `String` column. RustHouse has no other logical
+database, so non-default database names and trailing clauses are rejected. All
+three forms use the normal query row, value, byte, retained-result, and
+formatted-output limits.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
 bounded `String`, preserving the stored table and column display names and
 schema order while normalizing type spellings.
@@ -604,12 +608,14 @@ ClickHouse-style parameterized forms,
 `POST /?query=<percent-encoded SQL>`, accept the same SQL with no body
 (`Content-Length` may be omitted or be zero) for ordinary queries. A
 write-capable authenticated `POST` also accepts the canonical ClickHouse
-query-plus-data form `/?query=INSERT+INTO+<table>+FORMAT+CSVWithNames` with a
-nonempty named CSV body and one decimal `Content-Length`. The SQL shape is
-case-insensitive, permits one optional trailing semicolon, and otherwise must
-be exact: an explicit column list, another format, or any extra SQL is not
-accepted as query-plus-data. Both forms also accept one optional
-`database=default` parameter and
+query-plus-data forms `/?query=INSERT+INTO+<table>+FORMAT+CSVWithNames` with a
+named CSV body or `/?query=INSERT+INTO+<table>+FORMAT+TabSeparated` with a
+headerless TSV body in physical schema order. Each requires one decimal
+`Content-Length`. The SQL shape and either supported format name are
+case-insensitive, permit one optional trailing semicolon, and otherwise must be
+exact: an explicit column list, another format, or any extra SQL is not
+accepted as query-plus-data. Both parameterized request forms also accept one
+optional `database=default` parameter and
 one optional `default_format` parameter in any order with `query`, including
 percent-encoded parameter names and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
@@ -630,8 +636,8 @@ authenticated handler without an explicit output-format selector additionally
 accepts a nonempty `INSERT`-only batch and uses the atomic
 `SharedDatabase::try_execute_insert_batch` path. Mixed batches, other mutations,
 and INSERT requests carrying `X-ClickHouse-Format` or `default_format` are
-rejected without mutation. The query-plus-data form likewise rejects either
-output selector and is unavailable to GET, unauthenticated, and authenticated
+rejected without mutation. The query-plus-data forms likewise reject either
+output selector and are unavailable to GET, unauthenticated, and authenticated
 read-only handlers. Successful queries use the same compact JSON column
 metadata and positional-row shape as `--format json`; successful INSERT batches
 return an empty `200 OK` plain-text response.
@@ -695,10 +701,12 @@ method, so typed input, schema, capacity, and format-specific limit failures
 return `400 Bad Request` and append no rows. Empty headerless CSV and TSV are
 successful zero-row inserts. Success returns the same empty `200 OK` response as
 the SQL insert route. The unauthenticated handlers do not recognize it.
-The parameterized `INSERT INTO <table> FORMAT CSVWithNames` form calls this
-same named CSV importer and has the same success response, authentication,
-admission, resource-limit, and all-or-nothing behavior. An empty body fails as
-a missing named CSV header.
+The parameterized `INSERT INTO <table> FORMAT CSVWithNames` and `INSERT INTO
+<table> FORMAT TabSeparated` forms call the same named CSV and headerless TSV
+importers, respectively, with the same success response, authentication,
+admission, format-specific resource limits, and all-or-nothing behavior. An
+empty named CSV body fails as a missing header; an empty headerless TSV body is
+a successful zero-row insert.
 
 HTTP read admission never waits for the database lock. After request parsing,
 authentication, optional database-header and query-parameter validation, SQL
@@ -713,9 +721,9 @@ response limit retain their documented ordering and behavior.
 HTTP insert admission likewise never waits. After authentication and optional
 database-header validation, the bounded body or URL query is read and decoded.
 Standard authenticated POST insertion is disabled when an output format was
-selected. A parameterized named CSV insert validates the exact SQL shape and
-both the HTTP and CSV byte caps before reading its body. The standard and
-explicit SQL routes complete SQL parsing before
+selected. A parameterized named CSV or headerless TSV insert validates the
+exact SQL shape and both the HTTP and corresponding format byte caps before
+reading its body. The standard and explicit SQL routes complete SQL parsing before
 their immediate write-lock attempt; the headerless and named CSV and TSV routes
 pass their bounded bytes to the selected ingestion API, which attempts
 the lock before table lookup or parsing. Any active reader or writer returns
@@ -804,9 +812,9 @@ headers. CSV and TSV insertion each additionally apply their own ingestion
 defaults of 8 MiB, 100,000 rows, and 1,000,000 values; the default 1 MiB HTTP
 body cap is reached first for byte size. `HttpQueryLimits::csv_ingest_limits`
 and `HttpQueryLimits::tsv_ingest_limits` configure the two formats independently.
-For table insertion, including parameterized query-plus-data CSV insertion,
-the declared `Content-Length` must fit the HTTP byte cap and the selected
-format's byte cap before the handler allocates or reads the body. Header limits
+For table insertion, including parameterized query-plus-data CSV and TSV
+insertion, the declared `Content-Length` must fit the HTTP byte cap and the
+selected format's byte cap before the handler allocates or reads the body. Header limits
 apply to all routes, as does the complete-response limit.
 The full response is prepared and checked before anything is written. Call an
 authenticated handler's `*_and_limits` variant with `HttpQueryLimits` to set
