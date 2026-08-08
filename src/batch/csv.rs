@@ -91,7 +91,7 @@ pub enum CsvIngestError {
         values: usize,
         max_values: usize,
     },
-    /// A data row does not have exactly one field for each schema column.
+    /// A data row does not have exactly one field for each selected header column.
     WrongColumnCount {
         line: usize,
         expected: usize,
