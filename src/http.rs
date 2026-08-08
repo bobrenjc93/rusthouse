@@ -10,10 +10,11 @@ use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
     write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
 };
+use crate::batch::shared_database::{DatabaseMetricsSnapshot, DatabaseMetricsWithTableRows};
 use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
 use crate::batch::tsv::{TsvIngestError, TsvIngestLimits};
-use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
+use crate::{SharedDatabase, SharedDatabaseError};
 
 /// Default maximum size of the request line and headers, including the final
 /// empty line.
@@ -120,7 +121,12 @@ impl StdError for HttpQueryError {
 /// unknown, and unsupported parameters are rejected after authentication and
 /// before database access. A
 /// `default_format` parameter cannot be combined with an
-/// `X-ClickHouse-Format` header. GET requests and every request made through a
+/// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
+/// may instead end in the case-insensitive SQL clause `FORMAT CSVWithNames`,
+/// with an optional trailing semicolon. The clause selects the existing named
+/// CSV writer and cannot be combined with either HTTP format selector. Quoted
+/// strings and line comments are not interpreted as format clauses. GET
+/// requests and every request made through a
 /// read-only handler pass the SQL to [`SharedDatabase::try_query`], which
 /// accepts exactly one read-only statement and makes one nonblocking read-lock
 /// attempt. POST requests made through the insertion-capable handlers without an
@@ -166,10 +172,10 @@ impl StdError for HttpQueryError {
 /// same credentials but do not expose either explicit insertion route or
 /// enable INSERT execution on standard query routes.
 ///
-/// `GET /metrics` accepts no request body and returns four Prometheus gauges
-/// for retained tables, columns, rows, and scalar payload bytes. The byte gauge
-/// is named `rusthouse_retained_value_bytes`. It takes a nonblocking, consistent
-/// database metrics snapshot; lock contention and poisoning return `503`.
+/// `GET /metrics` accepts no request body and returns four unlabeled Prometheus
+/// gauges for database totals plus one `rusthouse_table_rows` gauge per current
+/// table. It takes a nonblocking, consistent database metrics snapshot; lock
+/// contention and poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
 /// database. `GET /ready` also accepts no body and returns the same successful
@@ -630,15 +636,37 @@ fn handle_http_query_exchange(
             );
         }
         HttpRequest::Metrics => {
-            let Some(metrics) = database.metrics_snapshot() else {
-                return write_error_response(
-                    &mut output,
-                    Status::SERVICE_UNAVAILABLE,
-                    &[],
-                    response_headers,
-                    "database is unavailable",
-                    limits.max_response_bytes,
-                );
+            let metrics = match database.metrics_snapshot_with_table_rows(
+                |totals, table_name_bytes, row_count_bytes| {
+                    let body_bytes =
+                        prometheus_metrics_body_len(totals, table_name_bytes, row_count_bytes);
+                    response_len(
+                        Status::OK,
+                        &[],
+                        response_headers,
+                        CONTENT_TYPE_PROMETHEUS,
+                        body_bytes,
+                    ) <= limits.max_response_bytes
+                },
+            ) {
+                DatabaseMetricsSnapshot::Available(metrics) => metrics,
+                DatabaseMetricsSnapshot::ResponseLimitExceeded => {
+                    return write_response_limit_error(
+                        &mut output,
+                        response_headers,
+                        limits.max_response_bytes,
+                    );
+                }
+                DatabaseMetricsSnapshot::Unavailable => {
+                    return write_error_response(
+                        &mut output,
+                        Status::SERVICE_UNAVAILABLE,
+                        &[],
+                        response_headers,
+                        "database is unavailable",
+                        limits.max_response_bytes,
+                    );
+                }
             };
             let mut body = BoundedVec::new(limits.max_response_bytes);
             if write_prometheus_metrics(&mut body, metrics).is_err() {
@@ -901,11 +929,11 @@ fn read_request(
         RequestKind::Query(QuerySource::Body) => {
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
             let output_format_selected = request.response_format.is_some();
-            Ok(classify_standard_query_request(
+            classify_standard_query_request(
                 sql,
-                request.response_format.unwrap_or(QueryResponseFormat::Json),
+                request.response_format,
                 access.allows_insert() && !output_format_selected,
-            ))
+            )
         }
         RequestKind::Insert => {
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
@@ -950,8 +978,8 @@ fn read_request(
                     )
                     .into());
                 }
-                (Some(format), None) | (None, Some(format)) => format,
-                (None, None) => QueryResponseFormat::Json,
+                (Some(format), None) | (None, Some(format)) => Some(format),
+                (None, None) => None,
             };
             let sql = String::from_utf8(decoded.sql).map_err(|_| {
                 RequestReadError::from(RequestFailure::new(
@@ -991,13 +1019,13 @@ fn read_request(
                 .into());
             }
 
-            Ok(classify_standard_query_request(
+            classify_standard_query_request(
                 sql,
                 response_format,
                 access.allows_insert()
                     && matches!(method, ParameterizedQueryMethod::Post)
                     && !output_format_selected,
-            ))
+            )
         }
     }
 }
@@ -1024,14 +1052,29 @@ fn parse_csv_with_names_insert(sql: &str) -> Option<String> {
 }
 
 fn classify_standard_query_request(
-    sql: String,
-    response_format: QueryResponseFormat,
+    mut sql: String,
+    response_format: Option<QueryResponseFormat>,
     insert_enabled: bool,
-) -> HttpRequest {
+) -> Result<HttpRequest, RequestReadError> {
+    let sql_format_selected = take_terminal_csv_with_names_format(&mut sql);
+    if sql_format_selected && response_format.is_some() {
+        return Err(RequestFailure::new(
+            Status::BAD_REQUEST,
+            "FORMAT CSVWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter",
+        )
+        .into());
+    }
+    let response_format = if sql_format_selected {
+        QueryResponseFormat::CsvWithNames
+    } else {
+        response_format.unwrap_or(QueryResponseFormat::Json)
+    };
+
     // Route mixed batches through the insert-only executor too, so its
     // authoritative all-statement validation and transaction semantics decide
     // the error without risking an earlier partial INSERT.
     let contains_insert = insert_enabled
+        && !sql_format_selected
         && sql::parse(&sql).is_ok_and(|statements| {
             statements.iter().any(|statement| {
                 matches!(
@@ -1041,13 +1084,140 @@ fn classify_standard_query_request(
             })
         });
     if contains_insert {
-        HttpRequest::Insert { sql }
+        Ok(HttpRequest::Insert { sql })
     } else {
-        HttpRequest::Query {
+        Ok(HttpRequest::Query {
             sql,
             response_format,
-        }
+        })
     }
+}
+
+/// Removes one terminal, unquoted `FORMAT CSVWithNames` clause.
+///
+/// The SQL parser deliberately does not own transport output formats, so the
+/// HTTP adapter recognizes this one ClickHouse-compatible clause before using
+/// the unchanged read-only query API. This scanner follows the SQL lexer's
+/// single-quote, doubled-quote, whitespace, and line-comment rules without
+/// retaining tokens proportional to the bounded request size.
+fn take_terminal_csv_with_names_format(sql: &mut String) -> bool {
+    let Some(format_start) = terminal_csv_with_names_format_start(sql) else {
+        return false;
+    };
+    sql.truncate(format_start);
+    true
+}
+
+fn terminal_csv_with_names_format_start(sql: &str) -> Option<usize> {
+    #[derive(Clone, Copy)]
+    struct Token<'a> {
+        text: &'a str,
+        start: usize,
+        has_previous: bool,
+        separated_by_semicolon: bool,
+    }
+
+    fn record_token<'a>(
+        token: Token<'a>,
+        previous: &mut Option<Token<'a>>,
+        last: &mut Option<Token<'a>>,
+    ) {
+        *previous = *last;
+        *last = Some(token);
+    }
+
+    let mut index = 0_usize;
+    let mut previous = None;
+    let mut last = None;
+    let mut semicolons_since_token = 0_usize;
+
+    while index < sql.len() {
+        let rest = &sql[index..];
+        let character = rest
+            .chars()
+            .next()
+            .expect("the byte index remains on a character boundary");
+
+        if character.is_whitespace() {
+            index += character.len_utf8();
+            continue;
+        }
+        if rest.starts_with("--") {
+            while index < sql.len() {
+                let character = sql[index..]
+                    .chars()
+                    .next()
+                    .expect("the byte index remains on a character boundary");
+                index += character.len_utf8();
+                if character == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == ';' {
+            semicolons_since_token = semicolons_since_token.saturating_add(1);
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        if character == '\'' {
+            index += 1;
+            let mut terminated = false;
+            while index < sql.len() {
+                let character = sql[index..]
+                    .chars()
+                    .next()
+                    .expect("the byte index remains on a character boundary");
+                index += character.len_utf8();
+                if character == '\'' {
+                    if sql[index..].starts_with('\'') {
+                        index += 1;
+                    } else {
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+            if !terminated {
+                return None;
+            }
+        } else if character.is_ascii_alphabetic() || character == '_' {
+            index += 1;
+            while index < sql.len() {
+                let character = sql[index..]
+                    .chars()
+                    .next()
+                    .expect("the byte index remains on a character boundary");
+                if !character.is_ascii_alphanumeric() && character != '_' {
+                    break;
+                }
+                index += character.len_utf8();
+            }
+        } else {
+            index += character.len_utf8();
+        }
+
+        let token = Token {
+            text: &sql[start..index],
+            start,
+            has_previous: last.is_some(),
+            separated_by_semicolon: semicolons_since_token != 0,
+        };
+        record_token(token, &mut previous, &mut last);
+        semicolons_since_token = 0;
+    }
+
+    let format = previous?;
+    let csv_with_names = last?;
+    (format.has_previous
+        && !format.separated_by_semicolon
+        && !csv_with_names.separated_by_semicolon
+        && semicolons_since_token <= 1
+        && format.text.eq_ignore_ascii_case("FORMAT")
+        && csv_with_names.text.eq_ignore_ascii_case("CSVWithNames"))
+    .then_some(format.start)
 }
 
 fn read_sql_body(
@@ -2015,27 +2185,80 @@ const CONTENT_TYPE_JSON: &[u8] = b"application/json";
 const CONTENT_TYPE_TEXT: &[u8] = b"text/plain; charset=utf-8";
 const CONTENT_TYPE_TSV: &[u8] = b"text/tab-separated-values; charset=utf-8";
 const CONTENT_TYPE_PROMETHEUS: &[u8] = b"text/plain; version=0.0.4; charset=utf-8";
+const TABLES_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_tables Number of tables retained by the database.\n",
+    "# TYPE rusthouse_tables gauge\n",
+    "rusthouse_tables ",
+);
+const COLUMNS_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_columns Number of columns retained by the database.\n",
+    "# TYPE rusthouse_columns gauge\n",
+    "rusthouse_columns ",
+);
+const RETAINED_ROWS_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_retained_rows Number of rows retained across all tables.\n",
+    "# TYPE rusthouse_retained_rows gauge\n",
+    "rusthouse_retained_rows ",
+);
+const RETAINED_VALUE_BYTES_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n",
+    "# TYPE rusthouse_retained_value_bytes gauge\n",
+    "rusthouse_retained_value_bytes ",
+);
+const TABLE_ROWS_METRIC_HEADER: &str = concat!(
+    "# HELP rusthouse_table_rows Number of rows retained by a table.\n",
+    "# TYPE rusthouse_table_rows gauge\n",
+);
+const TABLE_ROW_METRIC_PREFIX: &str = "rusthouse_table_rows{table=\"";
+const TABLE_ROW_METRIC_SEPARATOR: &str = "\"} ";
 
-fn write_prometheus_metrics(output: &mut impl Write, metrics: DatabaseMetrics) -> io::Result<()> {
-    writeln!(
-        output,
-        "# HELP rusthouse_tables Number of tables retained by the database.\n\
-         # TYPE rusthouse_tables gauge\n\
-         rusthouse_tables {}\n\
-         # HELP rusthouse_columns Number of columns retained by the database.\n\
-         # TYPE rusthouse_columns gauge\n\
-         rusthouse_columns {}\n\
-         # HELP rusthouse_retained_rows Number of rows retained across all tables.\n\
-         # TYPE rusthouse_retained_rows gauge\n\
-         rusthouse_retained_rows {}\n\
-         # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
-         # TYPE rusthouse_retained_value_bytes gauge\n\
-         rusthouse_retained_value_bytes {}",
-        metrics.table_count,
-        metrics.column_count,
-        metrics.retained_row_count,
-        metrics.retained_value_bytes,
-    )
+fn prometheus_metrics_body_len(
+    totals: crate::DatabaseMetrics,
+    table_name_bytes: usize,
+    row_count_bytes: usize,
+) -> usize {
+    let fixed_bytes = TABLES_METRIC_PREFIX
+        .len()
+        .saturating_add(COLUMNS_METRIC_PREFIX.len())
+        .saturating_add(RETAINED_ROWS_METRIC_PREFIX.len())
+        .saturating_add(RETAINED_VALUE_BYTES_METRIC_PREFIX.len())
+        .saturating_add(TABLE_ROWS_METRIC_HEADER.len())
+        .saturating_add(4)
+        .saturating_add(usize_decimal_len(totals.table_count))
+        .saturating_add(usize_decimal_len(totals.column_count))
+        .saturating_add(usize_decimal_len(totals.retained_row_count))
+        .saturating_add(usize_decimal_len(totals.retained_value_bytes));
+    let per_table_fixed_bytes = TABLE_ROW_METRIC_PREFIX
+        .len()
+        .saturating_add(TABLE_ROW_METRIC_SEPARATOR.len())
+        .saturating_add(1);
+    fixed_bytes
+        .saturating_add(totals.table_count.saturating_mul(per_table_fixed_bytes))
+        .saturating_add(table_name_bytes)
+        .saturating_add(row_count_bytes)
+}
+
+fn write_prometheus_metrics(
+    output: &mut impl Write,
+    metrics: DatabaseMetricsWithTableRows,
+) -> io::Result<()> {
+    let DatabaseMetricsWithTableRows { totals, table_rows } = metrics;
+    output.write_all(TABLES_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", totals.table_count)?;
+    output.write_all(COLUMNS_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", totals.column_count)?;
+    output.write_all(RETAINED_ROWS_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", totals.retained_row_count)?;
+    output.write_all(RETAINED_VALUE_BYTES_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", totals.retained_value_bytes)?;
+    output.write_all(TABLE_ROWS_METRIC_HEADER.as_bytes())?;
+    for (table, row_count) in table_rows {
+        output.write_all(TABLE_ROW_METRIC_PREFIX.as_bytes())?;
+        output.write_all(table.as_bytes())?;
+        output.write_all(TABLE_ROW_METRIC_SEPARATOR.as_bytes())?;
+        writeln!(output, "{row_count}")?;
+    }
+    Ok(())
 }
 
 fn write_error_response(
@@ -2116,6 +2339,17 @@ fn prepare_response(
     body: &[u8],
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, usize> {
+    let response_bytes = response_len(
+        status,
+        extra_headers,
+        response_headers,
+        content_type,
+        body.len(),
+    );
+    if response_bytes > max_response_bytes {
+        return Err(response_bytes);
+    }
+
     let mut header = Vec::new();
     write!(header, "HTTP/1.1 {} {}\r\n", status.code, status.reason)
         .expect("writing HTTP headers to a Vec cannot fail");
@@ -2133,12 +2367,45 @@ fn prepare_response(
     }
     header.extend_from_slice(b"\r\n");
 
-    let response_bytes = header.len().checked_add(body.len()).unwrap_or(usize::MAX);
-    if response_bytes > max_response_bytes {
-        return Err(response_bytes);
-    }
+    debug_assert_eq!(header.len().saturating_add(body.len()), response_bytes);
     header.extend_from_slice(body);
     Ok(header)
+}
+
+fn response_len(
+    status: Status,
+    extra_headers: &[&[u8]],
+    response_headers: &[&[u8]],
+    content_type: &[u8],
+    body_len: usize,
+) -> usize {
+    let extra_header_bytes = extra_headers
+        .iter()
+        .chain(response_headers)
+        .map(|header| header.len())
+        .fold(0_usize, usize::saturating_add);
+    b"HTTP/1.1 "
+        .len()
+        .saturating_add(usize_decimal_len(usize::from(status.code)))
+        .saturating_add(1)
+        .saturating_add(status.reason.len())
+        .saturating_add(b"\r\nContent-Type: ".len())
+        .saturating_add(content_type.len())
+        .saturating_add(b"\r\nContent-Length: ".len())
+        .saturating_add(usize_decimal_len(body_len))
+        .saturating_add(b"\r\nConnection: close\r\n".len())
+        .saturating_add(extra_header_bytes)
+        .saturating_add(b"\r\n".len())
+        .saturating_add(body_len)
+}
+
+fn usize_decimal_len(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 struct BoundedVec {

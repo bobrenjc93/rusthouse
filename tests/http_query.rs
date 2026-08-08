@@ -165,8 +165,9 @@ fn metrics_body(
     columns: usize,
     retained_rows: usize,
     retained_value_bytes: usize,
+    table_rows: &[(&str, usize)],
 ) -> String {
-    format!(
+    let mut body = format!(
         "# HELP rusthouse_tables Number of tables retained by the database.\n\
          # TYPE rusthouse_tables gauge\n\
          rusthouse_tables {tables}\n\
@@ -178,8 +179,16 @@ fn metrics_body(
          rusthouse_retained_rows {retained_rows}\n\
          # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
          # TYPE rusthouse_retained_value_bytes gauge\n\
-         rusthouse_retained_value_bytes {retained_value_bytes}\n"
-    )
+         rusthouse_retained_value_bytes {retained_value_bytes}\n\
+         # HELP rusthouse_table_rows Number of rows retained by a table.\n\
+         # TYPE rusthouse_table_rows gauge\n"
+    );
+    for (table, rows) in table_rows {
+        body.push_str(&format!(
+            "rusthouse_table_rows{{table=\"{table}\"}} {rows}\n"
+        ));
+    }
+    body
 }
 
 fn assert_ok_metrics_response(
@@ -188,12 +197,20 @@ fn assert_ok_metrics_response(
     columns: usize,
     retained_rows: usize,
     retained_value_bytes: usize,
+    table_rows: &[(&str, usize)],
 ) {
     assert_response_with_content_type(
         response,
         "HTTP/1.1 200 OK",
         "text/plain; version=0.0.4; charset=utf-8",
-        metrics_body(tables, columns, retained_rows, retained_value_bytes).as_bytes(),
+        metrics_body(
+            tables,
+            columns,
+            retained_rows,
+            retained_value_bytes,
+            table_rows,
+        )
+        .as_bytes(),
     );
 }
 
@@ -928,26 +945,49 @@ fn metrics_reports_state_changes_as_prometheus_gauges() {
     let database = SharedDatabase::default();
     const REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 0, 0, 0, 0);
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 0, 0, 0, 0, &[]);
     database
         .execute(
-            "CREATE TABLE events (id Int64, score Float64, active Bool, label String); \
-             CREATE TABLE flags (active Bool); \
-             INSERT INTO events VALUES (1, 1.5, true, 'one'), (2, 2.5, false, 'two'); \
-             INSERT INTO flags VALUES (true);",
+            "CREATE TABLE zebra (id Int64, score Float64, active Bool, label String); \
+             CREATE TABLE Alpha (active Bool);",
         )
         .unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 2, 5, 3, 41);
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        2,
+        5,
+        0,
+        0,
+        &[("Alpha", 0), ("zebra", 0)],
+    );
 
     database
-        .execute("DELETE FROM events WHERE id = 2;")
+        .execute(
+            "INSERT INTO zebra VALUES (1, 1.5, true, 'one'), (2, 2.5, false, 'two'); \
+             INSERT INTO Alpha VALUES (true);",
+        )
         .unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 2, 5, 2, 21);
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        2,
+        5,
+        3,
+        41,
+        &[("Alpha", 1), ("zebra", 2)],
+    );
 
-    database
-        .execute("TRUNCATE TABLE events; DROP TABLE flags;")
-        .unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 1, 4, 0, 0);
+    database.execute("TRUNCATE TABLE zebra;").unwrap();
+    assert_ok_metrics_response(
+        &exchange(&database, REQUEST),
+        2,
+        5,
+        1,
+        1,
+        &[("Alpha", 1), ("zebra", 0)],
+    );
+
+    database.execute("DROP TABLE Alpha;").unwrap();
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 1, 4, 0, 0, &[("zebra", 0)]);
 }
 
 #[test]
@@ -1036,6 +1076,7 @@ fn metrics_requires_exact_get_without_a_body_and_retains_bearer_authentication()
         0,
         0,
         0,
+        &[],
     );
 }
 
@@ -1201,6 +1242,201 @@ fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
             r#"{"columns":[{"name":"label","type":"String"}],"rows":[["snow 雪"]]}"#,
         )
         .as_bytes(),
+    );
+}
+
+#[test]
+fn terminal_csv_with_names_format_wires_get_and_post_with_escaped_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE samples (label String); \
+             INSERT INTO samples VALUES ('comma, \"quoted\"\nline');",
+        )
+        .unwrap();
+
+    assert_response_with_content_type(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+label+FROM+samples+FORMAT+CSVWithNames%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"label\n\"comma, \"\"quoted\"\"\nline\"\n",
+    );
+
+    assert_response_with_content_type(
+        &exchange(
+            &database,
+            &request(b"SELECT label FROM samples WHERE label = 'missing' FORMAT CSVWithNames;"),
+        ),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"label\n",
+    );
+
+    assert_response_with_content_type(
+        &exchange(
+            &database,
+            b"POST /?query=SELECT+7+AS+value+format+csvwithnames HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n7\n",
+    );
+}
+
+#[test]
+fn terminal_csv_with_names_format_works_with_both_authentication_modes() {
+    let database = SharedDatabase::default();
+    let bearer = request_for_target_with_headers(
+        "/query",
+        b"SELECT 7 AS value FORMAT CSVWithNames;",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &bearer),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n7\n",
+    );
+
+    let key_response = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"GET /?query=SELECT+8+AS+value+FORMAT+CSVWithNames HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+    );
+    assert_response_with_content_type(
+        &key_response,
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n8\n",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_response);
+}
+
+#[test]
+fn terminal_csv_with_names_format_rejects_metadata_conflicts_after_authentication() {
+    let database = SharedDatabase::default();
+    let conflict_error = r#"{"error":"FORMAT CSVWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter"}"#;
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target_with_headers(
+                "/query",
+                b"SELECT 1 FORMAT CSVWithNames;",
+                "X-ClickHouse-Format: CSVWithNames\r\n",
+            ),
+        ),
+        "HTTP/1.1 400 Bad Request",
+        conflict_error,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+1+FORMAT+CSVWithNames&default_format=CSVWithNames HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        conflict_error,
+    );
+
+    let unauthorized = b"GET /?query=SELECT+1+FORMAT+CSVWithNames&default_format=CSVWithNames HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", unauthorized),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    let missing_key_response = clickhouse_key_exchange(&database, "correct-key", unauthorized);
+    assert_response(
+        &missing_key_response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&missing_key_response);
+}
+
+#[test]
+fn terminal_csv_with_names_format_ignores_quoted_and_commented_text() {
+    let database = SharedDatabase::default();
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT 'FORMAT CSVWithNames' AS value;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"String"}],"rows":[["FORMAT CSVWithNames"]]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT 1 AS value; -- FORMAT CSVWithNames"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[1]]}"#,
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+%27escaped+%27%27FORMAT+CSVWithNames%27%27%27+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"String"}],"rows":[["escaped 'FORMAT CSVWithNames'"]]}"#,
+    );
+}
+
+#[test]
+fn terminal_csv_with_names_format_preserves_single_read_only_query_and_response_limits() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT 1; SELECT 2 FORMAT CSVWithNames;"),
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query requires exactly one statement; found 2"}"#,
+    );
+    let authenticated_insert = request_for_target_with_headers(
+        "/query",
+        b"INSERT INTO events VALUES (1) FORMAT CSVWithNames;",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &authenticated_insert),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+    assert_response(
+        &exchange(&database, &request(b"SELECT id FROM events;")),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+
+    let sql = format!(
+        "SELECT '{}' AS value FORMAT CSVWithNames;",
+        "x".repeat(1_000)
+    );
+    let limits = HttpQueryLimits {
+        max_response_bytes: 512,
+        ..HttpQueryLimits::default()
+    };
+    let mut response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request(sql.as_bytes())),
+        &mut response,
+        limits,
+    )
+    .unwrap();
+    assert!(response.len() <= limits.max_response_bytes);
+    assert_response(
+        &response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
     );
 }
 
@@ -3012,7 +3248,7 @@ fn clickhouse_key_authentication_wires_query_insert_and_operational_routes() {
         key,
         b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
     );
-    assert_ok_metrics_response(&metrics_response, 1, 1, 1, 8);
+    assert_ok_metrics_response(&metrics_response, 1, 1, 1, 8, &[("events", 1)]);
     assert_clickhouse_key_response_is_not_cacheable(&metrics_response);
 }
 
@@ -3075,13 +3311,14 @@ fn authenticated_read_only_modes_wire_queries_and_operational_routes() {
         1,
         1,
         8,
+        &[("events", 1)],
     );
     let key_metrics = read_only_clickhouse_key_exchange(
         &database,
         "read-key",
         b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: read-key\r\n\r\n",
     );
-    assert_ok_metrics_response(&key_metrics, 1, 1, 1, 8);
+    assert_ok_metrics_response(&key_metrics, 1, 1, 1, 8, &[("events", 1)]);
     assert_clickhouse_key_response_is_not_cacheable(&key_metrics);
 }
 
@@ -3954,8 +4191,16 @@ fn ready_honors_exact_header_and_complete_response_byte_limits() {
 }
 
 #[test]
-fn metrics_honors_the_complete_response_byte_limit() {
+fn metrics_preflights_the_complete_response_limit_before_materializing_samples() {
     let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE Observed (id Int64); \
+             INSERT INTO Observed VALUES \
+                 (1), (2), (3), (4), (5), (6), \
+                 (7), (8), (9), (10), (11), (12);",
+        )
+        .unwrap();
     let request = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let expected_response = exchange(&database, request);
 

@@ -638,6 +638,19 @@ return an empty `200 OK` plain-text response.
 Protocol and SQL failures return deterministic JSON error objects with an
 appropriate HTTP status. All other targets and query-string shapes are rejected.
 
+As a SQL-level alternative to HTTP format metadata, every query form recognizes
+a terminal `FORMAT CSVWithNames` clause on exactly one read-only query. `FORMAT`
+and `CSVWithNames` are case-insensitive, one trailing semicolon is optional, and
+the response uses the same named CSV writer and content type described below.
+Single-quoted text (including doubled quote escapes) and `--` line comments are
+scanned using the SQL lexer rules and are never mistaken for the clause. A real
+clause cannot be combined with `X-ClickHouse-Format` or `default_format`; the
+conflict is rejected after configured authentication and before database
+access. The decoded or body SQL limit still covers the clause, and the complete
+formatted response remains bounded by the HTTP response limit. This is an HTTP
+compatibility feature only: the database and CLI SQL execution APIs remain
+unchanged.
+
 Every query route and both authenticated insert routes accept one optional
 `X-ClickHouse-Database: default` header for ClickHouse client compatibility.
 The header name is case-insensitive, surrounding optional whitespace is
@@ -760,18 +773,29 @@ process-path liveness and `/ready` when routing work only to an instance that
 can immediately begin a database read.
 
 `GET /metrics` exposes a consistent, nonblocking Prometheus text snapshot. It
-accepts no body and returns exactly four unlabeled gauges: `rusthouse_tables`,
+accepts no body and returns four unlabeled gauges: `rusthouse_tables`,
 `rusthouse_columns`, `rusthouse_retained_rows`, and
 `rusthouse_retained_value_bytes`. They report the registered table count, the
 schema-column count across all tables, the row count retained across all tables,
-and retained scalar payload bytes. The byte gauge counts each `Int64` and
-`Float64` value as 8 bytes, each `Bool` as 1 byte, and each `String` by its UTF-8
-payload length; it excludes container capacity, schema text, and allocation
-metadata and saturates at the platform's maximum `usize`. The response uses
-Prometheus text format version 0.0.4. Table and database totals are maintained
-during mutations, so a scrape reads constant-time counters instead of scanning
-retained values. The snapshot attempts one database read lock and never waits
-for a writer; lock contention and poisoning return the same deterministic
+and retained scalar payload bytes. It also returns one
+`rusthouse_table_rows{table="<display-name>"}` gauge for every current table,
+ordered case-insensitively by table name. This labeled family's cardinality is
+bounded to exactly the current catalog table count; it never creates series for
+dropped tables or for values outside the catalog. A scrape that cannot fit all
+current-table samples within the configured complete-response cap fails with
+the existing bounded response-limit error instead of returning a partial metric
+family. An allocation-free catalog pass accounts for the table count, display
+name bytes, decimal row-count bytes, and complete HTTP envelope before any name
+is cloned or sorted. The byte gauge counts each `Int64` and `Float64` value as 8
+bytes, each `Bool` as 1 byte, and each `String` by its UTF-8 payload length; it
+excludes container capacity, schema text, and allocation metadata and saturates
+at the platform's maximum `usize`. The response uses Prometheus text format
+version 0.0.4. Table and database totals are maintained during mutations, so a
+scrape reads cached counters instead of scanning retained values. When the
+preflight succeeds, capturing the per-table samples copies and sorts the current
+catalog names and row counts under the same database read-lock attempt, then
+releases the lock before formatting or writing the response. It never waits for
+a writer; lock contention and poisoning return the same deterministic
 `503 Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a

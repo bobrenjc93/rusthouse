@@ -244,6 +244,33 @@ impl Catalog {
         tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         tables.into_iter().map(|(_, table)| table.name()).collect()
     }
+
+    /// Returns owned display names and row counts in deterministic,
+    /// case-insensitive table-name order.
+    #[must_use]
+    pub(crate) fn table_row_counts(&self) -> Vec<(String, usize)> {
+        let mut tables = self.tables.iter().collect::<Vec<_>>();
+        tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        tables
+            .into_iter()
+            .map(|(_, table)| (table.name().to_owned(), table.row_count()))
+            .collect()
+    }
+
+    /// Returns the variable bytes needed to encode every table display name
+    /// and decimal row count without allocating or sorting.
+    #[must_use]
+    pub(crate) fn table_row_metric_variable_bytes(&self) -> (usize, usize) {
+        self.tables.values().fold(
+            (0_usize, 0_usize),
+            |(table_name_bytes, row_count_bytes), table| {
+                (
+                    table_name_bytes.saturating_add(table.name().len()),
+                    row_count_bytes.saturating_add(usize_decimal_len(table.row_count())),
+                )
+            },
+        )
+    }
 }
 
 fn saturating_usize(value: u128) -> usize {
@@ -252,6 +279,15 @@ fn saturating_usize(value: u128) -> usize {
 
 fn normalize(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
+}
+
+fn usize_decimal_len(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 #[cfg(test)]
@@ -300,6 +336,15 @@ mod tests {
         assert_eq!(catalog.retained_row_count(), 0);
         assert_eq!(catalog.table_name_bytes(), 14);
         assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
+        assert_eq!(catalog.table_row_metric_variable_bytes(), (14, 3));
+        assert_eq!(
+            catalog.table_row_counts(),
+            [
+                ("Alpha".to_owned(), 0),
+                ("beta".to_owned(), 0),
+                ("zebra".to_owned(), 0),
+            ]
+        );
     }
 
     #[test]
