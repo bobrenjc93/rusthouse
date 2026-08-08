@@ -415,30 +415,37 @@ fn string_to_int64_reports_invalid_and_overflowing_selected_values() {
              INSERT INTO samples VALUES \
              (1, ''), (2, ' 1'), (3, '1 '), (4, '+'), (5, '-'), \
              (6, '1.0'), (7, '--1'), (8, 'twelve'), (9, '１２'), \
-             (10, '9223372036854775808'), (11, '-9223372036854775809');",
+             (10, '92233720368547758080x'), (11, '-92233720368547758090x'), \
+             (12, '9223372036854775808'), (13, '-9223372036854775809');",
         )
         .expect("setup");
 
-    for id in 1..=9 {
-        assert_eq!(
-            database.execute(&format!(
-                "SELECT CAST(reading AS Int64) FROM samples WHERE id = {id}"
-            )),
-            Err(Error::InvalidCast {
-                source_type: DataType::String,
-                target_type: DataType::Int64,
-            }),
-            "row {id}"
-        );
+    for id in 1..=11 {
+        for order_by in ["", " ORDER BY converted"] {
+            assert_eq!(
+                database.execute(&format!(
+                    "SELECT CAST(reading AS Int64) AS converted \
+                     FROM samples WHERE id = {id}{order_by}"
+                )),
+                Err(Error::InvalidCast {
+                    source_type: DataType::String,
+                    target_type: DataType::Int64,
+                }),
+                "row {id}, ordering {order_by:?}"
+            );
+        }
     }
-    for id in [10, 11] {
-        assert_eq!(
-            database.execute(&format!(
-                "SELECT CAST(reading AS Int64) FROM samples WHERE id = {id}"
-            )),
-            Err(Error::NumericOverflow("CAST(String AS Int64)".to_owned())),
-            "row {id}"
-        );
+    for id in [12, 13] {
+        for order_by in ["", " ORDER BY converted"] {
+            assert_eq!(
+                database.execute(&format!(
+                    "SELECT CAST(reading AS Int64) AS converted \
+                     FROM samples WHERE id = {id}{order_by}"
+                )),
+                Err(Error::NumericOverflow("CAST(String AS Int64)".to_owned())),
+                "row {id}, ordering {order_by:?}"
+            );
+        }
     }
 }
 

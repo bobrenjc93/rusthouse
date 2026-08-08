@@ -4176,16 +4176,40 @@ fn checked_float64_to_int64(value: f64) -> Result<i64> {
 }
 
 fn checked_string_to_int64(value: &str) -> Result<i64> {
-    value.parse::<i64>().map_err(|error| {
-        if matches!(
-            error.kind(),
-            std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
-        ) {
-            Error::NumericOverflow("CAST(String AS Int64)".to_owned())
+    const MAX_MAGNITUDE_DIGITS: usize = 19;
+    const NEGATIVE_LIMIT: u64 = 1_u64 << 63;
+
+    // Validate every byte before classifying the magnitude. The standard
+    // integer parser may report overflow before it reaches a malformed suffix.
+    let decimal = decimal_text(value).ok_or_else(invalid_string_cast)?;
+    if decimal.magnitude_len > MAX_MAGNITUDE_DIGITS {
+        return Err(Error::NumericOverflow("CAST(String AS Int64)".to_owned()));
+    }
+
+    let magnitude_end = decimal.magnitude_start + decimal.magnitude_len;
+    let magnitude = value.as_bytes()[decimal.magnitude_start..magnitude_end]
+        .iter()
+        .fold(0_u64, |magnitude, digit| {
+            magnitude * 10 + u64::from(*digit - b'0')
+        });
+    let limit = if decimal.negative {
+        NEGATIVE_LIMIT
+    } else {
+        i64::MAX as u64
+    };
+    if magnitude > limit {
+        return Err(Error::NumericOverflow("CAST(String AS Int64)".to_owned()));
+    }
+
+    if decimal.negative {
+        if magnitude == NEGATIVE_LIMIT {
+            Ok(i64::MIN)
         } else {
-            invalid_string_cast()
+            Ok(-(magnitude as i64))
         }
-    })
+    } else {
+        Ok(magnitude as i64)
+    }
 }
 
 fn invalid_string_cast() -> Error {
