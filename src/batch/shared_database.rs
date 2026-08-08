@@ -500,7 +500,8 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         | Statement::AddColumn { .. }
         | Statement::DropColumn { .. }
         | Statement::AlterUpdate { .. }
-        | Statement::AlterUpdateTyped { .. } => {
+        | Statement::AlterUpdateTyped { .. }
+        | Statement::AlterUpdateOwned { .. } => {
             Err(SharedDatabaseError::ReadOnlyStatementRequired {
                 statement: "ALTER TABLE",
             })

@@ -1,6 +1,6 @@
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{AlterUpdateLiteral, Statement, parse};
+use rusthouse::batch::sql::{AlterUpdateLiteral, AlterUpdateValue, Statement, parse};
 use rusthouse::batch::storage::Column;
 use rusthouse::batch::value::{DataType, Value};
 use rusthouse::{SharedDatabase, SharedDatabaseError};
@@ -99,25 +99,52 @@ fn parses_int64_bool_and_finite_float64_alter_update_literals() {
 }
 
 #[test]
+fn legacy_alter_update_literal_remains_copy_const_and_exhaustive() {
+    const LEGACY_DATA_TYPE: DataType = AlterUpdateLiteral::Int64(7).data_type();
+    const LEGACY_VALUE: Value = AlterUpdateLiteral::Bool(true).value();
+
+    fn requires_copy<T: Copy>() {}
+    fn exhaustive(literal: AlterUpdateLiteral) -> DataType {
+        match literal {
+            AlterUpdateLiteral::Int64(_) => DataType::Int64,
+            AlterUpdateLiteral::Float64(_) => DataType::Float64,
+            AlterUpdateLiteral::Bool(_) => DataType::Bool,
+        }
+    }
+
+    requires_copy::<AlterUpdateLiteral>();
+    let data_type_method: fn(AlterUpdateLiteral) -> DataType = AlterUpdateLiteral::data_type;
+    let value_method: fn(AlterUpdateLiteral) -> Value = AlterUpdateLiteral::value;
+    assert_eq!(LEGACY_DATA_TYPE, DataType::Int64);
+    assert_eq!(LEGACY_VALUE, Value::Bool(true));
+    assert_eq!(
+        data_type_method(AlterUpdateLiteral::Float64(1.5)),
+        DataType::Float64
+    );
+    assert_eq!(value_method(AlterUpdateLiteral::Int64(9)), Value::Int64(9));
+    assert_eq!(exhaustive(AlterUpdateLiteral::Bool(false)), DataType::Bool);
+}
+
+#[test]
 fn parses_empty_unicode_and_doubled_quote_string_literals() {
     assert_eq!(
         parse("ALTER TABLE Events UPDATE Label = 'it''s 🚀' WHERE Category = 'café'"),
-        Ok(vec![Statement::AlterUpdateTyped {
+        Ok(vec![Statement::AlterUpdateOwned {
             table: "Events".to_owned(),
             target_column: "Label".to_owned(),
-            value: AlterUpdateLiteral::String("it's 🚀".to_owned()),
+            value: AlterUpdateValue::String("it's 🚀".to_owned()),
             predicate_column: "Category".to_owned(),
-            predicate_value: AlterUpdateLiteral::String("café".to_owned()),
+            predicate_value: AlterUpdateValue::String("café".to_owned()),
         }])
     );
     assert_eq!(
         parse("ALTER TABLE Events UPDATE Label = '' WHERE Category = ''"),
-        Ok(vec![Statement::AlterUpdateTyped {
+        Ok(vec![Statement::AlterUpdateOwned {
             table: "Events".to_owned(),
             target_column: "Label".to_owned(),
-            value: AlterUpdateLiteral::String(String::new()),
+            value: AlterUpdateValue::String(String::new()),
             predicate_column: "Category".to_owned(),
-            predicate_value: AlterUpdateLiteral::String(String::new()),
+            predicate_value: AlterUpdateValue::String(String::new()),
         }])
     );
 }
@@ -302,6 +329,99 @@ fn string_validation_failures_roll_back_values_and_retained_bytes() {
     assert_eq!(
         string_column(&database, "events", "category"),
         vec!["queued", "done"]
+    );
+    assert_eq!(
+        database
+            .catalog()
+            .table("events")
+            .unwrap()
+            .retained_value_bytes(),
+        retained_before
+    );
+}
+
+fn string_update_database(max_replacement_bytes: usize) -> Database {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: max_replacement_bytes,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, selected Bool, label String); \
+             INSERT INTO events VALUES \
+                 (1, true, 'a'), (2, true, 'b'), (3, false, 'c');",
+        )
+        .expect("setup succeeds");
+    database
+}
+
+#[test]
+fn string_replacement_bytes_accept_the_exact_limit_and_reject_before_mutation() {
+    let replacement = "é🚀";
+    let required_bytes = replacement.len() * 2;
+    let mut exact = string_update_database(required_bytes);
+
+    assert_eq!(
+        exact.execute("ALTER TABLE events UPDATE label = 'é🚀' WHERE selected = true;"),
+        Ok(vec![StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 2,
+        }])
+    );
+    assert_eq!(
+        string_column(&exact, "events", "label"),
+        vec![replacement, replacement, "c"]
+    );
+
+    let mut exceeded = string_update_database(required_bytes - 1);
+    let retained_before = exceeded
+        .catalog()
+        .table("events")
+        .unwrap()
+        .retained_value_bytes();
+    assert_eq!(
+        exceeded.execute("ALTER TABLE events UPDATE label = 'é🚀' WHERE selected = true;"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "ALTER TABLE UPDATE replacement String bytes",
+            actual: required_bytes,
+            max: required_bytes - 1,
+        })
+    );
+    assert_eq!(
+        string_column(&exceeded, "events", "label"),
+        vec!["a", "b", "c"]
+    );
+    assert_eq!(
+        exceeded
+            .catalog()
+            .table("events")
+            .unwrap()
+            .retained_value_bytes(),
+        retained_before
+    );
+}
+
+#[test]
+fn zero_match_string_update_clones_nothing_and_fits_a_zero_byte_limit() {
+    let mut database = string_update_database(0);
+    let retained_before = database
+        .catalog()
+        .table("events")
+        .unwrap()
+        .retained_value_bytes();
+    let large_assignment = "x".repeat(64 * 1024);
+    let sql = format!("ALTER TABLE events UPDATE label = '{large_assignment}' WHERE id = 99;");
+
+    assert_eq!(
+        database.execute(&sql),
+        Ok(vec![StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 0,
+        }])
+    );
+    assert_eq!(
+        string_column(&database, "events", "label"),
+        vec!["a", "b", "c"]
     );
     assert_eq!(
         database

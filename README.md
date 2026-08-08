@@ -176,8 +176,12 @@ table and both columns are resolved, type-checked, and checked for finite
 Float64 literals before the full source row count is checked against the
 configured scan limit. After that bounded scan, all matches from the original
 predicate column are passed to one atomic column replacement, including an
-empty replacement for zero matches. Invalid syntax, missing names, wrong types,
-non-finite values, and scan-limit failures leave the table unchanged.
+empty replacement for zero matches. Before allocating replacements for a
+String assignment, RustHouse counts matches without cloning and checks the
+matched count times the assignment's UTF-8 byte length against the configured
+query byte limit (16 MiB by default). Only matching rows clone the assignment.
+Invalid syntax, missing names, wrong types, non-finite values, scan-limit
+failures, and replacement-byte-limit failures leave the table unchanged.
 Expressions, additional assignments or predicates, other operators, and
 clauses such as `LIMIT` are not supported. A successful command reports its
 matched-row count through the library API and is silent in formatted CLI
@@ -472,7 +476,8 @@ UPDATE` inspects at most 1,000,000 source rows by default. This scanned-row
 limit is checked against the full source table before matching-row indices or
 replacement values are allocated, so `WHERE` selectivity and `LIMIT` do not
 reduce it; each `UNION` operand and each `CROSS JOIN` input has its own source
-scan.
+scan. String assignments additionally bound their matched replacement payload
+to 16 MiB by default before cloning any replacement values.
 It is distinct from the 10,000-row output limit, which applies after filtering,
 grouping, ordering, and `LIMIT`. Query output is also checked before cloning
 against a limit of 250,000 values and an estimated 16 MiB. Grouped queries
