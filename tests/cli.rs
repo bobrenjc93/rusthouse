@@ -100,6 +100,24 @@ fn json_cli_executes_int64_alter_update_silently() {
 }
 
 #[test]
+fn json_cli_executes_bool_alter_update_silently() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE events (id Int64, active Bool, selected Bool); \
+          INSERT INTO events VALUES (1, false, false), (2, false, true), (3, false, true); \
+          ALTER TABLE events UPDATE active = true WHERE selected = TRUE; \
+          SELECT id, active FROM events ORDER BY id;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"active\",\"type\":\"Bool\"}],\"rows\":[[1,false],[2,true],[3,true]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_exposes_typed_defaults_from_reordered_insert_subsets() {
     let output = run(
         &["--format", "json"],
