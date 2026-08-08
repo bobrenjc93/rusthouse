@@ -46,6 +46,15 @@ pub const ESTIMATED_GROUP_KEY_CELL_BYTES: usize = std::mem::size_of::<ValueRef<'
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS: usize = 500_000;
 /// Maximum estimated aggregate state heap retained by one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
+/// Minimum matched rows that a global `countIf(Bool)` evaluates sequentially.
+///
+/// Parallel evaluation is considered only when the matched row count is
+/// strictly greater than this threshold.
+pub const COUNT_IF_PARALLEL_ROW_THRESHOLD: usize = 4 * 1024;
+/// Maximum number of scoped workers used by one global `countIf(Bool)`.
+///
+/// The executor also caps this value by [`std::thread::available_parallelism`].
+pub const MAX_COUNT_IF_PARALLEL_WORKERS: usize = 16;
 
 /// Resource limits for source scans, query-result materialization, ordering,
 /// and grouped working state.
@@ -159,6 +168,31 @@ pub struct Database {
     measurements: DatabaseMeasurements,
     query_result_limits: QueryResultLimits,
     table_limits: TableLimits,
+    count_if_parallelism: CountIfParallelism,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CountIfParallelism {
+    System,
+    #[cfg(test)]
+    Fixed(usize),
+}
+
+impl CountIfParallelism {
+    fn worker_count(self, matched_rows: usize) -> usize {
+        if matched_rows <= COUNT_IF_PARALLEL_ROW_THRESHOLD {
+            return 1;
+        }
+
+        let available_workers = match self {
+            Self::System => std::thread::available_parallelism().map_or(1, |value| value.get()),
+            #[cfg(test)]
+            Self::Fixed(workers) => workers,
+        };
+        available_workers
+            .clamp(1, MAX_COUNT_IF_PARALLEL_WORKERS)
+            .min(matched_rows)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -259,6 +293,7 @@ impl Default for Database {
             measurements: DatabaseMeasurements::default(),
             query_result_limits: QueryResultLimits::default(),
             table_limits: TableLimits::default(),
+            count_if_parallelism: CountIfParallelism::System,
         }
     }
 }
@@ -297,6 +332,7 @@ impl Database {
             measurements: DatabaseMeasurements::default(),
             query_result_limits,
             table_limits: TableLimits::default(),
+            count_if_parallelism: CountIfParallelism::System,
         }
     }
 
@@ -1383,6 +1419,7 @@ impl Database {
                 &group_columns,
                 &aggregate_specs,
                 query_result_limits,
+                self.count_if_parallelism,
             )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             if let Some(having) = having {
@@ -3245,6 +3282,7 @@ fn execute_grouped<'a>(
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
     limits: QueryResultLimits,
+    count_if_parallelism: CountIfParallelism,
 ) -> Result<GroupedData<'a>> {
     let planned_group_count = if group_columns.is_empty() {
         enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
@@ -3311,6 +3349,19 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
+    if group_columns.is_empty() {
+        for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
+            if spec.function == AggregateFunction::CountIf {
+                states[0] = AggregateState::Count(count_global_count_if(
+                    table,
+                    matching_rows,
+                    spec,
+                    count_if_parallelism,
+                )?);
+            }
+        }
+    }
+
     for row in matching_rows {
         let existing_group = groups.find(table, group_columns, *row, &mut multiple_key_probe);
         let (group, inserted) = if let Some(group) = existing_group {
@@ -3344,6 +3395,9 @@ fn execute_grouped<'a>(
         debug_assert!(!inserted || group + 1 == group_count);
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
+            if group_columns.is_empty() && spec.function == AggregateFunction::CountIf {
+                continue;
+            }
             states[group].update(
                 spec,
                 table,
@@ -3366,6 +3420,91 @@ fn execute_grouped<'a>(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(GroupedData { keys, aggregates })
+}
+
+fn count_global_count_if(
+    table: &Table,
+    matching_rows: &[usize],
+    spec: &AggregateSpec,
+    parallelism: CountIfParallelism,
+) -> Result<i64> {
+    debug_assert_eq!(spec.function, AggregateFunction::CountIf);
+    let Column::Bool(values) = &table.columns()[spec.argument.expect("countIf argument")] else {
+        unreachable!("countIf input type is resolved")
+    };
+    let worker_count = parallelism.worker_count(matching_rows.len());
+    if worker_count == 1 {
+        return count_if_chunk(values, matching_rows);
+    }
+
+    // Each worker receives one deterministic, contiguous slice of the
+    // already-filtered row index vector. If a scoped worker cannot be spawned
+    // or panics, discard every partial and repeat the complete count locally.
+    try_parallel_count_if(values, matching_rows, worker_count)
+        .unwrap_or_else(|| count_if_chunk(values, matching_rows))
+}
+
+fn try_parallel_count_if(
+    values: &[bool],
+    matching_rows: &[usize],
+    worker_count: usize,
+) -> Option<Result<i64>> {
+    debug_assert!(worker_count > 1);
+    let chunk_len = matching_rows.len().div_ceil(worker_count);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        let mut worker_failed = false;
+        for (chunk_index, rows) in matching_rows.chunks(chunk_len).enumerate() {
+            let spawn = std::thread::Builder::new()
+                .name(format!("rusthouse-count-if-{chunk_index}"))
+                .spawn_scoped(scope, move || count_if_chunk(values, rows));
+            match spawn {
+                Ok(handle) => handles.push(handle),
+                Err(_) => {
+                    worker_failed = true;
+                    break;
+                }
+            }
+        }
+
+        let mut partial_results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => partial_results.push(result),
+                Err(_) => worker_failed = true,
+            }
+        }
+        if worker_failed {
+            return None;
+        }
+
+        Some(
+            partial_results
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .and_then(reduce_count_if_counts),
+        )
+    })
+}
+
+fn count_if_chunk(values: &[bool], matching_rows: &[usize]) -> Result<i64> {
+    matching_rows.iter().try_fold(0_i64, |count, row| {
+        if values[*row] {
+            count
+                .checked_add(1)
+                .ok_or_else(|| Error::NumericOverflow("countIf".to_owned()))
+        } else {
+            Ok(count)
+        }
+    })
+}
+
+fn reduce_count_if_counts(partial_counts: Vec<i64>) -> Result<i64> {
+    partial_counts.into_iter().try_fold(0_i64, |total, count| {
+        total
+            .checked_add(count)
+            .ok_or_else(|| Error::NumericOverflow("countIf".to_owned()))
+    })
 }
 
 #[derive(Debug)]
@@ -4870,6 +5009,38 @@ mod tests {
         }
     }
 
+    fn count_if_database(row_count: usize) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE empty_events (active Bool); \
+                 CREATE TABLE events (id Int64, active Bool, included Bool);",
+            )
+            .expect("countIf differential setup");
+        if row_count > 0 {
+            let rows = (1..=row_count)
+                .map(|id| format!("({id}, {}, {})", id % 2 == 0, id % 3 != 0))
+                .collect::<Vec<_>>()
+                .join(",");
+            database
+                .execute(&format!("INSERT INTO events VALUES {rows}"))
+                .expect("countIf differential rows");
+        }
+        database
+    }
+
+    fn force_count_if_workers(database: &mut Database, workers: usize, sql: &str) -> QueryResult {
+        database.count_if_parallelism = CountIfParallelism::Fixed(workers);
+        query(database, sql)
+    }
+
+    fn assert_count_if_worker_differential(database: &mut Database, sql: &str) -> QueryResult {
+        let single_worker = force_count_if_workers(database, 1, sql);
+        let multi_worker = force_count_if_workers(database, 4, sql);
+        assert_eq!(single_worker, multi_worker, "worker differential for {sql}");
+        multi_worker
+    }
+
     #[test]
     fn insert_batch_preflight_rejects_non_finite_ast_values_without_mutation() {
         let mut database = Database::new();
@@ -4946,6 +5117,90 @@ mod tests {
                     Value::Float64(4.0),
                 ],
             ]
+        );
+    }
+
+    #[test]
+    fn global_count_if_forced_workers_match_for_empty_input() {
+        let mut database = count_if_database(0);
+        let result = assert_count_if_worker_differential(
+            &mut database,
+            "SELECT countIf(active) FROM empty_events",
+        );
+        assert_eq!(result.rows, [vec![Value::Int64(0)]]);
+    }
+
+    #[test]
+    fn global_count_if_forced_workers_match_after_filtering() {
+        let row_count = COUNT_IF_PARALLEL_ROW_THRESHOLD * 2;
+        let mut database = count_if_database(row_count);
+        let result = assert_count_if_worker_differential(
+            &mut database,
+            "SELECT countIf(active) FROM events WHERE included = true",
+        );
+        let expected = (1..=row_count)
+            .filter(|id| id % 2 == 0 && id % 3 != 0)
+            .count() as i64;
+        assert_eq!(result.rows, [vec![Value::Int64(expected)]]);
+    }
+
+    #[test]
+    fn global_count_if_forced_workers_match_at_parallel_boundary() {
+        let row_count = COUNT_IF_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = count_if_database(row_count);
+        for matched_rows in [
+            COUNT_IF_PARALLEL_ROW_THRESHOLD,
+            COUNT_IF_PARALLEL_ROW_THRESHOLD + 1,
+        ] {
+            let result = assert_count_if_worker_differential(
+                &mut database,
+                &format!("SELECT countIf(active) FROM events WHERE id <= {matched_rows}"),
+            );
+            assert_eq!(result.rows, [vec![Value::Int64((matched_rows / 2) as i64)]]);
+        }
+    }
+
+    #[test]
+    fn global_count_if_forced_workers_match_with_pagination() {
+        let matched_rows = COUNT_IF_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = count_if_database(matched_rows);
+        let first_page = assert_count_if_worker_differential(
+            &mut database,
+            &format!(
+                "SELECT COUNT(*) AS rows, countIf(active) AS matches FROM events \
+                 WHERE id <= {matched_rows} ORDER BY matches DESC LIMIT 1 OFFSET 0"
+            ),
+        );
+        assert_eq!(
+            first_page.rows,
+            [vec![
+                Value::Int64(matched_rows as i64),
+                Value::Int64((matched_rows / 2) as i64),
+            ]]
+        );
+
+        let second_page = assert_count_if_worker_differential(
+            &mut database,
+            &format!(
+                "SELECT COUNT(*) AS rows, countIf(active) AS matches FROM events \
+                 WHERE id <= {matched_rows} ORDER BY matches DESC LIMIT 1 OFFSET 1"
+            ),
+        );
+        assert!(second_page.rows.is_empty());
+    }
+
+    #[test]
+    fn global_count_if_worker_selection_and_reduction_are_bounded_and_checked() {
+        let boundary = COUNT_IF_PARALLEL_ROW_THRESHOLD;
+        assert_eq!(CountIfParallelism::Fixed(4).worker_count(boundary), 1);
+        assert_eq!(CountIfParallelism::Fixed(4).worker_count(boundary + 1), 4);
+        assert_eq!(
+            CountIfParallelism::Fixed(MAX_COUNT_IF_PARALLEL_WORKERS + 1).worker_count(boundary + 1),
+            MAX_COUNT_IF_PARALLEL_WORKERS
+        );
+        assert_eq!(
+            reduce_count_if_counts(vec![i64::MAX, 1]),
+            Err(Error::NumericOverflow("countIf".to_owned()))
         );
     }
 

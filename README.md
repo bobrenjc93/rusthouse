@@ -63,6 +63,12 @@ unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` and
 non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
 global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
+Global `countIf(Bool)` inputs with more than 4,096 matched rows use
+deterministic contiguous chunks and scoped threads. Worker count is capped at
+both 16 and the process's available parallelism; checked partial reduction and
+a sequential fallback preserve the same result if workers cannot run. Inputs
+at or below the threshold, grouped `countIf`, and all other aggregates remain
+sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
