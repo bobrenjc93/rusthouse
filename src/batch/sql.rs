@@ -1431,6 +1431,10 @@ impl<'a> Parser<'a> {
             });
         }
 
+        if self.eat_keyword("DELETE") {
+            return self.parse_delete_where(table);
+        }
+
         self.expect_keyword("DROP")?;
         self.expect_keyword("COLUMN")?;
         let column = self.expect_identifier("column name")?;
@@ -1466,6 +1470,13 @@ impl<'a> Parser<'a> {
     fn parse_delete(&mut self) -> Result<Statement> {
         self.expect_keyword("FROM")?;
         let table = self.expect_identifier("table name")?;
+        self.parse_delete_where(table)
+    }
+
+    /// Parse the predicate shared by `DELETE FROM <table>` and ClickHouse's
+    /// `ALTER TABLE <table> DELETE` spelling, lowering both to the same narrow
+    /// deletion statement shapes.
+    fn parse_delete_where(&mut self, table: String) -> Result<Statement> {
         self.expect_keyword("WHERE")?;
         self.predicate_depth = 0;
         self.predicate_nodes = 0;
