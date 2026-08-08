@@ -1059,6 +1059,7 @@ impl Database {
                         selection_limit,
                     );
                 }
+                apply_offset(&mut selected_groups, select.offset.unwrap_or(0));
             } else {
                 order_grouped_rows(
                     &mut selected_groups,
@@ -1532,7 +1533,7 @@ fn validate_distinct_shape(select: &Select) -> Result<()> {
             .all(|item| matches!(item, SelectItem::Column { alias: None, .. }));
     if !unaliased_columns || !select.group_by.is_empty() || select.having.is_some() {
         return Err(Error::InvalidQuery(
-            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, optional ordering by projected physical columns, and an optional LIMIT".to_owned(),
+            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, optional ordering by projected physical columns, and an optional LIMIT <count> [OFFSET <offset>]".to_owned(),
         ));
     }
 
@@ -1584,8 +1585,7 @@ fn validate_offset_shape(select: &Select) -> Result<()> {
             "OFFSET requires LIMIT <count>".to_owned(),
         ));
     }
-    if select.distinct
-        || !select.group_by.is_empty()
+    if !select.group_by.is_empty()
         || select.having.is_some()
         || select.items.iter().any(|item| {
             matches!(
@@ -1595,7 +1595,7 @@ fn validate_offset_shape(select: &Select) -> Result<()> {
         })
     {
         return Err(Error::InvalidQuery(
-            "OFFSET is only supported for ungrouped, non-DISTINCT, non-window SELECT projections"
+            "OFFSET is only supported for ungrouped or physical-column DISTINCT, non-window SELECT projections"
                 .to_owned(),
         ));
     }

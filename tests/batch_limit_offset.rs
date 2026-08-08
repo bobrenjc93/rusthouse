@@ -12,7 +12,7 @@ fn query(database: &mut Database, sql: &str) -> QueryResult {
 }
 
 #[test]
-fn parses_limit_offset_only_for_regular_ungrouped_non_window_selects() {
+fn parses_limit_offset_for_regular_and_physical_column_distinct_selects() {
     let statements = parse(
         "SELECT reading - 1 AS adjusted FROM samples \
          WHERE reading >= 0 ORDER BY adjusted DESC LIMIT 2 OFFSET 3",
@@ -35,6 +35,15 @@ fn parses_limit_offset_only_for_regular_ungrouped_non_window_selects() {
     };
     assert_eq!(select.limit, Some(4));
     assert_eq!(select.offset, None);
+
+    let distinct = parse("SELECT DISTINCT reading FROM samples ORDER BY reading LIMIT 2 OFFSET 1")
+        .expect("physical-column DISTINCT pagination parses");
+    let [Statement::Select(select)] = distinct.as_slice() else {
+        panic!("expected DISTINCT SELECT");
+    };
+    assert!(select.distinct);
+    assert_eq!(select.limit, Some(2));
+    assert_eq!(select.offset, Some(1));
 }
 
 #[test]
@@ -45,9 +54,13 @@ fn rejects_malformed_offsets_and_unsupported_select_shapes() {
         "SELECT n FROM samples LIMIT 1 OFFSET -1",
         "SELECT n FROM samples LIMIT 1 OFFSET 1.5",
         "SELECT n FROM samples LIMIT 1 OFFSET many",
+        "SELECT DISTINCT n FROM samples OFFSET 1",
+        "SELECT DISTINCT n FROM samples LIMIT 1 OFFSET",
+        "SELECT DISTINCT n FROM samples LIMIT 1 OFFSET -1",
+        "SELECT DISTINCT n FROM samples LIMIT 1 OFFSET 1.5",
+        "SELECT DISTINCT n FROM samples LIMIT 1 OFFSET many",
         "SELECT COUNT(*) FROM samples LIMIT 1 OFFSET 1",
         "SELECT n, COUNT(*) FROM samples GROUP BY n LIMIT 1 OFFSET 1",
-        "SELECT DISTINCT n FROM samples LIMIT 1 OFFSET 1",
         "SELECT n, ROW_NUMBER() OVER () FROM samples LIMIT 1 OFFSET 1",
         "SELECT 1 LIMIT 1 OFFSET 1",
         "SELECT * FROM samples CROSS JOIN other LIMIT 1 OFFSET 1",
