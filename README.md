@@ -859,6 +859,17 @@ over-wide, or quoted headers and malformed data quoting are rejected. Every
 record must match the selected header width. Any input, schema, value, limit,
 or remaining-capacity failure leaves the table unchanged.
 
+`Database::ingest_tsv` atomically appends bounded, headerless `TabSeparated`
+input in physical schema order. Every physical line is a data row and must
+supply every column; empty input is a zero-row no-op. The blocking
+`SharedDatabase::ingest_tsv` retains one write lock through lookup, parsing,
+all byte, row, total-value, and remaining table-capacity checks, and the one
+atomic append. `SharedDatabase::try_ingest_tsv` has the same behavior after one
+immediate lock attempt, returning `DatabaseBusy` before table lookup or input
+access when contended. Fields reuse the typed parsing and ClickHouse-style
+backslash escapes described below for `TabSeparatedWithNames`. Any late row,
+value, escape, line-ending, or capacity failure preserves all existing rows.
+
 `Database::ingest_tsv_with_names` provides the corresponding bounded,
 multi-column `TabSeparatedWithNames` importer, with
 `SharedDatabase::ingest_tsv_with_names` likewise retaining one write lock

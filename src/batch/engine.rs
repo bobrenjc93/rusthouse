@@ -633,6 +633,50 @@ impl Database {
         Ok(affected_rows)
     }
 
+    /// Atomically appends bounded, typed, headerless `TabSeparated` input.
+    ///
+    /// Every physical line is data and must contain exactly one field for each
+    /// physical schema column, in schema order. Fields use the TSV writer's
+    /// ClickHouse-style escapes: `\\`, `\t`, `\r`, `\n`, `\0`, `\b`, `\f`, and
+    /// `\'`. Decoded values parse as `Int64`, finite `Float64`, `Bool`, or
+    /// `String`; records may use LF or CRLF. Empty input appends zero rows.
+    ///
+    /// The complete input, every row and value, configured limits, and
+    /// remaining table capacity are validated before any physical column is
+    /// changed. Every error therefore leaves the target table unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::engine::Database;
+    /// use rusthouse::batch::tsv::TsvIngestLimits;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute("CREATE TABLE notes (id Int64, text String);")?;
+    /// let input = b"7\tline\\nwith\\ttab\n";
+    /// let rows = database.ingest_tsv(
+    ///     "notes",
+    ///     input,
+    ///     TsvIngestLimits::new(input.len(), 1, 2),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_tsv(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: TsvIngestLimits,
+    ) -> std::result::Result<usize, TsvIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            tsv::parse_rows_without_names(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        self.table_mut(table)?.append_prepared_insert_rows(rows);
+        Ok(affected_rows)
+    }
+
     /// Atomically appends bounded, typed `TabSeparatedWithNames` input.
     ///
     /// The decoded header must contain a nonempty, duplicate-free subset of
@@ -672,7 +716,7 @@ impl Database {
     ) -> std::result::Result<usize, TsvIngestError> {
         let rows = {
             let target = self.catalog.table(table)?;
-            tsv::parse_rows(target, input.as_ref(), limits)?
+            tsv::parse_rows_with_names(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
         self.table_mut(table)?.append_prepared_insert_rows(rows);
