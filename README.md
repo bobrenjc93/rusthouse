@@ -163,21 +163,29 @@ semicolon is optional.
 
 `ALTER TABLE <table> UPDATE <target> = <literal> WHERE <column> = <literal>`
 provides one deliberately narrow ClickHouse-style mutation. The target and
-predicate may independently be existing `Int64`, `Float64`, or `Bool` columns,
-and each literal must have its corresponding column's type. `Int64` literals
-support the complete optionally signed range. `Float64` literals use finite,
-optionally signed decimal or scientific notation; a decimal point or exponent
-distinguishes them from `Int64` literals. Boolean literals are case-insensitive
-`TRUE` or `FALSE`. Table and column lookup is case-insensitive. The table and
-both columns are resolved, type-checked, and checked for finite Float64 literals
-before the full source row count is checked against the configured scan limit.
-After that bounded scan, all matches from the original predicate column are
-passed to one atomic column replacement, including an empty replacement for
-zero matches. Invalid syntax, missing names, wrong types, non-finite values, and
-scan-limit failures leave the table unchanged. Expressions, additional
-assignments or predicates, other operators, `String` operands, and clauses such
-as `LIMIT` are not supported. A successful command reports its matched-row
-count through the library API and is silent in formatted CLI output.
+predicate may independently be existing `Int64`, `Float64`, `Bool`, or `String`
+columns, and each literal must have its corresponding column's type. `Int64`
+literals support the complete optionally signed range. `Float64` literals use
+finite, optionally signed decimal or scientific notation; a decimal point or
+exponent distinguishes them from `Int64` literals. Boolean literals are
+case-insensitive `TRUE` or `FALSE`. String literals are single-quoted, may be
+empty or contain Unicode, and escape an apostrophe by doubling it. For example,
+`ALTER TABLE events UPDATE label = 'it''s ready' WHERE category = 'queued'`
+updates every matching label. Table and column lookup is case-insensitive. The
+table and both columns are resolved, type-checked, and checked for finite
+Float64 literals before the full source row count is checked against the
+configured scan limit. After that bounded scan, all matches from the original
+predicate column are passed to one atomic column replacement, including an
+empty replacement for zero matches. Before allocating replacements for a
+String assignment, RustHouse counts matches without cloning and checks the
+matched count times the assignment's UTF-8 byte length against the configured
+query byte limit (16 MiB by default). Only matching rows clone the assignment.
+Invalid syntax, missing names, wrong types, non-finite values, scan-limit
+failures, and replacement-byte-limit failures leave the table unchanged.
+Expressions, additional assignments or predicates, other operators, and
+clauses such as `LIMIT` are not supported. A successful command reports its
+matched-row count through the library API and is silent in formatted CLI
+output.
 
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
@@ -468,7 +476,8 @@ UPDATE` inspects at most 1,000,000 source rows by default. This scanned-row
 limit is checked against the full source table before matching-row indices or
 replacement values are allocated, so `WHERE` selectivity and `LIMIT` do not
 reduce it; each `UNION` operand and each `CROSS JOIN` input has its own source
-scan.
+scan. String assignments additionally bound their matched replacement payload
+to 16 MiB by default before cloning any replacement values.
 It is distinct from the 10,000-row output limit, which applies after filtering,
 grouping, ordering, and `LIMIT`. Query output is also checked before cloning
 against a limit of 250,000 values and an estimated 16 MiB. Grouped queries
@@ -579,15 +588,16 @@ count toward that limit. Empty parameters or values, duplicate `query`,
 `database`, or `default_format` parameters, unknown parameters, malformed
 escapes, non-default database values, unsupported formats, and invalid SQL
 UTF-8 are rejected. Parameter validation follows configured authentication and
-precedes database access. GET requests and every request handled by the
-unauthenticated APIs use the read-only, exactly-one-statement
-`SharedDatabase::try_query` path. An authenticated POST without an explicit
-output-format selector additionally accepts a nonempty `INSERT`-only batch and
-uses the atomic `SharedDatabase::try_execute_insert_batch` path. Mixed batches,
-other mutations, and INSERT requests carrying `X-ClickHouse-Format` or
-`default_format` are rejected without mutation. Successful queries use the same
-compact JSON column metadata and positional-row shape as `--format json`;
-successful INSERT batches return an empty `200 OK` plain-text response.
+precedes database access. GET requests and every request handled by any
+read-only API use the read-only, exactly-one-statement
+`SharedDatabase::try_query` path. A POST through an insertion-capable
+authenticated handler without an explicit output-format selector additionally
+accepts a nonempty `INSERT`-only batch and uses the atomic
+`SharedDatabase::try_execute_insert_batch` path. Mixed batches, other mutations,
+and INSERT requests carrying `X-ClickHouse-Format` or `default_format` are
+rejected without mutation. Successful queries use the same compact JSON column
+metadata and positional-row shape as `--format json`; successful INSERT batches
+return an empty `200 OK` plain-text response.
 Protocol and SQL failures return deterministic JSON error objects with an
 appropriate HTTP status. All other targets and query-string shapes are rejected.
 
@@ -604,8 +614,8 @@ For parameterized GET and POST queries, the header and `database=default` query
 parameter may coexist; each is validated independently against the same single
 database.
 
-The bearer- and `X-ClickHouse-Key`-authenticated handlers also expose exact
-`POST /insert` as an explicit write route. It requires one decimal
+The insertion-capable bearer- and `X-ClickHouse-Key`-authenticated handlers also
+expose exact `POST /insert` as an explicit write route. It requires one decimal
 `Content-Length`, applies the same UTF-8 SQL body and request limits as
 `POST /query`, and executes the same nonempty `INSERT`-only transaction as an
 authenticated standard POST. The database preflights the entire batch before
@@ -614,7 +624,7 @@ mixed-statement failures return `400 Bad Request` without applying any rows.
 Success returns `200 OK` with an empty plain-text body. The route is not
 recognized by `handle_http_query` or `handle_http_query_with_limits`.
 
-Those authenticated handlers also expose exact `POST /insert/<table>` for
+Those insertion-capable handlers also expose exact `POST /insert/<table>` for
 `CSVWithNames` or `TabSeparatedWithNames` ingestion. `<table>` is one literal
 RustHouse SQL identifier; extra path segments, query strings, and
 percent-encoded names are not accepted. The request requires one decimal
@@ -747,6 +757,17 @@ tokens are rejected before any request input is read. The original
 in-process read-only embeddings: standard routes stay read-only and neither
 explicit insertion route is exposed.
 
+For credential-protected least-privilege access, use
+`handle_http_query_read_only_with_bearer_token` or its
+`_and_limits` variant. These handlers authenticate query, `/ping`, `/ready`,
+and `/metrics` requests exactly like the existing bearer handlers, but never
+enable INSERT on standard POST routes. Authenticated `POST /insert` and
+`POST /insert/<table>` requests receive `404 Not Found` before their body is
+read or any database lock is attempted. Authentication retains precedence, so
+missing or invalid credentials still receive the indistinguishable bounded
+`401 Unauthorized` response first. The existing bearer handlers remain
+insertion-capable for backward compatibility.
+
 For ClickHouse HTTP credential compatibility, embedders can instead call
 `handle_http_query_with_clickhouse_key`, or
 `handle_http_query_with_clickhouse_key_and_limits` for explicit resource
@@ -767,6 +788,14 @@ finishes before a SQL body is read or any database lock is attempted.
 Supplying `X-ClickHouse-Key` to a bearer handler does not replace
 `Authorization`, and supplying `Authorization` to a key handler does not
 replace `X-ClickHouse-Key`.
+
+The corresponding least-privilege key APIs are
+`handle_http_query_read_only_with_clickhouse_key` and its `_and_limits`
+variant. They preserve `X-ClickHouse-Key` authentication, response limits, and
+`Cache-Control: private, no-store` on query and operational responses while
+applying the same authenticated, pre-body insertion-route rejection as the
+read-only bearer APIs. Use these read-only variants for query or monitoring
+credentials that do not require ingestion authority.
 
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before

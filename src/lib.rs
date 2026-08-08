@@ -47,6 +47,10 @@ pub use grouping::{
 pub use http::{
     DEFAULT_MAX_HTTP_HEADER_BYTES, DEFAULT_MAX_HTTP_HEADER_COUNT, DEFAULT_MAX_HTTP_RESPONSE_BYTES,
     DEFAULT_MAX_HTTP_SQL_BYTES, HttpQueryError, HttpQueryLimits, handle_http_query,
+    handle_http_query_read_only_with_bearer_token,
+    handle_http_query_read_only_with_bearer_token_and_limits,
+    handle_http_query_read_only_with_clickhouse_key,
+    handle_http_query_read_only_with_clickhouse_key_and_limits,
     handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
     handle_http_query_with_clickhouse_key, handle_http_query_with_clickhouse_key_and_limits,
     handle_http_query_with_limits,

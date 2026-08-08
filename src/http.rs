@@ -115,11 +115,12 @@ impl StdError for HttpQueryError {
 /// duplicate, unknown, and unsupported parameters are rejected after
 /// authentication and before database access. A
 /// `default_format` parameter cannot be combined with an
-/// `X-ClickHouse-Format` header. GET and unauthenticated requests pass the SQL
-/// to [`SharedDatabase::try_query`], which accepts exactly one read-only
-/// statement and makes one nonblocking read-lock attempt. Authenticated POST
-/// requests without an output-format selector additionally accept a nonempty
-/// `INSERT`-only batch through [`SharedDatabase::try_execute_insert_batch`].
+/// `X-ClickHouse-Format` header. GET requests and every request made through a
+/// read-only handler pass the SQL to [`SharedDatabase::try_query`], which
+/// accepts exactly one read-only statement and makes one nonblocking read-lock
+/// attempt. POST requests made through the insertion-capable handlers without an
+/// output-format selector additionally accept a nonempty `INSERT`-only batch
+/// through [`SharedDatabase::try_execute_insert_batch`].
 /// Mixed batches, other mutations, and INSERTs with an output-format selector
 /// are rejected without mutation. Contention returns `503 Service Unavailable`;
 /// lock poisoning remains a `500 Internal Server Error`.
@@ -136,9 +137,10 @@ impl StdError for HttpQueryError {
 /// rejected after authentication and before a request body is read or the
 /// database is accessed.
 ///
-/// The bearer-authenticated handlers also accept exact `POST /insert` requests
-/// with the same body framing and limits. Like authenticated POST query-route
-/// INSERTs, they use [`SharedDatabase::try_execute_insert_batch`], which
+/// The insertion-capable bearer-authenticated handlers also accept exact
+/// `POST /insert` requests with the same body framing and limits. Like
+/// authenticated POST query-route INSERTs, they use
+/// [`SharedDatabase::try_execute_insert_batch`], which
 /// atomically executes a nonempty `INSERT`-only batch after one nonblocking
 /// write-lock attempt. Exact
 /// `POST /insert/<table>` requests treat the bounded body as `CSVWithNames` by
@@ -147,9 +149,13 @@ impl StdError for HttpQueryError {
 /// corresponding independent ingestion limits and nonblocking
 /// [`SharedDatabase`] importer are used. Success returns an empty `200 OK`
 /// response. The unauthenticated handlers do not expose either route. The
-/// `X-ClickHouse-Key`-authenticated handlers expose the same authenticated
+/// insertion-capable `X-ClickHouse-Key`-authenticated handlers expose the same
 /// route set. Both authenticated insert forms accept the same optional
-/// `X-ClickHouse-Database: default` header as the query forms.
+/// `X-ClickHouse-Database: default` header as the query forms. The
+/// [`handle_http_query_read_only_with_bearer_token`] and
+/// [`handle_http_query_read_only_with_clickhouse_key`] families require the
+/// same credentials but do not expose either explicit insertion route or
+/// enable INSERT execution on standard query routes.
 ///
 /// `GET /metrics` accepts no request body and returns four Prometheus gauges
 /// for retained tables, columns, rows, and scalar payload bytes. The byte gauge
@@ -196,7 +202,14 @@ pub fn handle_http_query_with_limits(
     output: impl Write,
     limits: HttpQueryLimits,
 ) -> Result<(), HttpQueryError> {
-    handle_http_query_exchange(database, input, output, limits, Authentication::None)
+    handle_http_query_exchange(
+        database,
+        input,
+        output,
+        limits,
+        Authentication::None,
+        HttpAccess::ReadOnly,
+    )
 }
 
 /// Handles one HTTP query, insert, health, or metrics exchange that requires a bearer token.
@@ -250,6 +263,80 @@ pub fn handle_http_query_with_bearer_token_and_limits(
     mut output: impl Write,
     limits: HttpQueryLimits,
 ) -> Result<(), HttpQueryError> {
+    handle_http_query_with_bearer_token_access_and_limits(
+        database,
+        expected_bearer_token,
+        input,
+        &mut output,
+        limits,
+        HttpAccess::ReadWrite,
+    )
+}
+
+/// Handles one read-only HTTP exchange that requires a bearer token.
+///
+/// Authentication and resource limits are identical to
+/// [`handle_http_query_with_bearer_token`], but this least-privilege variant
+/// never exposes `POST /insert` or `POST /insert/<table>` and never enables
+/// INSERT execution on a standard query route. Explicit insertion routes are
+/// rejected after authentication and before their body is read or the
+/// database is accessed. The existing bearer-token handlers retain their
+/// insertion behavior for backward compatibility.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_read_only_with_bearer_token(
+    database: &SharedDatabase,
+    expected_bearer_token: &str,
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_read_only_with_bearer_token_and_limits(
+        database,
+        expected_bearer_token,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one read-only bearer-authenticated HTTP exchange with explicit
+/// resource limits.
+///
+/// See [`handle_http_query_read_only_with_bearer_token`] for access-control
+/// behavior and [`handle_http_query_with_limits`] for resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_read_only_with_bearer_token_and_limits(
+    database: &SharedDatabase,
+    expected_bearer_token: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_with_bearer_token_access_and_limits(
+        database,
+        expected_bearer_token,
+        input,
+        &mut output,
+        limits,
+        HttpAccess::ReadOnly,
+    )
+}
+
+fn handle_http_query_with_bearer_token_access_and_limits(
+    database: &SharedDatabase,
+    expected_bearer_token: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+    access: HttpAccess,
+) -> Result<(), HttpQueryError> {
     if expected_bearer_token.is_empty() {
         return write_error_response(
             &mut output,
@@ -277,6 +364,7 @@ pub fn handle_http_query_with_bearer_token_and_limits(
         output,
         limits,
         Authentication::Bearer(expected_bearer_token.as_bytes()),
+        access,
     )
 }
 
@@ -336,6 +424,80 @@ pub fn handle_http_query_with_clickhouse_key_and_limits(
     mut output: impl Write,
     limits: HttpQueryLimits,
 ) -> Result<(), HttpQueryError> {
+    handle_http_query_with_clickhouse_key_access_and_limits(
+        database,
+        expected_clickhouse_key,
+        input,
+        &mut output,
+        limits,
+        HttpAccess::ReadWrite,
+    )
+}
+
+/// Handles one read-only HTTP exchange that requires an `X-ClickHouse-Key`.
+///
+/// Authentication, cache-control headers, and resource limits are identical
+/// to [`handle_http_query_with_clickhouse_key`], but this least-privilege
+/// variant never exposes `POST /insert` or `POST /insert/<table>` and never
+/// enables INSERT execution on a standard query route. Explicit insertion
+/// routes are rejected after authentication and before their body is read or
+/// the database is accessed. The existing key handlers retain their insertion
+/// behavior for backward compatibility.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_read_only_with_clickhouse_key(
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_read_only_with_clickhouse_key_and_limits(
+        database,
+        expected_clickhouse_key,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one read-only `X-ClickHouse-Key`-authenticated HTTP exchange with
+/// explicit resource limits.
+///
+/// See [`handle_http_query_read_only_with_clickhouse_key`] for access-control
+/// behavior and [`handle_http_query_with_limits`] for resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_read_only_with_clickhouse_key_and_limits(
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_with_clickhouse_key_access_and_limits(
+        database,
+        expected_clickhouse_key,
+        input,
+        &mut output,
+        limits,
+        HttpAccess::ReadOnly,
+    )
+}
+
+fn handle_http_query_with_clickhouse_key_access_and_limits(
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+    access: HttpAccess,
+) -> Result<(), HttpQueryError> {
     if expected_clickhouse_key.is_empty() {
         return write_error_response(
             &mut output,
@@ -363,7 +525,20 @@ pub fn handle_http_query_with_clickhouse_key_and_limits(
         output,
         limits,
         Authentication::ClickHouseKey(expected_clickhouse_key.as_bytes()),
+        access,
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl HttpAccess {
+    const fn allows_insert(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -374,7 +549,7 @@ enum Authentication<'a> {
 }
 
 impl Authentication<'_> {
-    const fn exposes_insert(self) -> bool {
+    const fn is_configured(self) -> bool {
         !matches!(self, Self::None)
     }
 
@@ -392,9 +567,10 @@ fn handle_http_query_exchange(
     mut output: impl Write,
     limits: HttpQueryLimits,
     authentication: Authentication<'_>,
+    access: HttpAccess,
 ) -> Result<(), HttpQueryError> {
     let response_headers = authentication.response_headers();
-    let request = match read_request(&mut input, limits, authentication) {
+    let request = match read_request(&mut input, limits, authentication, access) {
         Ok(request) => request,
         Err(RequestReadError::Io(error)) => return Err(HttpQueryError::Read(error)),
         Err(RequestReadError::Protocol(failure)) => {
@@ -661,9 +837,10 @@ fn read_request(
     input: &mut impl Read,
     limits: HttpQueryLimits,
     authentication: Authentication<'_>,
+    access: HttpAccess,
 ) -> Result<HttpRequest, RequestReadError> {
     let header = read_header_block(input, limits.max_header_bytes)?;
-    let request = parse_headers(&header, limits.max_header_count, authentication)?;
+    let request = parse_headers(&header, limits.max_header_count, authentication, access)?;
 
     match request.kind {
         RequestKind::Ping => {
@@ -702,7 +879,7 @@ fn read_request(
             Ok(classify_standard_query_request(
                 sql,
                 request.response_format.unwrap_or(QueryResponseFormat::Json),
-                authentication.exposes_insert() && !output_format_selected,
+                access.allows_insert() && !output_format_selected,
             ))
         }
         RequestKind::Insert => {
@@ -762,7 +939,7 @@ fn read_request(
                     classify_standard_query_request(
                         sql,
                         response_format,
-                        authentication.exposes_insert()
+                        access.allows_insert()
                             && matches!(method, ParameterizedQueryMethod::Post)
                             && !output_format_selected,
                     )
@@ -1060,6 +1237,7 @@ fn parse_headers(
     header: &[u8],
     max_header_count: usize,
     authentication: Authentication<'_>,
+    access: HttpAccess,
 ) -> Result<ParsedRequest, RequestReadError> {
     let Some(without_terminator) = header.strip_suffix(b"\r\n\r\n") else {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "malformed HTTP headers").into());
@@ -1069,7 +1247,10 @@ fn parse_headers(
         return Err(RequestFailure::new(Status::BAD_REQUEST, "missing request line").into());
     };
     let request_line = strict_header_line(raw_request_line, lines.peek().is_some())?;
-    let kind = parse_request_line(request_line, authentication.exposes_insert())?;
+    // Authenticated read-only handlers still recognize explicit insertion
+    // targets long enough to authenticate them. This preserves credential
+    // precedence without exposing the routes or consuming their bodies.
+    let kind = parse_request_line(request_line, authentication.is_configured())?;
 
     let mut content_length = None;
     let mut host_seen = false;
@@ -1174,6 +1355,13 @@ fn parse_headers(
                 .into());
             }
         }
+    }
+
+    if !access.allows_insert() && matches!(&kind, RequestKind::Insert | RequestKind::TableInsert(_))
+    {
+        return Err(
+            RequestFailure::new(Status::NOT_FOUND, "request target must be / or /query").into(),
+        );
     }
 
     if matches!(

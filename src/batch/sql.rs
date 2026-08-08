@@ -93,6 +93,14 @@ pub enum Statement {
         predicate_column: String,
         predicate_value: AlterUpdateLiteral,
     },
+    /// The same exact mutation shape when either operand is an owned String.
+    AlterUpdateOwned {
+        table: String,
+        target_column: String,
+        value: AlterUpdateValue,
+        predicate_column: String,
+        predicate_value: AlterUpdateValue,
+    },
     TruncateTable {
         name: String,
     },
@@ -160,7 +168,10 @@ pub enum Statement {
     },
 }
 
-/// A non-allocating literal accepted by the exact `ALTER TABLE UPDATE` form.
+/// A copyable numeric or Boolean literal accepted by `ALTER TABLE UPDATE`.
+///
+/// This type retains its original three-variant, `Copy`, and `const` API.
+/// Updates involving an owned String use [`AlterUpdateValue`] instead.
 #[derive(Debug, Clone, Copy)]
 pub enum AlterUpdateLiteral {
     Int64(i64),
@@ -199,6 +210,37 @@ impl AlterUpdateLiteral {
             Self::Int64(value) => Value::Int64(value),
             Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
+        }
+    }
+}
+
+/// An owned operand used when an `ALTER TABLE UPDATE` includes a String.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterUpdateValue {
+    Literal(AlterUpdateLiteral),
+    String(String),
+}
+
+impl From<AlterUpdateLiteral> for AlterUpdateValue {
+    fn from(value: AlterUpdateLiteral) -> Self {
+        Self::Literal(value)
+    }
+}
+
+impl AlterUpdateValue {
+    #[must_use]
+    pub const fn data_type(&self) -> DataType {
+        match self {
+            Self::Literal(value) => value.data_type(),
+            Self::String(_) => DataType::String,
+        }
+    }
+
+    #[must_use]
+    pub fn value(self) -> Value {
+        match self {
+            Self::Literal(value) => value.value(),
+            Self::String(value) => Value::String(value),
         }
     }
 }
@@ -1297,8 +1339,18 @@ impl<'a> Parser<'a> {
                 return self.error("unexpected trailing input after ALTER TABLE UPDATE");
             }
             return Ok(match (value, predicate_value) {
-                (AlterUpdateLiteral::Int64(value), AlterUpdateLiteral::Int64(predicate_value)) => {
-                    Statement::AlterUpdate {
+                (
+                    AlterUpdateValue::Literal(AlterUpdateLiteral::Int64(value)),
+                    AlterUpdateValue::Literal(AlterUpdateLiteral::Int64(predicate_value)),
+                ) => Statement::AlterUpdate {
+                    table,
+                    target_column,
+                    value,
+                    predicate_column,
+                    predicate_value,
+                },
+                (AlterUpdateValue::Literal(value), AlterUpdateValue::Literal(predicate_value)) => {
+                    Statement::AlterUpdateTyped {
                         table,
                         target_column,
                         value,
@@ -1306,7 +1358,7 @@ impl<'a> Parser<'a> {
                         predicate_value,
                     }
                 }
-                (value, predicate_value) => Statement::AlterUpdateTyped {
+                (value, predicate_value) => Statement::AlterUpdateOwned {
                     table,
                     target_column,
                     value,
@@ -1959,12 +2011,18 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_alter_update_literal(&mut self, context: &str) -> Result<AlterUpdateLiteral> {
+    fn parse_alter_update_literal(&mut self, context: &str) -> Result<AlterUpdateValue> {
+        if matches!(self.peek(), TokenKind::String(_)) {
+            let TokenKind::String(value) = self.take_kind() else {
+                unreachable!("matched string token")
+            };
+            return Ok(AlterUpdateValue::String(value));
+        }
         if self.eat_keyword("TRUE") {
-            return Ok(AlterUpdateLiteral::Bool(true));
+            return Ok(AlterUpdateLiteral::Bool(true).into());
         }
         if self.eat_keyword("FALSE") {
-            return Ok(AlterUpdateLiteral::Bool(false));
+            return Ok(AlterUpdateLiteral::Bool(false).into());
         }
 
         let position = self.position();
@@ -1977,7 +2035,7 @@ impl<'a> Parser<'a> {
         };
         let number = self.take_number().ok_or_else(|| Error::Sql {
             position,
-            message: format!("expected an Int64, Float64, or Bool literal in {context}"),
+            message: format!("expected an Int64, Float64, Bool, or String literal in {context}"),
         })?;
         let literal = format!("{sign}{number}");
         if literal.contains(['.', 'e', 'E']) {
@@ -1991,11 +2049,12 @@ impl<'a> Parser<'a> {
                     message: format!("Float64 literal must be finite in {context}"),
                 });
             }
-            return Ok(AlterUpdateLiteral::Float64(value));
+            return Ok(AlterUpdateLiteral::Float64(value).into());
         }
         literal
             .parse::<i64>()
             .map(AlterUpdateLiteral::Int64)
+            .map(AlterUpdateValue::from)
             .map_err(|_| Error::Sql {
                 position,
                 message: format!("invalid Int64 literal '{literal}' in {context}"),
