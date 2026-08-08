@@ -80,6 +80,76 @@ fn ingests_all_four_types_with_lf_and_crlf_and_selects_them_back() {
 }
 
 #[test]
+fn accepts_every_header_permutation_and_reorders_quoted_typed_fields() {
+    let fields = [
+        ("id", "\"-7\""),
+        ("score", "\"2.5\""),
+        ("active", "\"true\""),
+        ("label", "\"comma, \"\"quoted\"\"\nline\""),
+    ];
+    let mut tested = 0;
+
+    for first in 0..fields.len() {
+        for second in 0..fields.len() {
+            for third in 0..fields.len() {
+                for fourth in 0..fields.len() {
+                    let order = [first, second, third, fourth];
+                    if first == second
+                        || first == third
+                        || first == fourth
+                        || second == third
+                        || second == fourth
+                        || third == fourth
+                    {
+                        continue;
+                    }
+
+                    let header = order
+                        .iter()
+                        .map(|&index| fields[index].0)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let record = order
+                        .iter()
+                        .map(|&index| fields[index].1)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let input = format!("{header}\n{record}\n");
+                    let mut database = database(1);
+
+                    assert_eq!(
+                        database.ingest_csv_with_names(
+                            "metrics",
+                            input.as_bytes(),
+                            CsvIngestLimits::new(input.len(), 1, 4),
+                        ),
+                        Ok(1),
+                        "header permutation: {header}",
+                    );
+                    assert_eq!(
+                        query(
+                            &mut database,
+                            "SELECT id, score, active, label FROM metrics;",
+                        )
+                        .rows,
+                        [vec![
+                            Value::Int64(-7),
+                            Value::Float64(2.5),
+                            Value::Bool(true),
+                            Value::String("comma, \"quoted\"\nline".to_owned()),
+                        ]],
+                        "header permutation: {header}",
+                    );
+                    tested += 1;
+                }
+            }
+        }
+    }
+
+    assert_eq!(tested, 24);
+}
+
+#[test]
 fn ingests_quoted_scalars_and_mixed_fields_with_lf_and_crlf() {
     let mut database = database(4);
     let lf = concat!(
@@ -365,7 +435,7 @@ fn quoted_string_can_precede_more_typed_fields() {
 
 #[test]
 fn exact_byte_row_and_value_limits_succeed() {
-    let input = b"id,score,active,label\n1,1.5,true,one\n2,2.5,false,two\n";
+    let input = b"label,active,id,score\none,true,1,1.5\ntwo,false,2,2.5\n";
     let mut database = database(2);
 
     assert_eq!(
@@ -382,7 +452,7 @@ fn exact_byte_row_and_value_limits_succeed() {
 
 #[test]
 fn exceeded_byte_row_and_value_limits_leave_the_table_empty() {
-    let input = b"id,score,active,label\n1,1.5,true,one\n2,2.5,false,two\n";
+    let input = b"label,active,id,score\none,true,1,1.5\ntwo,false,2,2.5\n";
 
     let mut byte_limited = database(3);
     assert_eq!(
@@ -443,7 +513,7 @@ fn exceeded_byte_row_and_value_limits_leave_the_table_empty() {
 
 #[test]
 fn exact_table_capacity_succeeds_and_exceeded_capacity_rolls_back() {
-    let input = b"id,score,active,label\n2,2.0,false,two\n3,3.0,true,three\n";
+    let input = b"label,id,active,score\ntwo,2,false,2.0\nthree,3,true,3.0\n";
     let mut exact = database(3);
     exact
         .execute("INSERT INTO metrics VALUES (1, 1.0, true, 'one');")
@@ -634,10 +704,10 @@ fn invalid_quoted_scalar_values_report_their_schema_types() {
 }
 
 #[test]
-fn late_quoted_type_error_rolls_back_for_lf_and_crlf() {
+fn late_quoted_type_error_with_reordered_header_rolls_back_for_lf_and_crlf() {
     for line_ending in ["\n", "\r\n"] {
         let input = format!(
-            "{HEADER}{line_ending}\"1\",\"1.0\",\"true\",\"valid\"{line_ending}2,\"NaN\",false,bad{line_ending}"
+            "label,active,id,score{line_ending}\"valid\",\"true\",\"1\",\"1.0\"{line_ending}bad,false,2,\"NaN\"{line_ending}"
         );
         let mut database = database(4);
         database
@@ -652,7 +722,7 @@ fn late_quoted_type_error_rolls_back_for_lf_and_crlf() {
             ),
             Err(CsvIngestError::InvalidValue {
                 line: 3,
-                column: 2,
+                column: 4,
                 expected: DataType::Float64,
             }),
             "line ending: {line_ending:?}",
@@ -706,7 +776,7 @@ fn validates_utf8_line_endings_header_and_table_before_mutation() {
         })
     );
 
-    let header_mismatch = b"ID,score,active,label\n1,1.0,true,one\n";
+    let header_mismatch = b"label,score,active,ID\none,1.0,true,1\n";
     assert_eq!(
         database.ingest_csv_with_names(
             "metrics",
@@ -714,7 +784,7 @@ fn validates_utf8_line_endings_header_and_table_before_mutation() {
             generous_limits(header_mismatch),
         ),
         Err(CsvIngestError::HeaderMismatch {
-            column: 1,
+            column: 4,
             expected: "id".to_owned(),
         })
     );
@@ -755,4 +825,47 @@ fn validates_utf8_line_endings_header_and_table_before_mutation() {
             .rows
             .is_empty()
     );
+}
+
+#[test]
+fn duplicate_missing_and_unknown_header_names_preserve_existing_rows() {
+    let cases = [
+        (
+            b"label,id,score,id\none,1,1.0,1\n".as_slice(),
+            CsvIngestError::DuplicateHeaderColumn {
+                column: 4,
+                name: "id".to_owned(),
+            },
+        ),
+        (
+            b"label,id,score\none,1,1.0\n".as_slice(),
+            CsvIngestError::HeaderColumnCount {
+                expected: 4,
+                actual: 3,
+            },
+        ),
+        (
+            b"label,id,mystery,score\none,1,true,1.0\n".as_slice(),
+            CsvIngestError::UnknownHeaderColumn {
+                column: 3,
+                name: "mystery".to_owned(),
+            },
+        ),
+    ];
+
+    for (input, expected) in cases {
+        let mut database = database(2);
+        database
+            .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
+            .unwrap();
+
+        assert_eq!(
+            database.ingest_csv_with_names("metrics", input, generous_limits(input)),
+            Err(expected),
+        );
+        assert_eq!(
+            query(&mut database, "SELECT id, label FROM metrics;").rows,
+            [vec![Value::Int64(9), Value::String("existing".to_owned())]],
+        );
+    }
 }

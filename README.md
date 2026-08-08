@@ -34,9 +34,11 @@ String membership uses the nonempty form `column IN (literal [, ...])`; the
 same form also supports every other physical column type. Every member
 accepts the same finite typed literals and numeric compatibility as equality;
 the list binds as one predicate atom and is lowered to a balanced tree of
-equalities joined by `OR`. Incompatible member types report the normal typed
-comparison error. String prefix, suffix, and containment predicates use the
-exact forms
+equalities joined by `OR`. The standard infix form
+`column NOT IN (literal [, ...])` wraps that balanced predicate in exactly one
+negation; unary `NOT` remains available independently. Incompatible member
+types report the normal typed comparison error. String prefix, suffix, and
+containment predicates use the exact forms
 `column LIKE 'prefix%'`, `column LIKE '%suffix'`, and
 `column LIKE '%substring%'`. Matches are case-sensitive, and the bounded text
 may be empty or Unicode. Other placements of `%` and patterns with excess
@@ -194,8 +196,9 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n [OFFSET m]]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison, inclusive `BETWEEN`, nonempty `IN`, prefix, suffix, and
-contains `LIKE` predicates, including unary `NOT`, as regular `SELECT`.
+composable comparison, inclusive `BETWEEN`, nonempty `IN` and `NOT IN`, prefix,
+suffix, and contains `LIKE` predicates, including unary `NOT`, as regular
+`SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -328,7 +331,8 @@ lowered to two inclusive comparisons joined by `AND`, and all three expanded
 nodes count toward the 256-node limit. An `IN` atom is lowered to one equality
 per literal and a balanced set of joining `OR` nodes; every expanded node also
 counts toward that limit, while all leaves share one retained copy of the
-column identifier.
+column identifier. `NOT IN` adds and charges exactly one negation node around
+that balanced tree.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
@@ -476,10 +480,11 @@ Those authenticated handlers also expose exact `POST /insert/<table>` for
 `CSVWithNames` or `TabSeparatedWithNames` ingestion. `<table>` is one literal
 RustHouse SQL identifier; extra path segments, query strings, and
 percent-encoded names are not accepted. The request requires one decimal
-`Content-Length`, and its body starts with a header that exactly matches the
-target table's schema, followed by typed records. With no format header the
-body remains `CSVWithNames`, so `POST /insert/events` with
-`id,label\n1,"one, quoted"\n` imports one CSV row as before. An exact,
+`Content-Length`, and its body starts with a header containing every target
+column name exactly once with matching case, followed by typed records. CSV
+headers may place those names in any order; TSV headers remain in schema order.
+With no format header the body remains `CSVWithNames`, so `POST /insert/events`
+with `label,id\n"one, quoted",1\n` imports one CSV row. An exact,
 case-sensitive `X-ClickHouse-Format: TabSeparatedWithNames` selects TSV input;
 `X-ClickHouse-Format: CSVWithNames` may select CSV explicitly. Duplicate,
 differently cased, and other format values return `400 Bad Request`. The route
@@ -622,15 +627,18 @@ makes exactly one immediate write-lock attempt before table lookup or input
 access. It returns the typed `DatabaseBusy` error instead of waiting for an
 active reader or writer; poisoning and typed CSV, limit, and table-capacity
 failures remain distinct, and every failure leaves existing rows unchanged.
-The header must exactly match every schema column in order and case. Data fields
-parse according to the table's `Int64`, finite `Float64`, `Bool`, and `String`
-types, and callers provide complete-input byte, row, and total-value limits.
+The header must contain every schema column exactly once with matching case,
+but may list those names in any order. Each data field parses as the table type
+selected by its header, and complete rows are restored to schema order before
+the atomic append. Supported types are `Int64`, finite `Float64`, `Bool`, and
+`String`, and callers provide complete-input byte, row, and total-value limits.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. Any data field may be double-quoted so it can contain
 commas and LF or CRLF line endings, and doubled quotes inside it decode to one
 quote (for example, `"say ""hello"""`). Decoded contents use the same schema
 type rules as unquoted fields, and embedded line endings are retained exactly.
-Headers must remain unquoted, and malformed quoting is rejected. Any input,
+Headers must remain unquoted; missing, duplicate, unknown, differently cased,
+or quoted column names and malformed data quoting are rejected. Any input,
 schema, value, limit, or remaining-capacity failure leaves the table unchanged.
 
 `Database::ingest_tsv_with_names` provides the corresponding bounded,

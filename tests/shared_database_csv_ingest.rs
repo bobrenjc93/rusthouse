@@ -73,6 +73,33 @@ fn try_ingest_writer_output_succeeds_at_exact_limits() {
 }
 
 #[test]
+fn try_ingest_reordered_header_uses_selected_types_and_schema_order() {
+    let database = metrics_database(1);
+    let input = b"label,active,score,id\n\"shared, \"\"quoted\"\"\",\"false\",\"-0.125\",\"7\"\n";
+
+    assert_eq!(
+        database.try_ingest_csv_with_names(
+            "metrics",
+            input,
+            CsvIngestLimits::new(input.len(), 1, 4),
+        ),
+        Ok(1),
+    );
+    assert_eq!(
+        database
+            .query("SELECT id, score, active, label FROM metrics;")
+            .unwrap()
+            .rows,
+        [vec![
+            Value::Int64(7),
+            Value::Float64(-0.125),
+            Value::Bool(false),
+            Value::String("shared, \"quoted\"".to_owned()),
+        ]],
+    );
+}
+
+#[test]
 fn try_ingest_late_csv_error_is_typed_and_rolls_back_every_parsed_row() {
     let database = metrics_database(3);
     database

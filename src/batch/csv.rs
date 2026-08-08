@@ -2,8 +2,10 @@
 //!
 //! Data fields may be double-quoted. Commas and LF or CRLF line endings in a
 //! quoted field are data, and a double quote is decoded from `""` before the
-//! field is parsed according to its schema type. Headers must be unquoted.
+//! field is parsed according to the type selected by its header. Headers must
+//! contain every schema name exactly once, in any order, and remain unquoted.
 
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::str::Utf8Error;
@@ -55,8 +57,8 @@ impl Default for CsvIngestLimits {
 /// A failure while validating or appending typed `CSVWithNames` input.
 ///
 /// Line numbers are one-based physical input lines, and column numbers are
-/// one-based schema positions. Data-record errors use the physical line on
-/// which the record begins. The header is line 1.
+/// one-based input positions. Data-record errors use the physical line on which
+/// the record begins. The header is line 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CsvIngestError {
     /// The complete byte input exceeds its configured bound.
@@ -69,8 +71,12 @@ pub enum CsvIngestError {
     InvalidLineEnding { line: usize },
     /// The header does not have the same number of columns as the table.
     HeaderColumnCount { expected: usize, actual: usize },
-    /// A header field does not exactly equal the corresponding schema name.
+    /// A header field differs in case from an otherwise matching schema name.
     HeaderMismatch { column: usize, expected: String },
+    /// A header field does not name any schema column.
+    UnknownHeaderColumn { column: usize, name: String },
+    /// A schema column is named more than once in the header.
+    DuplicateHeaderColumn { column: usize, name: String },
     /// A data row crosses the configured row bound.
     RowLimitExceeded {
         line: usize,
@@ -128,6 +134,14 @@ impl fmt::Display for CsvIngestError {
             Self::HeaderMismatch { column, expected } => write!(
                 formatter,
                 "CSV header column {column} does not exactly match schema column '{expected}'"
+            ),
+            Self::UnknownHeaderColumn { column, name } => write!(
+                formatter,
+                "CSV header column {column} names unknown schema column '{name}'"
+            ),
+            Self::DuplicateHeaderColumn { column, name } => write!(
+                formatter,
+                "CSV header column {column} duplicates schema column '{name}'"
             ),
             Self::RowLimitExceeded {
                 line,
@@ -208,7 +222,7 @@ pub(crate) fn parse_rows(
     let mut physical_lines = input.split_inclusive('\n');
     let raw_header = physical_lines.next().expect("non-empty input has a line");
     let header = line_contents(raw_header, 1)?;
-    validate_header(table, header)?;
+    let header_plan = validate_header(table, header)?;
 
     let expected_columns = table.schema().len();
     let mut rows = Vec::new();
@@ -243,7 +257,8 @@ pub(crate) fn parse_rows(
 
         let mut row = Vec::with_capacity(expected_columns);
         scan_record(record, line, |column, field, quoted| {
-            let data_type = table.schema()[column - 1].data_type;
+            let schema_index = header_plan.schema_indexes[column - 1];
+            let data_type = table.schema()[schema_index].data_type;
             if quoted {
                 let decoded = field.replace("\"\"", "\"");
                 if data_type == DataType::String {
@@ -256,6 +271,7 @@ pub(crate) fn parse_rows(
             }
             Ok(())
         })?;
+        header_plan.reorder_row(&mut row);
         value_count = next_value_count;
         rows.push(row);
     }
@@ -369,7 +385,20 @@ fn line_contents(line: &str, line_number: usize) -> Result<&str, CsvIngestError>
     Ok(contents)
 }
 
-fn validate_header(table: &Table, header: &str) -> Result<(), CsvIngestError> {
+struct HeaderPlan {
+    schema_indexes: Vec<usize>,
+    row_swaps: Vec<(usize, usize)>,
+}
+
+impl HeaderPlan {
+    fn reorder_row(&self, row: &mut [Value]) {
+        for &(left, right) in &self.row_swaps {
+            row.swap(left, right);
+        }
+    }
+}
+
+fn validate_header(table: &Table, header: &str) -> Result<HeaderPlan, CsvIngestError> {
     let expected_columns = table.schema().len();
     let actual_columns = field_count(header);
     if actual_columns != expected_columns {
@@ -379,17 +408,57 @@ fn validate_header(table: &Table, header: &str) -> Result<(), CsvIngestError> {
         });
     }
 
-    for (column, (field, definition)) in header.split(',').zip(table.schema()).enumerate() {
+    let schema_indexes_by_name = table
+        .schema()
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| (definition.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut seen = vec![false; expected_columns];
+    let mut schema_indexes = Vec::with_capacity(expected_columns);
+    for (column, field) in header.split(',').enumerate() {
         let column = column + 1;
         reject_quoting(field, 1, column)?;
-        if field != definition.name {
-            return Err(CsvIngestError::HeaderMismatch {
+        let Some(&schema_index) = schema_indexes_by_name.get(field) else {
+            if let Some(definition) = table
+                .schema()
+                .iter()
+                .find(|definition| definition.name.eq_ignore_ascii_case(field))
+            {
+                return Err(CsvIngestError::HeaderMismatch {
+                    column,
+                    expected: definition.name.clone(),
+                });
+            }
+            return Err(CsvIngestError::UnknownHeaderColumn {
                 column,
-                expected: definition.name.clone(),
+                name: field.to_owned(),
+            });
+        };
+        if std::mem::replace(&mut seen[schema_index], true) {
+            return Err(CsvIngestError::DuplicateHeaderColumn {
+                column,
+                name: field.to_owned(),
             });
         }
+        schema_indexes.push(schema_index);
     }
-    Ok(())
+
+    debug_assert!(seen.into_iter().all(|was_seen| was_seen));
+    let mut destinations = schema_indexes.clone();
+    let mut row_swaps = Vec::with_capacity(expected_columns.saturating_sub(1));
+    for input_index in 0..expected_columns {
+        while destinations[input_index] != input_index {
+            let destination = destinations[input_index];
+            destinations.swap(input_index, destination);
+            row_swaps.push((input_index, destination));
+        }
+    }
+
+    Ok(HeaderPlan {
+        schema_indexes,
+        row_swaps,
+    })
 }
 
 fn field_count(record: &str) -> usize {
