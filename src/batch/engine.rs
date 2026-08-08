@@ -534,6 +534,52 @@ impl Database {
         self.table_limits
     }
 
+    /// Atomically appends bounded, typed, headerless `CSV` input.
+    ///
+    /// Every logical record is data and must contain exactly one field for each
+    /// physical schema column, in schema order. Fields parse as `Int64`, finite
+    /// `Float64`, `Bool`, or `String`. Double-quoted fields may contain commas,
+    /// LF or CRLF line endings, and doubled (`""`) quote escapes. Only LF and
+    /// CRLF record endings are accepted. Empty input appends zero rows.
+    ///
+    /// The complete input, every row and value, configured limits, and
+    /// remaining table capacity are validated before any physical column is
+    /// changed. Every error therefore leaves the target table unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::csv::CsvIngestLimits;
+    /// use rusthouse::batch::engine::Database;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute(
+    ///     "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);",
+    /// )?;
+    /// let input = b"1,2.5,true,\"alpha,beta\"\n";
+    /// let rows = database.ingest_csv(
+    ///     "metrics",
+    ///     input,
+    ///     CsvIngestLimits::new(input.len(), 1, 4),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_csv(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> std::result::Result<usize, CsvIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            csv::parse_rows_without_names(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        self.table_mut(table)?.append_prepared_insert_rows(rows);
+        Ok(affected_rows)
+    }
+
     /// Atomically appends a bounded, typed `CSVWithNames` input.
     ///
     /// The header must contain a nonempty subset of target column names without
@@ -577,7 +623,7 @@ impl Database {
     ) -> std::result::Result<usize, CsvIngestError> {
         let rows = {
             let target = self.catalog.table(table)?;
-            csv::parse_rows(target, input.as_ref(), limits)?
+            csv::parse_rows_with_names(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
         self.table_mut(table)?.append_prepared_insert_rows(rows);

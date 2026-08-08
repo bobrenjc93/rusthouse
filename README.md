@@ -810,7 +810,21 @@ sending keys, tokens, or queries over an untrusted network; otherwise they are
 exposed in plaintext. The handlers provide neither sessions nor credential
 issuance or rotation.
 
-The typed engine's `Database::ingest_csv_with_names` API atomically appends a
+The typed engine's `Database::ingest_csv` API atomically appends bounded,
+headerless `CSV` to an existing batch table. Every logical record is data and
+must supply every column in physical schema order. `SharedDatabase::ingest_csv`
+retains one write lock through table lookup, bounded parsing, remaining-capacity
+validation, and atomic append; `SharedDatabase::try_ingest_csv` makes one
+immediate lock attempt and returns `DatabaseBusy` without table lookup or input
+access when contended. Empty input is a zero-row no-op. Callers supply
+complete-input byte, logical-row, and total-value limits, and the table's row
+and cell limits are checked before the one append. Exact lowercase Boolean
+tokens, finite floats, LF and CRLF record endings, quoted commas and multiline
+fields, and doubled quote escapes follow the same rules as `CSVWithNames` below.
+Every format, value, limit, or remaining-capacity failure preserves all
+existing rows.
+
+`Database::ingest_csv_with_names` atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table.
 `SharedDatabase::ingest_csv_with_names` is the synchronized equivalent and
 retains one write lock through table lookup, bounded parsing, capacity
