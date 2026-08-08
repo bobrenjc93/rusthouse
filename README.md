@@ -687,6 +687,12 @@ format remains unchanged for existing callers.
 self-describing format. It recovers the schema, nullability, row cap, and rows
 without caller-supplied table metadata, rejects non-regular and oversized files
 before decoding, and keeps open, read, envelope, and payload failures distinct.
+`restore_int64_table_payload_from_file_with_backup` tries that same bounded
+self-describing restore against a caller-supplied backup only after the primary
+fails. Success reports whether the primary or backup supplied the table; if
+neither is valid, the recovery error retains both typed
+`Int64TablePayloadFileRestoreError` values. The same envelope, column-name,
+row, and payload limits apply independently to both attempts.
 On Unix, `save_int64_table_payload_to_file` is the matching high-level save
 path. It encodes all table metadata and rows with `Int64TablePayloadCodec`, then
 atomically replaces a checksummed envelope. Its typed error separates payload
