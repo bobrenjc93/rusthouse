@@ -877,8 +877,27 @@ impl Database {
         statement: Statement,
         max_result_bytes: usize,
     ) -> Result<QueryResult> {
+        self.execute_query_statement_with_result_limits(
+            statement,
+            max_result_bytes,
+            self.query_result_limits.max_rows,
+        )
+    }
+
+    /// Executes one already-parsed read-only query with caller-supplied result limits.
+    ///
+    /// Caller limits may only tighten the database's configured byte and row
+    /// limits. Result-shape validation applies both limits before result rows
+    /// are materialized.
+    pub(crate) fn execute_query_statement_with_result_limits(
+        &self,
+        statement: Statement,
+        max_result_bytes: usize,
+        max_result_rows: usize,
+    ) -> Result<QueryResult> {
         let tightened_result_limit = max_result_bytes < self.query_result_limits.max_bytes;
         let query_limits = QueryResultLimits {
+            max_rows: self.query_result_limits.max_rows.min(max_result_rows),
             max_bytes: self.query_result_limits.max_bytes.min(max_result_bytes),
             ..self.query_result_limits
         };

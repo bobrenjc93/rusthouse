@@ -1315,6 +1315,217 @@ fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
 }
 
 #[test]
+fn parameterized_get_and_post_tighten_result_rows_and_preserve_other_parameters() {
+    let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
+        max_rows: 2,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+
+    let exact_requests: &[(&[u8], &str, &[u8])] = &[
+        (
+            b"GET /?database=default&max_result_rows=%32&default_format=CSVWithNames&query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "text/csv; charset=utf-8",
+            b"value\n1\n2\n",
+        ),
+        (
+            b"POST /?query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            "text/tab-separated-values; charset=utf-8",
+            b"value\n1\n2\n",
+        ),
+    ];
+    for (request, content_type, body) in exact_requests {
+        assert_response_with_content_type(
+            &exchange(&database, request),
+            "HTTP/1.1 200 OK",
+            content_type,
+            body,
+        );
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            b"POST /?query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&max_result_rows=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"SELECT result rows requires at least 2, exceeding the limit of 1"}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?max_result_rows=3&query=SELECT+value+FROM+samples+ORDER+BY+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"SELECT result rows requires at least 3, exceeding the limit of 2"}"#,
+    );
+}
+
+#[test]
+fn parameterized_max_result_rows_accepts_zero_and_the_numeric_boundary() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1);",
+        )
+        .unwrap();
+
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+value+FROM+samples+WHERE+value+%3D+99%3B&max_result_rows=0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"POST /?max_result_rows=0&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"SELECT result rows requires at least 1, exceeding the limit of 0"}"#,
+    );
+
+    let largest = format!(
+        "GET /?query=SELECT+1%3B&max_result_rows={} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        usize::MAX,
+    );
+    assert_response(
+        &exchange(&database, largest.as_bytes()),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"1","type":"Int64"}],"rows":[[1]]}"#,
+    );
+}
+
+#[test]
+fn parameterized_max_result_rows_rejects_empty_duplicate_malformed_and_overflowing_values() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_result_rows= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_result_rows=1&query=SELECT+1%3B&max%5Fresult%5Frows=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_result_rows parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_result_rows=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_result_rows parameter must be a decimal integer"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_result_rows={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_result_rows parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn max_result_rows_validation_follows_authentication_and_precedes_lock_admission() {
+    let poisoned_inner = Arc::new(RwLock::new(Database::new()));
+    let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = poisoned_inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let invalid_without_credentials =
+        b"GET /?query=SELECT+1%3B&max_result_rows=nope HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(
+            &poisoned_database,
+            "correct-token",
+            invalid_without_credentials,
+        ),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    let missing_key = clickhouse_key_exchange(
+        &poisoned_database,
+        "correct-key",
+        invalid_without_credentials,
+    );
+    assert_response(
+        &missing_key,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&missing_key);
+
+    let authorized = b"GET /?query=SELECT+1%3B&max_result_rows=nope HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&poisoned_database, "correct-token", authorized),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"max_result_rows parameter must be a decimal integer"}"#,
+    );
+
+    let contended_inner = Arc::new(RwLock::new(Database::new()));
+    let contended_database = SharedDatabase::from_arc(Arc::clone(&contended_inner));
+    let mut writer = Some(contended_inner.write().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = contended_database.clone();
+    let worker = thread::spawn(move || {
+        let invalid = exchange(
+            &worker_database,
+            b"GET /?query=SELECT+1%3B&max_result_rows=-1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let valid = exchange(
+            &worker_database,
+            b"POST /?max_result_rows=1&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        sender.send((invalid, valid)).unwrap();
+    });
+    let (invalid, valid) = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(responses) => responses,
+        Err(error) => {
+            drop(writer.take());
+            worker.join().unwrap();
+            panic!("max_result_rows admission blocked behind a writer: {error}");
+        }
+    };
+    assert_response(
+        &invalid,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"max_result_rows parameter must be a decimal integer"}"#,
+    );
+    assert_response(
+        &valid,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    drop(writer.take());
+    worker.join().unwrap();
+}
+
+#[test]
 fn terminal_csv_with_names_format_wires_get_and_post_with_escaped_and_empty_results() {
     let database = SharedDatabase::default();
     database

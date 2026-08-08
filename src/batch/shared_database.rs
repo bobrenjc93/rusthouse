@@ -582,6 +582,26 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
+    /// Attempts one read-only query with an explicit result-row limit.
+    ///
+    /// Parsing and read-only validation finish before the single nonblocking
+    /// read-lock attempt. The supplied limit can tighten, but cannot relax, the
+    /// database's configured result-row limit.
+    pub(crate) fn try_query_with_result_row_limit(
+        &self,
+        input: &str,
+        max_result_rows: usize,
+    ) -> Result<QueryResult, SharedDatabaseError> {
+        let statement = parse_query_statement(input)?;
+        self.try_read()?
+            .execute_query_statement_with_result_limits(
+                statement,
+                DEFAULT_MAX_RETAINED_RESULT_BYTES,
+                max_result_rows,
+            )
+            .map_err(Into::into)
+    }
+
     /// Reports whether a database read lock is immediately available.
     ///
     /// This check never waits, parses SQL, or accesses database contents. A
