@@ -5888,6 +5888,36 @@ mod tests {
     }
 
     #[test]
+    fn qualified_show_tables_lower_to_the_same_bounded_result() {
+        let mut database = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: 2,
+            max_values: 2,
+            ..QueryResultLimits::default()
+        });
+        database
+            .execute("CREATE TABLE zebra (id Int64); CREATE TABLE Alpha (id Int64);")
+            .expect("setup");
+
+        let expected = query(&mut database, "SHOW TABLES");
+        assert_eq!(query(&mut database, "sHoW TaBlEs FrOm DeFaUlT"), expected);
+        assert_eq!(query(&mut database, "SHOW TABLES IN default;"), expected);
+
+        database
+            .execute("CREATE TABLE beta (id Int64)")
+            .expect("third table");
+        for sql in ["SHOW TABLES FROM default", "SHOW TABLES IN DEFAULT"] {
+            assert_eq!(
+                database.execute(sql),
+                Err(Error::ResourceLimitExceeded {
+                    resource: "SHOW TABLES result rows",
+                    actual: 3,
+                    max: 2,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn show_tables_accepts_exact_custom_row_and_value_limits() {
         let mut database = Database::with_query_result_limits(QueryResultLimits {
             max_rows: 2,

@@ -1101,6 +1101,37 @@ fn valid_query_returns_the_existing_json_result_shape() {
 }
 
 #[test]
+fn qualified_show_tables_is_read_only_and_rejects_invalid_qualifiers_over_http() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE zebra (id Int64); CREATE TABLE Alpha (id Int64);")
+        .unwrap();
+    let expected = r#"{"columns":[{"name":"name","type":"String"}],"rows":[["Alpha"],["zebra"]]}"#;
+
+    for sql in [
+        &b"SHOW TABLES FROM default;"[..],
+        &b"sHoW TaBlEs In DeFaUlT"[..],
+    ] {
+        assert_response(
+            &exchange(&database, &request(sql)),
+            "HTTP/1.1 200 OK",
+            expected,
+        );
+    }
+
+    assert_response(
+        &exchange(&database, &request(b"SHOW TABLES IN analytics;")),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"SQL error at byte 15: SHOW TABLES supports only the default database; found 'analytics'"}"#,
+    );
+    assert_response(
+        &exchange(&database, &request(b"SHOW TABLES FROM default LIMIT 1;")),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"SQL error at byte 25: unexpected trailing input after SHOW TABLES"}"#,
+    );
+}
+
+#[test]
 fn root_query_returns_the_existing_json_result_shape() {
     let database = SharedDatabase::default();
     database
