@@ -404,6 +404,60 @@ fn bool_to_int64_cast_is_visible_in_every_http_query_format() {
 }
 
 #[test]
+fn string_to_int64_cast_is_visible_in_every_http_query_format() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (value String); \
+             INSERT INTO readings VALUES ('2'), ('-10'), ('+0');",
+        )
+        .expect("setup");
+    let sql = b"SELECT CAST(value AS Int64) AS converted FROM readings ORDER BY converted;";
+
+    assert_response(
+        &exchange(&database, &request(sql)),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"converted","type":"Int64"}],"rows":[[-10],[0],[2]]}"#,
+    );
+
+    let csv =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+    assert_response_with_content_type(
+        &exchange(&database, &csv),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"converted\n-10\n0\n2\n",
+    );
+
+    let tsv = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &exchange(&database, &tsv),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"converted\n-10\n0\n2\n",
+    );
+
+    for (format, expected) in [
+        (
+            "JSONEachRow",
+            "{\"converted\":-10}\n{\"converted\":0}\n{\"converted\":2}\n",
+        ),
+        ("JSONCompactEachRow", "[-10]\n[0]\n[2]\n"),
+    ] {
+        let request = request_for_target_with_headers(
+            "/query",
+            sql,
+            &format!("X-ClickHouse-Format: {format}\r\n"),
+        );
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
 fn bool_to_float64_cast_is_visible_in_every_http_query_format() {
     let database = SharedDatabase::default();
     database
