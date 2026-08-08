@@ -73,14 +73,14 @@ pub enum Statement {
         table: String,
         column: String,
     },
-    /// Exact Int64 mutation: `ALTER TABLE <table> UPDATE <target> = <literal>
-    /// WHERE <column> = <literal>`.
+    /// Exact Int64-or-Bool mutation: `ALTER TABLE <table> UPDATE <target> =
+    /// <literal> WHERE <column> = <literal>`.
     AlterUpdate {
         table: String,
         target_column: String,
-        value: i64,
+        value: AlterUpdateLiteral,
         predicate_column: String,
-        predicate_value: i64,
+        predicate_value: AlterUpdateLiteral,
     },
     TruncateTable {
         name: String,
@@ -147,6 +147,31 @@ pub enum Statement {
     ExistsTable {
         name: String,
     },
+}
+
+/// A non-allocating literal accepted by the exact `ALTER TABLE UPDATE` form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterUpdateLiteral {
+    Int64(i64),
+    Bool(bool),
+}
+
+impl AlterUpdateLiteral {
+    #[must_use]
+    pub const fn data_type(self) -> DataType {
+        match self {
+            Self::Int64(_) => DataType::Int64,
+            Self::Bool(_) => DataType::Bool,
+        }
+    }
+
+    #[must_use]
+    pub const fn value(self) -> Value {
+        match self {
+            Self::Int64(value) => Value::Int64(value),
+            Self::Bool(value) => Value::Bool(value),
+        }
+    }
 }
 
 /// `SELECT <literal> [AS <alias>]`, including an explicitly typed `NULL`.
@@ -1230,7 +1255,7 @@ impl<'a> Parser<'a> {
                 &TokenKind::Equal,
                 "'=' after ALTER TABLE UPDATE target column",
             )?;
-            let value = self.parse_signed_int64_literal("ALTER TABLE UPDATE assignment")?;
+            let value = self.parse_alter_update_literal("ALTER TABLE UPDATE assignment")?;
             self.expect_keyword("WHERE")?;
             let predicate_column = self.expect_identifier("WHERE column name")?;
             self.expect(
@@ -1238,7 +1263,7 @@ impl<'a> Parser<'a> {
                 "'=' after ALTER TABLE UPDATE WHERE column",
             )?;
             let predicate_value =
-                self.parse_signed_int64_literal("ALTER TABLE UPDATE WHERE comparison")?;
+                self.parse_alter_update_literal("ALTER TABLE UPDATE WHERE comparison")?;
             if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("unexpected trailing input after ALTER TABLE UPDATE");
             }
@@ -1892,6 +1917,36 @@ impl<'a> Parser<'a> {
             position,
             message: format!("invalid Int64 literal '{literal}' in {context}"),
         })
+    }
+
+    fn parse_alter_update_literal(&mut self, context: &str) -> Result<AlterUpdateLiteral> {
+        if self.eat_keyword("TRUE") {
+            return Ok(AlterUpdateLiteral::Bool(true));
+        }
+        if self.eat_keyword("FALSE") {
+            return Ok(AlterUpdateLiteral::Bool(false));
+        }
+
+        let position = self.position();
+        let sign = if self.eat(&TokenKind::Minus) {
+            "-"
+        } else if self.eat(&TokenKind::Plus) {
+            "+"
+        } else {
+            ""
+        };
+        let number = self.take_number().ok_or_else(|| Error::Sql {
+            position,
+            message: format!("expected an Int64 or Bool literal in {context}"),
+        })?;
+        let literal = format!("{sign}{number}");
+        literal
+            .parse::<i64>()
+            .map(AlterUpdateLiteral::Int64)
+            .map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid Int64 literal '{literal}' in {context}"),
+            })
     }
 
     fn parse_having_threshold(&mut self) -> Result<Value> {

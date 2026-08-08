@@ -7,7 +7,7 @@ use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin,
+    self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, ComparisonOperator, CrossJoin,
     CurrentDatabaseSelect, DeleteComparisonPredicate, Having, HavingPredicate, LiteralSelect,
     Operand, OrderBy, Predicate, Select, SelectItem, Statement, VersionSelect,
 };
@@ -894,27 +894,28 @@ impl Database {
         &mut self,
         table: String,
         target_column: String,
-        value: i64,
+        value: AlterUpdateLiteral,
         predicate_column: String,
-        predicate_value: i64,
+        predicate_value: AlterUpdateLiteral,
         query_result_limits: QueryResultLimits,
     ) -> Result<StatementResult> {
         let replacements = {
             let target = self.catalog.table(&table)?;
             let target_index = target.column_index(&target_column)?;
             let predicate_index = target.column_index(&predicate_column)?;
-            for (column, index, role) in [
-                (&target_column, target_index, "target"),
-                (&predicate_column, predicate_index, "WHERE"),
+            for (column, index, literal, role) in [
+                (&target_column, target_index, value, "target"),
+                (&predicate_column, predicate_index, predicate_value, "WHERE"),
             ] {
                 let actual = target.schema()[index].data_type;
-                if actual != DataType::Int64 {
+                let expected = literal.data_type();
+                if actual != expected {
                     return Err(Error::TypeMismatch {
                         context: format!(
                             "ALTER TABLE UPDATE {role} column '{}.{column}'",
                             target.name()
                         ),
-                        expected: DataType::Int64.to_string(),
+                        expected: expected.to_string(),
                         actual: actual.to_string(),
                     });
                 }
@@ -925,16 +926,30 @@ impl Database {
                 "ALTER TABLE UPDATE scanned rows",
             )?;
 
-            let Column::Int64(predicate_values) = &target.columns()[predicate_index] else {
-                unreachable!("the ALTER TABLE UPDATE WHERE column was validated as Int64");
-            };
-            predicate_values
-                .iter()
-                .enumerate()
-                .filter_map(|(row, current)| {
-                    (*current == predicate_value).then_some((row, Value::Int64(value)))
-                })
-                .collect::<Vec<_>>()
+            let replacement = value.value();
+            match (&target.columns()[predicate_index], predicate_value) {
+                (Column::Int64(predicate_values), AlterUpdateLiteral::Int64(predicate_value)) => {
+                    predicate_values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, current)| {
+                            (*current == predicate_value).then_some((row, replacement.clone()))
+                        })
+                        .collect::<Vec<_>>()
+                }
+                (Column::Bool(predicate_values), AlterUpdateLiteral::Bool(predicate_value)) => {
+                    predicate_values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, current)| {
+                            (*current == predicate_value).then_some((row, replacement.clone()))
+                        })
+                        .collect::<Vec<_>>()
+                }
+                _ => unreachable!(
+                    "the ALTER TABLE UPDATE WHERE column was validated against its literal"
+                ),
+            }
         };
 
         let affected_rows = self
