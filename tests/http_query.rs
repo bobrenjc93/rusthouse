@@ -509,6 +509,60 @@ fn int64_to_string_cast_is_visible_in_every_http_query_format() {
 }
 
 #[test]
+fn float64_to_string_cast_is_visible_in_every_http_query_format() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (value Float64); \
+             INSERT INTO readings VALUES (10.0), (-0.0), (1.25);",
+        )
+        .expect("setup");
+    let sql = b"SELECT CAST(value AS String) AS text FROM readings ORDER BY text;";
+
+    assert_response(
+        &exchange(&database, &request(sql)),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"text","type":"String"}],"rows":[["-0"],["1.25"],["10"]]}"#,
+    );
+
+    let csv =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+    assert_response_with_content_type(
+        &exchange(&database, &csv),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"text\n-0\n1.25\n10\n",
+    );
+
+    let tsv = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &exchange(&database, &tsv),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"text\n-0\n1.25\n10\n",
+    );
+
+    for (format, expected) in [
+        (
+            "JSONEachRow",
+            "{\"text\":\"-0\"}\n{\"text\":\"1.25\"}\n{\"text\":\"10\"}\n",
+        ),
+        ("JSONCompactEachRow", "[\"-0\"]\n[\"1.25\"]\n[\"10\"]\n"),
+    ] {
+        let request = request_for_target_with_headers(
+            "/query",
+            sql,
+            &format!("X-ClickHouse-Format: {format}\r\n"),
+        );
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
 fn ping_returns_the_clickhouse_health_response_without_content_length() {
     let database = SharedDatabase::default();
 
@@ -2725,7 +2779,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
     assert_response(
         &exchange(&database, &request_for_target("/", b"DROP TABLE retained;")),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(
@@ -2733,7 +2787,7 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
             b"GET /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
     assert_response(
         &exchange(&database, &request(b"SHOW TABLES; SHOW TABLES;")),
@@ -2884,7 +2938,7 @@ fn insert_route_is_bearer_only_exact_and_does_not_make_query_routes_mutable() {
     assert_response(
         &authenticated_exchange(&database, "correct-token", &query_request),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
     );
 
     for target in ["/insert/", "/insert?async=1"] {
