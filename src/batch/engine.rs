@@ -1821,7 +1821,7 @@ fn validate_distinct_shape(select: &Select) -> Result<()> {
             .all(|item| matches!(item, SelectItem::Column { alias: None, .. }));
     if !unaliased_columns || !select.group_by.is_empty() || select.having.is_some() {
         return Err(Error::InvalidQuery(
-            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, optional ordering by projected physical columns, and an optional LIMIT <count> [OFFSET <offset>]".to_owned(),
+            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, optional ordering by projected physical columns, and optional LIMIT <count> [OFFSET <offset>] or LIMIT <offset>, <count> pagination".to_owned(),
         ));
     }
 

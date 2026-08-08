@@ -98,7 +98,8 @@ so any failure rolls back the batch without retaining expanded rows. Ordinary
 inserts likewise check current table capacity before materializing defaults.
 
 Regular non-window projections, including grouped and global-aggregate
-queries, support `LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`.
+queries, support `LIMIT <count> OFFSET <offset>` and ClickHouse's equivalent
+`LIMIT <offset>, <count>` form in addition to plain `LIMIT`.
 `WHERE` filtering and `ORDER BY` happen before rows are skipped. Ordered
 pagination uses the existing bounded top-k selection with a checked
 `count + offset` bound, and scalar projections are evaluated only for returned

@@ -67,6 +67,22 @@ fn parses_documented_limit_offset_for_regular_distinct_and_grouped_selects() {
 }
 
 #[test]
+fn parses_clickhouse_comma_pagination_for_regular_distinct_and_grouped_selects() {
+    for sql in [
+        "SELECT reading FROM samples ORDER BY reading LIMIT 3, 2",
+        "SELECT DISTINCT reading FROM samples ORDER BY reading LIMIT 3, 2",
+        "SELECT kind, COUNT(*) AS n FROM samples GROUP BY kind \
+         HAVING n > 0 ORDER BY n DESC LIMIT 3, 2",
+    ] {
+        let statements = parse(sql).expect("ClickHouse LIMIT offset, count syntax parses");
+        let [Statement::Select(select)] = statements.as_slice() else {
+            panic!("expected SELECT for {sql:?}");
+        };
+        assert_eq!((select.limit, select.offset), (Some(2), Some(3)), "{sql}");
+    }
+}
+
+#[test]
 fn rejects_malformed_offsets_and_unsupported_select_shapes() {
     for sql in [
         "SELECT n FROM samples OFFSET 1",
@@ -79,12 +95,109 @@ fn rejects_malformed_offsets_and_unsupported_select_shapes() {
         "SELECT DISTINCT n FROM samples LIMIT 1 OFFSET -1",
         "SELECT DISTINCT n FROM samples LIMIT 1 OFFSET 1.5",
         "SELECT DISTINCT n FROM samples LIMIT 1 OFFSET many",
+        "SELECT n FROM samples LIMIT , 1",
+        "SELECT n FROM samples LIMIT 1,",
+        "SELECT n FROM samples LIMIT -1, 1",
+        "SELECT n FROM samples LIMIT 1, -1",
+        "SELECT n FROM samples LIMIT 1.5, 2",
+        "SELECT n FROM samples LIMIT 1, 2.5",
+        "SELECT n FROM samples LIMIT many, 1",
+        "SELECT n FROM samples LIMIT 1, many",
+        "SELECT n FROM samples LIMIT 1, 2 OFFSET 3",
+        "SELECT n FROM samples LIMIT 1, 2, 3",
+        "SELECT DISTINCT n FROM samples LIMIT 1,",
+        "SELECT DISTINCT n FROM samples LIMIT 1, -1",
         "SELECT n, ROW_NUMBER() OVER () FROM samples LIMIT 1 OFFSET 1",
+        "SELECT n, ROW_NUMBER() OVER () FROM samples LIMIT 1, 1",
         "SELECT 1 LIMIT 1 OFFSET 1",
+        "SELECT 1 LIMIT 1, 1",
         "SELECT * FROM samples CROSS JOIN other LIMIT 1 OFFSET 1",
+        "SELECT * FROM samples CROSS JOIN other LIMIT 1, 1",
     ] {
         assert!(parse(sql).is_err(), "{sql:?} must be rejected");
     }
+}
+
+#[test]
+fn clickhouse_comma_pagination_runs_after_ordering_grouping_and_distinct() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (kind String, amount Int64, included Bool); \
+             INSERT INTO events VALUES \
+                 ('alpha', 1, true), \
+                 ('beta', 5, true), ('beta', 7, true), \
+                 ('gamma', 2, true), ('gamma', 3, true), ('gamma', 4, true), \
+                 ('ignored', 100, false);",
+        )
+        .expect("fixture succeeds");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT amount FROM events WHERE included = true \
+             ORDER BY amount LIMIT 1, 2",
+        )
+        .rows,
+        [vec![Value::Int64(2)], vec![Value::Int64(3)]]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT kind, COUNT(*) AS n FROM events WHERE included = true \
+             GROUP BY kind ORDER BY n DESC, kind ASC LIMIT 1, 1",
+        )
+        .rows,
+        [vec![Value::String("beta".to_owned()), Value::Int64(2)]]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT kind FROM events WHERE included = true \
+             ORDER BY kind LIMIT 1, 2",
+        )
+        .rows,
+        [
+            vec![Value::String("beta".to_owned())],
+            vec![Value::String("gamma".to_owned())],
+        ]
+    );
+}
+
+#[test]
+fn clickhouse_comma_pagination_applies_to_each_union_operand() {
+    let statements = parse(
+        "SELECT n FROM older ORDER BY n LIMIT 1, 2 \
+         UNION ALL SELECT n FROM newer ORDER BY n DESC LIMIT 2, 1",
+    )
+    .expect("paginated union operands parse");
+    let [Statement::UnionAll { left, right }] = statements.as_slice() else {
+        panic!("expected UNION ALL");
+    };
+    assert_eq!((left.limit, left.offset), (Some(2), Some(1)));
+    assert_eq!((right.limit, right.offset), (Some(1), Some(2)));
+
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE older (n Int64); CREATE TABLE newer (n Int64); \
+             INSERT INTO older VALUES (1), (2), (3), (4); \
+             INSERT INTO newer VALUES (10), (20), (30), (40);",
+        )
+        .expect("fixture succeeds");
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT n FROM older ORDER BY n LIMIT 1, 2 \
+             UNION ALL SELECT n FROM newer ORDER BY n DESC LIMIT 2, 1",
+        )
+        .rows,
+        [
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(20)],
+        ]
+    );
 }
 
 #[test]
@@ -277,22 +390,41 @@ fn zero_count_and_beyond_end_offsets_return_no_rows() {
 }
 
 #[test]
-fn rejects_an_overflowing_count_plus_offset_bound() {
+fn rejects_overflowing_count_plus_offset_bounds_in_both_syntaxes() {
     let mut database = Database::new();
     database
         .execute("CREATE TABLE samples (reading Int64); INSERT INTO samples VALUES (1);")
         .expect("fixture succeeds");
 
-    let sql = format!(
-        "SELECT reading FROM samples ORDER BY reading LIMIT {} OFFSET 1",
-        usize::MAX
-    );
-    assert_eq!(
-        database.execute(&sql),
-        Err(Error::NumericOverflow(
-            "LIMIT + OFFSET selection bound".to_owned()
-        ))
-    );
+    for sql in [
+        format!(
+            "SELECT reading FROM samples ORDER BY reading LIMIT {} OFFSET 1",
+            usize::MAX
+        ),
+        format!(
+            "SELECT reading FROM samples ORDER BY reading LIMIT 1, {}",
+            usize::MAX
+        ),
+    ] {
+        assert_eq!(
+            database.execute(&sql),
+            Err(Error::NumericOverflow(
+                "LIMIT + OFFSET selection bound".to_owned()
+            )),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn rejects_each_overflowing_clickhouse_comma_operand_during_parsing() {
+    let too_large = (usize::MAX as u128) + 1;
+    for sql in [
+        format!("SELECT n FROM samples LIMIT {too_large}, 1"),
+        format!("SELECT n FROM samples LIMIT 1, {too_large}"),
+    ] {
+        assert!(parse(&sql).is_err(), "{sql:?} must be rejected");
+    }
 }
 
 #[test]

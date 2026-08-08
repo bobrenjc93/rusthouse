@@ -197,7 +197,7 @@ pub struct Select {
     pub limit: Option<usize>,
     /// Rows skipped after filtering, grouping or DISTINCT processing, HAVING,
     /// and ordering. This is only populated for supported
-    /// `LIMIT <count> OFFSET <offset>` shapes.
+    /// `LIMIT <count> OFFSET <offset>` and `LIMIT <offset>, <count>` shapes.
     pub offset: Option<usize>,
 }
 
@@ -1491,34 +1491,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let limit = if self.eat_keyword("LIMIT") {
-            let position = self.position();
-            let number = self.take_number().ok_or_else(|| Error::Sql {
-                position,
-                message: "expected a non-negative integer after LIMIT".to_owned(),
-            })?;
-            Some(number.parse::<usize>().map_err(|_| Error::Sql {
-                position,
-                message: format!("invalid LIMIT '{number}'"),
-            })?)
-        } else {
-            None
-        };
-
-        let offset_position = self.position();
-        let offset = if limit.is_some() && self.eat_keyword("OFFSET") {
-            let position = self.position();
-            let number = self.take_number().ok_or_else(|| Error::Sql {
-                position,
-                message: "expected a non-negative integer after OFFSET".to_owned(),
-            })?;
-            Some(number.parse::<usize>().map_err(|_| Error::Sql {
-                position,
-                message: format!("invalid OFFSET '{number}'"),
-            })?)
-        } else {
-            None
-        };
+        let (limit, offset, offset_position) = self.parse_pagination()?;
 
         let select = Select {
             distinct: false,
@@ -1537,7 +1510,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_distinct_select(&mut self) -> Result<Select> {
-        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table>, an optional WHERE predicate, an optional ORDER BY projected_column [ASC|DESC] list, and an optional LIMIT <count> [OFFSET <offset>]";
+        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table>, an optional WHERE predicate, an optional ORDER BY projected_column [ASC|DESC] list, and optional LIMIT <count> [OFFSET <offset>] or LIMIT <offset>, <count> pagination";
 
         let mut items = Vec::new();
         loop {
@@ -1580,33 +1553,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let limit = if self.eat_keyword("LIMIT") {
-            let position = self.position();
-            let number = self.take_number().ok_or_else(|| Error::Sql {
-                position,
-                message: "expected a non-negative integer after LIMIT".to_owned(),
-            })?;
-            Some(number.parse::<usize>().map_err(|_| Error::Sql {
-                position,
-                message: format!("invalid LIMIT '{number}'"),
-            })?)
-        } else {
-            None
-        };
-
-        let offset = if limit.is_some() && self.eat_keyword("OFFSET") {
-            let position = self.position();
-            let number = self.take_number().ok_or_else(|| Error::Sql {
-                position,
-                message: "expected a non-negative integer after OFFSET".to_owned(),
-            })?;
-            Some(number.parse::<usize>().map_err(|_| Error::Sql {
-                position,
-                message: format!("invalid OFFSET '{number}'"),
-            })?)
-        } else {
-            None
-        };
+        let (limit, offset, _) = self.parse_pagination()?;
 
         if !self.at_keyword("UNION") && !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End)
         {
@@ -1623,6 +1570,55 @@ impl<'a> Parser<'a> {
             order_by,
             limit,
             offset,
+        })
+    }
+
+    fn parse_pagination(&mut self) -> Result<(Option<usize>, Option<usize>, usize)> {
+        if !self.eat_keyword("LIMIT") {
+            return Ok((None, None, self.position()));
+        }
+
+        let first_position = self.position();
+        let first = self.take_number().ok_or_else(|| Error::Sql {
+            position: first_position,
+            message: "expected a non-negative integer after LIMIT".to_owned(),
+        })?;
+        let offset_position = self.position();
+
+        if self.eat(&TokenKind::Comma) {
+            let count_position = self.position();
+            let count = self.take_number().ok_or_else(|| Error::Sql {
+                position: count_position,
+                message: "expected a non-negative count after ',' in LIMIT".to_owned(),
+            })?;
+
+            // ClickHouse's comma form reverses the operands. Normalize it to
+            // the same fields as `LIMIT count OFFSET offset` so execution and
+            // its checked count-plus-offset bound remain shared.
+            let offset = Self::parse_pagination_value(&first, first_position, "OFFSET")?;
+            let limit = Self::parse_pagination_value(&count, count_position, "LIMIT")?;
+            return Ok((Some(limit), Some(offset), offset_position));
+        }
+
+        let limit = Self::parse_pagination_value(&first, first_position, "LIMIT")?;
+        let offset = if self.eat_keyword("OFFSET") {
+            let position = self.position();
+            let number = self.take_number().ok_or_else(|| Error::Sql {
+                position,
+                message: "expected a non-negative integer after OFFSET".to_owned(),
+            })?;
+            Some(Self::parse_pagination_value(&number, position, "OFFSET")?)
+        } else {
+            None
+        };
+
+        Ok((Some(limit), offset, offset_position))
+    }
+
+    fn parse_pagination_value(number: &str, position: usize, name: &str) -> Result<usize> {
+        number.parse::<usize>().map_err(|_| Error::Sql {
+            position,
+            message: format!("invalid {name} '{number}'"),
         })
     }
 
