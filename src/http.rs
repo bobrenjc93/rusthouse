@@ -34,7 +34,7 @@ pub struct HttpQueryLimits {
     pub max_header_bytes: usize,
     /// Maximum number of request header fields.
     pub max_header_count: usize,
-    /// Maximum bytes in a POST body or decoded GET SQL query parameter.
+    /// Maximum bytes in a POST body or decoded URL SQL query parameter.
     pub max_sql_bytes: usize,
     /// Byte, row, and value limits for one `POST /insert/<table>` CSV body.
     ///
@@ -103,22 +103,24 @@ impl StdError for HttpQueryError {
 /// Handles one strict, bounded HTTP/1.1 exchange.
 ///
 /// `POST /` and `POST /query` require exactly one decimal `Content-Length` and
-/// carry UTF-8 SQL in their body. `GET /?query=<percent-encoded SQL>` carries
-/// the same SQL in a required form-style query parameter and optionally accepts
-/// one `database=default` parameter and one `default_format` parameter in any
-/// order. `default_format` accepts `JSON`, `CSVWithNames`,
+/// carry UTF-8 SQL in their body. `GET /?query=<percent-encoded SQL>` and
+/// `POST /?query=<percent-encoded SQL>` carry the same SQL in a required
+/// form-style query parameter and optionally accept one `database=default`
+/// parameter and one `default_format` parameter in any order. `default_format`
+/// accepts `JSON`, `CSVWithNames`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
-/// names and values are percent-decoded, `+` becomes a space, and no request
-/// body is accepted. Empty, duplicate, unknown, and unsupported parameters are
+/// names and values are percent-decoded, `+` becomes a space, and neither form
+/// accepts a request body (`Content-Length` may be absent or zero). Empty,
+/// duplicate, unknown, and unsupported parameters are
 /// rejected after authentication and before database access. A
 /// `default_format` parameter cannot be combined with an
-/// `X-ClickHouse-Format` header. All three forms pass the SQL to
+/// `X-ClickHouse-Format` header. All four forms pass the SQL to
 /// [`SharedDatabase::try_query`], which accepts exactly one read-only statement
 /// and makes one nonblocking read-lock attempt. Writer contention returns
 /// `503 Service Unavailable`; lock poisoning remains a `500 Internal Server Error`.
 /// A successful query response uses the same JSON result shape as the batch
-/// JSON formatter unless one format selector requests a streaming format. GET
-/// `default_format` additionally accepts an explicit `JSON`; the
+/// JSON formatter unless one format selector requests a streaming format.
+/// Parameterized-query `default_format` additionally accepts an explicit `JSON`; the
 /// `X-ClickHouse-Format` header accepts `CSVWithNames`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. CSV, TSV,
 /// and row-oriented JSON responses use the corresponding batch writers;
@@ -720,16 +722,19 @@ fn read_request(
                 input_format: request.table_insert_format,
             })
         }
-        RequestKind::Query(QuerySource::UrlEncodedParameters(encoded_parameters)) => {
+        RequestKind::Query(QuerySource::UrlEncodedParameters {
+            encoded_parameters,
+            method,
+        }) => {
             if request.content_length.unwrap_or(0) != 0 {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
-                    "GET /?query= does not accept a request body",
+                    method.body_rejection_message(),
                 )
                 .into());
             }
 
-            let decoded = decode_get_query_parameters(&encoded_parameters, limits.max_sql_bytes)?;
+            let decoded = decode_query_parameters(&encoded_parameters, limits.max_sql_bytes)?;
             let response_format = match (request.response_format, decoded.response_format) {
                 (Some(_), Some(_)) => {
                     return Err(RequestFailure::new(
@@ -961,10 +966,28 @@ enum TableInsertFormat {
 
 enum QuerySource {
     Body,
-    UrlEncodedParameters(Vec<u8>),
+    UrlEncodedParameters {
+        encoded_parameters: Vec<u8>,
+        method: ParameterizedQueryMethod,
+    },
 }
 
-struct DecodedGetQuery {
+#[derive(Clone, Copy)]
+enum ParameterizedQueryMethod {
+    Get,
+    Post,
+}
+
+impl ParameterizedQueryMethod {
+    const fn body_rejection_message(self) -> &'static str {
+        match self {
+            Self::Get => "GET /?query= does not accept a request body",
+            Self::Post => "POST /?query= does not accept a request body",
+        }
+    }
+}
+
+struct DecodedQuery {
     sql: Vec<u8>,
     response_format: Option<QueryResponseFormat>,
 }
@@ -1248,7 +1271,7 @@ fn parse_request_line(
         )
         .into());
     }
-    const GET_PARAMETERS_PREFIX: &[u8] = b"/?";
+    const QUERY_PARAMETERS_PREFIX: &[u8] = b"/?";
 
     match (method, target) {
         (b"POST", b"/" | b"/query") => Ok(RequestKind::Query(QuerySource::Body)),
@@ -1263,9 +1286,18 @@ fn parse_request_line(
                     ))
                 })
         }
-        (b"GET", target) if target.starts_with(GET_PARAMETERS_PREFIX) => Ok(RequestKind::Query(
-            QuerySource::UrlEncodedParameters(target[GET_PARAMETERS_PREFIX.len()..].to_vec()),
-        )),
+        (b"GET", target) if target.starts_with(QUERY_PARAMETERS_PREFIX) => {
+            Ok(RequestKind::Query(QuerySource::UrlEncodedParameters {
+                encoded_parameters: target[QUERY_PARAMETERS_PREFIX.len()..].to_vec(),
+                method: ParameterizedQueryMethod::Get,
+            }))
+        }
+        (b"POST", target) if target.starts_with(QUERY_PARAMETERS_PREFIX) => {
+            Ok(RequestKind::Query(QuerySource::UrlEncodedParameters {
+                encoded_parameters: target[QUERY_PARAMETERS_PREFIX.len()..].to_vec(),
+                method: ParameterizedQueryMethod::Post,
+            }))
+        }
         (b"GET", b"/ping") => Ok(RequestKind::Ping),
         (b"GET", b"/ready") => Ok(RequestKind::Ready),
         (b"GET", b"/metrics") => Ok(RequestKind::Metrics),
@@ -1282,8 +1314,8 @@ fn parse_request_line(
         {
             Err(RequestFailure::with_headers(
                 Status::METHOD_NOT_ALLOWED,
-                "method must be GET for /?query=",
-                &[b"Allow: GET\r\n"],
+                "method must be GET or POST for /?query=",
+                &[b"Allow: GET, POST\r\n"],
             )
             .into())
         }
@@ -1344,10 +1376,10 @@ fn parse_table_insert_target(target: &[u8]) -> Option<&str> {
     validate_table_name(table).is_ok().then_some(table)
 }
 
-fn decode_get_query_parameters(
+fn decode_query_parameters(
     encoded_parameters: &[u8],
     max_sql_bytes: usize,
-) -> Result<DecodedGetQuery, RequestReadError> {
+) -> Result<DecodedQuery, RequestReadError> {
     let mut query = None;
     let mut database_seen = false;
     let mut response_format = None;
@@ -1439,7 +1471,7 @@ fn decode_get_query_parameters(
             "GET query target must contain exactly one query parameter",
         ))
     })?;
-    Ok(DecodedGetQuery {
+    Ok(DecodedQuery {
         sql,
         response_format,
     })

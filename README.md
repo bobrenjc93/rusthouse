@@ -552,11 +552,13 @@ whose sender may be awaiting an interim response.
 
 `POST /` and `POST /query` are equivalent query routes. Each requires one
 decimal `Content-Length` and sends its UTF-8 SQL body through
-`SharedDatabase::try_query`. The standard ClickHouse-style
-`GET /?query=<percent-encoded SQL>` form does the same with no body
-(`Content-Length` may be omitted or be zero). It also accepts one optional
-`database=default` parameter and one optional `default_format` parameter in any
-order with `query`, including percent-encoded parameter names and values. All
+`SharedDatabase::try_query`. The standard ClickHouse-style parameterized forms,
+`GET /?query=<percent-encoded SQL>` and
+`POST /?query=<percent-encoded SQL>`, do the same with no body
+(`Content-Length` may be omitted or be zero). A nonzero `Content-Length` is
+rejected. Both forms also accept one optional `database=default` parameter and
+one optional `default_format` parameter in any order with `query`, including
+percent-encoded parameter names and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
 `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, and
@@ -583,8 +585,9 @@ values return `400 Bad Request`. Database-header validation runs after either
 configured authentication mode, so credential failures retain precedence, but
 before a POST body is read or any database lock is attempted. Omitting the
 header retains the existing single-database behavior.
-For GET queries, the header and `database=default` query parameter may coexist;
-each is validated independently against the same single database.
+For parameterized GET and POST queries, the header and `database=default` query
+parameter may coexist; each is validated independently against the same single
+database.
 
 The bearer- and `X-ClickHouse-Key`-authenticated handlers additionally expose
 exact `POST /insert`. It requires one decimal `Content-Length`, applies the
@@ -657,12 +660,12 @@ one positional JSON array per row, each followed by a line feed; column
 metadata is omitted and an empty result has an empty body. Header names are
 case-insensitive, but format values are case-sensitive and must use one of
 those exact spellings. Duplicate format headers and all other format values
-receive deterministic `400 Bad Request` JSON errors. A GET request cannot
-combine this header with `default_format`; the independently valid selectors
-also receive a deterministic `400 Bad Request` after authentication and before
-database access. When neither selector is present, the existing JSON response
-shape is unchanged. Every selected writer remains subject to the complete HTTP
-response cap.
+receive deterministic `400 Bad Request` JSON errors. A parameterized GET or
+POST request cannot combine this header with `default_format`; the independently
+valid selectors also receive a deterministic `400 Bad Request` after
+authentication and before database access. When neither selector is present,
+the existing JSON response shape is unchanged. Every selected writer remains
+subject to the complete HTTP response cap.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`
