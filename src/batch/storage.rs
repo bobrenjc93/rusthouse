@@ -322,20 +322,31 @@ impl Table {
             })
     }
 
-    /// Resolves a complete explicit INSERT column list and returns rows in
-    /// physical schema order. Positional rows are returned unchanged.
+    /// Resolves a nonempty explicit INSERT column list and returns complete
+    /// rows in physical schema order. Positional rows are returned unchanged.
     ///
-    /// Explicit names resolve case-insensitively. Every schema column must be
-    /// named exactly once; unknown, duplicate, and omitted names are rejected
-    /// before any row is changed.
+    /// Explicit names resolve case-insensitively. Unknown and duplicate names
+    /// are rejected. Omitted columns receive their type's non-null default:
+    /// `0`, `0.0`, `false`, or an empty String. After column and row-width
+    /// validation, `capacity_rows` is checked before those defaults are
+    /// materialized. Atomic callers pass the cumulative rows for this table.
     pub(crate) fn prepare_insert_rows(
         &self,
         insert_columns: Option<&[String]>,
         mut rows: Vec<Vec<Value>>,
+        capacity_rows: usize,
     ) -> Result<Vec<Vec<Value>>> {
         let Some(insert_columns) = insert_columns else {
+            self.validate_row_capacity(capacity_rows)?;
             return Ok(rows);
         };
+
+        if insert_columns.is_empty() {
+            return Err(Error::MissingInsertColumn {
+                table: self.name.clone(),
+                column: self.schema[0].name.clone(),
+            });
+        }
 
         let schema_indexes_by_name = self
             .schema
@@ -357,37 +368,40 @@ impl Table {
             }
             schema_indexes.push(schema_index);
         }
-        if let Some((index, _)) = seen.iter().enumerate().find(|(_, present)| !**present) {
-            return Err(Error::MissingInsertColumn {
-                table: self.name.clone(),
-                column: self.schema[index].name.clone(),
-            });
-        }
 
         for row in &rows {
-            if row.len() != self.schema.len() {
+            if row.len() != insert_columns.len() {
                 return Err(Error::RowLength {
                     table: self.name.clone(),
-                    expected: self.schema.len(),
+                    expected: insert_columns.len(),
                     actual: row.len(),
                 });
             }
         }
 
-        if schema_indexes.iter().copied().eq(0..self.schema.len()) {
+        self.validate_row_capacity(capacity_rows)?;
+
+        if insert_columns.len() == self.schema.len()
+            && schema_indexes.iter().copied().eq(0..self.schema.len())
+        {
             return Ok(rows);
         }
         for row in &mut rows {
             let source = std::mem::take(row);
-            let mut reordered = Vec::with_capacity(source.len());
-            reordered.resize_with(source.len(), || None);
+            let mut reordered = self
+                .schema
+                .iter()
+                .map(|field| match field.data_type {
+                    DataType::Int64 => Value::Int64(0),
+                    DataType::Float64 => Value::Float64(0.0),
+                    DataType::Bool => Value::Bool(false),
+                    DataType::String => Value::String(String::new()),
+                })
+                .collect::<Vec<_>>();
             for (value, schema_index) in source.into_iter().zip(schema_indexes.iter().copied()) {
-                reordered[schema_index] = Some(value);
+                reordered[schema_index] = value;
             }
-            *row = reordered
-                .into_iter()
-                .map(|value| value.expect("complete INSERT columns cover every schema position"))
-                .collect();
+            *row = reordered;
         }
         Ok(rows)
     }

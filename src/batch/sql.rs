@@ -99,7 +99,8 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
-    /// `INSERT` with a complete explicit input-column order.
+    /// `INSERT` with a nonempty explicit input-column order. Omitted schema
+    /// columns are filled with typed defaults during execution.
     InsertWithColumns {
         table: String,
         columns: Vec<String>,

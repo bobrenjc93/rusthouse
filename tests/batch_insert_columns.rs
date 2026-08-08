@@ -1,4 +1,6 @@
-use rusthouse::batch::engine::{Database, StatementResult};
+use std::fmt::Write as _;
+
+use rusthouse::batch::engine::{DEFAULT_MAX_CELLS_PER_TABLE, Database, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::Statement;
 use rusthouse::batch::value::Value;
@@ -76,32 +78,74 @@ fn complete_insert_columns_reorder_every_type_and_preserve_positional_insert() {
 }
 
 #[test]
-fn explicit_insert_columns_reject_duplicates_omissions_unknowns_and_bad_rows() {
+fn explicit_insert_column_subsets_fill_every_typed_default_in_schema_order() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String); \
+             INSERT INTO metrics (LABEL, ID) VALUES ('first', 1); \
+             INSERT INTO metrics (active, score) VALUES (true, 2.5);",
+        )
+        .expect("reordered subsets receive typed defaults");
+
+    assert_eq!(
+        query_rows(
+            &mut database,
+            "SELECT id, score, active, label FROM metrics ORDER BY id;",
+        ),
+        [
+            vec![
+                Value::Int64(0),
+                Value::Float64(2.5),
+                Value::Bool(true),
+                Value::String(String::new()),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String("first".to_owned()),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn explicit_insert_columns_reject_duplicates_unknowns_wrong_widths_and_types() {
     let cases = [
         (
-            "INSERT INTO metrics (id, ID, active, label) VALUES (1, 2.5, true, 'x');",
+            "INSERT INTO metrics (id, ID) VALUES (1, 2);",
             Error::DuplicateColumn("ID".to_owned()),
         ),
         (
-            "INSERT INTO metrics (id, score, active) VALUES (1, 2.5, true);",
-            Error::MissingInsertColumn {
-                table: "metrics".to_owned(),
-                column: "label".to_owned(),
-            },
-        ),
-        (
-            "INSERT INTO metrics (id, score, active, missing) VALUES (1, 2.5, true, 'x');",
+            "INSERT INTO metrics (id, missing) VALUES (1, 'x');",
             Error::ColumnNotFound {
                 table: "metrics".to_owned(),
                 column: "missing".to_owned(),
             },
         ),
         (
-            "INSERT INTO metrics (label, active, score, id) VALUES ('x', true, 2.5);",
+            "INSERT INTO metrics (label, id) VALUES ('x');",
             Error::RowLength {
                 table: "metrics".to_owned(),
-                expected: 4,
+                expected: 2,
+                actual: 1,
+            },
+        ),
+        (
+            "INSERT INTO metrics (label, id) VALUES ('x', 1, true);",
+            Error::RowLength {
+                table: "metrics".to_owned(),
+                expected: 2,
                 actual: 3,
+            },
+        ),
+        (
+            "INSERT INTO metrics (label, id) VALUES ('x', 'not an integer');",
+            Error::TypeMismatch {
+                context: "column 'metrics.id'".to_owned(),
+                expected: "Int64".to_owned(),
+                actual: "String".to_owned(),
             },
         ),
     ];
@@ -126,67 +170,166 @@ fn named_insert_batch_reorders_before_validation_and_rolls_back_every_target() {
         )
         .expect("create targets");
 
-    assert_eq!(
-        database.execute_insert_batch(
-            "INSERT INTO events (label, id) VALUES ('kept only on success', 1); \
-             INSERT INTO metrics (label, active, score, id) \
-                 VALUES ('bad', true, 2.5, 'not an integer');",
+    for (invalid_insert, expected) in [
+        (
+            "INSERT INTO metrics (id, ID) VALUES (1, 2);",
+            Error::DuplicateColumn("ID".to_owned()),
         ),
-        Err(Error::TypeMismatch {
-            context: "column 'metrics.id'".to_owned(),
-            expected: "Int64".to_owned(),
-            actual: "String".to_owned(),
-        })
-    );
-    assert_eq!(database.catalog().table("events").unwrap().row_count(), 0);
-    assert_eq!(database.catalog().table("metrics").unwrap().row_count(), 0);
+        (
+            "INSERT INTO metrics (id, missing) VALUES (1, 2);",
+            Error::ColumnNotFound {
+                table: "metrics".to_owned(),
+                column: "missing".to_owned(),
+            },
+        ),
+        (
+            "INSERT INTO metrics (label, score) VALUES ('bad');",
+            Error::RowLength {
+                table: "metrics".to_owned(),
+                expected: 2,
+                actual: 1,
+            },
+        ),
+        (
+            "INSERT INTO metrics (label, id) VALUES ('bad', 'not an integer');",
+            Error::TypeMismatch {
+                context: "column 'metrics.id'".to_owned(),
+                expected: "Int64".to_owned(),
+                actual: "String".to_owned(),
+            },
+        ),
+    ] {
+        let batch =
+            format!("INSERT INTO events (label) VALUES ('kept only on success'); {invalid_insert}");
+        assert_eq!(database.execute_insert_batch(&batch), Err(expected));
+        assert_eq!(database.catalog().table("events").unwrap().row_count(), 0);
+        assert_eq!(database.catalog().table("metrics").unwrap().row_count(), 0);
+    }
 
     database
         .execute_insert_batch(
-            "INSERT INTO events (LABEL, ID) VALUES ('one', 1), ('two', 2); \
-             INSERT INTO metrics (active, label, id, score) \
-                 VALUES (true, 'metric', 3, 3.5);",
+            "INSERT INTO events (LABEL) VALUES ('one'), ('two'); \
+             INSERT INTO metrics (label, score) VALUES ('metric', 3.5);",
         )
-        .expect("valid named INSERT batch commits");
+        .expect("valid INSERT subsets commit with defaults");
     assert_eq!(database.catalog().table("events").unwrap().row_count(), 2);
     assert_eq!(database.catalog().table("metrics").unwrap().row_count(), 1);
 }
 
 #[test]
-fn named_insert_batches_follow_the_schema_after_a_column_is_dropped() {
-    let mut database = Database::new();
+fn named_insert_batches_preflight_cumulative_capacity_before_defaulted_rows_commit() {
+    let mut database = Database::with_max_rows_per_table(2);
     database
-        .execute(
-            "CREATE TABLE Metrics (id Int64, score Float64, active Bool); \
-             INSERT INTO metrics VALUES (1, 1.5, true); \
-             ALTER TABLE metrics DROP COLUMN score;",
-        )
-        .expect("setup and drop succeed");
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .expect("create target");
 
     assert_eq!(
         database.execute_insert_batch(
-            "INSERT INTO metrics (active, id) VALUES (false, 2); \
-             INSERT INTO metrics (id, score, active) VALUES (3, 3.5, true);",
+            "INSERT INTO events (label) VALUES ('first'); \
+             INSERT INTO EVENTS (id) VALUES (2), (3);",
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+    assert_eq!(database.catalog().table("events").unwrap().row_count(), 0);
+}
+
+#[test]
+fn wide_subsets_reject_capacity_before_ordinary_or_atomic_default_expansion() {
+    const COLUMN_COUNT: usize = 1_024;
+    const ROW_COUNT: usize = 100_000;
+
+    let mut create = String::from("CREATE TABLE wide (");
+    for index in 0..COLUMN_COUNT {
+        if index != 0 {
+            create.push_str(", ");
+        }
+        write!(create, "c{index} Int64").unwrap();
+    }
+    create.push_str(");");
+
+    let insert = |row_count: usize| {
+        let mut sql = String::with_capacity(35 + row_count.saturating_mul(4));
+        sql.push_str("INSERT INTO wide (c0) VALUES ");
+        for row in 0..row_count {
+            if row != 0 {
+                sql.push(',');
+            }
+            sql.push_str("(1)");
+        }
+        sql.push(';');
+        sql
+    };
+
+    let mut database = Database::new();
+    database.execute(&create).expect("create wide target");
+    let expected = Error::ResourceLimitExceeded {
+        resource: "table cells",
+        actual: ROW_COUNT * COLUMN_COUNT,
+        max: DEFAULT_MAX_CELLS_PER_TABLE,
+    };
+
+    assert_eq!(database.execute(&insert(ROW_COUNT)), Err(expected.clone()));
+    assert_eq!(database.catalog().table("wide").unwrap().row_count(), 0);
+
+    let atomic = format!("{}{}", insert(1), insert(ROW_COUNT - 1),);
+    assert_eq!(database.execute_insert_batch(&atomic), Err(expected));
+    assert_eq!(database.catalog().table("wide").unwrap().row_count(), 0);
+}
+
+#[test]
+fn insert_subsets_follow_the_schema_after_columns_are_added_and_dropped() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Metrics (id Int64, score Float64); \
+             INSERT INTO metrics (id) VALUES (1); \
+             ALTER TABLE metrics ADD COLUMN active Bool; \
+             ALTER TABLE metrics ADD COLUMN label String; \
+             INSERT INTO metrics (LABEL, ID) VALUES ('second', 2); \
+             ALTER TABLE metrics DROP COLUMN score;",
+        )
+        .expect("subsets use the schema in effect for each statement");
+
+    assert_eq!(
+        database.execute_insert_batch(
+            "INSERT INTO metrics (active) VALUES (true); \
+             INSERT INTO metrics (id, score) VALUES (3, 3.5);",
         ),
         Err(Error::ColumnNotFound {
             table: "Metrics".to_owned(),
             column: "score".to_owned(),
         })
     );
-    assert_eq!(database.catalog().table("metrics").unwrap().row_count(), 1);
+    assert_eq!(database.catalog().table("metrics").unwrap().row_count(), 2);
 
     database
-        .execute_insert_batch(
-            "INSERT INTO metrics (ACTIVE, ID) VALUES (false, 2); \
-             INSERT INTO metrics (id, active) VALUES (3, true);",
-        )
-        .expect("complete lists for the remaining schema commit");
+        .execute_insert_batch("INSERT INTO metrics (ACTIVE) VALUES (true);")
+        .expect("the current schema supplies defaults for both omitted columns");
     assert_eq!(
-        query_rows(&mut database, "SELECT id, active FROM metrics ORDER BY id;"),
+        query_rows(
+            &mut database,
+            "SELECT id, active, label FROM metrics ORDER BY id;",
+        ),
         [
-            vec![Value::Int64(1), Value::Bool(true)],
-            vec![Value::Int64(2), Value::Bool(false)],
-            vec![Value::Int64(3), Value::Bool(true)],
+            vec![
+                Value::Int64(0),
+                Value::Bool(true),
+                Value::String(String::new()),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Bool(false),
+                Value::String(String::new()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Bool(false),
+                Value::String("second".to_owned()),
+            ],
         ]
     );
 }

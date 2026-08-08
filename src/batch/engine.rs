@@ -335,10 +335,12 @@ impl Database {
 
     /// Atomically executes a nonempty SQL batch containing only `INSERT` statements.
     ///
-    /// Every target table, row shape, value type, finite floating-point value,
-    /// and cumulative per-table row count is validated before any row is
-    /// appended. A failure therefore leaves every table unchanged. Successful
-    /// statements are committed and reported in input order.
+    /// Every target table, explicit-column mapping, row shape, value type,
+    /// finite floating-point value, and cumulative per-table row count is
+    /// validated before any row is appended. Omitted explicit columns are
+    /// expanded to typed defaults during that preflight. A failure therefore
+    /// leaves every table unchanged. Successful statements are committed and
+    /// reported in input order.
     pub fn execute_insert_batch(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         let statements = sql::parse(sql)?;
         self.execute_insert_statements(statements)
@@ -426,12 +428,11 @@ impl Database {
                 _ => unreachable!("non-INSERT statements were rejected"),
             };
             let target = self.catalog.table(&table)?;
-            let rows = target.prepare_insert_rows(columns.as_deref(), rows)?;
             let cumulative_rows = incoming_rows_by_table
                 .entry(table.to_ascii_lowercase())
                 .or_default();
             *cumulative_rows = cumulative_rows.saturating_add(rows.len());
-            target.validate_row_capacity(*cumulative_rows)?;
+            let rows = target.prepare_insert_rows(columns.as_deref(), rows, *cumulative_rows)?;
             for row in &rows {
                 target.validate_row(row)?;
             }
@@ -691,10 +692,12 @@ impl Database {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Value>>,
     ) -> Result<StatementResult> {
-        let rows = self
-            .catalog
-            .table(&table)?
-            .prepare_insert_rows(columns.as_deref(), rows)?;
+        let incoming_rows = rows.len();
+        let rows = self.catalog.table(&table)?.prepare_insert_rows(
+            columns.as_deref(),
+            rows,
+            incoming_rows,
+        )?;
         let affected_rows = rows.len();
         self.catalog.table_mut(&table)?.insert_rows(rows)?;
         Ok(StatementResult::Command {
