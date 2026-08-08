@@ -1,4 +1,7 @@
-use rusthouse::batch::engine::{Database, QueryResultLimits, ResultColumn, StatementResult};
+use rusthouse::batch::engine::{
+    Database, QueryResultLimits, ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES, ResultColumn,
+    StatementResult,
+};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{self, BatchSqlLimits};
 use rusthouse::batch::value::{DataType, Value};
@@ -164,6 +167,111 @@ fn ordered_row_number_supports_both_directions_stable_ties_filtering_and_limit()
 }
 
 #[test]
+fn ordered_row_number_charges_exact_filtered_state_and_preserves_stable_ties() {
+    let setup = "CREATE TABLE events (id Int64, rank_key Int64, keep Bool); \
+                 INSERT INTO events VALUES \
+                     (1, 2, true), (2, 1, true), (3, 2, true), \
+                     (4, 1, true), (5, 0, false);";
+    let filtered_state_bytes = 4 * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES;
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: filtered_state_bytes,
+        ..QueryResultLimits::default()
+    });
+    exact.execute(setup).expect("setup");
+
+    let results = exact
+        .execute(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY rank_key ASC) AS n \
+             FROM events WHERE keep = true LIMIT 3; \
+             SELECT id, ROW_NUMBER() OVER (ORDER BY rank_key DESC) AS n \
+             FROM events WHERE keep = true LIMIT 3;",
+        )
+        .expect("the exact filtered-state boundary succeeds");
+    assert_eq!(
+        query(&results[0]).rows,
+        [
+            vec![Value::Int64(2), Value::Int64(1)],
+            vec![Value::Int64(4), Value::Int64(2)],
+            vec![Value::Int64(1), Value::Int64(3)],
+        ]
+    );
+    assert_eq!(
+        query(&results[1]).rows,
+        [
+            vec![Value::Int64(1), Value::Int64(1)],
+            vec![Value::Int64(3), Value::Int64(2)],
+            vec![Value::Int64(2), Value::Int64(3)],
+        ]
+    );
+
+    assert_eq!(
+        exact.execute(
+            "SELECT ROW_NUMBER() OVER (ORDER BY rank_key ASC) \
+             FROM events LIMIT 1"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: 5 * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES,
+            max: filtered_state_bytes,
+        })
+    );
+
+    let mut one_byte_short = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: filtered_state_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_byte_short.execute(setup).expect("setup");
+    assert_eq!(
+        one_byte_short.execute(
+            "SELECT ROW_NUMBER() OVER (ORDER BY rank_key DESC) \
+             FROM events WHERE keep = true LIMIT 1"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: filtered_state_bytes,
+            max: filtered_state_bytes - 1,
+        })
+    );
+}
+
+#[test]
+fn ordered_row_number_limit_zero_still_charges_state_but_empty_inputs_do_not() {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    let results = database
+        .execute(
+            "CREATE TABLE empty (rank_key Int64); \
+             CREATE TABLE events (rank_key Int64, keep Bool); \
+             INSERT INTO events VALUES (2, true), (1, false); \
+             SELECT ROW_NUMBER() OVER (ORDER BY rank_key ASC) FROM empty LIMIT 0; \
+             SELECT ROW_NUMBER() OVER (ORDER BY rank_key DESC) \
+             FROM events WHERE keep = false AND rank_key = 2 LIMIT 0;",
+        )
+        .expect("empty filtered ordering state fits a zero-byte limit");
+    assert!(query(&results[3]).rows.is_empty());
+    assert!(query(&results[4]).rows.is_empty());
+
+    assert_eq!(
+        database.execute(
+            "SELECT ROW_NUMBER() OVER (ORDER BY rank_key ASC) \
+             FROM events WHERE keep = true LIMIT 0"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES,
+            max: 0,
+        })
+    );
+
+    let results = database
+        .execute("SELECT ROW_NUMBER() OVER () FROM events LIMIT 0")
+        .expect("unordered ROW_NUMBER does not use ordering state");
+    assert!(query(&results[0]).rows.is_empty());
+}
+
+#[test]
 fn ordered_row_number_limits_match_a_full_stable_ordering() {
     let source_rows = [
         (-2, -100),
@@ -270,7 +378,10 @@ fn ordered_row_number_limits_rows_before_checked_cast_projection() {
 
 #[test]
 fn ordered_row_number_rejects_missing_and_non_int64_columns() {
-    let mut database = Database::new();
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: 0,
+        ..QueryResultLimits::default()
+    });
     database
         .execute(
             "CREATE TABLE events (id Int64, label String); \
