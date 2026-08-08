@@ -71,8 +71,8 @@ pub const MAX_COUNT_IF_PARALLEL_WORKERS: usize = 16;
 /// ordering, and grouped working state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryResultLimits {
-    /// Maximum rows in the source table of one table-backed `SELECT`, `DELETE`,
-    /// or `ALTER TABLE UPDATE`.
+    /// Maximum rows in the source table of one table-backed `SELECT`, `DELETE`
+    /// (including `ALTER TABLE DELETE`), or `ALTER TABLE UPDATE`.
     ///
     /// This is checked before row inspection and matching-row or replacement
     /// allocation. `WHERE` and `LIMIT` therefore cannot reduce the charged

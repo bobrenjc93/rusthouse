@@ -125,10 +125,11 @@ impl StdError for HttpQueryError {
 /// before database access. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
-/// may instead end in the case-insensitive SQL clause `FORMAT CSVWithNames`,
-/// with an optional trailing semicolon. The clause selects the existing named
-/// CSV writer and cannot be combined with either HTTP format selector. Quoted
-/// strings and line comments are not interpreted as format clauses. GET
+/// may instead end in a case-insensitive SQL `FORMAT CSVWithNames` or `FORMAT
+/// JSONEachRow` clause, with an optional trailing semicolon. The clause selects
+/// the corresponding existing bounded writer and cannot be combined with
+/// either HTTP format selector. Quoted strings and line comments are not
+/// interpreted as format clauses. GET
 /// requests and every request made through a
 /// read-only handler pass the SQL to [`SharedDatabase::try_query`], which
 /// accepts exactly one read-only statement and makes one nonblocking read-lock
@@ -1055,25 +1056,28 @@ fn classify_standard_query_request(
     response_format: Option<QueryResponseFormat>,
     insert_enabled: bool,
 ) -> Result<HttpRequest, RequestReadError> {
-    let sql_format_selected = take_terminal_csv_with_names_format(&mut sql);
-    if sql_format_selected && response_format.is_some() {
-        return Err(RequestFailure::new(
-            Status::BAD_REQUEST,
-            "FORMAT CSVWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter",
-        )
-        .into());
-    }
-    let response_format = if sql_format_selected {
-        QueryResponseFormat::CsvWithNames
-    } else {
-        response_format.unwrap_or(QueryResponseFormat::Json)
+    let sql_format = take_terminal_query_format(&mut sql);
+    if let (Some(sql_format), Some(_)) = (sql_format, response_format) {
+        let message = match sql_format {
+            QueryResponseFormat::CsvWithNames => {
+                "FORMAT CSVWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
+            }
+            QueryResponseFormat::JsonEachRow => {
+                "FORMAT JSONEachRow clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
+            }
+            _ => unreachable!("the SQL FORMAT scanner only returns supported terminal formats"),
+        };
+        return Err(RequestFailure::new(Status::BAD_REQUEST, message).into());
     };
+    let response_format = sql_format
+        .or(response_format)
+        .unwrap_or(QueryResponseFormat::Json);
 
     // Route mixed batches through the insert-only executor too, so its
     // authoritative all-statement validation and transaction semantics decide
     // the error without risking an earlier partial INSERT.
     let contains_insert = insert_enabled
-        && !sql_format_selected
+        && sql_format.is_none()
         && sql::parse(&sql).is_ok_and(|statements| {
             statements.iter().any(|statement| {
                 matches!(
@@ -1092,22 +1096,20 @@ fn classify_standard_query_request(
     }
 }
 
-/// Removes one terminal, unquoted `FORMAT CSVWithNames` clause.
+/// Removes one supported terminal, unquoted SQL `FORMAT` clause.
 ///
 /// The SQL parser deliberately does not own transport output formats, so the
-/// HTTP adapter recognizes this one ClickHouse-compatible clause before using
+/// HTTP adapter recognizes these ClickHouse-compatible clauses before using
 /// the unchanged read-only query API. This scanner follows the SQL lexer's
 /// single-quote, doubled-quote, whitespace, and line-comment rules without
 /// retaining tokens proportional to the bounded request size.
-fn take_terminal_csv_with_names_format(sql: &mut String) -> bool {
-    let Some(format_start) = terminal_csv_with_names_format_start(sql) else {
-        return false;
-    };
+fn take_terminal_query_format(sql: &mut String) -> Option<QueryResponseFormat> {
+    let (format_start, response_format) = terminal_query_format(sql)?;
     sql.truncate(format_start);
-    true
+    Some(response_format)
 }
 
-fn terminal_csv_with_names_format_start(sql: &str) -> Option<usize> {
+fn terminal_query_format(sql: &str) -> Option<(usize, QueryResponseFormat)> {
     #[derive(Clone, Copy)]
     struct Token<'a> {
         text: &'a str,
@@ -1209,14 +1211,23 @@ fn terminal_csv_with_names_format_start(sql: &str) -> Option<usize> {
     }
 
     let format = previous?;
-    let csv_with_names = last?;
-    (format.has_previous
-        && !format.separated_by_semicolon
-        && !csv_with_names.separated_by_semicolon
-        && semicolons_since_token <= 1
-        && format.text.eq_ignore_ascii_case("FORMAT")
-        && csv_with_names.text.eq_ignore_ascii_case("CSVWithNames"))
-    .then_some(format.start)
+    let format_name = last?;
+    if !format.has_previous
+        || format.separated_by_semicolon
+        || format_name.separated_by_semicolon
+        || semicolons_since_token > 1
+        || !format.text.eq_ignore_ascii_case("FORMAT")
+    {
+        return None;
+    }
+    let response_format = if format_name.text.eq_ignore_ascii_case("CSVWithNames") {
+        QueryResponseFormat::CsvWithNames
+    } else if format_name.text.eq_ignore_ascii_case("JSONEachRow") {
+        QueryResponseFormat::JsonEachRow
+    } else {
+        return None;
+    };
+    Some((format.start, response_format))
 }
 
 fn read_sql_body(
