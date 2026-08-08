@@ -72,16 +72,17 @@ formatted CLI output.
 
 `INSERT INTO <table> (<columns>) VALUES ...` accepts any nonempty explicit
 column subset in any order. Names resolve case-insensitively, and each row must
-contain exactly one value per listed column. Rows are expanded into schema
-order before typed validation and columnar storage; omitted `Int64`, `Float64`,
-`Bool`, and `String` fields receive `0`, `0.0`, `false`, and an empty String,
-respectively. Duplicate or unknown names, wrong-width rows, and mistyped values
-are errors. A complete explicit list and positional `INSERT INTO <table>
-VALUES ...` retain their existing behavior. The atomic insert-only APIs resolve,
-validate column mappings and row widths, and check cumulative table capacity
-before expanding defaults during preflight, so any failure rolls back the
-complete batch. Ordinary inserts likewise check current table capacity before
-materializing omitted fields.
+contain exactly one value per listed column. Supplied values are mapped and
+type-checked against schema order; omitted `Int64`, `Float64`, `Bool`, and
+`String` fields receive `0`, `0.0`, `false`, and an empty String, respectively,
+during commit. Duplicate or unknown names, wrong-width rows, and mistyped
+values are errors. A complete explicit list and positional `INSERT INTO
+<table> VALUES ...` retain their existing behavior. The atomic insert-only APIs
+resolve and validate every column mapping, row width, supplied value, and
+cumulative table capacity without expanding omitted fields. Defaults are
+materialized one row at a time only after the complete batch passes preflight,
+so any failure rolls back the batch without retaining expanded rows. Ordinary
+inserts likewise check current table capacity before materializing defaults.
 
 Regular ungrouped, non-window projections support
 `LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`. `WHERE` filtering
@@ -413,10 +414,10 @@ passed to `execute` retain one write lock for the entire batch and cannot
 interleave.
 For transactional ingestion, `Database::execute_insert_batch` and the matching
 `SharedDatabase` method accept a nonempty `INSERT`-only batch, preflight every
-statement (including explicit-subset expansion) and cumulative per-table row
-cap, then commit in statement order. Any validation or resource failure leaves
-all tables unchanged; the shared form retains one write lock across preflight
-and commit.
+statement's explicit-column mapping, supplied values, and cumulative per-table
+row cap, then commit in statement order while materializing omitted defaults
+incrementally. Any validation or resource failure leaves all tables unchanged;
+the shared form retains one write lock across preflight and commit.
 `SharedDatabase::try_execute_insert_batch` performs the same parsing and atomic
 execution after one nonblocking write-lock attempt. An active reader or writer
 returns the typed `DatabaseBusy` error without applying any rows, while lock

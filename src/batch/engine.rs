@@ -433,9 +433,6 @@ impl Database {
                 .or_default();
             *cumulative_rows = cumulative_rows.saturating_add(rows.len());
             let rows = target.prepare_insert_rows(columns.as_deref(), rows, *cumulative_rows)?;
-            for row in &rows {
-                target.validate_row(row)?;
-            }
             prepared.push((table, rows));
         }
 
@@ -445,7 +442,7 @@ impl Database {
             self.catalog
                 .table_mut(&table)
                 .expect("preflight resolved every INSERT target")
-                .append_validated_rows(rows);
+                .append_prepared_insert_rows(rows);
             results.push(StatementResult::Command {
                 tag: "INSERT",
                 affected_rows,
@@ -699,7 +696,9 @@ impl Database {
             incoming_rows,
         )?;
         let affected_rows = rows.len();
-        self.catalog.table_mut(&table)?.insert_rows(rows)?;
+        self.catalog
+            .table_mut(&table)?
+            .append_prepared_insert_rows(rows);
         Ok(StatementResult::Command {
             tag: "INSERT",
             affected_rows,

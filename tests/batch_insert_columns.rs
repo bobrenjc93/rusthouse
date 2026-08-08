@@ -238,6 +238,65 @@ fn named_insert_batches_preflight_cumulative_capacity_before_defaulted_rows_comm
 }
 
 #[test]
+fn multi_table_late_type_failure_does_not_retain_default_expansions() {
+    const TABLE_COUNT: usize = 25;
+    const COLUMN_COUNT: usize = 1_000;
+    const ROWS_PER_TABLE: usize = 4_000;
+
+    // The SQL input contains exactly the default 100,000-value parser bound,
+    // but eagerly expanding each row would retain 100 million Values before
+    // discovering the final type error.
+    let mut create = String::new();
+    for table in 0..TABLE_COUNT {
+        write!(create, "CREATE TABLE wide{table} (").unwrap();
+        for column in 0..COLUMN_COUNT {
+            if column != 0 {
+                create.push_str(", ");
+            }
+            write!(create, "c{column} Int64").unwrap();
+        }
+        create.push_str(");");
+    }
+
+    let mut batch = String::new();
+    for table in 0..TABLE_COUNT {
+        write!(batch, "INSERT INTO wide{table} (c0) VALUES ").unwrap();
+        for row in 0..ROWS_PER_TABLE {
+            if row != 0 {
+                batch.push(',');
+            }
+            if table == TABLE_COUNT - 1 && row == ROWS_PER_TABLE - 1 {
+                batch.push_str("('late type error')");
+            } else {
+                batch.push_str("(1)");
+            }
+        }
+        batch.push(';');
+    }
+
+    let mut database = Database::new();
+    database.execute(&create).expect("create wide targets");
+    assert_eq!(
+        database.execute_insert_batch(&batch),
+        Err(Error::TypeMismatch {
+            context: "column 'wide24.c0'".to_owned(),
+            expected: "Int64".to_owned(),
+            actual: "String".to_owned(),
+        })
+    );
+    for table in 0..TABLE_COUNT {
+        assert_eq!(
+            database
+                .catalog()
+                .table(&format!("wide{table}"))
+                .unwrap()
+                .row_count(),
+            0
+        );
+    }
+}
+
+#[test]
 fn wide_subsets_reject_capacity_before_ordinary_or_atomic_default_expansion() {
     const COLUMN_COUNT: usize = 1_024;
     const ROW_COUNT: usize = 100_000;
