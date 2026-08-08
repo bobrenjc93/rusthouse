@@ -216,6 +216,18 @@ impl Column {
         }
         deleted_value_bytes
     }
+
+    fn replace_values(&mut self, replacements: Vec<(usize, Value)>) {
+        for (row_index, value) in replacements {
+            match (&mut *self, value) {
+                (Self::Int64(values), Value::Int64(value)) => values[row_index] = value,
+                (Self::Float64(values), Value::Float64(value)) => values[row_index] = value,
+                (Self::Bool(values), Value::Bool(value)) => values[row_index] = value,
+                (Self::String(values), Value::String(value)) => values[row_index] = value,
+                _ => unreachable!("replacement values are validated before mutation"),
+            }
+        }
+    }
 }
 
 fn saturating_usize(value: u128) -> usize {
@@ -708,6 +720,45 @@ impl Table {
         self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
     }
 
+    /// Replaces selected values in one column and returns the number replaced.
+    ///
+    /// The column name is resolved case-insensitively. `replacements` must be
+    /// unique and strictly increasing by row index, and every index must be
+    /// less than the row count at the start of this call. Every replacement
+    /// must have the column's physical type; `NULL` and non-finite `Float64`
+    /// values are rejected. The column, complete index selection, and all
+    /// values are validated before mutation, so an error leaves the entire
+    /// table unchanged. Valid owned values are moved into the selected cells
+    /// without cloning. All other cells and table metadata are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ColumnNotFound`] for an unknown column,
+    /// [`Error::SelectionIndexOutOfBounds`] for an index outside the table,
+    /// [`Error::SelectionNotStrictlyIncreasing`] for a duplicate or decreasing
+    /// index, [`Error::TypeMismatch`] for `NULL` or a different physical type,
+    /// or [`Error::InvalidQuery`] for a non-finite `Float64` value.
+    pub fn replace_column_values(
+        &mut self,
+        column: &str,
+        replacements: Vec<(usize, Value)>,
+    ) -> Result<usize> {
+        let column_index = self.column_index(column)?;
+        validate_row_selection(
+            replacements.iter().map(|(row_index, _)| *row_index),
+            self.row_count,
+        )?;
+
+        let field = &self.schema[column_index];
+        for (_, value) in &replacements {
+            self.validate_value(field, value)?;
+        }
+
+        let replaced = replacements.len();
+        self.columns[column_index].replace_values(replacements);
+        Ok(replaced)
+    }
+
     /// Deletes selected source rows and returns the number deleted.
     ///
     /// `row_indexes` must be unique and strictly increasing, and every index
@@ -722,7 +773,7 @@ impl Table {
     /// original table or [`Error::SelectionNotStrictlyIncreasing`] for a
     /// duplicate or decreasing index.
     pub fn delete_rows(&mut self, row_indexes: &[usize]) -> Result<usize> {
-        validate_row_selection(row_indexes, self.row_count)?;
+        validate_row_selection(row_indexes.iter().copied(), self.row_count)?;
         if row_indexes.is_empty() {
             return Ok(0);
         }
@@ -752,9 +803,12 @@ impl Table {
     }
 }
 
-fn validate_row_selection(row_indexes: &[usize], input_rows: usize) -> Result<()> {
+fn validate_row_selection(
+    row_indexes: impl IntoIterator<Item = usize>,
+    input_rows: usize,
+) -> Result<()> {
     let mut previous = None;
-    for (selection_position, &row_index) in row_indexes.iter().enumerate() {
+    for (selection_position, row_index) in row_indexes.into_iter().enumerate() {
         if row_index >= input_rows {
             return Err(Error::SelectionIndexOutOfBounds {
                 selection_position,

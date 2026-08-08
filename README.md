@@ -390,6 +390,11 @@ current row count multiplied by the schema width, so repeated `ADD COLUMN` and
 and ADD COLUMN reject an exceeded cap before changing table state; INSERT also
 does so before materializing typed defaults for omitted fields. DROP COLUMN,
 TRUNCATE TABLE, and DELETE restore reusable cell capacity.
+The library-level `Table::replace_column_values` operation atomically replaces
+a strictly increasing selection of owned values in one named physical column.
+It preflights every index and value (including non-null, exact-type, and finite
+`Float64` rules), then moves values into place without cloning while preserving
+all unselected cells and table metadata.
 `Database::with_query_result_limits` and the matching `SharedDatabase`
 constructor configure the scan and output limits.
 `Database::with_max_rows_per_table` and its shared counterpart configure the
