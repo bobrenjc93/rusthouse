@@ -200,6 +200,28 @@ fn query_executes_unicode_contains_like_over_http() {
 }
 
 #[test]
+fn query_executes_unicode_suffix_like_over_http() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (1, '東京'), (2, '西東京'), (3, '東京駅'), (4, 'Tokyo');",
+        )
+        .expect("setup");
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(
+                "SELECT label FROM events WHERE label LIKE '%東京' ORDER BY label;".as_bytes(),
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"label","type":"String"}],"rows":[["東京"],["西東京"]]}"#,
+    );
+}
+
+#[test]
 fn query_executes_inclusive_between_over_http() {
     let database = SharedDatabase::default();
     database

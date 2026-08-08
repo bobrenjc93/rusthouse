@@ -35,11 +35,13 @@ same form also supports every other physical column type. Every member
 accepts the same finite typed literals and numeric compatibility as equality;
 the list binds as one predicate atom and is lowered to a balanced tree of
 equalities joined by `OR`. Incompatible member types report the normal typed
-comparison error. Case-sensitive
-String prefix and containment predicates use the exact forms
-`column LIKE 'prefix%'` and `column LIKE '%substring%'`. Prefixes and substrings
+comparison error. String prefix, suffix, and containment predicates use the
+exact forms
+`column LIKE 'prefix%'`, `column LIKE '%suffix'`, and
+`column LIKE '%substring%'`. Matches are case-sensitive, and the bounded text
 may be empty or Unicode. Other placements of `%` and patterns with excess
-wildcards are rejected.
+wildcards are rejected. The single-wildcard pattern `LIKE '%'` is the shared
+empty prefix/suffix form and matches every String.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
 projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
@@ -188,7 +190,7 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n [OFFSET m]]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison, inclusive `BETWEEN`, nonempty `IN`, prefix `LIKE`, and
+composable comparison, inclusive `BETWEEN`, nonempty `IN`, prefix, suffix, and
 contains `LIKE` predicates, including unary `NOT`, as regular `SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
