@@ -231,6 +231,15 @@ Open, non-regular-file, read, oversized-file, envelope, and payload errors are
 separate typed variants. A table is returned only after the payload codec has
 validated its schema metadata, nullability, row cap, rows, and exact boundary.
 
+`restore_int64_table_payload_from_file_with_backup` composes that bounded
+self-describing restore for a caller-supplied primary and explicit backup path.
+It returns a valid primary without inspecting the backup. Any typed primary
+failure, including a missing, corrupt, or over-limit file, causes one backup
+attempt with exactly the same envelope and table-payload codecs. Success reports
+which path supplied the table. If both attempts fail, one recovery error retains
+both `Int64TablePayloadFileRestoreError` values. No caller-supplied schema or row
+cap is introduced by recovery, and no failure returns a partially decoded table.
+
 `restore_int64_table` composes a caller-configured `SnapshotCodec` and
 `NullableI64PayloadCodec` with a caller-supplied schema and table row cap. It
 decodes the complete envelope and payload before atomically appending the rows

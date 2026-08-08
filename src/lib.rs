@@ -72,11 +72,13 @@ pub use shared_catalog::{SharedCatalog, SharedCatalogError};
 pub use snapshot::{
     Int64TableFileRecovery, Int64TableFileRecoveryError, Int64TableFileRecoverySource,
     Int64TableFileRestoreError, Int64TablePayloadCodec, Int64TablePayloadError,
-    Int64TablePayloadFileRestoreError, Int64TableRestoreError, Int64TableRleFileRestoreError,
-    NullableI64PayloadCodec, NullableI64PayloadError, NullableI64RlePayloadCodec,
-    NullableI64RlePayloadError, SnapshotCodec, SnapshotError, SnapshotFileError,
-    restore_int64_table, restore_int64_table_from_file, restore_int64_table_from_file_with_backup,
-    restore_int64_table_payload_from_file, restore_int64_table_rle_from_file,
+    Int64TablePayloadFileRecovery, Int64TablePayloadFileRecoveryError,
+    Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError, Int64TableRestoreError,
+    Int64TableRleFileRestoreError, NullableI64PayloadCodec, NullableI64PayloadError,
+    NullableI64RlePayloadCodec, NullableI64RlePayloadError, SnapshotCodec, SnapshotError,
+    SnapshotFileError, restore_int64_table, restore_int64_table_from_file,
+    restore_int64_table_from_file_with_backup, restore_int64_table_payload_from_file,
+    restore_int64_table_payload_from_file_with_backup, restore_int64_table_rle_from_file,
 };
 #[cfg(unix)]
 pub use snapshot::{
