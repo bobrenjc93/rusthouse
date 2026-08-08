@@ -553,10 +553,10 @@ returns `417 Expectation Failed` for `Expect` instead of waiting for a body
 whose sender may be awaiting an interim response.
 
 `POST /` and `POST /query` are equivalent query routes. Each requires one
-decimal `Content-Length` and sends its UTF-8 SQL body through
-`SharedDatabase::try_query`. The standard ClickHouse-style parameterized forms,
+decimal `Content-Length` and accepts UTF-8 SQL in its body. The standard
+ClickHouse-style parameterized forms,
 `GET /?query=<percent-encoded SQL>` and
-`POST /?query=<percent-encoded SQL>`, do the same with no body
+`POST /?query=<percent-encoded SQL>`, accept the same SQL with no body
 (`Content-Length` may be omitted or be zero). A nonzero `Content-Length` is
 rejected. Both forms also accept one optional `database=default` parameter and
 one optional `default_format` parameter in any order with `query`, including
@@ -571,12 +571,17 @@ count toward that limit. Empty parameters or values, duplicate `query`,
 `database`, or `default_format` parameters, unknown parameters, malformed
 escapes, non-default database values, unsupported formats, and invalid SQL
 UTF-8 are rejected. Parameter validation follows configured authentication and
-precedes database access. All query forms use the read-only,
-exactly-one-statement `SharedDatabase::try_query` path. Successful responses use
-the same compact JSON column metadata and positional-row shape as `--format
-json`; protocol and query failures return deterministic JSON error objects with
-an appropriate HTTP status. All other targets and query-string shapes are
-rejected.
+precedes database access. GET requests and every request handled by the
+unauthenticated APIs use the read-only, exactly-one-statement
+`SharedDatabase::try_query` path. An authenticated POST without an explicit
+output-format selector additionally accepts a nonempty `INSERT`-only batch and
+uses the atomic `SharedDatabase::try_execute_insert_batch` path. Mixed batches,
+other mutations, and INSERT requests carrying `X-ClickHouse-Format` or
+`default_format` are rejected without mutation. Successful queries use the same
+compact JSON column metadata and positional-row shape as `--format json`;
+successful INSERT batches return an empty `200 OK` plain-text response.
+Protocol and SQL failures return deterministic JSON error objects with an
+appropriate HTTP status. All other targets and query-string shapes are rejected.
 
 Every query route and both authenticated insert routes accept one optional
 `X-ClickHouse-Database: default` header for ClickHouse client compatibility.
@@ -591,16 +596,15 @@ For parameterized GET and POST queries, the header and `database=default` query
 parameter may coexist; each is validated independently against the same single
 database.
 
-The bearer- and `X-ClickHouse-Key`-authenticated handlers additionally expose
-exact `POST /insert`. It requires one decimal `Content-Length`, applies the
-same UTF-8 SQL body and request limits as `POST /query`, and executes a
-nonempty `INSERT`-only batch through
-`SharedDatabase::try_execute_insert_batch`. The database preflights the entire
-batch before commit, so syntax, target, shape, type, capacity, empty batch, or
+The bearer- and `X-ClickHouse-Key`-authenticated handlers also expose exact
+`POST /insert` as an explicit write route. It requires one decimal
+`Content-Length`, applies the same UTF-8 SQL body and request limits as
+`POST /query`, and executes the same nonempty `INSERT`-only transaction as an
+authenticated standard POST. The database preflights the entire batch before
+commit, so syntax, target, shape, type, capacity, empty batch, or
 mixed-statement failures return `400 Bad Request` without applying any rows.
 Success returns `200 OK` with an empty plain-text body. The route is not
-recognized by `handle_http_query` or `handle_http_query_with_limits`, and query
-routes remain read-only even when their request is authenticated.
+recognized by `handle_http_query` or `handle_http_query_with_limits`.
 
 Those authenticated handlers also expose exact `POST /insert/<table>` for
 `CSVWithNames` or `TabSeparatedWithNames` ingestion. `<table>` is one literal
@@ -622,24 +626,26 @@ Bad Request` and append no rows. Success returns the same empty `200 OK`
 response as the SQL insert route. The unauthenticated handlers do not recognize
 it.
 
-HTTP query admission never waits for the database lock. After request parsing,
+HTTP read admission never waits for the database lock. After request parsing,
 authentication, optional database-header and query-parameter validation, SQL
-decoding, and read-only statement validation, each query makes one immediate
-shared read-lock attempt. Concurrent readers are admitted; an active writer
-returns `503 Service Unavailable` with the deterministic JSON body
+decoding, and read-only statement validation, each read makes one immediate
+shared-lock attempt. Concurrent readers are admitted; an active writer returns
+`503 Service Unavailable` with the deterministic JSON body
 `{"error":"database is unavailable"}`. A poisoned lock remains a `500 Internal
 Server Error`, and SQL errors remain `400 Bad Request`. Authentication, database
 and format header validation, SQL/result resource limits, and the complete HTTP
 response limit retain their documented ordering and behavior.
 
 HTTP insert admission likewise never waits. After authentication and optional
-database-header validation, the bounded body is read. The SQL route completes
-SQL parsing before its immediate write-lock attempt; the CSV and TSV routes
-pass their bounded bytes to the selected ingestion API, which attempts the lock
-before table lookup or parsing. Any active reader or writer returns the same
-deterministic `503 Service Unavailable`; a poisoned lock returns `500 Internal
-Server Error`. Validation and commit occur under the acquired write lock so
-concurrent work cannot expose or cause a partial batch.
+database-header validation, the bounded body or URL query is read and decoded.
+Standard authenticated POST insertion is disabled when an output format was
+selected. The standard and explicit SQL routes complete SQL parsing before
+their immediate write-lock attempt; the CSV and TSV routes pass their bounded
+bytes to the selected ingestion API, which attempts the lock before table
+lookup or parsing. Any active reader or writer returns the same deterministic
+`503 Service Unavailable`; a poisoned lock returns `500 Internal Server Error`.
+Validation and commit occur under the acquired write lock so concurrent work
+cannot expose or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, or
@@ -667,7 +673,9 @@ POST request cannot combine this header with `default_format`; the independently
 valid selectors also receive a deterministic `400 Bad Request` after
 authentication and before database access. When neither selector is present,
 the existing JSON response shape is unchanged. Every selected writer remains
-subject to the complete HTTP response cap.
+subject to the complete HTTP response cap. On authenticated POST routes, the
+presence of either valid selector also keeps SQL execution on the read-only
+path, so a selector cannot accompany or trigger an INSERT.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`
@@ -728,7 +736,8 @@ credentials receive the same bounded `401 Unauthorized` response before a
 request body is read or the database lock is acquired. Invalid configured
 tokens are rejected before any request input is read. The original
 `handle_http_query` APIs intentionally remain unauthenticated for existing
-in-process read-only embeddings and do not expose either insertion route.
+in-process read-only embeddings: standard routes stay read-only and neither
+explicit insertion route is exposed.
 
 For ClickHouse HTTP credential compatibility, embedders can instead call
 `handle_http_query_with_clickhouse_key`, or
