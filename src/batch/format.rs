@@ -349,6 +349,14 @@ pub fn write_csv(output: &mut impl io::Write, result: &QueryResult) -> io::Resul
     }
     output.write_all(b"\n")?;
 
+    write_csv_rows(output, result)
+}
+
+/// Streams one headerless ClickHouse-style `CSV` result.
+///
+/// Values use the same typed rendering and RFC 4180-style field escaping as
+/// [`write_csv`], but column names are omitted. An empty result emits no bytes.
+pub fn write_csv_rows(output: &mut impl io::Write, result: &QueryResult) -> io::Result<()> {
     for row in &result.rows {
         for (index, value) in row.iter().enumerate() {
             if index > 0 {
@@ -734,6 +742,65 @@ mod tests {
             render(&result(), OutputFormat::Csv),
             "id,note\n1,\"quote: \"\", comma\"\n"
         );
+    }
+
+    #[test]
+    fn streams_headerless_csv_typed_rows_nulls_and_escaping() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "missing".to_owned(),
+                    data_type: DataType::String,
+                },
+                ResultColumn {
+                    name: "integer".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ResultColumn {
+                    name: "float".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ResultColumn {
+                    name: "boolean".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ResultColumn {
+                    name: "text".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+            rows: vec![vec![
+                Value::Null(DataType::String),
+                Value::Int64(i64::MIN),
+                Value::Float64(2.0),
+                Value::Bool(false),
+                Value::String("comma, \"quote\"\ncarriage\rsnow 雪".to_owned()),
+            ]],
+        };
+        let mut output = Vec::new();
+
+        write_csv_rows(&mut output, &result).expect("Vec accepts streamed CSV rows");
+
+        assert_eq!(
+            output,
+            b"NULL,-9223372036854775808,2.0,false,\"comma, \"\"quote\"\"\ncarriage\rsnow \xE9\x9B\xAA\"\n"
+        );
+    }
+
+    #[test]
+    fn headerless_csv_empty_result_emits_no_bytes() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "value".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            rows: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        write_csv_rows(&mut output, &result).expect("Vec accepts empty streamed CSV");
+
+        assert!(output.is_empty());
     }
 
     #[test]

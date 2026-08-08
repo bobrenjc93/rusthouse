@@ -1214,6 +1214,11 @@ fn url_encoded_post_query_accepts_absent_or_zero_length_and_every_default_format
             br#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#,
         ),
         (
+            b"POST /?query=SELECT+7+AS+value%3B&default_format=CSV HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "text/csv; charset=utf-8",
+            b"7\n",
+        ),
+        (
             b"POST /?query=SELECT+7+AS+value%3B&default_format=CSVWithNames HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
             "text/csv; charset=utf-8",
             b"value\n7\n",
@@ -1297,11 +1302,19 @@ fn url_encoded_post_query_rejects_bodies_conflicts_and_invalid_parameters() {
             r#"{"error":"default_format parameter cannot be combined with X-ClickHouse-Format header"}"#,
         ),
         (
+            b"POST /?query=SELECT+1%3B&default_format=CSV HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Format: CSV\r\n\r\n",
+            r#"{"error":"default_format parameter cannot be combined with X-ClickHouse-Format header"}"#,
+        ),
+        (
             b"POST /?database=analytics&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
             r#"{"error":"database query parameter must be default"}"#,
         ),
         (
             b"POST /?query=SELECT+1%3B&default_format=XML HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            r#"{"error":"unsupported default_format parameter"}"#,
+        ),
+        (
+            b"POST /?query=SELECT+1%3B&default_format=csv HTTP/1.1\r\nHost: localhost\r\n\r\n",
             r#"{"error":"unsupported default_format parameter"}"#,
         ),
         (
@@ -1365,6 +1378,11 @@ fn get_default_format_selects_every_writer_with_encoded_parameters_in_any_order(
             b"GET /?default_format=JSON&query=SELECT+7+AS+value%3B&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "application/json",
             br#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#,
+        ),
+        (
+            b"GET /?query=SELECT+7+AS+value%3B&default_format=CSV&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "text/csv; charset=utf-8",
+            b"7\n",
         ),
         (
             b"GET /?query=SELECT+7+AS+value%3B&default_format=CSVWithNames&database=default HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -1992,7 +2010,7 @@ fn both_query_routes_stream_typed_json_compact_each_row_and_empty_results() {
 }
 
 #[test]
-fn both_query_routes_return_csv_with_names_for_all_value_types_and_empty_results() {
+fn both_query_routes_return_both_csv_formats_for_all_value_types_and_empty_results() {
     let database = SharedDatabase::default();
     database
         .execute(
@@ -2003,48 +2021,64 @@ fn both_query_routes_return_csv_with_names_for_all_value_types_and_empty_results
              CREATE TABLE empty_values (integer Int64, score Float64, active Bool, label String);",
         )
         .unwrap();
-    let expected = concat!(
-        "integer,score,active,label\n",
+    let expected_rows = concat!(
         "-9223372036854775808,2.0,false,\"comma, \"\"quote\"\"\ncarriage\rsnow 雪\"\n",
         "7,-1.25,true,\n",
     );
 
     for target in ["/", "/query"] {
-        let typed_request = request_for_target_with_headers(
-            target,
-            b"SELECT integer, score, active, label FROM typed_values ORDER BY integer;",
-            "X-ClickHouse-Format: CSVWithNames\r\n",
-        );
-        assert_response_with_content_type(
-            &exchange(&database, &typed_request),
-            "HTTP/1.1 200 OK",
-            "text/csv; charset=utf-8",
-            expected.as_bytes(),
-        );
+        for (format, expected, expected_null, expected_empty) in [
+            (
+                "CSV",
+                expected_rows.to_owned(),
+                "NULL,NULL,NULL,NULL\n".to_owned(),
+                String::new(),
+            ),
+            (
+                "CSVWithNames",
+                format!("integer,score,active,label\n{expected_rows}"),
+                "missing_integer,missing_float,missing_boolean,missing_string\nNULL,NULL,NULL,NULL\n"
+                    .to_owned(),
+                "integer,score,active,label\n".to_owned(),
+            ),
+        ] {
+            let headers = format!("X-ClickHouse-Format: {format}\r\n");
+            let typed_request = request_for_target_with_headers(
+                target,
+                b"SELECT integer, score, active, label FROM typed_values ORDER BY integer;",
+                &headers,
+            );
+            assert_response_with_content_type(
+                &exchange(&database, &typed_request),
+                "HTTP/1.1 200 OK",
+                "text/csv; charset=utf-8",
+                expected.as_bytes(),
+            );
 
-        let null_request = request_for_target_with_headers(
-            target,
-            b"SELECT MIN(integer) AS missing_integer, MIN(score) AS missing_float, MIN(active) AS missing_boolean, MIN(label) AS missing_string FROM empty_values;",
-            "X-ClickHouse-Format: CSVWithNames\r\n",
-        );
-        assert_response_with_content_type(
-            &exchange(&database, &null_request),
-            "HTTP/1.1 200 OK",
-            "text/csv; charset=utf-8",
-            b"missing_integer,missing_float,missing_boolean,missing_string\nNULL,NULL,NULL,NULL\n",
-        );
+            let null_request = request_for_target_with_headers(
+                target,
+                b"SELECT MIN(integer) AS missing_integer, MIN(score) AS missing_float, MIN(active) AS missing_boolean, MIN(label) AS missing_string FROM empty_values;",
+                &headers,
+            );
+            assert_response_with_content_type(
+                &exchange(&database, &null_request),
+                "HTTP/1.1 200 OK",
+                "text/csv; charset=utf-8",
+                expected_null.as_bytes(),
+            );
 
-        let empty_request = request_for_target_with_headers(
-            target,
-            b"SELECT integer, score, active, label FROM empty_values;",
-            "X-ClickHouse-Format: CSVWithNames\r\n",
-        );
-        assert_response_with_content_type(
-            &exchange(&database, &empty_request),
-            "HTTP/1.1 200 OK",
-            "text/csv; charset=utf-8",
-            b"integer,score,active,label\n",
-        );
+            let empty_request = request_for_target_with_headers(
+                target,
+                b"SELECT integer, score, active, label FROM empty_values;",
+                &headers,
+            );
+            assert_response_with_content_type(
+                &exchange(&database, &empty_request),
+                "HTTP/1.1 200 OK",
+                "text/csv; charset=utf-8",
+                expected_empty.as_bytes(),
+            );
+        }
     }
 }
 
@@ -2265,9 +2299,10 @@ fn query_forms_reject_duplicate_and_unsupported_clickhouse_formats() {
             "JSONEACHROW",
             "jsoncompacteachrow",
             "csvwithnames",
+            "csv",
+            "Csv",
             "tabseparatedwithnames",
             "TabSeparated",
-            "CSV",
             "",
         ] {
             let headers = format!("X-ClickHouse-Format: {unsupported}\r\n");
@@ -2402,6 +2437,47 @@ fn csv_with_names_honors_the_complete_response_cap() {
         },
     )
     .expect("the exact complete CSV response size is accepted");
+    assert_eq!(exact_response, expected_response);
+
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut capped_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut capped_response,
+        limits,
+    )
+    .expect("the fixed response-limit error fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
+fn headerless_csv_honors_the_exact_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let sql = format!("SELECT '{}' AS value;", "x".repeat(1_000));
+    let request =
+        request_for_target_with_headers("/query", sql.as_bytes(), "X-ClickHouse-Format: CSV\r\n");
+    let expected_response = exchange(&database, &request);
+
+    let mut exact_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut exact_response,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect("the exact complete headerless CSV response size is accepted");
     assert_eq!(exact_response, expected_response);
 
     let limits = HttpQueryLimits {
@@ -4685,6 +4761,90 @@ fn authenticated_csv_insert_ingests_all_physical_types_quoting_and_is_query_visi
 }
 
 #[test]
+fn authenticated_headerless_csv_insert_ingests_all_physical_types_in_schema_order() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
+        .unwrap();
+    let csv = concat!(
+        "-9223372036854775808,2.5,true,\"comma, \"\"quoted\"\"\nnext\"\r\n",
+        "7,-3e2,false,plain\n",
+    )
+    .as_bytes();
+    let (request, _) = request_with_authorization_for_target(
+        "/insert/typed_values",
+        csv,
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Database: default\r\n\
+         X-ClickHouse-Format: CSV\r\n",
+    );
+
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target(
+                "/query",
+                b"SELECT id, score, active, label FROM typed_values ORDER BY id;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"score","type":"Float64"},{"name":"active","type":"Bool"},{"name":"label","type":"String"}],"rows":[[-9223372036854775808,2.5,true,"comma, \"quoted\"\nnext"],[7,-300.0,false,"plain"]]}"#,
+    );
+}
+
+#[test]
+fn headerless_csv_empty_input_is_a_no_op_and_named_csv_remains_the_default() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (9, 'existing');",
+        )
+        .unwrap();
+    let empty = request_for_target_with_headers(
+        "/insert/events",
+        b"",
+        "X-ClickHouse-Key: correct key:42\r\n\
+         X-ClickHouse-Format: CSV\r\n",
+    );
+
+    let response = clickhouse_key_exchange(&database, "correct key:42", &empty);
+    assert_response_with_content_type(
+        &response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&response);
+
+    let named = request_for_target_with_headers(
+        "/insert/events",
+        b"label,id\nnamed-default,1\n",
+        "X-ClickHouse-Key: correct key:42\r\n",
+    );
+    assert_response_with_content_type(
+        &clickhouse_key_exchange(&database, "correct key:42", &named),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id, label FROM events ORDER BY id;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"named-default"],[9,"existing"]]}"#,
+    );
+}
+
+#[test]
 fn authenticated_csv_insert_accepts_subsets_and_fills_every_typed_default() {
     let database = SharedDatabase::default();
     database
@@ -4891,6 +5051,52 @@ fn table_insert_authentication_precedes_exact_format_validation_and_body_reads()
         &authorized_response,
         "HTTP/1.1 400 Bad Request",
         r#"{"error":"unsupported X-ClickHouse-Format header"}"#,
+    );
+}
+
+#[test]
+fn table_insert_rejects_nonexact_and_duplicate_headerless_csv_formats_before_body_reads() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+
+    for format_headers in [
+        "X-ClickHouse-Format: csv\r\n",
+        "X-ClickHouse-Format: Csv\r\n",
+        "X-ClickHouse-Format: CSVWithnames\r\n",
+    ] {
+        let headers = format!("Authorization: Bearer correct-token\r\n{format_headers}");
+        let (request, body_offset) =
+            request_with_authorization_for_target("/insert/events", b"1\n", &headers);
+        let mut input = Cursor::new(request);
+        let mut response = Vec::new();
+        handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+            .unwrap();
+
+        assert_eq!(input.position(), body_offset);
+        assert_response(
+            &response,
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"unsupported X-ClickHouse-Format header"}"#,
+        );
+    }
+
+    let (duplicate, body_offset) = request_with_authorization_for_target(
+        "/insert/events",
+        b"1\n",
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Format: CSV\r\n\
+         x-clickhouse-format: CSV\r\n",
+    );
+    let mut input = Cursor::new(duplicate);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+        .unwrap();
+
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"duplicate X-ClickHouse-Format header"}"#,
     );
 }
 
@@ -5166,6 +5372,50 @@ fn csv_insert_reports_typed_malformed_errors_and_rolls_back_late_rows() {
 }
 
 #[test]
+fn headerless_csv_insert_rolls_back_late_format_and_capacity_failures() {
+    let database = SharedDatabase::with_max_rows_per_table(2);
+    database
+        .execute(
+            "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String); \
+             INSERT INTO metrics VALUES (9, 9.0, true, 'existing');",
+        )
+        .unwrap();
+    let cases: &[(&[u8], &str)] = &[
+        (
+            b"1,1.5,true,valid\n2,NaN,false,late\n",
+            r#"{"error":"database CSV ingestion failed: CSV field at line 2, column 2 is not a valid Float64"}"#,
+        ),
+        (
+            b"1,1.5,true,one\n2,2.5,false,two\n",
+            r#"{"error":"database CSV ingestion failed: could not ingest CSV input: table rows requires at least 3, exceeding the limit of 2"}"#,
+        ),
+    ];
+
+    for (csv, expected_body) in cases {
+        let (request, _) = request_with_authorization_for_target(
+            "/insert/metrics",
+            csv,
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: CSV\r\n",
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 400 Bad Request",
+            expected_body,
+        );
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id, label FROM metrics;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[9,"existing"]]}"#,
+    );
+}
+
+#[test]
 fn csv_insert_is_authenticated_and_requires_an_exact_table_target() {
     let database = SharedDatabase::default();
     database.execute("CREATE TABLE events (id Int64);").unwrap();
@@ -5315,54 +5565,56 @@ fn csv_insert_preserves_http_and_csv_ingest_limits_without_partial_rows() {
 }
 
 #[test]
-fn csv_insert_returns_503_without_waiting_for_a_reader() {
+fn csv_table_insert_formats_return_503_without_waiting_for_a_reader() {
     let mut initial = Database::new();
     initial.execute("CREATE TABLE events (id Int64);").unwrap();
     let inner = Arc::new(RwLock::new(initial));
     let database = SharedDatabase::from_arc(Arc::clone(&inner));
     let mut reader = Some(inner.read().unwrap());
-    let (request, _) = request_with_authorization_for_target(
-        "/insert/events",
-        b"id\n1\n",
-        "Authorization: Bearer correct-token\r\n",
-    );
-    let (sender, receiver) = mpsc::channel();
-    let worker_database = database.clone();
-    let worker = thread::spawn(move || {
-        sender
-            .send(authenticated_exchange(
-                &worker_database,
-                "correct-token",
-                &request,
-            ))
-            .unwrap();
-    });
+    for (csv, format_header) in [
+        (b"id\n1\n".as_slice(), ""),
+        (b"1\n".as_slice(), "X-ClickHouse-Format: CSV\r\n"),
+    ] {
+        let headers = format!("Authorization: Bearer correct-token\r\n{format_header}");
+        let (request, _) = request_with_authorization_for_target("/insert/events", csv, &headers);
+        let (sender, receiver) = mpsc::channel();
+        let worker_database = database.clone();
+        let worker = thread::spawn(move || {
+            sender
+                .send(authenticated_exchange(
+                    &worker_database,
+                    "correct-token",
+                    &request,
+                ))
+                .unwrap();
+        });
 
-    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
-        Ok(response) => response,
-        Err(error) => {
-            drop(reader.take());
-            worker.join().unwrap();
-            panic!("HTTP CSV admission blocked behind a reader: {error}");
-        }
-    };
-    assert_response(
-        &response,
-        "HTTP/1.1 503 Service Unavailable",
-        r#"{"error":"database is unavailable"}"#,
-    );
-    assert_eq!(
-        reader
-            .as_ref()
-            .unwrap()
-            .catalog()
-            .table("events")
-            .unwrap()
-            .row_count(),
-        0
-    );
+        let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(response) => response,
+            Err(error) => {
+                drop(reader.take());
+                worker.join().unwrap();
+                panic!("HTTP CSV admission blocked behind a reader: {error}");
+            }
+        };
+        assert_response(
+            &response,
+            "HTTP/1.1 503 Service Unavailable",
+            r#"{"error":"database is unavailable"}"#,
+        );
+        assert_eq!(
+            reader
+                .as_ref()
+                .unwrap()
+                .catalog()
+                .table("events")
+                .unwrap()
+                .row_count(),
+            0
+        );
+        worker.join().unwrap();
+    }
     drop(reader.take());
-    worker.join().unwrap();
 }
 
 #[test]
