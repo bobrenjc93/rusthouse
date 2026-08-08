@@ -10,7 +10,7 @@ use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
     write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
 };
-use crate::batch::shared_database::{DatabaseMetricsSnapshot, DatabaseMetricsWithTableRows};
+use crate::batch::shared_database::{DatabaseMetricsSnapshot, DatabaseMetricsWithTables};
 use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
 use crate::batch::tsv::{TsvIngestError, TsvIngestLimits};
@@ -125,11 +125,11 @@ impl StdError for HttpQueryError {
 /// before database access. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
-/// may instead end in a case-insensitive SQL `FORMAT CSVWithNames` or `FORMAT
-/// JSONEachRow` clause, with an optional trailing semicolon. The clause selects
-/// the corresponding existing bounded writer and cannot be combined with
-/// either HTTP format selector. Quoted strings and line comments are not
-/// interpreted as format clauses. GET
+/// may instead end in a case-insensitive SQL `FORMAT CSVWithNames`, `FORMAT
+/// TabSeparated`, or `FORMAT JSONEachRow` clause, with an optional trailing
+/// semicolon. The clause selects the corresponding existing bounded writer and
+/// cannot be combined with either HTTP format selector. Quoted strings and line
+/// comments are not interpreted as format clauses. GET
 /// requests and every request made through a
 /// read-only handler pass the SQL to [`SharedDatabase::try_query`], which
 /// accepts exactly one read-only statement and makes one nonblocking read-lock
@@ -177,9 +177,10 @@ impl StdError for HttpQueryError {
 /// enable INSERT execution on standard query routes.
 ///
 /// `GET /metrics` accepts no request body and returns four unlabeled Prometheus
-/// gauges for database totals plus one `rusthouse_table_rows` gauge per current
-/// table. It takes a nonblocking, consistent database metrics snapshot; lock
-/// contention and poisoning return `503`.
+/// gauges for database totals plus `rusthouse_table_rows` and
+/// `rusthouse_table_retained_value_bytes` gauges per current table. It takes a
+/// nonblocking, consistent database metrics snapshot; lock contention and
+/// poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
 /// database. `GET /ready` also accepts no body and returns the same successful
@@ -640,10 +641,14 @@ fn handle_http_query_exchange(
             );
         }
         HttpRequest::Metrics => {
-            let metrics = match database.metrics_snapshot_with_table_rows(
-                |totals, table_name_bytes, row_count_bytes| {
-                    let body_bytes =
-                        prometheus_metrics_body_len(totals, table_name_bytes, row_count_bytes);
+            let metrics = match database.metrics_snapshot_with_tables(
+                |totals, table_name_bytes, row_count_bytes, retained_value_byte_count_bytes| {
+                    let body_bytes = prometheus_metrics_body_len(
+                        totals,
+                        table_name_bytes,
+                        row_count_bytes,
+                        retained_value_byte_count_bytes,
+                    );
                     response_len(
                         Status::OK,
                         &[],
@@ -1065,6 +1070,9 @@ fn classify_standard_query_request(
             QueryResponseFormat::JsonEachRow => {
                 "FORMAT JSONEachRow clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
             }
+            QueryResponseFormat::TabSeparated => {
+                "FORMAT TabSeparated clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
+            }
             _ => unreachable!("the SQL FORMAT scanner only returns supported terminal formats"),
         };
         return Err(RequestFailure::new(Status::BAD_REQUEST, message).into());
@@ -1222,6 +1230,8 @@ fn terminal_query_format(sql: &str) -> Option<(usize, QueryResponseFormat)> {
     }
     let response_format = if format_name.text.eq_ignore_ascii_case("CSVWithNames") {
         QueryResponseFormat::CsvWithNames
+    } else if format_name.text.eq_ignore_ascii_case("TabSeparated") {
+        QueryResponseFormat::TabSeparated
     } else if format_name.text.eq_ignore_ascii_case("JSONEachRow") {
         QueryResponseFormat::JsonEachRow
     } else {
@@ -2257,11 +2267,18 @@ const TABLE_ROWS_METRIC_HEADER: &str = concat!(
 );
 const TABLE_ROW_METRIC_PREFIX: &str = "rusthouse_table_rows{table=\"";
 const TABLE_ROW_METRIC_SEPARATOR: &str = "\"} ";
+const TABLE_RETAINED_VALUE_BYTES_METRIC_HEADER: &str = concat!(
+    "# HELP rusthouse_table_retained_value_bytes Scalar payload bytes retained by a table.\n",
+    "# TYPE rusthouse_table_retained_value_bytes gauge\n",
+);
+const TABLE_RETAINED_VALUE_BYTES_METRIC_PREFIX: &str =
+    "rusthouse_table_retained_value_bytes{table=\"";
 
 fn prometheus_metrics_body_len(
     totals: crate::DatabaseMetrics,
     table_name_bytes: usize,
     row_count_bytes: usize,
+    retained_value_byte_count_bytes: usize,
 ) -> usize {
     let fixed_bytes = TABLES_METRIC_PREFIX
         .len()
@@ -2269,6 +2286,7 @@ fn prometheus_metrics_body_len(
         .saturating_add(RETAINED_ROWS_METRIC_PREFIX.len())
         .saturating_add(RETAINED_VALUE_BYTES_METRIC_PREFIX.len())
         .saturating_add(TABLE_ROWS_METRIC_HEADER.len())
+        .saturating_add(TABLE_RETAINED_VALUE_BYTES_METRIC_HEADER.len())
         .saturating_add(4)
         .saturating_add(usize_decimal_len(totals.table_count))
         .saturating_add(usize_decimal_len(totals.column_count))
@@ -2277,18 +2295,22 @@ fn prometheus_metrics_body_len(
     let per_table_fixed_bytes = TABLE_ROW_METRIC_PREFIX
         .len()
         .saturating_add(TABLE_ROW_METRIC_SEPARATOR.len())
+        .saturating_add(1)
+        .saturating_add(TABLE_RETAINED_VALUE_BYTES_METRIC_PREFIX.len())
+        .saturating_add(TABLE_ROW_METRIC_SEPARATOR.len())
         .saturating_add(1);
     fixed_bytes
         .saturating_add(totals.table_count.saturating_mul(per_table_fixed_bytes))
-        .saturating_add(table_name_bytes)
+        .saturating_add(table_name_bytes.saturating_mul(2))
         .saturating_add(row_count_bytes)
+        .saturating_add(retained_value_byte_count_bytes)
 }
 
 fn write_prometheus_metrics(
     output: &mut impl Write,
-    metrics: DatabaseMetricsWithTableRows,
+    metrics: DatabaseMetricsWithTables,
 ) -> io::Result<()> {
-    let DatabaseMetricsWithTableRows { totals, table_rows } = metrics;
+    let DatabaseMetricsWithTables { totals, tables } = metrics;
     output.write_all(TABLES_METRIC_PREFIX.as_bytes())?;
     writeln!(output, "{}", totals.table_count)?;
     output.write_all(COLUMNS_METRIC_PREFIX.as_bytes())?;
@@ -2298,11 +2320,18 @@ fn write_prometheus_metrics(
     output.write_all(RETAINED_VALUE_BYTES_METRIC_PREFIX.as_bytes())?;
     writeln!(output, "{}", totals.retained_value_bytes)?;
     output.write_all(TABLE_ROWS_METRIC_HEADER.as_bytes())?;
-    for (table, row_count) in table_rows {
+    for (table, row_count, _) in &tables {
         output.write_all(TABLE_ROW_METRIC_PREFIX.as_bytes())?;
         output.write_all(table.as_bytes())?;
         output.write_all(TABLE_ROW_METRIC_SEPARATOR.as_bytes())?;
         writeln!(output, "{row_count}")?;
+    }
+    output.write_all(TABLE_RETAINED_VALUE_BYTES_METRIC_HEADER.as_bytes())?;
+    for (table, _, retained_value_bytes) in tables {
+        output.write_all(TABLE_RETAINED_VALUE_BYTES_METRIC_PREFIX.as_bytes())?;
+        output.write_all(table.as_bytes())?;
+        output.write_all(TABLE_ROW_METRIC_SEPARATOR.as_bytes())?;
+        writeln!(output, "{retained_value_bytes}")?;
     }
     Ok(())
 }
