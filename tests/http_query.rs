@@ -3123,19 +3123,19 @@ fn clickhouse_key_csv_insert_uses_the_same_authenticated_route() {
 }
 
 #[test]
-fn bearer_authenticated_tsv_insert_round_trips_all_writer_escapes() {
+fn bearer_authenticated_tsv_insert_accepts_reordered_all_type_fields_and_escapes() {
     let database = SharedDatabase::default();
     database
         .execute("CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String);")
         .unwrap();
-    let tsv = concat!(
-        "id\tscore\tactive\tlabel\n",
-        "-9223372036854775808\t1.5\ttrue\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\n",
+    let reordered_tsv = concat!(
+        "label\tactive\tscore\tid\n",
+        "slash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\ttrue\t1.5\t-9223372036854775808\n",
     )
     .as_bytes();
     let (request, _) = request_with_authorization_for_target(
         "/insert/typed_values",
-        tsv,
+        reordered_tsv,
         "Authorization: Bearer correct-token\r\n\
          X-ClickHouse-Format: TabSeparatedWithNames\r\n",
     );
@@ -3155,7 +3155,11 @@ fn bearer_authenticated_tsv_insert_round_trips_all_writer_escapes() {
         &exchange(&database, &query),
         "HTTP/1.1 200 OK",
         "text/tab-separated-values; charset=utf-8",
-        tsv,
+        concat!(
+            "id\tscore\tactive\tlabel\n",
+            "-9223372036854775808\t1.5\ttrue\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\n",
+        )
+        .as_bytes(),
     );
 }
 

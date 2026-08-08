@@ -650,7 +650,11 @@ one immediate write-lock attempt before table lookup or input access and returns
 the typed `DatabaseBusy` error rather than waiting for an active reader or
 writer. Lock poisoning and typed TSV, limit, and table-capacity failures remain
 distinct, and every failure preserves all existing rows.
-The decoded header must exactly match every schema column in order and case.
+The decoded header must contain every schema column exactly once with matching
+case, but may list those names in any order. Missing, duplicate, unknown, and
+differently cased header names are rejected. Each data field parses as the
+table type selected by its header, and complete rows are restored to schema
+order before the atomic append.
 Data rows accept the same `Int64`, finite `Float64`, exact lowercase `Bool`, and
 `String` types, with LF or CRLF record endings. Fields decode the escape
 sequences emitted by RustHouse's TSV writer: `\\`, `\t`, `\r`, `\n`, `\0`,
