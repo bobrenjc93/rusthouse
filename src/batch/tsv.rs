@@ -89,7 +89,7 @@ pub enum TsvIngestError {
         values: usize,
         max_values: usize,
     },
-    /// A row does not have exactly one field for each schema column.
+    /// A row does not have exactly one field for each selected header column.
     WrongColumnCount {
         line: usize,
         expected: usize,
