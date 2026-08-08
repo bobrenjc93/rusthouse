@@ -394,10 +394,14 @@ and `LIMIT`; non-`Float64` arguments are rejected with a typed error.
 non-`DISTINCT` projection and accepts an optional `AS alias`. The ordered form
 `ROW_NUMBER() OVER (ORDER BY int64_column ASC|DESC)` filters with `WHERE`, then
 orders equal keys by stable source position and numbers rows before `LIMIT`.
-The empty window retains source order. These minimal window forms deliberately
-reject arguments, partitioning, multiple or implicit-direction window sort
-keys, aggregate projections, `GROUP BY`, `HAVING`, and query-level `ORDER BY`;
-their output is covered by the normal result row, value, and byte caps.
+It charges one `usize` row index for every filtered row against the 16 MiB
+ordering-state limit before allocating the row-index vector or sorting; the
+complete filtered state is required even when `LIMIT`, including `LIMIT 0`,
+reduces the output. The empty window retains source order and uses no ordering
+state. These minimal window forms deliberately reject arguments, partitioning,
+multiple or implicit-direction window sort keys, aggregate projections,
+`GROUP BY`, `HAVING`, and query-level `ORDER BY`; their output is covered by the
+normal result row, value, and byte caps.
 
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
@@ -492,10 +496,12 @@ additionally allow 100,000 groups and bound grouped keys to 500,000 cells and
 an estimated 32 MiB. Their
 grouped-key accounting includes the reusable lookup probe for tuples wider
 than two columns. Aggregate working state has separate 500,000-cell and
-estimated 32 MiB limits, including cloned string extrema. Single-key
-`lengthUTF8` ordering has a separate 16 MiB cache limit, charged before
-allocation over all rows retained by `WHERE`. The collecting library API
-separately caps all retained query results at an estimated 64 MiB.
+estimated 32 MiB limits, including cloned string extrema. A separate 16 MiB
+ordering-state limit covers the filtered row-index vector for ordered
+`ROW_NUMBER` and the cache for single-key `lengthUTF8` ordering. Both charge
+the complete row set retained by `WHERE`, regardless of `LIMIT`, before
+allocating their temporary state. The collecting library API separately caps
+all retained query results at an estimated 64 MiB.
 Typed batch tables also retain at most 1,000,000 rows, 1,024 physical columns,
 and 4,000,000 physical scalar cells each by default. The cell count is the
 current row count multiplied by the schema width, so repeated `ADD COLUMN` and
@@ -810,7 +816,21 @@ sending keys, tokens, or queries over an untrusted network; otherwise they are
 exposed in plaintext. The handlers provide neither sessions nor credential
 issuance or rotation.
 
-The typed engine's `Database::ingest_csv_with_names` API atomically appends a
+The typed engine's `Database::ingest_csv` API atomically appends bounded,
+headerless `CSV` to an existing batch table. Every logical record is data and
+must supply every column in physical schema order. `SharedDatabase::ingest_csv`
+retains one write lock through table lookup, bounded parsing, remaining-capacity
+validation, and atomic append; `SharedDatabase::try_ingest_csv` makes one
+immediate lock attempt and returns `DatabaseBusy` without table lookup or input
+access when contended. Empty input is a zero-row no-op. Callers supply
+complete-input byte, logical-row, and total-value limits, and the table's row
+and cell limits are checked before the one append. Exact lowercase Boolean
+tokens, finite floats, LF and CRLF record endings, quoted commas and multiline
+fields, and doubled quote escapes follow the same rules as `CSVWithNames` below.
+Every format, value, limit, or remaining-capacity failure preserves all
+existing rows.
+
+`Database::ingest_csv_with_names` atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table.
 `SharedDatabase::ingest_csv_with_names` is the synchronized equivalent and
 retains one write lock through table lookup, bounded parsing, capacity

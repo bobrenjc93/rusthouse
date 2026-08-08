@@ -1,11 +1,12 @@
-//! Bounded ingestion for a typed `CSVWithNames` subset.
+//! Bounded ingestion for typed `CSV` and `CSVWithNames` subsets.
 //!
 //! Data fields may be double-quoted. Commas and LF or CRLF line endings in a
 //! quoted field are data, and a double quote is decoded from `""` before the
-//! field is parsed according to the type selected by its header. Headers must
-//! contain a nonempty, exact-case subset of schema names without duplicates;
-//! names may appear in any order and must remain unquoted. Omitted columns use
-//! the same typed defaults as an explicit-column SQL `INSERT`.
+//! field is parsed according to its schema type. Headerless `CSV` fields map to
+//! every physical schema column in order. `CSVWithNames` headers must contain a
+//! nonempty, exact-case subset of schema names without duplicates; names may
+//! appear in any order and must remain unquoted. Omitted named columns use the
+//! same typed defaults as an explicit-column SQL `INSERT`.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -16,19 +17,19 @@ use super::error::Error;
 use super::storage::{PreparedInsertRows, Table};
 use super::value::{DataType, Value};
 
-/// Default maximum size of one typed CSV input, including its header.
+/// Default maximum size of one typed CSV input, including a header when present.
 pub const DEFAULT_MAX_CSV_BYTES: usize = 8 * 1024 * 1024;
 /// Default maximum number of data rows in one typed CSV input.
 pub const DEFAULT_MAX_CSV_ROWS: usize = 100_000;
 /// Default maximum number of data values in one typed CSV input.
 pub const DEFAULT_MAX_CSV_VALUES: usize = 1_000_000;
 
-/// Resource bounds for one typed `CSVWithNames` ingestion operation.
+/// Resource bounds for one typed CSV ingestion operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CsvIngestLimits {
-    /// Maximum complete input size, in bytes, including the header.
+    /// Maximum complete input size, in bytes, including a header when present.
     pub max_bytes: usize,
-    /// Maximum number of data rows after the header.
+    /// Maximum number of data records (excluding a `CSVWithNames` header).
     pub max_rows: usize,
     /// Maximum total number of fields across all data rows.
     pub max_values: usize,
@@ -56,11 +57,11 @@ impl Default for CsvIngestLimits {
     }
 }
 
-/// A failure while validating or appending typed `CSVWithNames` input.
+/// A failure while validating or appending typed CSV input.
 ///
 /// Line numbers are one-based physical input lines, and column numbers are
 /// one-based input positions. Data-record errors use the physical line on which
-/// the record begins. The header is line 1.
+/// the record begins. A `CSVWithNames` header is line 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CsvIngestError {
     /// The complete byte input exceeds its configured bound.
@@ -205,7 +206,7 @@ impl From<Error> for CsvIngestError {
     }
 }
 
-pub(crate) fn parse_rows(
+pub(crate) fn parse_rows_with_names(
     table: &Table,
     input: &[u8],
     limits: CsvIngestLimits,
@@ -226,10 +227,42 @@ pub(crate) fn parse_rows(
     let header = line_contents(raw_header, 1)?;
     let header_plan = validate_header(table, header)?;
 
-    let expected_columns = header_plan.schema_indexes.len();
+    parse_data_rows(
+        table,
+        &input[raw_header.len()..],
+        2,
+        header_plan.schema_indexes,
+        limits,
+    )
+}
+
+pub(crate) fn parse_rows_without_names(
+    table: &Table,
+    input: &[u8],
+    limits: CsvIngestLimits,
+) -> Result<PreparedInsertRows, CsvIngestError> {
+    if input.len() > limits.max_bytes {
+        return Err(CsvIngestError::ByteLimitExceeded {
+            bytes: input.len(),
+            max_bytes: limits.max_bytes,
+        });
+    }
+    let input = std::str::from_utf8(input).map_err(invalid_utf8)?;
+    let schema_indexes = (0..table.schema().len()).collect();
+    parse_data_rows(table, input, 1, schema_indexes, limits)
+}
+
+fn parse_data_rows(
+    table: &Table,
+    input: &str,
+    first_line: usize,
+    schema_indexes: Vec<usize>,
+    limits: CsvIngestLimits,
+) -> Result<PreparedInsertRows, CsvIngestError> {
+    let expected_columns = schema_indexes.len();
     let mut rows = Vec::new();
     let mut value_count = 0_usize;
-    for record in DataRecords::new(&input[raw_header.len()..], 2) {
+    for record in DataRecords::new(input, first_line) {
         let (record, line) = record?;
         let row_count = rows.len().saturating_add(1);
         if row_count > limits.max_rows {
@@ -259,7 +292,7 @@ pub(crate) fn parse_rows(
 
         let mut row = Vec::with_capacity(expected_columns);
         scan_record(record, line, |column, field, quoted| {
-            let schema_index = header_plan.schema_indexes[column - 1];
+            let schema_index = schema_indexes[column - 1];
             let data_type = table.schema()[schema_index].data_type;
             if quoted {
                 let decoded = field.replace("\"\"", "\"");
@@ -278,7 +311,7 @@ pub(crate) fn parse_rows(
     }
 
     table
-        .prepare_projected_rows(header_plan.schema_indexes, rows)
+        .prepare_projected_rows(schema_indexes, rows)
         .map_err(Into::into)
 }
 
