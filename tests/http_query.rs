@@ -397,6 +397,60 @@ fn bool_to_string_cast_is_visible_in_every_http_query_format() {
 }
 
 #[test]
+fn int64_to_string_cast_is_visible_in_every_http_query_format() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (value Int64); \
+             INSERT INTO readings VALUES (2), (-10), (0);",
+        )
+        .expect("setup");
+    let sql = b"SELECT CAST(value AS String) AS text FROM readings ORDER BY text;";
+
+    assert_response(
+        &exchange(&database, &request(sql)),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"text","type":"String"}],"rows":[["-10"],["0"],["2"]]}"#,
+    );
+
+    let csv =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+    assert_response_with_content_type(
+        &exchange(&database, &csv),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"text\n-10\n0\n2\n",
+    );
+
+    let tsv = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &exchange(&database, &tsv),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"text\n-10\n0\n2\n",
+    );
+
+    for (format, expected) in [
+        (
+            "JSONEachRow",
+            "{\"text\":\"-10\"}\n{\"text\":\"0\"}\n{\"text\":\"2\"}\n",
+        ),
+        ("JSONCompactEachRow", "[\"-10\"]\n[\"0\"]\n[\"2\"]\n"),
+    ] {
+        let request = request_for_target_with_headers(
+            "/query",
+            sql,
+            &format!("X-ClickHouse-Format: {format}\r\n"),
+        );
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
 fn ping_returns_the_clickhouse_health_response_without_content_length() {
     let database = SharedDatabase::default();
 

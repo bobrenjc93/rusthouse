@@ -1778,6 +1778,9 @@ enum ResolvedItem {
     CastFloat64ToBool {
         source: usize,
     },
+    CastInt64ToString {
+        source: usize,
+    },
     CastBoolToString {
         source: usize,
     },
@@ -1984,6 +1987,9 @@ fn resolve_select_items(
                     (DataType::Float64, DataType::Bool) => {
                         Some(ResolvedItem::CastFloat64ToBool { source })
                     }
+                    (DataType::Int64, DataType::String) => {
+                        Some(ResolvedItem::CastInt64ToString { source })
+                    }
                     (DataType::Bool, DataType::String) => {
                         Some(ResolvedItem::CastBoolToString { source })
                     }
@@ -1994,7 +2000,7 @@ fn resolve_select_items(
                         DataType::Float64 => "Int64",
                         DataType::Bool => "Int64 or Float64",
                         DataType::Int64 => "Float64 or Bool",
-                        DataType::String => "Bool",
+                        DataType::String => "Int64 or Bool",
                     };
                     return Err(Error::TypeMismatch {
                         context: format!("CAST argument '{name}'"),
@@ -2375,6 +2381,9 @@ fn execute_projection(
                         ResolvedItem::CastFloat64ToBool { source } => {
                             Value::Bool(float64_at(table, *source, *row) != 0.0)
                         }
+                        ResolvedItem::CastInt64ToString { source } => {
+                            Value::String(int64_at(table, *source, *row).to_string())
+                        }
                         ResolvedItem::CastBoolToString { source } => {
                             Value::String(bool_string(bool_at(table, *source, *row)).to_owned())
                         }
@@ -2525,6 +2534,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
@@ -2541,9 +2551,20 @@ fn validate_projection_result_limits(
                     bytes = bytes.saturating_add(value.len());
                     enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
                 }
-            } else if let ResolvedItem::CastBoolToString { source } = item {
-                bytes = bytes.saturating_add(bool_string(bool_at(table, *source, *row)).len());
-                enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+            } else {
+                let cast_string_len = match item {
+                    ResolvedItem::CastInt64ToString { source } => {
+                        Some(int64_text_len(int64_at(table, *source, *row)))
+                    }
+                    ResolvedItem::CastBoolToString { source } => {
+                        Some(bool_string(bool_at(table, *source, *row)).len())
+                    }
+                    _ => None,
+                };
+                if let Some(cast_string_len) = cast_string_len {
+                    bytes = bytes.saturating_add(cast_string_len);
+                    enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+                }
             }
         }
     }
@@ -2584,6 +2605,7 @@ fn validate_grouped_result_limits(
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -3046,6 +3068,7 @@ impl GroupedData<'_> {
                         | ResolvedItem::CastBoolToInt64 { .. }
                         | ResolvedItem::CastInt64ToBool { .. }
                         | ResolvedItem::CastFloat64ToBool { .. }
+                        | ResolvedItem::CastInt64ToString { .. }
                         | ResolvedItem::CastBoolToString { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
@@ -3398,6 +3421,10 @@ fn order_source_rows(
                 ResolvedItem::CastFloat64ToBool { source } => (float64_at(table, source, left)
                     != 0.0)
                     .cmp(&(float64_at(table, source, right) != 0.0)),
+                ResolvedItem::CastInt64ToString { source } => int64_text_cmp(
+                    int64_at(table, source, left),
+                    int64_at(table, source, right),
+                ),
                 ResolvedItem::CastBoolToString { source } => {
                     bool_at(table, source, left).cmp(&bool_at(table, source, right))
                 }
@@ -3479,6 +3506,7 @@ fn order_grouped_rows(
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -3545,6 +3573,41 @@ fn bool_at(table: &Table, source: usize, row: usize) -> bool {
 
 fn bool_string(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+fn int64_text_len(value: i64) -> usize {
+    let magnitude = value.unsigned_abs();
+    let digits = if magnitude == 0 {
+        1
+    } else {
+        magnitude.ilog10() as usize + 1
+    };
+    digits + usize::from(value.is_negative())
+}
+
+fn int64_text_cmp(left: i64, right: i64) -> Ordering {
+    let (left_bytes, left_start) = render_int64_text(left);
+    let (right_bytes, right_start) = render_int64_text(right);
+    left_bytes[left_start..].cmp(&right_bytes[right_start..])
+}
+
+fn render_int64_text(value: i64) -> ([u8; 20], usize) {
+    let mut bytes = [0_u8; 20];
+    let mut start = bytes.len();
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        start -= 1;
+        bytes[start] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value.is_negative() {
+        start -= 1;
+        bytes[start] = b'-';
+    }
+    (bytes, start)
 }
 
 fn checked_float64_to_int64(value: f64) -> Result<i64> {
