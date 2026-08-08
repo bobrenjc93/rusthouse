@@ -408,6 +408,15 @@ pub fn write_tsv(output: &mut impl io::Write, result: &QueryResult) -> io::Resul
     }
     output.write_all(b"\n")?;
 
+    write_tsv_rows(output, result)
+}
+
+/// Streams one headerless ClickHouse-style `TabSeparated` result.
+///
+/// Values use the same typed rendering, `NULL` representation, and backslash
+/// escaping as [`write_tsv`], but column names are omitted. An empty result
+/// emits no bytes.
+pub fn write_tsv_rows(output: &mut impl io::Write, result: &QueryResult) -> io::Result<()> {
     for row in &result.rows {
         for (index, value) in row.iter().enumerate() {
             if index > 0 {
@@ -846,6 +855,72 @@ mod tests {
 
         assert_eq!(output, expected.as_bytes());
         assert_eq!(render(&result, OutputFormat::Tsv), expected);
+    }
+
+    #[test]
+    fn streams_headerless_tsv_value_types_nulls_and_escaping() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "null".to_owned(),
+                    data_type: DataType::String,
+                },
+                ResultColumn {
+                    name: "integer".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ResultColumn {
+                    name: "float".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ResultColumn {
+                    name: "boolean".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ResultColumn {
+                    name: "text".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+            rows: vec![vec![
+                Value::Null(DataType::String),
+                Value::Int64(i64::MIN),
+                Value::Float64(2.0),
+                Value::Bool(false),
+                Value::String(
+                    "slash\\tab\tcarriage\rline\nnul\0backspace\u{08}formfeed\u{0c}apostrophe' 雪"
+                        .to_owned(),
+                ),
+            ]],
+        };
+        let mut output = Vec::new();
+
+        write_tsv_rows(&mut output, &result).expect("Vec accepts streamed TSV rows");
+
+        assert_eq!(
+            output,
+            concat!(
+                "\\N\t-9223372036854775808\t2.0\tfalse\t",
+                "slash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' 雪\n",
+            )
+            .as_bytes(),
+        );
+    }
+
+    #[test]
+    fn headerless_tsv_empty_result_emits_no_bytes() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "value".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            rows: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        write_tsv_rows(&mut output, &result).expect("Vec accepts empty streamed TSV");
+
+        assert!(output.is_empty());
     }
 
     #[test]

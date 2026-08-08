@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
 use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
-    write_json_each_row_with_limit, write_json_string, write_tsv,
+    write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
 };
 use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
@@ -109,7 +109,7 @@ impl StdError for HttpQueryError {
 /// `POST /?query=<percent-encoded SQL>` carry the same SQL in a required
 /// form-style query parameter and optionally accept one `database=default`
 /// parameter and one `default_format` parameter in any order. `default_format`
-/// accepts `JSON`, `CSV`, `CSVWithNames`,
+/// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, `+` becomes a space, and neither form
 /// accepts a request body (`Content-Length` may be absent or zero). Empty,
@@ -128,11 +128,12 @@ impl StdError for HttpQueryError {
 /// A successful query response uses the same JSON result shape as the batch
 /// JSON formatter unless one format selector requests a streaming format.
 /// Parameterized-query `default_format` additionally accepts an explicit `JSON`; the
-/// `X-ClickHouse-Format` header accepts `CSV`, `CSVWithNames`,
+/// `X-ClickHouse-Format` header accepts `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. CSV, TSV,
 /// and row-oriented JSON responses use the corresponding batch writers;
-/// headerless `CSV` omits column names and emits no bytes for an empty result,
-/// while positional JSON responses contain arrays separated by line feeds.
+/// headerless `CSV` and `TabSeparated` omit column names and emit no bytes for
+/// an empty result, while positional JSON responses contain arrays separated
+/// by line feeds.
 /// Every query form also accepts at most one case-insensitive
 /// `X-ClickHouse-Database` header whose value is exactly `default`, matching
 /// RustHouse's single logical database. Empty, duplicate, and other values are
@@ -789,6 +790,10 @@ fn handle_http_query_exchange(
                 QueryResponseFormat::TabSeparatedWithNames => {
                     (write_tsv(&mut body, &result).is_err(), CONTENT_TYPE_TSV)
                 }
+                QueryResponseFormat::TabSeparated => (
+                    write_tsv_rows(&mut body, &result).is_err(),
+                    CONTENT_TYPE_TSV,
+                ),
                 QueryResponseFormat::JsonEachRow => (
                     write_json_each_row_with_limit(&mut body, &result, limits.max_response_bytes)
                         .is_err(),
@@ -1181,6 +1186,7 @@ enum QueryResponseFormat {
     Json,
     Csv,
     CsvWithNames,
+    TabSeparated,
     TabSeparatedWithNames,
     JsonEachRow,
     JsonCompactEachRow,
@@ -1430,6 +1436,7 @@ fn parse_headers(
             None => None,
             Some(b"CSV") => Some(QueryResponseFormat::Csv),
             Some(b"CSVWithNames") => Some(QueryResponseFormat::CsvWithNames),
+            Some(b"TabSeparated") => Some(QueryResponseFormat::TabSeparated),
             Some(b"TabSeparatedWithNames") => Some(QueryResponseFormat::TabSeparatedWithNames),
             Some(b"JSONEachRow") => Some(QueryResponseFormat::JsonEachRow),
             Some(b"JSONCompactEachRow") => Some(QueryResponseFormat::JsonCompactEachRow),
@@ -1715,6 +1722,7 @@ fn decode_query_parameters(
                     b"JSON" => QueryResponseFormat::Json,
                     b"CSV" => QueryResponseFormat::Csv,
                     b"CSVWithNames" => QueryResponseFormat::CsvWithNames,
+                    b"TabSeparated" => QueryResponseFormat::TabSeparated,
                     b"TabSeparatedWithNames" => QueryResponseFormat::TabSeparatedWithNames,
                     b"JSONEachRow" => QueryResponseFormat::JsonEachRow,
                     b"JSONCompactEachRow" => QueryResponseFormat::JsonCompactEachRow,
