@@ -8,6 +8,10 @@ use rusthouse::batch::engine::{Database, QueryResultLimits};
 use rusthouse::batch::tsv::TsvIngestLimits;
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
+    handle_http_query_read_only_with_bearer_token,
+    handle_http_query_read_only_with_bearer_token_and_limits,
+    handle_http_query_read_only_with_clickhouse_key,
+    handle_http_query_read_only_with_clickhouse_key_and_limits,
     handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
     handle_http_query_with_clickhouse_key, handle_http_query_with_clickhouse_key_and_limits,
     handle_http_query_with_limits,
@@ -67,6 +71,34 @@ fn clickhouse_key_exchange(database: &SharedDatabase, key: &str, request: &[u8])
     let mut response = Vec::new();
     handle_http_query_with_clickhouse_key(database, key, Cursor::new(request), &mut response)
         .expect("ClickHouse-key-authenticated exchange succeeds");
+    response
+}
+
+fn read_only_bearer_exchange(database: &SharedDatabase, token: &str, request: &[u8]) -> Vec<u8> {
+    let mut response = Vec::new();
+    handle_http_query_read_only_with_bearer_token(
+        database,
+        token,
+        Cursor::new(request),
+        &mut response,
+    )
+    .expect("read-only bearer-authenticated exchange succeeds");
+    response
+}
+
+fn read_only_clickhouse_key_exchange(
+    database: &SharedDatabase,
+    key: &str,
+    request: &[u8],
+) -> Vec<u8> {
+    let mut response = Vec::new();
+    handle_http_query_read_only_with_clickhouse_key(
+        database,
+        key,
+        Cursor::new(request),
+        &mut response,
+    )
+    .expect("read-only ClickHouse-key-authenticated exchange succeeds");
     response
 }
 
@@ -2806,6 +2838,251 @@ fn clickhouse_key_authentication_wires_query_insert_and_operational_routes() {
     );
     assert_ok_metrics_response(&metrics_response, 1, 1, 1, 8);
     assert_clickhouse_key_response_is_not_cacheable(&metrics_response);
+}
+
+#[test]
+fn authenticated_read_only_modes_wire_queries_and_operational_routes() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (7);")
+        .unwrap();
+
+    let bearer_query = request_for_target_with_headers(
+        "/query",
+        b"SELECT id FROM events;",
+        "Authorization: Bearer read-token\r\n",
+    );
+    assert_response(
+        &read_only_bearer_exchange(&database, "read-token", &bearer_query),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[7]]}"#,
+    );
+
+    let key_query = read_only_clickhouse_key_exchange(
+        &database,
+        "read-key",
+        b"GET /?query=SELECT+id+FROM+events%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: read-key\r\n\r\n",
+    );
+    assert_response(
+        &key_query,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[7]]}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_query);
+
+    for target in ["/ping", "/ready"] {
+        let bearer_request = format!(
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer read-token\r\n\r\n"
+        );
+        assert_ok_health_response(&read_only_bearer_exchange(
+            &database,
+            "read-token",
+            bearer_request.as_bytes(),
+        ));
+
+        let key_request = format!(
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: read-key\r\n\r\n"
+        );
+        let response =
+            read_only_clickhouse_key_exchange(&database, "read-key", key_request.as_bytes());
+        assert_ok_health_response(&response);
+        assert_clickhouse_key_response_is_not_cacheable(&response);
+    }
+
+    assert_ok_metrics_response(
+        &read_only_bearer_exchange(
+            &database,
+            "read-token",
+            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer read-token\r\n\r\n",
+        ),
+        1,
+        1,
+        1,
+        8,
+    );
+    let key_metrics = read_only_clickhouse_key_exchange(
+        &database,
+        "read-key",
+        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: read-key\r\n\r\n",
+    );
+    assert_ok_metrics_response(&key_metrics, 1, 1, 1, 8);
+    assert_clickhouse_key_response_is_not_cacheable(&key_metrics);
+}
+
+#[test]
+fn authenticated_read_only_modes_reject_every_insert_surface_without_locking() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    for (target, body) in [
+        ("/insert", &b"INSERT INTO events VALUES (1);"[..]),
+        ("/insert/events", &b"id\n1\n"[..]),
+    ] {
+        let (missing_bearer, body_offset) = request_with_authorization_for_target(target, body, "");
+        let mut input = Cursor::new(missing_bearer);
+        let mut response = Vec::new();
+        handle_http_query_read_only_with_bearer_token(
+            &database,
+            "read-token",
+            &mut input,
+            &mut response,
+        )
+        .unwrap();
+        assert_eq!(input.position(), body_offset);
+        assert_response(
+            &response,
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"bearer authentication required"}"#,
+        );
+
+        let (authorized_bearer, body_offset) = request_with_authorization_for_target(
+            target,
+            body,
+            "Authorization: Bearer read-token\r\n",
+        );
+        let mut input = Cursor::new(authorized_bearer);
+        response.clear();
+        handle_http_query_read_only_with_bearer_token(
+            &database,
+            "read-token",
+            &mut input,
+            &mut response,
+        )
+        .unwrap();
+        assert_eq!(input.position(), body_offset);
+        assert_response(
+            &response,
+            "HTTP/1.1 404 Not Found",
+            r#"{"error":"request target must be / or /query"}"#,
+        );
+
+        let (missing_key, body_offset) = request_with_authorization_for_target(target, body, "");
+        let mut input = Cursor::new(missing_key);
+        response.clear();
+        handle_http_query_read_only_with_clickhouse_key(
+            &database,
+            "read-key",
+            &mut input,
+            &mut response,
+        )
+        .unwrap();
+        assert_eq!(input.position(), body_offset);
+        assert_response(
+            &response,
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+        );
+        assert_clickhouse_key_response_is_not_cacheable(&response);
+
+        let (authorized_key, body_offset) =
+            request_with_authorization_for_target(target, body, "X-ClickHouse-Key: read-key\r\n");
+        let mut input = Cursor::new(authorized_key);
+        response.clear();
+        handle_http_query_read_only_with_clickhouse_key(
+            &database,
+            "read-key",
+            &mut input,
+            &mut response,
+        )
+        .unwrap();
+        assert_eq!(input.position(), body_offset);
+        assert_response(
+            &response,
+            "HTTP/1.1 404 Not Found",
+            r#"{"error":"request target must be / or /query"}"#,
+        );
+        assert_clickhouse_key_response_is_not_cacheable(&response);
+    }
+
+    let bearer_standard_insert = request_for_target_with_headers(
+        "/query",
+        b"INSERT INTO events VALUES (1);",
+        "Authorization: Bearer read-token\r\n",
+    );
+    assert_response(
+        &read_only_bearer_exchange(&database, "read-token", &bearer_standard_insert),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+
+    let key_parameterized_insert = read_only_clickhouse_key_exchange(
+        &database,
+        "read-key",
+        b"POST /?query=INSERT+INTO+events+VALUES+%281%29%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: read-key\r\n\r\n",
+    );
+    assert_response(
+        &key_parameterized_insert,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&key_parameterized_insert);
+}
+
+#[test]
+fn authenticated_read_only_modes_preserve_complete_response_limits() {
+    let database = SharedDatabase::default();
+    let sql = format!("SELECT '{}' AS value;", "x".repeat(256));
+    let bearer_request = request_for_target_with_headers(
+        "/query",
+        sql.as_bytes(),
+        "Authorization: Bearer read-token\r\n",
+    );
+    let unrestricted = read_only_bearer_exchange(&database, "read-token", &bearer_request);
+    let mut exact = Vec::new();
+    handle_http_query_read_only_with_bearer_token_and_limits(
+        &database,
+        "read-token",
+        Cursor::new(&bearer_request),
+        &mut exact,
+        HttpQueryLimits {
+            max_response_bytes: unrestricted.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(exact, unrestricted);
+
+    let mut capped = Vec::new();
+    handle_http_query_read_only_with_bearer_token_and_limits(
+        &database,
+        "read-token",
+        Cursor::new(&bearer_request),
+        &mut capped,
+        HttpQueryLimits {
+            max_response_bytes: unrestricted.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect("the fixed response-limit error fits");
+    assert_response(
+        &capped,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+
+    let key_request = b"GET /?query=SELECT+7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: read-key\r\n\r\n";
+    let mut no_output = Vec::new();
+    let error = handle_http_query_read_only_with_clickhouse_key_and_limits(
+        &database,
+        "read-key",
+        Cursor::new(key_request),
+        &mut no_output,
+        HttpQueryLimits {
+            max_response_bytes: 0,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("even the fixed response-limit error cannot fit");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes: 0, .. }
+    ));
+    assert!(no_output.is_empty());
 }
 
 #[test]
