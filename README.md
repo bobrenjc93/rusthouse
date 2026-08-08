@@ -25,12 +25,15 @@ The early implementation should favor Rust's standard library and a small depend
 The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and composable `WHERE`
-comparisons with unary `NOT`, `AND`, and `OR`. The exact inclusive range form
-`column BETWEEN lower_literal AND upper_literal` accepts the same typed literals
-as comparisons, binds as one predicate atom, and is equivalent to
-`column >= lower_literal AND column <= upper_literal`. Bounds are not reordered,
-so a lower bound greater than its upper bound matches no rows. Case-sensitive
-String membership uses the nonempty form `column IN (literal [, ...])`; the
+comparisons with unary `NOT`, `AND`, and `OR`. The exact inclusive range forms
+`column BETWEEN lower_literal AND upper_literal` and
+`column NOT BETWEEN lower_literal AND upper_literal` accept the same typed
+literals as comparisons and bind as one predicate atom. `BETWEEN` is equivalent
+to `column >= lower_literal AND column <= upper_literal`; `NOT BETWEEN` wraps
+that complete predicate in one negation. Bounds are not reordered, so a lower
+bound greater than its upper bound makes `BETWEEN` match no rows and `NOT BETWEEN`
+match every row. Case-sensitive String membership uses the nonempty form
+`column IN (literal [, ...])`; the
 same form also supports every other physical column type. Every member
 accepts the same finite typed literals and numeric compatibility as equality;
 the list binds as one predicate atom and is lowered to a balanced tree of
@@ -196,9 +199,9 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n [OFFSET m]]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison, inclusive `BETWEEN`, nonempty `IN` and `NOT IN`, prefix,
-suffix, and contains `LIKE` predicates, including unary `NOT`, as regular
-`SELECT`.
+composable comparison, inclusive `BETWEEN` and `NOT BETWEEN`, nonempty `IN` and
+`NOT IN`, prefix, suffix, and contains `LIKE` predicates, including unary `NOT`,
+as regular `SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -328,11 +331,12 @@ compact input cannot expand into an unbounded retained token or AST graph.
 Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
 combined levels of parenthesized or unary-`NOT` nesting. A `BETWEEN` atom is
 lowered to two inclusive comparisons joined by `AND`, and all three expanded
-nodes count toward the 256-node limit. An `IN` atom is lowered to one equality
-per literal and a balanced set of joining `OR` nodes; every expanded node also
-counts toward that limit, while all leaves share one retained copy of the
-column identifier. `NOT IN` adds and charges exactly one negation node around
-that balanced tree.
+nodes count toward the 256-node limit. `NOT BETWEEN` adds and charges exactly
+one negation node around that existing tree. An `IN` atom is lowered to one
+equality per literal and a balanced set of joining `OR` nodes; every expanded
+node also counts toward that limit, while all leaves share one retained copy of
+the column identifier. `NOT IN` adds and charges exactly one negation node
+around that balanced tree.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
@@ -481,8 +485,8 @@ Those authenticated handlers also expose exact `POST /insert/<table>` for
 RustHouse SQL identifier; extra path segments, query strings, and
 percent-encoded names are not accepted. The request requires one decimal
 `Content-Length`, and its body starts with a header containing every target
-column name exactly once with matching case, followed by typed records. CSV
-headers may place those names in any order; TSV headers remain in schema order.
+column name exactly once with matching case, followed by typed records. CSV and
+TSV headers may place those names in any order.
 With no format header the body remains `CSVWithNames`, so `POST /insert/events`
 with `label,id\n"one, quoted",1\n` imports one CSV row. An exact,
 case-sensitive `X-ClickHouse-Format: TabSeparatedWithNames` selects TSV input;
@@ -650,7 +654,11 @@ one immediate write-lock attempt before table lookup or input access and returns
 the typed `DatabaseBusy` error rather than waiting for an active reader or
 writer. Lock poisoning and typed TSV, limit, and table-capacity failures remain
 distinct, and every failure preserves all existing rows.
-The decoded header must exactly match every schema column in order and case.
+The decoded header must contain every schema column exactly once with matching
+case, but may list those names in any order. Missing, duplicate, unknown, and
+differently cased header names are rejected. Each data field parses as the
+table type selected by its header, and complete rows are restored to schema
+order before the atomic append.
 Data rows accept the same `Int64`, finite `Float64`, exact lowercase `Bool`, and
 `String` types, with LF or CRLF record endings. Fields decode the escape
 sequences emitted by RustHouse's TSV writer: `\\`, `\t`, `\r`, `\n`, `\0`,

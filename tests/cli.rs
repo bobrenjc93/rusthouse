@@ -175,19 +175,21 @@ fn json_cli_executes_unicode_suffix_like_for_regular_and_distinct_where() {
 }
 
 #[test]
-fn json_cli_executes_inclusive_between_for_distinct_where() {
+fn json_cli_executes_not_between_for_regular_and_distinct_where() {
     let output = run(
         &["--format", "json"],
         b"CREATE TABLE ranges (id Int64, label String); \
           INSERT INTO ranges VALUES \
           (1, 'outside'), (2, 'inside'), (3, 'inside'), (4, 'edge'), (5, 'outside'); \
-          SELECT DISTINCT label FROM ranges WHERE id BETWEEN 2 AND 4 ORDER BY label;",
+          SELECT id FROM ranges WHERE id NOT BETWEEN 2 AND 4 ORDER BY id; \
+          SELECT DISTINCT label FROM ranges WHERE id NOT BETWEEN 2 AND 4 ORDER BY label;",
     );
 
     assert!(output.status.success(), "{:?}", output.stderr);
     assert_eq!(
         output.stdout,
-        b"{\"columns\":[{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[\"edge\"],[\"inside\"]]}\n"
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[1],[5]]}\n\
+          {\"columns\":[{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[\"outside\"]]}\n"
     );
     assert!(output.stderr.is_empty());
 }
