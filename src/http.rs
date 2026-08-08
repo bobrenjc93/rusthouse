@@ -129,8 +129,9 @@ impl StdError for HttpQueryError {
 /// `X-ClickHouse-Key`-authenticated handlers expose the same authenticated
 /// route set.
 ///
-/// `GET /metrics` accepts no request body and returns three Prometheus gauges
-/// for retained tables, columns, and rows. It takes a nonblocking, consistent
+/// `GET /metrics` accepts no request body and returns four Prometheus gauges
+/// for retained tables, columns, rows, and scalar payload bytes. The byte gauge
+/// is named `rusthouse_retained_value_bytes`. It takes a nonblocking, consistent
 /// database metrics snapshot; lock contention and poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
