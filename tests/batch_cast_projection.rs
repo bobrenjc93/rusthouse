@@ -1221,6 +1221,113 @@ fn bool_to_string_maps_both_values_after_filtering_ordering_and_pagination() {
 }
 
 #[test]
+fn string_to_bool_accepts_trim_free_mixed_case_and_preserves_query_semantics() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, text String); \
+             INSERT INTO samples VALUES \
+             (1, 'invalid'), (2, 'TrUe'), (3, 'FALSE'), \
+             (4, 'true'), (5, 'fAlSe'), (6, ' false');",
+        )
+        .expect("setup");
+
+    let aliased = query(
+        &mut database,
+        "SELECT id, CAST(text AS Bool) AS enabled FROM samples \
+         WHERE id >= 2 AND id <= 5 \
+         ORDER BY enabled, id DESC LIMIT 3 OFFSET 1",
+    );
+    assert_eq!(
+        aliased.columns,
+        [
+            ResultColumn {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "enabled".to_owned(),
+                data_type: DataType::Bool,
+            },
+        ]
+    );
+    assert_eq!(
+        aliased.rows,
+        [
+            vec![Value::Int64(3), Value::Bool(false)],
+            vec![Value::Int64(4), Value::Bool(true)],
+            vec![Value::Int64(2), Value::Bool(true)],
+        ]
+    );
+
+    let expression_ordered = query(
+        &mut database,
+        "SELECT id, CAST(text AS Bool) FROM samples \
+         WHERE id >= 2 AND id <= 5 \
+         ORDER BY CAST(text AS Bool) DESC, id LIMIT 2",
+    );
+    assert_eq!(
+        expression_ordered.columns[1],
+        ResultColumn {
+            name: "CAST(text AS Bool)".to_owned(),
+            data_type: DataType::Bool,
+        }
+    );
+    assert_eq!(
+        expression_ordered.rows,
+        [
+            vec![Value::Int64(2), Value::Bool(true)],
+            vec![Value::Int64(4), Value::Bool(true)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(text AS Bool) FROM samples LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Bool(true)], vec![Value::Bool(false)]]
+    );
+}
+
+#[test]
+fn string_to_bool_reports_typed_errors_for_malformed_selected_values() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, text String); \
+             INSERT INTO samples VALUES \
+             (1, ''), (2, ' true'), (3, 'false '), (4, '1'), \
+             (5, 'yes'), (6, 'TRUE'), (7, 'false');",
+        )
+        .expect("setup");
+
+    for id in 1..=5 {
+        assert_eq!(
+            database.execute(&format!(
+                "SELECT CAST(text AS Bool) FROM samples WHERE id = {id}"
+            )),
+            Err(Error::InvalidCast {
+                source_type: DataType::String,
+                target_type: DataType::Bool,
+            }),
+            "row {id}"
+        );
+    }
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(text AS Bool) AS enabled FROM samples \
+             WHERE id >= 6 ORDER BY enabled LIMIT 1 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Bool(true)]]
+    );
+}
+
+#[test]
 fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
     let mut database = Database::new();
     database
@@ -1267,17 +1374,14 @@ fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
             column: "missing".to_owned(),
         })
     );
-    for (name, actual) in [("b", DataType::Bool), ("s", DataType::String)] {
-        assert_eq!(
-            database.execute(&format!("SELECT CAST({name} AS Bool) FROM samples")),
-            Err(Error::TypeMismatch {
-                context: format!("CAST argument '{name}'"),
-                expected: "Int64 or Float64".to_owned(),
-                actual: actual.to_string(),
-            }),
-            "column {name}"
-        );
-    }
+    assert_eq!(
+        database.execute("SELECT CAST(b AS Bool) FROM samples"),
+        Err(Error::TypeMismatch {
+            context: "CAST argument 'b'".to_owned(),
+            expected: "Int64, Float64, or String".to_owned(),
+            actual: DataType::Bool.to_string(),
+        })
+    );
 
     assert_eq!(
         database.execute("SELECT CAST(missing AS String) FROM samples"),

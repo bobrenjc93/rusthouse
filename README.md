@@ -153,19 +153,21 @@ row count and configured row cap are unchanged. Missing tables or columns and
 attempts to remove a table's sole column fail before mutation. A trailing
 semicolon is optional.
 
-`ALTER TABLE <table> UPDATE <target> = <Int64 literal> WHERE <column> = <Int64
-literal>` provides one deliberately narrow ClickHouse-style mutation. The
-target and predicate must be existing `Int64` columns; table and column lookup
-are case-insensitive, and both literals support the complete optionally signed
-`Int64` range. The table and both columns are resolved and type-checked before
-the full source row count is checked against the configured scan limit. After
-that bounded scan, all matches from the original predicate column are passed
-to one atomic column replacement, including an empty replacement for zero
-matches. Invalid syntax, missing names, wrong types, and scan-limit failures
-leave the table unchanged. Expressions, additional assignments or predicates,
-other operators and types, and clauses such as `LIMIT` are not supported. A
-successful command reports its matched-row count through the library API and
-is silent in formatted CLI output.
+`ALTER TABLE <table> UPDATE <target> = <literal> WHERE <column> = <literal>`
+provides one deliberately narrow ClickHouse-style mutation. The target and
+predicate may independently be existing `Int64` or `Bool` columns, and each
+literal must have its corresponding column's type. `Int64` literals support
+the complete optionally signed range, while Boolean literals are
+case-insensitive `TRUE` or `FALSE`. Table and column lookup is case-insensitive.
+The table and both columns are resolved and type-checked before the full source
+row count is checked against the configured scan limit. After that bounded
+scan, all matches from the original predicate column are passed to one atomic
+column replacement, including an empty replacement for zero matches. Invalid
+syntax, missing names, wrong types, and scan-limit failures leave the table
+unchanged. Expressions, additional assignments or predicates, other operators
+and physical types, and clauses such as `LIMIT` are not supported. A successful
+command reports its matched-row count through the library API and is silent in
+formatted CLI output.
 
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
@@ -256,7 +258,8 @@ not fail the query. A selected overflow or non-`Int64` argument is a typed error
 `CAST(bool_column AS Float64)`, `CAST(string_column AS Float64)`,
 `CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`,
 `CAST(string_column AS Int64)`,
-`CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`, and
+`CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`,
+`CAST(string_column AS Bool)`, and
 `CAST(int64_column AS String)`, `CAST(float64_column AS String)`, and
 `CAST(bool_column AS String)`. Integer-to-String casts use canonical base-10
 text: zero is `0`, positive values have no leading plus sign or zeroes, and
@@ -273,7 +276,10 @@ lexicographically. Boolean-to-String casts produce the exact lowercase values
 `true`. For `Float64`, positive and negative zero become `false`, while every
 finite nonzero value becomes `true`. Float-to-integer casts truncate finite
 values toward zero and report typed numeric-overflow errors outside the
-`Int64` range. String-to-integer casts accept nonempty, trim-free ASCII
+`Int64` range. String-to-Boolean casts accept the trim-free words `true` and
+`false` case-insensitively and return a typed invalid-cast error for every
+other value. Boolean ordering places `false` before `true`.
+String-to-integer casts accept nonempty, trim-free ASCII
 base-10 digits with one optional leading `+` or `-`; leading zeroes are
 accepted, and both `Int64` extrema are exact. Empty, whitespace-padded, or
 otherwise malformed text returns a typed invalid-cast error, while values
