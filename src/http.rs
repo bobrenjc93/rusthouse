@@ -111,10 +111,14 @@ impl StdError for HttpQueryError {
 /// parameter and one `default_format` parameter in any order. `default_format`
 /// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
-/// names and values are percent-decoded, `+` becomes a space, and neither form
-/// accepts a request body (`Content-Length` may be absent or zero). Empty,
-/// duplicate, unknown, and unsupported parameters are rejected after
-/// authentication and before database access. A
+/// names and values are percent-decoded, and `+` becomes a space. An
+/// insertion-capable authenticated `POST` additionally accepts a nonempty
+/// `CSVWithNames` body when the decoded SQL is exactly `INSERT INTO <table>
+/// FORMAT CSVWithNames`; it routes the body through the same bounded, atomic,
+/// nonblocking importer as `POST /insert/<table>`. All other parameterized
+/// queries require an absent or zero `Content-Length`. Empty, duplicate,
+/// unknown, and unsupported parameters are rejected after authentication and
+/// before database access. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. GET requests and every request made through a
 /// read-only handler pass the SQL to [`SharedDatabase::try_query`], which
@@ -283,10 +287,11 @@ pub fn handle_http_query_with_bearer_token_and_limits(
 /// Authentication and resource limits are identical to
 /// [`handle_http_query_with_bearer_token`], but this least-privilege variant
 /// never exposes `POST /insert` or `POST /insert/<table>` and never enables
-/// INSERT execution on a standard query route. Explicit insertion routes are
-/// rejected after authentication and before their body is read or the
-/// database is accessed. The existing bearer-token handlers retain their
-/// insertion behavior for backward compatibility.
+/// INSERT execution or parameterized query-plus-data ingestion on a standard
+/// query route. Explicit insertion routes and parameterized data bodies are
+/// rejected after authentication and before their body is read or the database
+/// is accessed. The existing bearer-token handlers retain their insertion
+/// behavior for backward compatibility.
 ///
 /// # Errors
 ///
@@ -444,8 +449,9 @@ pub fn handle_http_query_with_clickhouse_key_and_limits(
 /// Authentication, cache-control headers, and resource limits are identical
 /// to [`handle_http_query_with_clickhouse_key`], but this least-privilege
 /// variant never exposes `POST /insert` or `POST /insert/<table>` and never
-/// enables INSERT execution on a standard query route. Explicit insertion
-/// routes are rejected after authentication and before their body is read or
+/// enables INSERT execution or parameterized query-plus-data ingestion on a
+/// standard query route. Explicit insertion routes and parameterized data
+/// bodies are rejected after authentication and before their body is read or
 /// the database is accessed. The existing key handlers retain their insertion
 /// behavior for backward compatibility.
 ///
@@ -932,14 +938,6 @@ fn read_request(
             encoded_parameters,
             method,
         }) => {
-            if request.content_length.unwrap_or(0) != 0 {
-                return Err(RequestFailure::new(
-                    Status::BAD_REQUEST,
-                    method.body_rejection_message(),
-                )
-                .into());
-            }
-
             let decoded =
                 decode_query_parameters(&encoded_parameters, method, limits.max_sql_bytes)?;
             let output_format_selected =
@@ -955,21 +953,74 @@ fn read_request(
                 (Some(format), None) | (None, Some(format)) => format,
                 (None, None) => QueryResponseFormat::Json,
             };
-            String::from_utf8(decoded.sql)
-                .map(|sql| {
-                    classify_standard_query_request(
-                        sql,
-                        response_format,
-                        access.allows_insert()
-                            && matches!(method, ParameterizedQueryMethod::Post)
-                            && !output_format_selected,
-                    )
-                })
-                .map_err(|_| {
-                    RequestFailure::new(Status::BAD_REQUEST, "SQL query is not valid UTF-8").into()
-                })
+            let sql = String::from_utf8(decoded.sql).map_err(|_| {
+                RequestReadError::from(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "SQL query is not valid UTF-8",
+                ))
+            })?;
+
+            if matches!(method, ParameterizedQueryMethod::Post) && access.allows_insert() {
+                if let Some(table) = parse_csv_with_names_insert(&sql) {
+                    if output_format_selected {
+                        return Err(RequestFailure::new(
+                            Status::BAD_REQUEST,
+                            "CSVWithNames INSERT does not accept an output format selector",
+                        )
+                        .into());
+                    }
+                    let body = read_csv_body(
+                        input,
+                        request.content_length,
+                        limits.max_sql_bytes,
+                        limits.csv_ingest_limits,
+                    )?;
+                    return Ok(HttpRequest::TableInsert {
+                        table,
+                        body,
+                        input_format: TableInsertFormat::CsvWithNames,
+                    });
+                }
+            }
+
+            if request.content_length.unwrap_or(0) != 0 {
+                return Err(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    method.body_rejection_message(),
+                )
+                .into());
+            }
+
+            Ok(classify_standard_query_request(
+                sql,
+                response_format,
+                access.allows_insert()
+                    && matches!(method, ParameterizedQueryMethod::Post)
+                    && !output_format_selected,
+            ))
         }
     }
+}
+
+fn parse_csv_with_names_insert(sql: &str) -> Option<String> {
+    let sql = sql.trim();
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+    let mut tokens = sql.split_whitespace();
+    let insert = tokens.next()?;
+    let into = tokens.next()?;
+    let table = tokens.next()?;
+    let format = tokens.next()?;
+    let csv_with_names = tokens.next()?;
+    if tokens.next().is_some()
+        || !insert.eq_ignore_ascii_case("INSERT")
+        || !into.eq_ignore_ascii_case("INTO")
+        || !format.eq_ignore_ascii_case("FORMAT")
+        || !csv_with_names.eq_ignore_ascii_case("CSVWithNames")
+        || validate_table_name(table).is_err()
+    {
+        return None;
+    }
+    Some(table.to_owned())
 }
 
 fn classify_standard_query_request(
