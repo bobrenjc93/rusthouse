@@ -39,6 +39,9 @@ pub const DEFAULT_MAX_QUERY_ORDERING_STATE_BYTES: usize = 16 * 1024 * 1024;
 pub const ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES: usize = std::mem::size_of::<usize>();
 /// Bytes charged for each cached single-key `lengthUTF8` ordering entry.
 pub const LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES: usize = 2 * std::mem::size_of::<usize>();
+/// Bytes charged for each cached single-key String-to-`Float64` ordering entry.
+pub const STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES: usize =
+    std::mem::size_of::<CachedStringToFloat64Order>();
 /// Maximum groups retained while evaluating one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_GROUPS: usize = 100_000;
 /// Maximum grouped-key scalar cells retained while evaluating one grouped `SELECT`.
@@ -81,9 +84,10 @@ pub struct QueryResultLimits {
     /// Maximum estimated bytes retained in one query result and maximum cloned
     /// String payload materialized by one `ALTER TABLE UPDATE`.
     pub max_bytes: usize,
-    /// Maximum temporary bytes used for ordered `ROW_NUMBER` row indices and
-    /// single-key `lengthUTF8` ordering state. Each operator charges its
-    /// complete filtered row set before allocating that state.
+    /// Maximum temporary bytes used for ordered `ROW_NUMBER` row indices,
+    /// single-key `lengthUTF8` ordering state, and single-key String-to-`Float64`
+    /// ordering state. Each operator charges its complete filtered row set
+    /// before allocating that state.
     pub max_ordering_state_bytes: usize,
     pub max_groups: usize,
     pub max_group_key_cells: usize,
@@ -633,6 +637,50 @@ impl Database {
         Ok(affected_rows)
     }
 
+    /// Atomically appends bounded, typed, headerless `TabSeparated` input.
+    ///
+    /// Every physical line is data and must contain exactly one field for each
+    /// physical schema column, in schema order. Fields use the TSV writer's
+    /// ClickHouse-style escapes: `\\`, `\t`, `\r`, `\n`, `\0`, `\b`, `\f`, and
+    /// `\'`. Decoded values parse as `Int64`, finite `Float64`, `Bool`, or
+    /// `String`; records may use LF or CRLF. Empty input appends zero rows.
+    ///
+    /// The complete input, every row and value, configured limits, and
+    /// remaining table capacity are validated before any physical column is
+    /// changed. Every error therefore leaves the target table unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::engine::Database;
+    /// use rusthouse::batch::tsv::TsvIngestLimits;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute("CREATE TABLE notes (id Int64, text String);")?;
+    /// let input = b"7\tline\\nwith\\ttab\n";
+    /// let rows = database.ingest_tsv(
+    ///     "notes",
+    ///     input,
+    ///     TsvIngestLimits::new(input.len(), 1, 2),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_tsv(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: TsvIngestLimits,
+    ) -> std::result::Result<usize, TsvIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            tsv::parse_rows_without_names(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        self.table_mut(table)?.append_prepared_insert_rows(rows);
+        Ok(affected_rows)
+    }
+
     /// Atomically appends bounded, typed `TabSeparatedWithNames` input.
     ///
     /// The decoded header must contain a nonempty, duplicate-free subset of
@@ -672,7 +720,7 @@ impl Database {
     ) -> std::result::Result<usize, TsvIngestError> {
         let rows = {
             let target = self.catalog.table(table)?;
-            tsv::parse_rows(target, input.as_ref(), limits)?
+            tsv::parse_rows_with_names(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
         self.table_mut(table)?.append_prepared_insert_rows(rows);
@@ -4515,16 +4563,30 @@ fn order_source_rows(
     }
 
     if let [order] = ordering {
-        if let ResolvedItem::StringLengthUtf8 { source } = items[order.output] {
-            order_source_rows_by_length_utf8(
-                rows,
-                table,
-                source,
-                order.descending,
-                limit,
-                max_ordering_state_bytes,
-            )?;
-            return Ok(());
+        match items[order.output] {
+            ResolvedItem::StringLengthUtf8 { source } => {
+                order_source_rows_by_length_utf8(
+                    rows,
+                    table,
+                    source,
+                    order.descending,
+                    limit,
+                    max_ordering_state_bytes,
+                )?;
+                return Ok(());
+            }
+            ResolvedItem::CastStringToFloat64 { source } => {
+                order_source_rows_by_string_to_float64(
+                    rows,
+                    table,
+                    source,
+                    order.descending,
+                    limit,
+                    max_ordering_state_bytes,
+                )?;
+                return Ok(());
+            }
+            _ => {}
         }
     }
     if limit == Some(0) {
@@ -4721,6 +4783,66 @@ fn order_source_rows_by_length_utf8(
     }));
     sort_and_limit_by(&mut cached, limit, |left, right| {
         let comparison = left.scalar_count.cmp(&right.scalar_count);
+        let comparison = if descending {
+            comparison.reverse()
+        } else {
+            comparison
+        };
+        comparison.then_with(|| left.row.cmp(&right.row))
+    });
+
+    rows.clear();
+    rows.extend(cached.into_iter().map(|cached| cached.row));
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedStringToFloat64Order {
+    row: usize,
+    key: f64,
+}
+
+fn order_source_rows_by_string_to_float64(
+    rows: &mut Vec<usize>,
+    table: &Table,
+    source: usize,
+    descending: bool,
+    limit: Option<usize>,
+    max_ordering_state_bytes: usize,
+) -> Result<()> {
+    // Keep the parsed key beside its source row so bounded selection never
+    // reparses either operand. Charge every filtered candidate before the
+    // cache allocation; LIMIT and OFFSET cannot reduce this working state.
+    debug_assert_eq!(
+        std::mem::size_of::<CachedStringToFloat64Order>(),
+        STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES
+    );
+    let ordering_state_bytes = rows
+        .len()
+        .saturating_mul(STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES);
+    enforce_resource_limit(
+        "SELECT ordering state bytes",
+        ordering_state_bytes,
+        max_ordering_state_bytes,
+    )?;
+    if limit == Some(0) {
+        rows.clear();
+        return Ok(());
+    }
+
+    let mut cached = Vec::with_capacity(rows.len());
+    for row in rows.iter().copied() {
+        let value = string_at(table, source, row);
+        if !float64_text(value) {
+            return Err(invalid_string_to_float64_cast());
+        }
+        cached.push(CachedStringToFloat64Order {
+            row,
+            key: ordering_string_to_float64(value),
+        });
+    }
+    sort_and_limit_by(&mut cached, limit, |left, right| {
+        let comparison = ValueRef::Float64(left.key).cmp(&ValueRef::Float64(right.key));
         let comparison = if descending {
             comparison.reverse()
         } else {

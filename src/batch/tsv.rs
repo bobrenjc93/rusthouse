@@ -1,11 +1,13 @@
-//! Bounded ingestion for typed `TabSeparatedWithNames` input.
+//! Bounded ingestion for typed `TabSeparated` and `TabSeparatedWithNames` input.
 //!
 //! Fields use the same ClickHouse-style backslash escapes as the TSV writer.
 //! Physical records may end in LF or CRLF; escaped line endings remain field
-//! data after decoding. Headers must contain a nonempty, exact-case subset of
-//! schema names without duplicates; names may appear in any order. Each data
-//! field is parsed using the type selected by its header, and omitted columns
-//! use the same typed defaults as an explicit-column SQL `INSERT`.
+//! data after decoding. Headerless `TabSeparated` fields map to every physical
+//! schema column in order. `TabSeparatedWithNames` headers must contain a
+//! nonempty, exact-case subset of schema names without duplicates; names may
+//! appear in any order. Each data field is parsed using its selected type, and
+//! omitted named columns use the same typed defaults as an explicit-column SQL
+//! `INSERT`.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -16,19 +18,19 @@ use super::error::Error;
 use super::storage::{PreparedInsertRows, Table};
 use super::value::{DataType, Value};
 
-/// Default maximum size of one typed TSV input, including its header.
+/// Default maximum size of one typed TSV input, including a header when present.
 pub const DEFAULT_MAX_TSV_BYTES: usize = 8 * 1024 * 1024;
 /// Default maximum number of data rows in one typed TSV input.
 pub const DEFAULT_MAX_TSV_ROWS: usize = 100_000;
 /// Default maximum number of data values in one typed TSV input.
 pub const DEFAULT_MAX_TSV_VALUES: usize = 1_000_000;
 
-/// Resource bounds for one typed `TabSeparatedWithNames` ingestion operation.
+/// Resource bounds for one typed TSV ingestion operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TsvIngestLimits {
-    /// Maximum complete input size, in bytes, including the header.
+    /// Maximum complete input size, in bytes, including a header when present.
     pub max_bytes: usize,
-    /// Maximum number of data rows after the header.
+    /// Maximum number of data rows (excluding a `TabSeparatedWithNames` header).
     pub max_rows: usize,
     /// Maximum total number of fields across all data rows.
     pub max_values: usize,
@@ -56,9 +58,10 @@ impl Default for TsvIngestLimits {
     }
 }
 
-/// A failure while validating or appending typed `TabSeparatedWithNames` input.
+/// A failure while validating or appending typed TSV input.
 ///
-/// Line and column numbers are one-based. The header is line 1.
+/// Line and column numbers are one-based. A `TabSeparatedWithNames` header is
+/// line 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TsvIngestError {
     /// The complete byte input exceeds its configured bound.
@@ -202,7 +205,7 @@ impl From<Error> for TsvIngestError {
     }
 }
 
-pub(crate) fn parse_rows(
+pub(crate) fn parse_rows_with_names(
     table: &Table,
     input: &[u8],
     limits: TsvIngestLimits,
@@ -218,16 +221,48 @@ pub(crate) fn parse_rows(
         return Err(TsvIngestError::MissingHeader { line: 1 });
     }
 
-    let mut lines = input.split_inclusive('\n');
-    let raw_header = lines.next().expect("non-empty input has a line");
+    let mut physical_lines = input.split_inclusive('\n');
+    let raw_header = physical_lines.next().expect("non-empty input has a line");
     let header = line_contents(raw_header, 1)?;
     let header_plan = validate_header(table, header)?;
 
-    let expected_columns = header_plan.schema_indexes.len();
+    parse_data_rows(
+        table,
+        &input[raw_header.len()..],
+        2,
+        header_plan.schema_indexes,
+        limits,
+    )
+}
+
+pub(crate) fn parse_rows_without_names(
+    table: &Table,
+    input: &[u8],
+    limits: TsvIngestLimits,
+) -> Result<PreparedInsertRows, TsvIngestError> {
+    if input.len() > limits.max_bytes {
+        return Err(TsvIngestError::ByteLimitExceeded {
+            bytes: input.len(),
+            max_bytes: limits.max_bytes,
+        });
+    }
+    let input = std::str::from_utf8(input).map_err(invalid_utf8)?;
+    let schema_indexes = (0..table.schema().len()).collect();
+    parse_data_rows(table, input, 1, schema_indexes, limits)
+}
+
+fn parse_data_rows(
+    table: &Table,
+    input: &str,
+    first_line: usize,
+    schema_indexes: Vec<usize>,
+    limits: TsvIngestLimits,
+) -> Result<PreparedInsertRows, TsvIngestError> {
+    let expected_columns = schema_indexes.len();
     let mut rows = Vec::new();
     let mut value_count = 0_usize;
-    for (offset, raw_record) in lines.enumerate() {
-        let line = offset.saturating_add(2);
+    for (offset, raw_record) in input.split_inclusive('\n').enumerate() {
+        let line = first_line.saturating_add(offset);
         let record = line_contents(raw_record, line)?;
         let row_count = rows.len().saturating_add(1);
         if row_count > limits.max_rows {
@@ -264,7 +299,7 @@ pub(crate) fn parse_rows(
         for (offset, field) in record.split('\t').enumerate() {
             let column = offset.saturating_add(1);
             let decoded = decode_field(field, line, column)?;
-            let schema_index = header_plan.schema_indexes[offset];
+            let schema_index = schema_indexes[offset];
             row.push(parse_value(
                 decoded,
                 table.schema()[schema_index].data_type,
@@ -277,7 +312,7 @@ pub(crate) fn parse_rows(
     }
 
     table
-        .prepare_projected_rows(header_plan.schema_indexes, rows)
+        .prepare_projected_rows(schema_indexes, rows)
         .map_err(Into::into)
 }
 

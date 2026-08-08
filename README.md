@@ -324,6 +324,12 @@ returns a typed numeric-overflow error. Ordering compares parsed numeric
 values rather than source text. Syntactically valid positive or negative
 overflow values participate at the corresponding end of that ordering and
 can be removed by `LIMIT`/`OFFSET` before conversion.
+Ungrouped ordering by only a String-to-`Float64` cast parses each filtered
+candidate once into a fixed-size `(source row, Float64 key)` cache before
+bounded top-k selection. The complete cache is charged against the separate
+16 MiB ordering-state limit before allocation; `LIMIT` and `OFFSET` do not
+reduce that charge. Ties retain source order, and overflow is still reported
+only when the corresponding row survives pagination and is converted.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
@@ -858,6 +864,17 @@ Headers must remain unquoted; empty, duplicate, unknown, differently cased,
 over-wide, or quoted headers and malformed data quoting are rejected. Every
 record must match the selected header width. Any input, schema, value, limit,
 or remaining-capacity failure leaves the table unchanged.
+
+`Database::ingest_tsv` atomically appends bounded, headerless `TabSeparated`
+input in physical schema order. Every physical line is a data row and must
+supply every column; empty input is a zero-row no-op. The blocking
+`SharedDatabase::ingest_tsv` retains one write lock through lookup, parsing,
+all byte, row, total-value, and remaining table-capacity checks, and the one
+atomic append. `SharedDatabase::try_ingest_tsv` has the same behavior after one
+immediate lock attempt, returning `DatabaseBusy` before table lookup or input
+access when contended. Fields reuse the typed parsing and ClickHouse-style
+backslash escapes described below for `TabSeparatedWithNames`. Any late row,
+value, escape, line-ending, or capacity failure preserves all existing rows.
 
 `Database::ingest_tsv_with_names` provides the corresponding bounded,
 multi-column `TabSeparatedWithNames` importer, with
