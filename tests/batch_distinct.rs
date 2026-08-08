@@ -412,6 +412,66 @@ fn filters_before_first_seen_deduplication_and_limits_afterward() {
 }
 
 #[test]
+fn pages_filtered_distinct_values_after_deduplication_and_ordering() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (reading Int64, included Bool); \
+             INSERT INTO samples VALUES \
+                 (30, true), (10, true), (20, false), (30, true), \
+                 (50, true), (40, true), (10, true);",
+        )
+        .expect("fixture succeeds");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT reading FROM samples \
+             WHERE included = true LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Int64(10)], vec![Value::Int64(50)]]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT reading FROM samples WHERE included = true \
+             ORDER BY reading ASC LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Int64(30)], vec![Value::Int64(40)]]
+    );
+
+    for sql in [
+        "SELECT DISTINCT reading FROM samples LIMIT 0 OFFSET 0",
+        "SELECT DISTINCT reading FROM samples LIMIT 0 OFFSET 2",
+        "SELECT DISTINCT reading FROM samples ORDER BY reading LIMIT 1 OFFSET 5",
+        "SELECT DISTINCT reading FROM samples LIMIT 1 OFFSET 9",
+    ] {
+        assert!(query(&mut database, sql).rows.is_empty(), "{sql}");
+    }
+}
+
+#[test]
+fn rejects_an_overflowing_distinct_count_plus_offset_bound() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE samples (reading Int64); INSERT INTO samples VALUES (1), (1);")
+        .expect("fixture succeeds");
+
+    let sql = format!(
+        "SELECT DISTINCT reading FROM samples ORDER BY reading LIMIT {} OFFSET 1",
+        usize::MAX
+    );
+    assert_eq!(
+        database.execute(&sql),
+        Err(Error::NumericOverflow(
+            "LIMIT + OFFSET selection bound".to_owned()
+        ))
+    );
+}
+
+#[test]
 fn deduplicates_mixed_type_tuples_in_first_seen_order() {
     let mut database = Database::new();
     database
@@ -682,7 +742,7 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
         group_limited
             .execute(
                 "SELECT DISTINCT value, label FROM samples WHERE included = true \
-                 ORDER BY label DESC, value ASC LIMIT 0",
+                 ORDER BY label DESC, value ASC LIMIT 0 OFFSET 1",
             )
             .expect_err("LIMIT cannot bypass DISTINCT working-state limits"),
         Error::ResourceLimitExceeded {

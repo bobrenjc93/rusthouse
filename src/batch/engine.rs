@@ -1004,7 +1004,13 @@ impl Database {
             .as_ref()
             .map(|having| resolve_having(&result_columns, &items, &aggregate_specs, having))
             .transpose()?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        let ordering = resolve_ordering(
+            table,
+            &items,
+            &aggregate_specs,
+            &result_columns,
+            &select.order_by,
+        )?;
         if let Some(prefix) = result_prefix {
             // Reject a UNION schema mismatch before scanning or materializing
             // any rows from its right operand.
@@ -1059,6 +1065,7 @@ impl Database {
                         selection_limit,
                     );
                 }
+                apply_offset(&mut selected_groups, select.offset.unwrap_or(0));
             } else {
                 order_grouped_rows(
                     &mut selected_groups,
@@ -1532,7 +1539,7 @@ fn validate_distinct_shape(select: &Select) -> Result<()> {
             .all(|item| matches!(item, SelectItem::Column { alias: None, .. }));
     if !unaliased_columns || !select.group_by.is_empty() || select.having.is_some() {
         return Err(Error::InvalidQuery(
-            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, optional ordering by projected physical columns, and an optional LIMIT".to_owned(),
+            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, optional ordering by projected physical columns, and an optional LIMIT <count> [OFFSET <offset>]".to_owned(),
         ));
     }
 
@@ -1584,8 +1591,7 @@ fn validate_offset_shape(select: &Select) -> Result<()> {
             "OFFSET requires LIMIT <count>".to_owned(),
         ));
     }
-    if select.distinct
-        || !select.group_by.is_empty()
+    if !select.group_by.is_empty()
         || select.having.is_some()
         || select.items.iter().any(|item| {
             matches!(
@@ -1595,7 +1601,7 @@ fn validate_offset_shape(select: &Select) -> Result<()> {
         })
     {
         return Err(Error::InvalidQuery(
-            "OFFSET is only supported for ungrouped, non-DISTINCT, non-window SELECT projections"
+            "OFFSET is only supported for ungrouped or physical-column DISTINCT, non-window SELECT projections"
                 .to_owned(),
         ));
     }
@@ -1776,6 +1782,9 @@ enum ResolvedItem {
         source: usize,
     },
     CastFloat64ToBool {
+        source: usize,
+    },
+    CastInt64ToString {
         source: usize,
     },
     CastBoolToString {
@@ -1984,6 +1993,9 @@ fn resolve_select_items(
                     (DataType::Float64, DataType::Bool) => {
                         Some(ResolvedItem::CastFloat64ToBool { source })
                     }
+                    (DataType::Int64, DataType::String) => {
+                        Some(ResolvedItem::CastInt64ToString { source })
+                    }
                     (DataType::Bool, DataType::String) => {
                         Some(ResolvedItem::CastBoolToString { source })
                     }
@@ -1994,7 +2006,7 @@ fn resolve_select_items(
                         DataType::Float64 => "Int64",
                         DataType::Bool => "Int64 or Float64",
                         DataType::Int64 => "Float64 or Bool",
-                        DataType::String => "Bool",
+                        DataType::String => "Int64 or Bool",
                     };
                     return Err(Error::TypeMismatch {
                         context: format!("CAST argument '{name}'"),
@@ -2375,6 +2387,9 @@ fn execute_projection(
                         ResolvedItem::CastFloat64ToBool { source } => {
                             Value::Bool(float64_at(table, *source, *row) != 0.0)
                         }
+                        ResolvedItem::CastInt64ToString { source } => {
+                            Value::String(int64_at(table, *source, *row).to_string())
+                        }
                         ResolvedItem::CastBoolToString { source } => {
                             Value::String(bool_string(bool_at(table, *source, *row)).to_owned())
                         }
@@ -2525,6 +2540,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
@@ -2541,9 +2557,20 @@ fn validate_projection_result_limits(
                     bytes = bytes.saturating_add(value.len());
                     enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
                 }
-            } else if let ResolvedItem::CastBoolToString { source } = item {
-                bytes = bytes.saturating_add(bool_string(bool_at(table, *source, *row)).len());
-                enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+            } else {
+                let cast_string_len = match item {
+                    ResolvedItem::CastInt64ToString { source } => {
+                        Some(int64_text_len(int64_at(table, *source, *row)))
+                    }
+                    ResolvedItem::CastBoolToString { source } => {
+                        Some(bool_string(bool_at(table, *source, *row)).len())
+                    }
+                    _ => None,
+                };
+                if let Some(cast_string_len) = cast_string_len {
+                    bytes = bytes.saturating_add(cast_string_len);
+                    enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+                }
             }
         }
     }
@@ -2584,6 +2611,7 @@ fn validate_grouped_result_limits(
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -3046,6 +3074,7 @@ impl GroupedData<'_> {
                         | ResolvedItem::CastBoolToInt64 { .. }
                         | ResolvedItem::CastInt64ToBool { .. }
                         | ResolvedItem::CastFloat64ToBool { .. }
+                        | ResolvedItem::CastInt64ToString { .. }
                         | ResolvedItem::CastBoolToString { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
@@ -3324,15 +3353,40 @@ struct ResolvedOrder {
     descending: bool,
 }
 
-fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
+fn resolve_ordering(
+    table: &Table,
+    items: &[ResolvedItem],
+    aggregate_specs: &[AggregateSpec],
+    columns: &[ResultColumn],
+    requested: &[OrderBy],
+) -> Result<Vec<ResolvedOrder>> {
+    debug_assert_eq!(items.len(), columns.len());
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let expression_names = items
+        .iter()
+        .map(|item| resolved_expression_name(table, item, aggregate_specs))
+        .collect::<Vec<_>>();
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let matches = columns
+        let output_matches = columns
             .iter()
             .enumerate()
             .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
+        let matches = if output_matches.is_empty() {
+            expression_names
+                .iter()
+                .enumerate()
+                .filter(|(_, expression)| expression.eq_ignore_ascii_case(&order.name))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        } else {
+            output_matches
+        };
         match matches.as_slice() {
             [index] => ordering.push(ResolvedOrder {
                 output: *index,
@@ -3353,6 +3407,61 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
         }
     }
     Ok(ordering)
+}
+
+fn resolved_expression_name(
+    table: &Table,
+    item: &ResolvedItem,
+    aggregate_specs: &[AggregateSpec],
+) -> String {
+    match item {
+        ResolvedItem::Column { source, .. } => table.schema()[*source].name.clone(),
+        ResolvedItem::Int64Subtract { source, literal } => {
+            sql::int64_subtraction_name(&table.schema()[*source].name, *literal)
+        }
+        ResolvedItem::CastInt64ToFloat64 { source } => {
+            format!("CAST({} AS Float64)", table.schema()[*source].name)
+        }
+        ResolvedItem::CastFloat64ToInt64 { source } | ResolvedItem::CastBoolToInt64 { source } => {
+            format!("CAST({} AS Int64)", table.schema()[*source].name)
+        }
+        ResolvedItem::CastInt64ToBool { source } | ResolvedItem::CastFloat64ToBool { source } => {
+            format!("CAST({} AS Bool)", table.schema()[*source].name)
+        }
+        ResolvedItem::CastInt64ToString { source } | ResolvedItem::CastBoolToString { source } => {
+            format!("CAST({} AS String)", table.schema()[*source].name)
+        }
+        ResolvedItem::StringLength { source } => {
+            format!("LENGTH({})", table.schema()[*source].name)
+        }
+        ResolvedItem::StringLower { source } => {
+            format!("LOWER({})", table.schema()[*source].name)
+        }
+        ResolvedItem::StringUpper { source } => {
+            format!("UPPER({})", table.schema()[*source].name)
+        }
+        ResolvedItem::Int64Abs { source } => {
+            format!("ABS({})", table.schema()[*source].name)
+        }
+        ResolvedItem::Float64Round { source } => {
+            format!("ROUND({})", table.schema()[*source].name)
+        }
+        ResolvedItem::Float64Floor { source } => {
+            format!("FLOOR({})", table.schema()[*source].name)
+        }
+        ResolvedItem::Float64Ceil { source } => {
+            format!("CEIL({})", table.schema()[*source].name)
+        }
+        ResolvedItem::RowNumber => "ROW_NUMBER()".to_owned(),
+        ResolvedItem::Aggregate { state } => {
+            let spec = &aggregate_specs[*state];
+            let argument = spec
+                .argument
+                .map(|source| table.schema()[source].name.as_str())
+                .unwrap_or("*");
+            format!("{}({argument})", spec.function.name())
+        }
+    }
 }
 
 fn order_source_rows(
@@ -3398,6 +3507,10 @@ fn order_source_rows(
                 ResolvedItem::CastFloat64ToBool { source } => (float64_at(table, source, left)
                     != 0.0)
                     .cmp(&(float64_at(table, source, right) != 0.0)),
+                ResolvedItem::CastInt64ToString { source } => int64_text_cmp(
+                    int64_at(table, source, left),
+                    int64_at(table, source, right),
+                ),
                 ResolvedItem::CastBoolToString { source } => {
                     bool_at(table, source, left).cmp(&bool_at(table, source, right))
                 }
@@ -3479,6 +3592,7 @@ fn order_grouped_rows(
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
+                | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -3545,6 +3659,41 @@ fn bool_at(table: &Table, source: usize, row: usize) -> bool {
 
 fn bool_string(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+fn int64_text_len(value: i64) -> usize {
+    let magnitude = value.unsigned_abs();
+    let digits = if magnitude == 0 {
+        1
+    } else {
+        magnitude.ilog10() as usize + 1
+    };
+    digits + usize::from(value.is_negative())
+}
+
+fn int64_text_cmp(left: i64, right: i64) -> Ordering {
+    let (left_bytes, left_start) = render_int64_text(left);
+    let (right_bytes, right_start) = render_int64_text(right);
+    left_bytes[left_start..].cmp(&right_bytes[right_start..])
+}
+
+fn render_int64_text(value: i64) -> ([u8; 20], usize) {
+    let mut bytes = [0_u8; 20];
+    let mut start = bytes.len();
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        start -= 1;
+        bytes[start] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value.is_negative() {
+        start -= 1;
+        bytes[start] = b'-';
+    }
+    (bytes, start)
 }
 
 fn checked_float64_to_int64(value: f64) -> Result<i64> {

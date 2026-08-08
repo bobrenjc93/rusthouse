@@ -176,8 +176,8 @@ pub struct Select {
     pub having: Option<Having>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
-    /// Rows skipped after filtering and ordering. This is only populated for
-    /// the narrow `LIMIT <count> OFFSET <offset>` projection shape.
+    /// Rows skipped after filtering, DISTINCT processing, and ordering. This
+    /// is only populated for supported `LIMIT <count> OFFSET <offset>` shapes.
     pub offset: Option<usize>,
 }
 
@@ -405,8 +405,7 @@ fn validate_offset_shape(select: &Select, position: usize) -> Result<()> {
         return Ok(());
     }
 
-    let unsupported = select.distinct
-        || !select.group_by.is_empty()
+    let unsupported = !select.group_by.is_empty()
         || select.having.is_some()
         || select.items.iter().any(|item| {
             matches!(
@@ -417,7 +416,7 @@ fn validate_offset_shape(select: &Select, position: usize) -> Result<()> {
     if unsupported {
         return Err(Error::Sql {
             position,
-            message: "OFFSET is only supported for ungrouped, non-DISTINCT, non-window SELECT projections"
+            message: "OFFSET is only supported for ungrouped or physical-column DISTINCT, non-window SELECT projections"
                 .to_owned(),
         });
     }
@@ -1449,7 +1448,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_distinct_select(&mut self) -> Result<Select> {
-        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table>, an optional WHERE predicate, an optional ORDER BY projected_column [ASC|DESC] list, and an optional LIMIT";
+        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table>, an optional WHERE predicate, an optional ORDER BY projected_column [ASC|DESC] list, and an optional LIMIT <count> [OFFSET <offset>]";
 
         let mut items = Vec::new();
         loop {
@@ -1506,6 +1505,20 @@ impl<'a> Parser<'a> {
             None
         };
 
+        let offset = if limit.is_some() && self.eat_keyword("OFFSET") {
+            let position = self.position();
+            let number = self.take_number().ok_or_else(|| Error::Sql {
+                position,
+                message: "expected a non-negative integer after OFFSET".to_owned(),
+            })?;
+            Some(number.parse::<usize>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid OFFSET '{number}'"),
+            })?)
+        } else {
+            None
+        };
+
         if !self.at_keyword("UNION") && !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End)
         {
             return self.error(SHAPE);
@@ -1520,7 +1533,7 @@ impl<'a> Parser<'a> {
             having: None,
             order_by,
             limit,
-            offset: None,
+            offset,
         })
     }
 
