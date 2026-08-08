@@ -1131,6 +1131,24 @@ fn get_query_accepts_percent_decoded_default_database_in_either_order() {
 }
 
 #[test]
+fn get_default_database_parameter_executes_length_utf8_projection() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE samples (label String); \
+             INSERT INTO samples VALUES ('é'), ('東京'), ('👨‍👩‍👧‍👦');",
+        )
+        .unwrap();
+    let request = b"GET /?database=default&query=SELECT+lengthUTF8%28label%29+AS+characters+FROM+samples+ORDER+BY+characters%3B HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    assert_response(
+        &exchange(&database, request),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"characters","type":"Int64"}],"rows":[[1],[2],[7]]}"#,
+    );
+}
+
+#[test]
 fn get_database_parameter_coexists_with_headers_and_both_authentication_modes() {
     let database = SharedDatabase::default();
     let bearer_request = b"GET /?query=SELECT+7+AS+value%3B&database=default HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\nX-ClickHouse-Database: default\r\nX-ClickHouse-Format: CSVWithNames\r\n\r\n";
