@@ -236,13 +236,14 @@ impl Database {
 
     /// Atomically appends a bounded, typed `CSVWithNames` input.
     ///
-    /// The header must exactly match the target table's column names in schema
-    /// order. Data fields are parsed using their `Int64`, finite `Float64`,
-    /// `Bool`, or `String` schema types. Data fields may be double-quoted,
-    /// allowing commas, LF or CRLF line endings, and doubled (`""`) quote
-    /// escapes; decoded contents are parsed using the same schema-type rules.
-    /// Headers must remain unquoted. Only LF and CRLF line endings are
-    /// accepted.
+    /// The header must contain every target column name exactly once, with
+    /// exact case, but may place those names in any order. Each data field is
+    /// parsed using the `Int64`, finite `Float64`, `Bool`, or `String` type
+    /// selected by its header, then complete rows are restored to schema order.
+    /// Data fields may be double-quoted, allowing commas, LF or CRLF line
+    /// endings, and doubled (`""`) quote escapes; decoded contents use the same
+    /// type rules. Headers must remain unquoted. Only LF and CRLF line endings
+    /// are accepted.
     ///
     /// The complete input, header, every row and value, configured limits, and
     /// remaining table capacity are validated before any physical column is
@@ -258,7 +259,7 @@ impl Database {
     /// database.execute(
     ///     "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);",
     /// )?;
-    /// let input = b"id,score,active,label\n1,2.5,true,alpha\n";
+    /// let input = b"label,active,score,id\nalpha,true,2.5,1\n";
     /// let rows = database.ingest_csv_with_names(
     ///     "metrics",
     ///     input,
