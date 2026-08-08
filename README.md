@@ -241,6 +241,7 @@ and `LIMIT` select rows before subtraction, so overflow in an excluded row does
 not fail the query. A selected overflow or non-`Int64` argument is a typed error.
 
 `SELECT` projections support `CAST(int64_column AS Float64)`,
+`CAST(bool_column AS Float64)`,
 `CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`,
 `CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`, and
 `CAST(int64_column AS String)`, `CAST(float64_column AS String)`, and
@@ -253,12 +254,13 @@ values omit a decimal point, fractions and finite extrema retain the digits
 needed to identify the stored `Float64`, and negative zero is preserved as
 `-0`. Ordering a Float-to-String expression compares this generated text
 lexicographically. Boolean-to-String casts produce the exact lowercase values
-`false` and `true`. Boolean `false` becomes `0` and `true` becomes `1`; integer
-zero becomes `false`, and every nonzero integer, including both `Int64`
-extrema, becomes `true`. For `Float64`, positive and negative zero become
-`false`, while every finite nonzero value becomes `true`. Float-to-integer
-casts truncate finite values toward zero and report typed numeric-overflow
-errors outside the `Int64` range.
+`false` and `true`. Boolean `false` becomes `0` as `Int64` or `0.0` as
+`Float64`, and `true` becomes `1` or `1.0`, respectively. Integer zero becomes
+`false`, and every nonzero integer, including both `Int64` extrema, becomes
+`true`. For `Float64`, positive and negative zero become `false`, while every
+finite nonzero value becomes `true`. Float-to-integer casts truncate finite
+values toward zero and report typed numeric-overflow errors outside the
+`Int64` range.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections

@@ -2010,6 +2010,9 @@ enum ResolvedItem {
     CastInt64ToFloat64 {
         source: usize,
     },
+    CastBoolToFloat64 {
+        source: usize,
+    },
     CastFloat64ToInt64 {
         source: usize,
     },
@@ -2225,6 +2228,9 @@ fn resolve_select_items(
                     (DataType::Int64, DataType::Float64) => {
                         Some(ResolvedItem::CastInt64ToFloat64 { source })
                     }
+                    (DataType::Bool, DataType::Float64) => {
+                        Some(ResolvedItem::CastBoolToFloat64 { source })
+                    }
                     (DataType::Float64, DataType::Int64) => {
                         Some(ResolvedItem::CastFloat64ToInt64 { source })
                     }
@@ -2250,7 +2256,7 @@ fn resolve_select_items(
                 };
                 let Some(resolved) = resolved else {
                     let expected = match target_type {
-                        DataType::Float64 => "Int64",
+                        DataType::Float64 => "Int64 or Bool",
                         DataType::Bool => "Int64 or Float64",
                         DataType::Int64 => "Float64 or Bool",
                         DataType::String => "Int64, Float64, or Bool",
@@ -2626,6 +2632,13 @@ fn execute_projection(
                         ResolvedItem::CastInt64ToFloat64 { source } => {
                             Value::Float64(int64_at(table, *source, *row) as f64)
                         }
+                        ResolvedItem::CastBoolToFloat64 { source } => {
+                            Value::Float64(if bool_at(table, *source, *row) {
+                                1.0
+                            } else {
+                                0.0
+                            })
+                        }
                         ResolvedItem::CastFloat64ToInt64 { source } => Value::Int64(
                             checked_float64_to_int64(float64_at(table, *source, *row))?,
                         ),
@@ -2793,6 +2806,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::StringUpper { source } => Some(*source),
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
+                | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
@@ -2869,6 +2883,7 @@ fn validate_grouped_result_limits(
                     )
                 }
                 ResolvedItem::CastInt64ToFloat64 { .. }
+                | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
@@ -3342,6 +3357,7 @@ impl GroupedData<'_> {
                             )
                         }
                         ResolvedItem::CastInt64ToFloat64 { .. }
+                        | ResolvedItem::CastBoolToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. }
                         | ResolvedItem::CastBoolToInt64 { .. }
                         | ResolvedItem::CastInt64ToBool { .. }
@@ -3698,6 +3714,9 @@ fn resolved_expression_name(
         ResolvedItem::CastInt64ToFloat64 { source } => {
             format!("CAST({} AS Float64)", table.schema()[*source].name)
         }
+        ResolvedItem::CastBoolToFloat64 { source } => {
+            format!("CAST({} AS Float64)", table.schema()[*source].name)
+        }
         ResolvedItem::CastFloat64ToInt64 { source } | ResolvedItem::CastBoolToInt64 { source } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
@@ -3770,6 +3789,9 @@ fn order_source_rows(
                     let left = ValueRef::Float64(int64_at(table, source, left) as f64);
                     let right = ValueRef::Float64(int64_at(table, source, right) as f64);
                     left.cmp(&right)
+                }
+                ResolvedItem::CastBoolToFloat64 { source } => {
+                    bool_at(table, source, left).cmp(&bool_at(table, source, right))
                 }
                 ResolvedItem::CastFloat64ToInt64 { source } => {
                     let left = ValueRef::Float64(float64_at(table, source, left).trunc());
@@ -3876,6 +3898,7 @@ fn order_grouped_rows(
                     )
                 }
                 ResolvedItem::CastInt64ToFloat64 { .. }
+                | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
