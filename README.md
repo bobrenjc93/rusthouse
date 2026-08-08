@@ -612,10 +612,11 @@ ClickHouse-style parameterized forms,
 `POST /?query=<percent-encoded SQL>`, accept the same SQL with no body
 (`Content-Length` may be omitted or be zero) for ordinary queries. A
 write-capable authenticated `POST` also accepts the canonical ClickHouse
-query-plus-data forms `/?query=INSERT+INTO+<table>+FORMAT+CSVWithNames` with a
-named CSV body or `/?query=INSERT+INTO+<table>+FORMAT+TabSeparated` with a
-headerless TSV body in physical schema order. Each requires one decimal
-`Content-Length`. The SQL shape and either supported format name are
+query-plus-data forms `/?query=INSERT+INTO+<table>+FORMAT+CSV` with a headerless
+CSV body, `/?query=INSERT+INTO+<table>+FORMAT+CSVWithNames` with a named CSV
+body, or `/?query=INSERT+INTO+<table>+FORMAT+TabSeparated` with a headerless TSV
+body. Headerless inputs use physical schema order. Each requires one decimal
+`Content-Length`. The SQL shape and supported format names are
 case-insensitive, permit one optional trailing semicolon, and otherwise must be
 exact: an explicit column list, another format, or any extra SQL is not
 accepted as query-plus-data. Both parameterized request forms also accept one
@@ -706,12 +707,12 @@ method, so typed input, schema, capacity, and format-specific limit failures
 return `400 Bad Request` and append no rows. Empty headerless CSV and TSV are
 successful zero-row inserts. Success returns the same empty `200 OK` response as
 the SQL insert route. The unauthenticated handlers do not recognize it.
-The parameterized `INSERT INTO <table> FORMAT CSVWithNames` and `INSERT INTO
-<table> FORMAT TabSeparated` forms call the same named CSV and headerless TSV
-importers, respectively, with the same success response, authentication,
-admission, format-specific resource limits, and all-or-nothing behavior. An
-empty named CSV body fails as a missing header; an empty headerless TSV body is
-a successful zero-row insert.
+The parameterized `INSERT INTO <table> FORMAT CSV`, `INSERT INTO <table> FORMAT
+CSVWithNames`, and `INSERT INTO <table> FORMAT TabSeparated` forms call the same
+headerless CSV, named CSV, and headerless TSV importers, respectively, with the
+same success response, authentication, admission, format-specific resource
+limits, and all-or-nothing behavior. An empty named CSV body fails as a missing
+header; empty headerless CSV and TSV bodies are successful zero-row inserts.
 
 HTTP read admission never waits for the database lock. After request parsing,
 authentication, optional database-header and query-parameter validation, SQL
@@ -726,15 +727,15 @@ response limit retain their documented ordering and behavior.
 HTTP insert admission likewise never waits. After authentication and optional
 database-header validation, the bounded body or URL query is read and decoded.
 Standard authenticated POST insertion is disabled when an output format was
-selected. A parameterized named CSV or headerless TSV insert validates the
-exact SQL shape and both the HTTP and corresponding format byte caps before
-reading its body. The standard and explicit SQL routes complete SQL parsing before
-their immediate write-lock attempt; the headerless and named CSV and TSV routes
-pass their bounded bytes to the selected ingestion API, which attempts
-the lock before table lookup or parsing. Any active reader or writer returns
-the same deterministic `503 Service Unavailable`; a poisoned lock returns `500
-Internal Server Error`. Validation and commit occur under the acquired write
-lock so concurrent work cannot expose or cause a partial batch.
+selected. A parameterized headerless CSV, named CSV, or headerless TSV insert
+validates the exact SQL shape and both the HTTP and corresponding format byte
+caps before reading its body. The standard and explicit SQL routes complete SQL
+parsing before their immediate write-lock attempt; the headerless and named CSV
+and TSV routes pass their bounded bytes to the selected ingestion API, which
+attempts the lock before table lookup or parsing. Any active reader or writer
+returns the same deterministic `503 Service Unavailable`; a poisoned lock
+returns `500 Internal Server Error`. Validation and commit occur under the
+acquired write lock so concurrent work cannot expose or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSV`, `CSVWithNames`, `TabSeparated`,
