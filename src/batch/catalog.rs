@@ -213,6 +213,18 @@ impl Catalog {
             .fold(0_usize, usize::saturating_add)
     }
 
+    /// Returns scalar payload bytes retained across all tables without allocating.
+    ///
+    /// The sum saturates at [`usize::MAX`] and excludes container capacity,
+    /// schema text, and allocation metadata.
+    #[must_use]
+    pub fn retained_value_bytes(&self) -> usize {
+        self.tables
+            .values()
+            .map(Table::retained_value_bytes)
+            .fold(0_usize, usize::saturating_add)
+    }
+
     /// Returns the combined byte length of all display names without allocating.
     #[must_use]
     pub fn table_name_bytes(&self) -> usize {
@@ -238,7 +250,7 @@ fn normalize(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch::value::DataType;
+    use crate::batch::value::{DataType, Value};
 
     #[test]
     fn table_lookup_is_case_insensitive() {
@@ -325,5 +337,44 @@ mod tests {
         assert!(catalog.drop_table_if_exists("eVeNtS"));
         assert!(!catalog.drop_table_if_exists("EVENTS"));
         assert_eq!(catalog.table_count(), 0);
+    }
+
+    #[test]
+    fn retained_value_bytes_aggregate_tables_and_drop_with_them() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "numbers".to_owned(),
+                vec![ColumnDef {
+                    name: "value".to_owned(),
+                    data_type: DataType::Int64,
+                }],
+            )
+            .expect("create numbers");
+        catalog
+            .create_table(
+                "labels".to_owned(),
+                vec![ColumnDef {
+                    name: "value".to_owned(),
+                    data_type: DataType::String,
+                }],
+            )
+            .expect("create labels");
+        catalog
+            .table_mut("numbers")
+            .expect("numbers table")
+            .insert_row(vec![Value::Int64(7)])
+            .expect("insert number");
+        catalog
+            .table_mut("labels")
+            .expect("labels table")
+            .insert_row(vec![Value::String("é".to_owned())])
+            .expect("insert label");
+
+        assert_eq!(catalog.retained_value_bytes(), 10);
+        catalog.drop_table("NUMBERS").expect("drop numbers");
+        assert_eq!(catalog.retained_value_bytes(), 2);
+        catalog.drop_table("labels").expect("drop labels");
+        assert_eq!(catalog.retained_value_bytes(), 0);
     }
 }

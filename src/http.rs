@@ -1506,8 +1506,14 @@ fn write_prometheus_metrics(output: &mut impl Write, metrics: DatabaseMetrics) -
          rusthouse_columns {}\n\
          # HELP rusthouse_retained_rows Number of rows retained across all tables.\n\
          # TYPE rusthouse_retained_rows gauge\n\
-         rusthouse_retained_rows {}",
-        metrics.table_count, metrics.column_count, metrics.retained_row_count,
+         rusthouse_retained_rows {}\n\
+         # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
+         # TYPE rusthouse_retained_value_bytes gauge\n\
+         rusthouse_retained_value_bytes {}",
+        metrics.table_count,
+        metrics.column_count,
+        metrics.retained_row_count,
+        metrics.retained_value_bytes,
     )
 }
 

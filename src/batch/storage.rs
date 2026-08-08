@@ -127,6 +127,24 @@ impl Column {
         self.len() == 0
     }
 
+    /// Returns the scalar payload bytes retained by this column without allocating.
+    ///
+    /// Each `Int64` and `Float64` counts as eight bytes, each `Bool` as one byte,
+    /// and each `String` as its UTF-8 payload length. The result saturates at
+    /// [`usize::MAX`]. Container capacity and allocation metadata are excluded.
+    #[must_use]
+    pub fn retained_value_bytes(&self) -> usize {
+        match self {
+            Self::Int64(values) => values.len().saturating_mul(8),
+            Self::Float64(values) => values.len().saturating_mul(8),
+            Self::Bool(values) => values.len(),
+            Self::String(values) => values
+                .iter()
+                .map(String::len)
+                .fold(0_usize, usize::saturating_add),
+        }
+    }
+
     #[must_use]
     pub fn value(&self, row: usize) -> Value {
         self.value_ref(row).to_owned()
@@ -325,6 +343,18 @@ impl Table {
     #[must_use]
     pub fn retained_cell_count(&self) -> usize {
         self.row_count.saturating_mul(self.schema.len())
+    }
+
+    /// Returns scalar payload bytes retained across all columns without allocating.
+    ///
+    /// The sum saturates at [`usize::MAX`]. Container capacity, schema text, and
+    /// allocation metadata are excluded.
+    #[must_use]
+    pub fn retained_value_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(Column::retained_value_bytes)
+            .fold(0_usize, usize::saturating_add)
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
@@ -730,6 +760,65 @@ mod tests {
 
         assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
         assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
+    }
+
+    #[test]
+    fn retained_value_bytes_counts_every_type_and_tracks_row_removal() {
+        assert_eq!(Column::Int64(vec![1, 2]).retained_value_bytes(), 16);
+        assert_eq!(Column::Float64(vec![1.0, 2.0]).retained_value_bytes(), 16);
+        assert_eq!(Column::Bool(vec![true, false]).retained_value_bytes(), 2);
+        assert_eq!(
+            Column::String(vec!["ASCII".to_owned(), "é".to_owned()]).retained_value_bytes(),
+            7
+        );
+
+        let mut table = Table::new(
+            "metrics".to_owned(),
+            vec![
+                ColumnDef {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ColumnDef {
+                    name: "score".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ColumnDef {
+                    name: "active".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ColumnDef {
+                    name: "label".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+        )
+        .expect("valid schema");
+        assert_eq!(table.retained_value_bytes(), 0);
+
+        table
+            .insert_rows(vec![
+                vec![
+                    Value::Int64(1),
+                    Value::Float64(1.5),
+                    Value::Bool(true),
+                    Value::String("é".to_owned()),
+                ],
+                vec![
+                    Value::Int64(2),
+                    Value::Float64(2.5),
+                    Value::Bool(false),
+                    Value::String("rust".to_owned()),
+                ],
+            ])
+            .expect("valid rows");
+        assert_eq!(table.retained_value_bytes(), 40);
+
+        table.delete_rows(&[0]).expect("valid deletion");
+        assert_eq!(table.retained_value_bytes(), 21);
+
+        assert_eq!(table.truncate(), 1);
+        assert_eq!(table.retained_value_bytes(), 0);
     }
 
     #[test]

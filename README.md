@@ -560,13 +560,17 @@ process-path liveness and `/ready` when routing work only to an instance that
 can immediately begin a database read.
 
 `GET /metrics` exposes a consistent, nonblocking Prometheus text snapshot. It
-accepts no body and returns exactly three unlabeled gauges:
-`rusthouse_tables`, `rusthouse_columns`, and `rusthouse_retained_rows`. They
-report the registered table count, the schema-column count across all tables,
-and the row count retained across all tables. The response uses Prometheus
-text format version 0.0.4. The snapshot attempts one database read lock and
-never waits for a writer; lock contention and poisoning return the same
-deterministic `503 Service Unavailable` response as `/ready`.
+accepts no body and returns exactly four unlabeled gauges: `rusthouse_tables`,
+`rusthouse_columns`, `rusthouse_retained_rows`, and
+`rusthouse_retained_value_bytes`. They report the registered table count, the
+schema-column count across all tables, the row count retained across all tables,
+and retained scalar payload bytes. The byte gauge counts each `Int64` and
+`Float64` value as 8 bytes, each `Bool` as 1 byte, and each `String` by its UTF-8
+payload length; it excludes container capacity, schema text, and allocation
+metadata and saturates at the platform's maximum `usize`. The response uses
+Prometheus text format version 0.0.4. The snapshot attempts one database read
+lock and never waits for a writer; lock contention and poisoning return the
+same deterministic `503 Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a
 POST body or decoded GET SQL, and 16 MiB for the complete response including

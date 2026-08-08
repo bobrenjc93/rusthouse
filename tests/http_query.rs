@@ -128,7 +128,12 @@ fn assert_ok_health_response(response: &[u8]) {
     );
 }
 
-fn metrics_body(tables: usize, columns: usize, retained_rows: usize) -> String {
+fn metrics_body(
+    tables: usize,
+    columns: usize,
+    retained_rows: usize,
+    retained_value_bytes: usize,
+) -> String {
     format!(
         "# HELP rusthouse_tables Number of tables retained by the database.\n\
          # TYPE rusthouse_tables gauge\n\
@@ -138,7 +143,10 @@ fn metrics_body(tables: usize, columns: usize, retained_rows: usize) -> String {
          rusthouse_columns {columns}\n\
          # HELP rusthouse_retained_rows Number of rows retained across all tables.\n\
          # TYPE rusthouse_retained_rows gauge\n\
-         rusthouse_retained_rows {retained_rows}\n"
+         rusthouse_retained_rows {retained_rows}\n\
+         # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
+         # TYPE rusthouse_retained_value_bytes gauge\n\
+         rusthouse_retained_value_bytes {retained_value_bytes}\n"
     )
 }
 
@@ -147,12 +155,13 @@ fn assert_ok_metrics_response(
     tables: usize,
     columns: usize,
     retained_rows: usize,
+    retained_value_bytes: usize,
 ) {
     assert_response_with_content_type(
         response,
         "HTTP/1.1 200 OK",
         "text/plain; version=0.0.4; charset=utf-8",
-        metrics_body(tables, columns, retained_rows).as_bytes(),
+        metrics_body(tables, columns, retained_rows, retained_value_bytes).as_bytes(),
     );
 }
 
@@ -650,21 +659,26 @@ fn metrics_reports_state_changes_as_prometheus_gauges() {
     let database = SharedDatabase::default();
     const REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 0, 0, 0);
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 0, 0, 0, 0);
     database
         .execute(
-            "CREATE TABLE events (id Int64, label String); \
+            "CREATE TABLE events (id Int64, score Float64, active Bool, label String); \
              CREATE TABLE flags (active Bool); \
-             INSERT INTO events VALUES (1, 'one'), (2, 'two'); \
+             INSERT INTO events VALUES (1, 1.5, true, 'one'), (2, 2.5, false, 'two'); \
              INSERT INTO flags VALUES (true);",
         )
         .unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 2, 3, 3);
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 2, 5, 3, 41);
+
+    database
+        .execute("DELETE FROM events WHERE id = 2;")
+        .unwrap();
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 2, 5, 2, 21);
 
     database
         .execute("TRUNCATE TABLE events; DROP TABLE flags;")
         .unwrap();
-    assert_ok_metrics_response(&exchange(&database, REQUEST), 1, 2, 0);
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 1, 4, 0, 0);
 }
 
 #[test]
@@ -749,6 +763,7 @@ fn metrics_requires_exact_get_without_a_body_and_retains_bearer_authentication()
             "correct-token",
             b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
         ),
+        0,
         0,
         0,
         0,
@@ -1984,7 +1999,7 @@ fn clickhouse_key_authentication_wires_query_insert_and_operational_routes() {
         key,
         b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
     );
-    assert_ok_metrics_response(&metrics_response, 1, 1, 1);
+    assert_ok_metrics_response(&metrics_response, 1, 1, 1, 8);
     assert_clickhouse_key_response_is_not_cacheable(&metrics_response);
 }
 
