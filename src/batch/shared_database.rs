@@ -194,10 +194,12 @@ impl SharedDatabase {
         Ok(self.read()?.table_limits())
     }
 
-    /// Takes a consistent metrics snapshot without waiting for the database lock.
+    /// Takes a consistent, constant-time metrics snapshot without waiting for
+    /// the database lock.
     ///
     /// Returns `None` when a read lock is not immediately available or when the
-    /// lock is poisoned. The acquired read guard is released before this method
+    /// lock is poisoned. Cached catalog totals are read without scanning tables
+    /// or values, and the acquired read guard is released before this method
     /// returns.
     #[must_use]
     pub fn metrics_snapshot(&self) -> Option<DatabaseMetrics> {
