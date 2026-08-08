@@ -461,8 +461,7 @@ impl Table {
             .collect::<HashMap<_, _>>();
         let mut schema_indexes = Vec::with_capacity(insert_columns.len());
         let mut seen = vec![false; self.schema.len()];
-        let mut input_indexes_by_schema = vec![None; self.schema.len()];
-        for (input_index, name) in insert_columns.iter().enumerate() {
+        for name in insert_columns {
             let Some(&schema_index) = schema_indexes_by_name.get(&name.to_ascii_lowercase()) else {
                 return Err(Error::ColumnNotFound {
                     table: self.name.clone(),
@@ -473,7 +472,6 @@ impl Table {
                 return Err(Error::DuplicateColumn(name.clone()));
             }
             schema_indexes.push(schema_index);
-            input_indexes_by_schema[schema_index] = Some(input_index);
         }
 
         for row in &rows {
@@ -486,17 +484,60 @@ impl Table {
             }
         }
 
-        self.validate_row_capacity(capacity_rows)?;
+        self.prepare_projected_rows_with_capacity(schema_indexes, rows, capacity_rows)
+    }
+
+    /// Validates projected input and retains omitted columns for defaulting at commit.
+    ///
+    /// `schema_indexes` maps each input field to its physical schema column. Callers
+    /// must resolve a unique, nonempty set of indexes before calling this helper.
+    pub(crate) fn prepare_projected_rows(
+        &self,
+        schema_indexes: Vec<usize>,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<PreparedInsertRows> {
+        let capacity_rows = rows.len();
+        self.prepare_projected_rows_with_capacity(schema_indexes, rows, capacity_rows)
+    }
+
+    fn prepare_projected_rows_with_capacity(
+        &self,
+        schema_indexes: Vec<usize>,
+        rows: Vec<Vec<Value>>,
+        capacity_rows: usize,
+    ) -> Result<PreparedInsertRows> {
+        debug_assert!(!schema_indexes.is_empty());
+        debug_assert!(
+            schema_indexes
+                .iter()
+                .all(|index| *index < self.schema.len())
+        );
+        debug_assert!({
+            let mut sorted = schema_indexes.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted.len() == schema_indexes.len()
+        });
 
         for row in &rows {
-            for (field, input_index) in self.schema.iter().zip(&input_indexes_by_schema) {
-                if let Some(input_index) = input_index {
-                    self.validate_value(field, &row[*input_index])?;
-                }
+            if row.len() != schema_indexes.len() {
+                return Err(Error::RowLength {
+                    table: self.name.clone(),
+                    expected: schema_indexes.len(),
+                    actual: row.len(),
+                });
             }
         }
 
-        let schema_indexes = (insert_columns.len() != self.schema.len()
+        self.validate_row_capacity(capacity_rows)?;
+
+        for row in &rows {
+            for (&schema_index, value) in schema_indexes.iter().zip(row) {
+                self.validate_value(&self.schema[schema_index], value)?;
+            }
+        }
+
+        let schema_indexes = (schema_indexes.len() != self.schema.len()
             || !schema_indexes.iter().copied().eq(0..self.schema.len()))
         .then_some(schema_indexes);
         Ok(PreparedInsertRows {

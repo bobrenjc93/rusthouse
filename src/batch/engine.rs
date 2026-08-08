@@ -358,10 +358,11 @@ impl Database {
 
     /// Atomically appends a bounded, typed `CSVWithNames` input.
     ///
-    /// The header must contain every target column name exactly once, with
-    /// exact case, but may place those names in any order. Each data field is
-    /// parsed using the `Int64`, finite `Float64`, `Bool`, or `String` type
-    /// selected by its header, then complete rows are restored to schema order.
+    /// The header must contain a nonempty subset of target column names without
+    /// duplicates, using exact case, but may place those names in any order.
+    /// Each data field is parsed using the `Int64`, finite `Float64`, `Bool`, or
+    /// `String` type selected by its header. Omitted columns receive the same
+    /// typed defaults as SQL `INSERT`: `0`, `0.0`, `false`, or an empty string.
     /// Data fields may be double-quoted, allowing commas, LF or CRLF line
     /// endings, and doubled (`""`) quote escapes; decoded contents use the same
     /// type rules. Headers must remain unquoted. Only LF and CRLF line endings
@@ -381,11 +382,11 @@ impl Database {
     /// database.execute(
     ///     "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);",
     /// )?;
-    /// let input = b"label,active,score,id\nalpha,true,2.5,1\n";
+    /// let input = b"label,id\nalpha,1\n";
     /// let rows = database.ingest_csv_with_names(
     ///     "metrics",
     ///     input,
-    ///     CsvIngestLimits::new(input.len(), 1, 4),
+    ///     CsvIngestLimits::new(input.len(), 1, 2),
     /// )?;
     /// assert_eq!(rows, 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -401,7 +402,7 @@ impl Database {
             csv::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
-        self.table_mut(table)?.insert_rows(rows)?;
+        self.table_mut(table)?.append_prepared_insert_rows(rows);
         Ok(affected_rows)
     }
 
