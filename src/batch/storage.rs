@@ -188,6 +188,21 @@ fn compact_deleted_rows<T>(values: &mut Vec<T>, row_indexes: &[usize]) {
     debug_assert_eq!(deletion_position, row_indexes.len());
 }
 
+/// Validated INSERT input retained without materializing omitted defaults.
+pub(crate) struct PreparedInsertRows {
+    rows: Vec<Vec<Value>>,
+    /// Input position to physical schema position. `None` means the input is
+    /// already in schema order and contains every column.
+    schema_indexes: Option<Vec<usize>>,
+}
+
+impl PreparedInsertRows {
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+}
+
 /// A table stores one typed vector per schema field.
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -322,20 +337,38 @@ impl Table {
             })
     }
 
-    /// Resolves a complete explicit INSERT column list and returns rows in
-    /// physical schema order. Positional rows are returned unchanged.
+    /// Resolves and validates a nonempty explicit INSERT column list without
+    /// materializing omitted defaults. Positional rows retain schema order.
     ///
-    /// Explicit names resolve case-insensitively. Every schema column must be
-    /// named exactly once; unknown, duplicate, and omitted names are rejected
-    /// before any row is changed.
+    /// Explicit names resolve case-insensitively. Unknown and duplicate names
+    /// are rejected. Omitted columns receive their type's non-null default:
+    /// `0`, `0.0`, `false`, or an empty String when the prepared rows are
+    /// committed. After column and row-width validation, `capacity_rows` is
+    /// checked before supplied values are type-checked. Atomic callers pass
+    /// the cumulative rows for this table.
     pub(crate) fn prepare_insert_rows(
         &self,
         insert_columns: Option<&[String]>,
-        mut rows: Vec<Vec<Value>>,
-    ) -> Result<Vec<Vec<Value>>> {
+        rows: Vec<Vec<Value>>,
+        capacity_rows: usize,
+    ) -> Result<PreparedInsertRows> {
         let Some(insert_columns) = insert_columns else {
-            return Ok(rows);
+            self.validate_row_capacity(capacity_rows)?;
+            for row in &rows {
+                self.validate_row(row)?;
+            }
+            return Ok(PreparedInsertRows {
+                rows,
+                schema_indexes: None,
+            });
         };
+
+        if insert_columns.is_empty() {
+            return Err(Error::MissingInsertColumn {
+                table: self.name.clone(),
+                column: self.schema[0].name.clone(),
+            });
+        }
 
         let schema_indexes_by_name = self
             .schema
@@ -345,7 +378,8 @@ impl Table {
             .collect::<HashMap<_, _>>();
         let mut schema_indexes = Vec::with_capacity(insert_columns.len());
         let mut seen = vec![false; self.schema.len()];
-        for name in insert_columns {
+        let mut input_indexes_by_schema = vec![None; self.schema.len()];
+        for (input_index, name) in insert_columns.iter().enumerate() {
             let Some(&schema_index) = schema_indexes_by_name.get(&name.to_ascii_lowercase()) else {
                 return Err(Error::ColumnNotFound {
                     table: self.name.clone(),
@@ -356,40 +390,36 @@ impl Table {
                 return Err(Error::DuplicateColumn(name.clone()));
             }
             schema_indexes.push(schema_index);
-        }
-        if let Some((index, _)) = seen.iter().enumerate().find(|(_, present)| !**present) {
-            return Err(Error::MissingInsertColumn {
-                table: self.name.clone(),
-                column: self.schema[index].name.clone(),
-            });
+            input_indexes_by_schema[schema_index] = Some(input_index);
         }
 
         for row in &rows {
-            if row.len() != self.schema.len() {
+            if row.len() != insert_columns.len() {
                 return Err(Error::RowLength {
                     table: self.name.clone(),
-                    expected: self.schema.len(),
+                    expected: insert_columns.len(),
                     actual: row.len(),
                 });
             }
         }
 
-        if schema_indexes.iter().copied().eq(0..self.schema.len()) {
-            return Ok(rows);
-        }
-        for row in &mut rows {
-            let source = std::mem::take(row);
-            let mut reordered = Vec::with_capacity(source.len());
-            reordered.resize_with(source.len(), || None);
-            for (value, schema_index) in source.into_iter().zip(schema_indexes.iter().copied()) {
-                reordered[schema_index] = Some(value);
+        self.validate_row_capacity(capacity_rows)?;
+
+        for row in &rows {
+            for (field, input_index) in self.schema.iter().zip(&input_indexes_by_schema) {
+                if let Some(input_index) = input_index {
+                    self.validate_value(field, &row[*input_index])?;
+                }
             }
-            *row = reordered
-                .into_iter()
-                .map(|value| value.expect("complete INSERT columns cover every schema position"))
-                .collect();
         }
-        Ok(rows)
+
+        let schema_indexes = (insert_columns.len() != self.schema.len()
+            || !schema_indexes.iter().copied().eq(0..self.schema.len()))
+        .then_some(schema_indexes);
+        Ok(PreparedInsertRows {
+            rows,
+            schema_indexes,
+        })
     }
 
     /// Changes only a column's display name after validating the complete rename.
@@ -498,28 +528,33 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if matches!(value, Value::Null(_)) {
-                return Err(Error::TypeMismatch {
-                    context: format!("column '{}.{}'", self.name, field.name),
-                    expected: field.data_type.to_string(),
-                    actual: "NULL".to_owned(),
-                });
-            }
-            if field.data_type != value.data_type() {
-                return Err(Error::TypeMismatch {
-                    context: format!("column '{}.{}'", self.name, field.name),
-                    expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
-                });
-            }
-            if matches!(value, Value::Float64(number) if !number.is_finite()) {
-                return Err(Error::InvalidQuery(format!(
-                    "column '{}.{}' cannot store a non-finite Float64",
-                    self.name, field.name
-                )));
-            }
+            self.validate_value(field, value)?;
         }
 
+        Ok(())
+    }
+
+    fn validate_value(&self, field: &ColumnDef, value: &Value) -> Result<()> {
+        if matches!(value, Value::Null(_)) {
+            return Err(Error::TypeMismatch {
+                context: format!("column '{}.{}'", self.name, field.name),
+                expected: field.data_type.to_string(),
+                actual: "NULL".to_owned(),
+            });
+        }
+        if field.data_type != value.data_type() {
+            return Err(Error::TypeMismatch {
+                context: format!("column '{}.{}'", self.name, field.name),
+                expected: field.data_type.to_string(),
+                actual: value.data_type().to_string(),
+            });
+        }
+        if matches!(value, Value::Float64(number) if !number.is_finite()) {
+            return Err(Error::InvalidQuery(format!(
+                "column '{}.{}' cannot store a non-finite Float64",
+                self.name, field.name
+            )));
+        }
         Ok(())
     }
 
@@ -563,6 +598,35 @@ impl Table {
 
     pub(crate) fn append_validated_rows(&mut self, rows: Vec<Vec<Value>>) {
         for row in rows {
+            self.append_validated_row(row);
+        }
+    }
+
+    /// Commits preflighted input, materializing at most one defaulted row at a time.
+    pub(crate) fn append_prepared_insert_rows(&mut self, prepared: PreparedInsertRows) {
+        let PreparedInsertRows {
+            rows,
+            schema_indexes,
+        } = prepared;
+        let Some(schema_indexes) = schema_indexes else {
+            self.append_validated_rows(rows);
+            return;
+        };
+
+        for source in rows {
+            let mut row = self
+                .schema
+                .iter()
+                .map(|field| match field.data_type {
+                    DataType::Int64 => Value::Int64(0),
+                    DataType::Float64 => Value::Float64(0.0),
+                    DataType::Bool => Value::Bool(false),
+                    DataType::String => Value::String(String::new()),
+                })
+                .collect::<Vec<_>>();
+            for (value, schema_index) in source.into_iter().zip(schema_indexes.iter().copied()) {
+                row[schema_index] = value;
+            }
             self.append_validated_row(row);
         }
     }

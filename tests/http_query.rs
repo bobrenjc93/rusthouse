@@ -2634,7 +2634,7 @@ fn authenticated_insert_route_commits_a_batch_and_returns_an_empty_response() {
     let database = SharedDatabase::default();
     database
         .execute(
-            "CREATE TABLE events (id Int64, label String); \
+            "CREATE TABLE events (id Int64, label String, score Float64, active Bool); \
              CREATE TABLE readings (value Float64); \
              ALTER TABLE events RENAME COLUMN label TO name;",
         )
@@ -2643,7 +2643,7 @@ fn authenticated_insert_route_commits_a_batch_and_returns_an_empty_response() {
         "/insert",
         b"INSERT INTO events (name, ID) VALUES ('one', 1), ('two', 2); \
           INSERT INTO readings (VALUE) VALUES (1.5); \
-          INSERT INTO events (id, name) VALUES (3, 'three');",
+          INSERT INTO events (active, id, name) VALUES (true, 3, 'three');",
         "Authorization: Bearer correct-token\r\n",
     );
 
@@ -2656,10 +2656,13 @@ fn authenticated_insert_route_commits_a_batch_and_returns_an_empty_response() {
     assert_response(
         &exchange(
             &database,
-            &request_for_target("/query", b"SELECT id, name FROM events ORDER BY id;"),
+            &request_for_target(
+                "/query",
+                b"SELECT id, name, score, active FROM events ORDER BY id;",
+            ),
         ),
         "HTTP/1.1 200 OK",
-        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"name","type":"String"}],"rows":[[1,"one"],[2,"two"],[3,"three"]]}"#,
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"name","type":"String"},{"name":"score","type":"Float64"},{"name":"active","type":"Bool"}],"rows":[[1,"one",0.0,false],[2,"two",0.0,false],[3,"three",0.0,true]]}"#,
     );
     assert_response(
         &exchange(

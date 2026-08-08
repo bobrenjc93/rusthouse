@@ -99,7 +99,8 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
-    /// `INSERT` with a complete explicit input-column order.
+    /// `INSERT` with a nonempty explicit input-column order. Omitted schema
+    /// columns are filled with typed defaults during execution.
     InsertWithColumns {
         table: String,
         columns: Vec<String>,
@@ -203,6 +204,10 @@ pub enum SelectItem {
         alias: Option<String>,
     },
     Lower {
+        name: String,
+        alias: Option<String>,
+    },
+    Upper {
         name: String,
         alias: Option<String>,
     },
@@ -1597,6 +1602,13 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::Lower { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("UPPER") {
+                let name = self.expect_identifier("String column in UPPER")?;
+                self.expect(&TokenKind::RightParen, "')' after UPPER expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Upper { name, alias });
+            }
+
             if name.eq_ignore_ascii_case("ABS") {
                 let name = self.expect_identifier("Int64 column in ABS")?;
                 self.expect(&TokenKind::RightParen, "')' after ABS expression")?;
@@ -1674,6 +1686,13 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY LOWER expression",
             )?;
             Ok(format!("LOWER({argument})"))
+        } else if name.eq_ignore_ascii_case("UPPER") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("String column in ORDER BY UPPER")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY UPPER expression",
+            )?;
+            Ok(format!("UPPER({argument})"))
         } else if name.eq_ignore_ascii_case("ABS") && self.eat(&TokenKind::LeftParen) {
             let argument = self.expect_identifier("Int64 column in ORDER BY ABS")?;
             self.expect(&TokenKind::RightParen, "')' after ORDER BY ABS expression")?;

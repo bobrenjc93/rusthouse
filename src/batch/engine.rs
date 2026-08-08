@@ -80,9 +80,9 @@ impl Default for QueryResultLimits {
 /// A reusable in-memory SQL database.
 ///
 /// Checked `Int64` column-minus-literal expressions, `CAST`, `LENGTH`, `LOWER`,
-/// `ABS`, `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER`
-/// window forms provide bounded projections in ungrouped queries. An optional
-/// `AS` alias controls each result column name.
+/// `UPPER`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned
+/// `ROW_NUMBER` window forms provide bounded projections in ungrouped queries.
+/// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
 ///
@@ -335,10 +335,12 @@ impl Database {
 
     /// Atomically executes a nonempty SQL batch containing only `INSERT` statements.
     ///
-    /// Every target table, row shape, value type, finite floating-point value,
-    /// and cumulative per-table row count is validated before any row is
-    /// appended. A failure therefore leaves every table unchanged. Successful
-    /// statements are committed and reported in input order.
+    /// Every target table, explicit-column mapping, row shape, value type,
+    /// finite floating-point value, and cumulative per-table row count is
+    /// validated before any row is appended. Omitted explicit columns are
+    /// expanded to typed defaults during that preflight. A failure therefore
+    /// leaves every table unchanged. Successful statements are committed and
+    /// reported in input order.
     pub fn execute_insert_batch(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         let statements = sql::parse(sql)?;
         self.execute_insert_statements(statements)
@@ -426,15 +428,11 @@ impl Database {
                 _ => unreachable!("non-INSERT statements were rejected"),
             };
             let target = self.catalog.table(&table)?;
-            let rows = target.prepare_insert_rows(columns.as_deref(), rows)?;
             let cumulative_rows = incoming_rows_by_table
                 .entry(table.to_ascii_lowercase())
                 .or_default();
             *cumulative_rows = cumulative_rows.saturating_add(rows.len());
-            target.validate_row_capacity(*cumulative_rows)?;
-            for row in &rows {
-                target.validate_row(row)?;
-            }
+            let rows = target.prepare_insert_rows(columns.as_deref(), rows, *cumulative_rows)?;
             prepared.push((table, rows));
         }
 
@@ -444,7 +442,7 @@ impl Database {
             self.catalog
                 .table_mut(&table)
                 .expect("preflight resolved every INSERT target")
-                .append_validated_rows(rows);
+                .append_prepared_insert_rows(rows);
             results.push(StatementResult::Command {
                 tag: "INSERT",
                 affected_rows,
@@ -691,12 +689,16 @@ impl Database {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Value>>,
     ) -> Result<StatementResult> {
-        let rows = self
-            .catalog
-            .table(&table)?
-            .prepare_insert_rows(columns.as_deref(), rows)?;
+        let incoming_rows = rows.len();
+        let rows = self.catalog.table(&table)?.prepare_insert_rows(
+            columns.as_deref(),
+            rows,
+            incoming_rows,
+        )?;
         let affected_rows = rows.len();
-        self.catalog.table_mut(&table)?.insert_rows(rows)?;
+        self.catalog
+            .table_mut(&table)?
+            .append_prepared_insert_rows(rows);
         Ok(StatementResult::Command {
             tag: "INSERT",
             affected_rows,
@@ -1785,6 +1787,9 @@ enum ResolvedItem {
     StringLower {
         source: usize,
     },
+    StringUpper {
+        source: usize,
+    },
     Int64Abs {
         source: usize,
     },
@@ -2056,6 +2061,30 @@ fn resolve_select_items(
                     name: alias
                         .clone()
                         .unwrap_or_else(|| format!("LOWER({})", table.schema()[source].name)),
+                    data_type: DataType::String,
+                });
+            }
+            SelectItem::Upper { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::String {
+                    return Err(Error::TypeMismatch {
+                        context: format!("UPPER argument '{name}'"),
+                        expected: DataType::String.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "UPPER projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::StringUpper { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("UPPER({})", table.schema()[source].name)),
                     data_type: DataType::String,
                 });
             }
@@ -2355,6 +2384,9 @@ fn execute_projection(
                         ResolvedItem::StringLower { source } => {
                             Value::String(string_at(table, *source, *row).to_ascii_lowercase())
                         }
+                        ResolvedItem::StringUpper { source } => {
+                            Value::String(string_at(table, *source, *row).to_ascii_uppercase())
+                        }
                         ResolvedItem::Int64Abs { source } => {
                             Value::Int64(checked_int64_abs(int64_at(table, *source, *row))?)
                         }
@@ -2484,9 +2516,9 @@ fn validate_projection_result_limits(
     for row in rows {
         for item in items {
             let source = match item {
-                ResolvedItem::Column { source, .. } | ResolvedItem::StringLower { source } => {
-                    Some(*source)
-                }
+                ResolvedItem::Column { source, .. }
+                | ResolvedItem::StringLower { source }
+                | ResolvedItem::StringUpper { source } => Some(*source),
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
@@ -2560,6 +2592,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::StringLower { .. } => {
                     unreachable!("LOWER projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringUpper { .. } => {
+                    unreachable!("UPPER projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Int64Abs { .. } => {
                     unreachable!("ABS projections are restricted to ungrouped queries")
@@ -3020,6 +3055,9 @@ impl GroupedData<'_> {
                         ResolvedItem::StringLower { .. } => {
                             unreachable!("LOWER projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::StringUpper { .. } => {
+                            unreachable!("UPPER projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::Int64Abs { .. } => {
                             unreachable!("ABS projections are restricted to ungrouped queries")
                         }
@@ -3370,6 +3408,10 @@ fn order_source_rows(
                     string_at(table, source, left),
                     string_at(table, source, right),
                 ),
+                ResolvedItem::StringUpper { source } => ascii_upper_cmp(
+                    string_at(table, source, left),
+                    string_at(table, source, right),
+                ),
                 ResolvedItem::Int64Abs { source } => int64_at(table, source, left)
                     .unsigned_abs()
                     .cmp(&int64_at(table, source, right).unsigned_abs()),
@@ -3445,6 +3487,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::StringLower { .. } => {
                     unreachable!("LOWER projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringUpper { .. } => {
+                    unreachable!("UPPER projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Int64Abs { .. } => {
                     unreachable!("ABS projections are restricted to ungrouped queries")
@@ -3522,6 +3567,12 @@ fn ascii_lower_cmp(left: &str, right: &str) -> Ordering {
     left.bytes()
         .map(|byte| byte.to_ascii_lowercase())
         .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
+}
+
+fn ascii_upper_cmp(left: &str, right: &str) -> Ordering {
+    left.bytes()
+        .map(|byte| byte.to_ascii_uppercase())
+        .cmp(right.bytes().map(|byte| byte.to_ascii_uppercase()))
 }
 
 fn string_length_to_i64(length: usize) -> Result<i64> {

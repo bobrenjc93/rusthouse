@@ -82,19 +82,19 @@ fn json_cli_executes_conjoined_comparison_delete_silently() {
 }
 
 #[test]
-fn json_cli_accepts_complete_insert_columns_in_any_order() {
+fn json_cli_exposes_typed_defaults_from_reordered_insert_subsets() {
     let output = run(
         &["--format", "json"],
         b"CREATE TABLE metrics (id Int64, score Float64, enabled Bool, label String); \
-          INSERT INTO metrics (LABEL, enabled, SCORE, id) VALUES \
-              ('first', true, 1.5, 1), ('second', false, 2.5, 2); \
+          INSERT INTO metrics (LABEL, id) VALUES ('first', 1); \
+          INSERT INTO metrics (enabled, SCORE) VALUES (true, 2.5); \
           SELECT id, score, enabled, label FROM metrics ORDER BY id;",
     );
 
     assert!(output.status.success(), "{:?}", output.stderr);
     assert_eq!(
         output.stdout,
-        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"score\",\"type\":\"Float64\"},{\"name\":\"enabled\",\"type\":\"Bool\"},{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[1,1.5,true,\"first\"],[2,2.5,false,\"second\"]]}\n"
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"score\",\"type\":\"Float64\"},{\"name\":\"enabled\",\"type\":\"Bool\"},{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[0,2.5,true,\"\"],[1,0.0,false,\"first\"]]}\n"
     );
     assert!(output.stderr.is_empty());
 }
