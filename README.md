@@ -223,24 +223,30 @@ not fail the query. A selected overflow or non-`Int64` argument is a typed error
 `SELECT` projections support `CAST(int64_column AS Float64)`,
 `CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`,
 `CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`, and
-`CAST(bool_column AS String)`, and `CAST(int64_column AS String)`. Integer-to-
-String casts use canonical base-10 text: zero is `0`, positive values have no
-leading plus sign or zeroes, and negative values have one leading minus sign.
-This includes exact representations of both `Int64` extrema. Boolean-to-String
-casts produce the exact lowercase values `false` and `true`. Boolean `false`
-becomes `0` and `true` becomes `1`; integer zero becomes `false`, and every
-nonzero integer, including both `Int64` extrema, becomes `true`. For `Float64`,
-positive and negative zero become `false`, while every finite nonzero value
-becomes `true`. Float-to-integer casts truncate finite values toward zero and
-report typed numeric-overflow errors outside the `Int64` range.
+`CAST(int64_column AS String)`, `CAST(float64_column AS String)`, and
+`CAST(bool_column AS String)`. Integer-to-String casts use canonical base-10
+text: zero is `0`, positive values have no leading plus sign or zeroes, and
+negative values have one leading minus sign. This includes exact
+representations of both `Int64` extrema. Float-to-String casts use the
+deterministic shortest round-trip finite decimal representation; integral
+values omit a decimal point, fractions and finite extrema retain the digits
+needed to identify the stored `Float64`, and negative zero is preserved as
+`-0`. Ordering a Float-to-String expression compares this generated text
+lexicographically. Boolean-to-String casts produce the exact lowercase values
+`false` and `true`. Boolean `false` becomes `0` and `true` becomes `1`; integer
+zero becomes `false`, and every nonzero integer, including both `Int64`
+extrema, becomes `true`. For `Float64`, positive and negative zero become
+`false`, while every finite nonzero value becomes `true`. Float-to-integer
+casts truncate finite values toward zero and report typed numeric-overflow
+errors outside the `Int64` range.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
 are currently limited to ungrouped queries: they cannot be combined with
 aggregate projections or `GROUP BY`. Generated `String` payload bytes—four or
-five for booleans and one through twenty for integers—are charged exactly
-against the result-byte limit before materialization. No other source/target
-type pairs are accepted.
+five for booleans, one through twenty for integers, and one through 327 for
+finite floats—are charged exactly against the result-byte limit before
+materialization. No other source/target type pairs are accepted.
 `LENGTH(string_column)` is another ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named

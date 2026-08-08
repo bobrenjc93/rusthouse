@@ -1915,6 +1915,9 @@ enum ResolvedItem {
     CastInt64ToString {
         source: usize,
     },
+    CastFloat64ToString {
+        source: usize,
+    },
     CastBoolToString {
         source: usize,
     },
@@ -2127,6 +2130,9 @@ fn resolve_select_items(
                     (DataType::Int64, DataType::String) => {
                         Some(ResolvedItem::CastInt64ToString { source })
                     }
+                    (DataType::Float64, DataType::String) => {
+                        Some(ResolvedItem::CastFloat64ToString { source })
+                    }
                     (DataType::Bool, DataType::String) => {
                         Some(ResolvedItem::CastBoolToString { source })
                     }
@@ -2137,7 +2143,7 @@ fn resolve_select_items(
                         DataType::Float64 => "Int64",
                         DataType::Bool => "Int64 or Float64",
                         DataType::Int64 => "Float64 or Bool",
-                        DataType::String => "Int64 or Bool",
+                        DataType::String => "Int64, Float64, or Bool",
                     };
                     return Err(Error::TypeMismatch {
                         context: format!("CAST argument '{name}'"),
@@ -2525,6 +2531,9 @@ fn execute_projection(
                         ResolvedItem::CastInt64ToString { source } => {
                             Value::String(int64_at(table, *source, *row).to_string())
                         }
+                        ResolvedItem::CastFloat64ToString { source } => Value::String(
+                            render_float64_text(float64_at(table, *source, *row)).into_string(),
+                        ),
                         ResolvedItem::CastBoolToString { source } => {
                             Value::String(bool_string(bool_at(table, *source, *row)).to_owned())
                         }
@@ -2679,6 +2688,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
+                | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
@@ -2700,6 +2710,9 @@ fn validate_projection_result_limits(
                 let cast_string_len = match item {
                     ResolvedItem::CastInt64ToString { source } => {
                         Some(int64_text_len(int64_at(table, *source, *row)))
+                    }
+                    ResolvedItem::CastFloat64ToString { source } => {
+                        Some(render_float64_text(float64_at(table, *source, *row)).len())
                     }
                     ResolvedItem::CastBoolToString { source } => {
                         Some(bool_string(bool_at(table, *source, *row)).len())
@@ -2751,6 +2764,7 @@ fn validate_grouped_result_limits(
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
+                | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -3217,6 +3231,7 @@ impl GroupedData<'_> {
                         | ResolvedItem::CastInt64ToBool { .. }
                         | ResolvedItem::CastFloat64ToBool { .. }
                         | ResolvedItem::CastInt64ToString { .. }
+                        | ResolvedItem::CastFloat64ToString { .. }
                         | ResolvedItem::CastBoolToString { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
@@ -3573,7 +3588,9 @@ fn resolved_expression_name(
         ResolvedItem::CastInt64ToBool { source } | ResolvedItem::CastFloat64ToBool { source } => {
             format!("CAST({} AS Bool)", table.schema()[*source].name)
         }
-        ResolvedItem::CastInt64ToString { source } | ResolvedItem::CastBoolToString { source } => {
+        ResolvedItem::CastInt64ToString { source }
+        | ResolvedItem::CastFloat64ToString { source }
+        | ResolvedItem::CastBoolToString { source } => {
             format!("CAST({} AS String)", table.schema()[*source].name)
         }
         ResolvedItem::StringLength { source } => {
@@ -3656,6 +3673,11 @@ fn order_source_rows(
                     int64_at(table, source, left),
                     int64_at(table, source, right),
                 ),
+                ResolvedItem::CastFloat64ToString { source } => {
+                    let left = render_float64_text(float64_at(table, source, left));
+                    let right = render_float64_text(float64_at(table, source, right));
+                    left.as_str().cmp(right.as_str())
+                }
                 ResolvedItem::CastBoolToString { source } => {
                     bool_at(table, source, left).cmp(&bool_at(table, source, right))
                 }
@@ -3743,6 +3765,7 @@ fn order_grouped_rows(
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastInt64ToString { .. }
+                | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -3812,6 +3835,50 @@ fn bool_at(table: &Table, source: usize, row: usize) -> bool {
 
 fn bool_string(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+// Rust's finite `f64` Display form is longest for the negative smallest
+// subnormal: `-0.` followed by its fractional decimal digits.
+const MAX_FLOAT64_TEXT_BYTES: usize = 327;
+
+struct Float64Text {
+    bytes: [u8; MAX_FLOAT64_TEXT_BYTES],
+    len: usize,
+}
+
+impl Float64Text {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("Float64 text is ASCII")
+    }
+
+    fn into_string(self) -> String {
+        self.as_str().to_owned()
+    }
+}
+
+impl fmt::Write for Float64Text {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        destination.copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+fn render_float64_text(value: f64) -> Float64Text {
+    debug_assert!(value.is_finite(), "stored Float64 values are finite");
+    let mut rendered = Float64Text {
+        bytes: [0; MAX_FLOAT64_TEXT_BYTES],
+        len: 0,
+    };
+    fmt::write(&mut rendered, format_args!("{value}"))
+        .expect("a finite Float64 decimal fits the bounded text buffer");
+    rendered
 }
 
 fn int64_text_len(value: i64) -> usize {
