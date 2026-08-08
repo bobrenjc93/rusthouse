@@ -167,7 +167,7 @@ fn ordered_row_number_supports_both_directions_stable_ties_filtering_and_limit()
 }
 
 #[test]
-fn ordered_row_number_charges_exact_filtered_state_and_preserves_stable_ties() {
+fn ordered_row_number_preflights_exact_filtered_state_and_preserves_stable_ties() {
     let setup = "CREATE TABLE events (id Int64, rank_key Int64, keep Bool); \
                  INSERT INTO events VALUES \
                      (1, 2, true), (2, 1, true), (3, 2, true), \
