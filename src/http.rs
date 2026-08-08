@@ -10,6 +10,7 @@ use crate::batch::format::{
     write_csv, write_json, write_json_compact_each_row, write_json_each_row_with_limit,
     write_json_string, write_tsv,
 };
+use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
 use crate::batch::tsv::{TsvIngestError, TsvIngestLimits};
 use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
@@ -111,13 +112,17 @@ impl StdError for HttpQueryError {
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, `+` becomes a space, and neither form
 /// accepts a request body (`Content-Length` may be absent or zero). Empty,
-/// duplicate, unknown, and unsupported parameters are
-/// rejected after authentication and before database access. A
+/// duplicate, unknown, and unsupported parameters are rejected after
+/// authentication and before database access. A
 /// `default_format` parameter cannot be combined with an
-/// `X-ClickHouse-Format` header. All four forms pass the SQL to
-/// [`SharedDatabase::try_query`], which accepts exactly one read-only statement
-/// and makes one nonblocking read-lock attempt. Writer contention returns
-/// `503 Service Unavailable`; lock poisoning remains a `500 Internal Server Error`.
+/// `X-ClickHouse-Format` header. GET and unauthenticated requests pass the SQL
+/// to [`SharedDatabase::try_query`], which accepts exactly one read-only
+/// statement and makes one nonblocking read-lock attempt. Authenticated POST
+/// requests without an output-format selector additionally accept a nonempty
+/// `INSERT`-only batch through [`SharedDatabase::try_execute_insert_batch`].
+/// Mixed batches, other mutations, and INSERTs with an output-format selector
+/// are rejected without mutation. Contention returns `503 Service Unavailable`;
+/// lock poisoning remains a `500 Internal Server Error`.
 /// A successful query response uses the same JSON result shape as the batch
 /// JSON formatter unless one format selector requests a streaming format.
 /// Parameterized-query `default_format` additionally accepts an explicit `JSON`; the
@@ -131,10 +136,11 @@ impl StdError for HttpQueryError {
 /// rejected after authentication and before a request body is read or the
 /// database is accessed.
 ///
-/// The bearer-authenticated handlers additionally accept exact `POST /insert`
-/// requests with the same body framing and limits. They pass the SQL to
-/// [`SharedDatabase::try_execute_insert_batch`], which atomically executes a
-/// nonempty `INSERT`-only batch after one nonblocking write-lock attempt. Exact
+/// The bearer-authenticated handlers also accept exact `POST /insert` requests
+/// with the same body framing and limits. Like authenticated POST query-route
+/// INSERTs, they use [`SharedDatabase::try_execute_insert_batch`], which
+/// atomically executes a nonempty `INSERT`-only batch after one nonblocking
+/// write-lock attempt. Exact
 /// `POST /insert/<table>` requests treat the bounded body as `CSVWithNames` by
 /// default. An exact `X-ClickHouse-Format: TabSeparatedWithNames` header selects
 /// TSV input instead; `CSVWithNames` may also be selected explicitly. The
@@ -692,10 +698,12 @@ fn read_request(
         }
         RequestKind::Query(QuerySource::Body) => {
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
-            Ok(HttpRequest::Query {
+            let output_format_selected = request.response_format.is_some();
+            Ok(classify_standard_query_request(
                 sql,
-                response_format: request.response_format.unwrap_or(QueryResponseFormat::Json),
-            })
+                request.response_format.unwrap_or(QueryResponseFormat::Json),
+                authentication.exposes_insert() && !output_format_selected,
+            ))
         }
         RequestKind::Insert => {
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
@@ -736,6 +744,8 @@ fn read_request(
 
             let decoded =
                 decode_query_parameters(&encoded_parameters, method, limits.max_sql_bytes)?;
+            let output_format_selected =
+                request.response_format.is_some() || decoded.response_format.is_some();
             let response_format = match (request.response_format, decoded.response_format) {
                 (Some(_), Some(_)) => {
                     return Err(RequestFailure::new(
@@ -748,13 +758,45 @@ fn read_request(
                 (None, None) => QueryResponseFormat::Json,
             };
             String::from_utf8(decoded.sql)
-                .map(|sql| HttpRequest::Query {
-                    sql,
-                    response_format,
+                .map(|sql| {
+                    classify_standard_query_request(
+                        sql,
+                        response_format,
+                        authentication.exposes_insert()
+                            && matches!(method, ParameterizedQueryMethod::Post)
+                            && !output_format_selected,
+                    )
                 })
                 .map_err(|_| {
                     RequestFailure::new(Status::BAD_REQUEST, "SQL query is not valid UTF-8").into()
                 })
+        }
+    }
+}
+
+fn classify_standard_query_request(
+    sql: String,
+    response_format: QueryResponseFormat,
+    insert_enabled: bool,
+) -> HttpRequest {
+    // Route mixed batches through the insert-only executor too, so its
+    // authoritative all-statement validation and transaction semantics decide
+    // the error without risking an earlier partial INSERT.
+    let contains_insert = insert_enabled
+        && sql::parse(&sql).is_ok_and(|statements| {
+            statements.iter().any(|statement| {
+                matches!(
+                    statement,
+                    Statement::Insert { .. } | Statement::InsertWithColumns { .. }
+                )
+            })
+        });
+    if contains_insert {
+        HttpRequest::Insert { sql }
+    } else {
+        HttpRequest::Query {
+            sql,
+            response_format,
         }
     }
 }
