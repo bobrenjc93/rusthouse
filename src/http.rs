@@ -10,10 +10,11 @@ use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
     write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
 };
+use crate::batch::shared_database::{DatabaseMetricsSnapshot, DatabaseMetricsWithTableRows};
 use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
 use crate::batch::tsv::{TsvIngestError, TsvIngestLimits};
-use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
+use crate::{SharedDatabase, SharedDatabaseError};
 
 /// Default maximum size of the request line and headers, including the final
 /// empty line.
@@ -171,10 +172,10 @@ impl StdError for HttpQueryError {
 /// same credentials but do not expose either explicit insertion route or
 /// enable INSERT execution on standard query routes.
 ///
-/// `GET /metrics` accepts no request body and returns four Prometheus gauges
-/// for retained tables, columns, rows, and scalar payload bytes. The byte gauge
-/// is named `rusthouse_retained_value_bytes`. It takes a nonblocking, consistent
-/// database metrics snapshot; lock contention and poisoning return `503`.
+/// `GET /metrics` accepts no request body and returns four unlabeled Prometheus
+/// gauges for database totals plus one `rusthouse_table_rows` gauge per current
+/// table. It takes a nonblocking, consistent database metrics snapshot; lock
+/// contention and poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
 /// database. `GET /ready` also accepts no body and returns the same successful
@@ -635,15 +636,37 @@ fn handle_http_query_exchange(
             );
         }
         HttpRequest::Metrics => {
-            let Some(metrics) = database.metrics_snapshot() else {
-                return write_error_response(
-                    &mut output,
-                    Status::SERVICE_UNAVAILABLE,
-                    &[],
-                    response_headers,
-                    "database is unavailable",
-                    limits.max_response_bytes,
-                );
+            let metrics = match database.metrics_snapshot_with_table_rows(
+                |totals, table_name_bytes, row_count_bytes| {
+                    let body_bytes =
+                        prometheus_metrics_body_len(totals, table_name_bytes, row_count_bytes);
+                    response_len(
+                        Status::OK,
+                        &[],
+                        response_headers,
+                        CONTENT_TYPE_PROMETHEUS,
+                        body_bytes,
+                    ) <= limits.max_response_bytes
+                },
+            ) {
+                DatabaseMetricsSnapshot::Available(metrics) => metrics,
+                DatabaseMetricsSnapshot::ResponseLimitExceeded => {
+                    return write_response_limit_error(
+                        &mut output,
+                        response_headers,
+                        limits.max_response_bytes,
+                    );
+                }
+                DatabaseMetricsSnapshot::Unavailable => {
+                    return write_error_response(
+                        &mut output,
+                        Status::SERVICE_UNAVAILABLE,
+                        &[],
+                        response_headers,
+                        "database is unavailable",
+                        limits.max_response_bytes,
+                    );
+                }
             };
             let mut body = BoundedVec::new(limits.max_response_bytes);
             if write_prometheus_metrics(&mut body, metrics).is_err() {
@@ -2162,27 +2185,80 @@ const CONTENT_TYPE_JSON: &[u8] = b"application/json";
 const CONTENT_TYPE_TEXT: &[u8] = b"text/plain; charset=utf-8";
 const CONTENT_TYPE_TSV: &[u8] = b"text/tab-separated-values; charset=utf-8";
 const CONTENT_TYPE_PROMETHEUS: &[u8] = b"text/plain; version=0.0.4; charset=utf-8";
+const TABLES_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_tables Number of tables retained by the database.\n",
+    "# TYPE rusthouse_tables gauge\n",
+    "rusthouse_tables ",
+);
+const COLUMNS_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_columns Number of columns retained by the database.\n",
+    "# TYPE rusthouse_columns gauge\n",
+    "rusthouse_columns ",
+);
+const RETAINED_ROWS_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_retained_rows Number of rows retained across all tables.\n",
+    "# TYPE rusthouse_retained_rows gauge\n",
+    "rusthouse_retained_rows ",
+);
+const RETAINED_VALUE_BYTES_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n",
+    "# TYPE rusthouse_retained_value_bytes gauge\n",
+    "rusthouse_retained_value_bytes ",
+);
+const TABLE_ROWS_METRIC_HEADER: &str = concat!(
+    "# HELP rusthouse_table_rows Number of rows retained by a table.\n",
+    "# TYPE rusthouse_table_rows gauge\n",
+);
+const TABLE_ROW_METRIC_PREFIX: &str = "rusthouse_table_rows{table=\"";
+const TABLE_ROW_METRIC_SEPARATOR: &str = "\"} ";
 
-fn write_prometheus_metrics(output: &mut impl Write, metrics: DatabaseMetrics) -> io::Result<()> {
-    writeln!(
-        output,
-        "# HELP rusthouse_tables Number of tables retained by the database.\n\
-         # TYPE rusthouse_tables gauge\n\
-         rusthouse_tables {}\n\
-         # HELP rusthouse_columns Number of columns retained by the database.\n\
-         # TYPE rusthouse_columns gauge\n\
-         rusthouse_columns {}\n\
-         # HELP rusthouse_retained_rows Number of rows retained across all tables.\n\
-         # TYPE rusthouse_retained_rows gauge\n\
-         rusthouse_retained_rows {}\n\
-         # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
-         # TYPE rusthouse_retained_value_bytes gauge\n\
-         rusthouse_retained_value_bytes {}",
-        metrics.table_count,
-        metrics.column_count,
-        metrics.retained_row_count,
-        metrics.retained_value_bytes,
-    )
+fn prometheus_metrics_body_len(
+    totals: crate::DatabaseMetrics,
+    table_name_bytes: usize,
+    row_count_bytes: usize,
+) -> usize {
+    let fixed_bytes = TABLES_METRIC_PREFIX
+        .len()
+        .saturating_add(COLUMNS_METRIC_PREFIX.len())
+        .saturating_add(RETAINED_ROWS_METRIC_PREFIX.len())
+        .saturating_add(RETAINED_VALUE_BYTES_METRIC_PREFIX.len())
+        .saturating_add(TABLE_ROWS_METRIC_HEADER.len())
+        .saturating_add(4)
+        .saturating_add(usize_decimal_len(totals.table_count))
+        .saturating_add(usize_decimal_len(totals.column_count))
+        .saturating_add(usize_decimal_len(totals.retained_row_count))
+        .saturating_add(usize_decimal_len(totals.retained_value_bytes));
+    let per_table_fixed_bytes = TABLE_ROW_METRIC_PREFIX
+        .len()
+        .saturating_add(TABLE_ROW_METRIC_SEPARATOR.len())
+        .saturating_add(1);
+    fixed_bytes
+        .saturating_add(totals.table_count.saturating_mul(per_table_fixed_bytes))
+        .saturating_add(table_name_bytes)
+        .saturating_add(row_count_bytes)
+}
+
+fn write_prometheus_metrics(
+    output: &mut impl Write,
+    metrics: DatabaseMetricsWithTableRows,
+) -> io::Result<()> {
+    let DatabaseMetricsWithTableRows { totals, table_rows } = metrics;
+    output.write_all(TABLES_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", totals.table_count)?;
+    output.write_all(COLUMNS_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", totals.column_count)?;
+    output.write_all(RETAINED_ROWS_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", totals.retained_row_count)?;
+    output.write_all(RETAINED_VALUE_BYTES_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", totals.retained_value_bytes)?;
+    output.write_all(TABLE_ROWS_METRIC_HEADER.as_bytes())?;
+    for (table, row_count) in table_rows {
+        output.write_all(TABLE_ROW_METRIC_PREFIX.as_bytes())?;
+        output.write_all(table.as_bytes())?;
+        output.write_all(TABLE_ROW_METRIC_SEPARATOR.as_bytes())?;
+        writeln!(output, "{row_count}")?;
+    }
+    Ok(())
 }
 
 fn write_error_response(
@@ -2263,6 +2339,17 @@ fn prepare_response(
     body: &[u8],
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, usize> {
+    let response_bytes = response_len(
+        status,
+        extra_headers,
+        response_headers,
+        content_type,
+        body.len(),
+    );
+    if response_bytes > max_response_bytes {
+        return Err(response_bytes);
+    }
+
     let mut header = Vec::new();
     write!(header, "HTTP/1.1 {} {}\r\n", status.code, status.reason)
         .expect("writing HTTP headers to a Vec cannot fail");
@@ -2280,12 +2367,45 @@ fn prepare_response(
     }
     header.extend_from_slice(b"\r\n");
 
-    let response_bytes = header.len().checked_add(body.len()).unwrap_or(usize::MAX);
-    if response_bytes > max_response_bytes {
-        return Err(response_bytes);
-    }
+    debug_assert_eq!(header.len().saturating_add(body.len()), response_bytes);
     header.extend_from_slice(body);
     Ok(header)
+}
+
+fn response_len(
+    status: Status,
+    extra_headers: &[&[u8]],
+    response_headers: &[&[u8]],
+    content_type: &[u8],
+    body_len: usize,
+) -> usize {
+    let extra_header_bytes = extra_headers
+        .iter()
+        .chain(response_headers)
+        .map(|header| header.len())
+        .fold(0_usize, usize::saturating_add);
+    b"HTTP/1.1 "
+        .len()
+        .saturating_add(usize_decimal_len(usize::from(status.code)))
+        .saturating_add(1)
+        .saturating_add(status.reason.len())
+        .saturating_add(b"\r\nContent-Type: ".len())
+        .saturating_add(content_type.len())
+        .saturating_add(b"\r\nContent-Length: ".len())
+        .saturating_add(usize_decimal_len(body_len))
+        .saturating_add(b"\r\nConnection: close\r\n".len())
+        .saturating_add(extra_header_bytes)
+        .saturating_add(b"\r\n".len())
+        .saturating_add(body_len)
+}
+
+fn usize_decimal_len(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 struct BoundedVec {
