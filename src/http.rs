@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
 use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
-    write_json_each_row_with_limit, write_json_string, write_tsv,
+    write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
 };
 use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
@@ -43,7 +43,7 @@ pub struct HttpQueryLimits {
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub csv_ingest_limits: CsvIngestLimits,
     /// Byte, row, and value limits for one `POST /insert/<table>`
-    /// `TabSeparatedWithNames` body.
+    /// `TabSeparated` or `TabSeparatedWithNames` body.
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub tsv_ingest_limits: TsvIngestLimits,
@@ -109,7 +109,7 @@ impl StdError for HttpQueryError {
 /// `POST /?query=<percent-encoded SQL>` carry the same SQL in a required
 /// form-style query parameter and optionally accept one `database=default`
 /// parameter and one `default_format` parameter in any order. `default_format`
-/// accepts `JSON`, `CSV`, `CSVWithNames`,
+/// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, `+` becomes a space, and neither form
 /// accepts a request body (`Content-Length` may be absent or zero). Empty,
@@ -128,11 +128,12 @@ impl StdError for HttpQueryError {
 /// A successful query response uses the same JSON result shape as the batch
 /// JSON formatter unless one format selector requests a streaming format.
 /// Parameterized-query `default_format` additionally accepts an explicit `JSON`; the
-/// `X-ClickHouse-Format` header accepts `CSV`, `CSVWithNames`,
+/// `X-ClickHouse-Format` header accepts `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. CSV, TSV,
 /// and row-oriented JSON responses use the corresponding batch writers;
-/// headerless `CSV` omits column names and emits no bytes for an empty result,
-/// while positional JSON responses contain arrays separated by line feeds.
+/// headerless `CSV` and `TabSeparated` omit column names and emit no bytes for
+/// an empty result, while positional JSON responses contain arrays separated
+/// by line feeds.
 /// Every query form also accepts at most one case-insensitive
 /// `X-ClickHouse-Database` header whose value is exactly `default`, matching
 /// RustHouse's single logical database. Empty, duplicate, and other values are
@@ -147,13 +148,14 @@ impl StdError for HttpQueryError {
 /// write-lock attempt. Exact
 /// `POST /insert/<table>` requests treat the bounded body as `CSVWithNames` by
 /// default. An exact `X-ClickHouse-Format: CSV` header selects headerless CSV
-/// input in physical schema order, while `TabSeparatedWithNames` selects TSV;
-/// `CSVWithNames` may also be selected explicitly. The corresponding
-/// independent ingestion limits and nonblocking [`SharedDatabase`] importer
-/// are used. Success returns an empty `200 OK` response. The unauthenticated
-/// handlers do not expose either route. The
-/// insertion-capable `X-ClickHouse-Key`-authenticated handlers expose the same
-/// route set. Both authenticated insert forms accept the same optional
+/// input in physical schema order. Exact `X-ClickHouse-Format: TabSeparated`
+/// similarly selects headerless TSV in physical schema order, while
+/// `TabSeparatedWithNames` selects named TSV; `CSVWithNames` may also be
+/// selected explicitly. The corresponding independent ingestion limits and
+/// nonblocking [`SharedDatabase`] importer are used. Success returns an empty
+/// `200 OK` response. The unauthenticated handlers do not expose either route.
+/// The insertion-capable `X-ClickHouse-Key`-authenticated handlers expose the
+/// same route set. Both authenticated insert forms accept the same optional
 /// `X-ClickHouse-Database: default` header as the query forms. The
 /// [`handle_http_query_read_only_with_bearer_token`] and
 /// [`handle_http_query_read_only_with_clickhouse_key`] families require the
@@ -728,6 +730,9 @@ fn handle_http_query_exchange(
                 TableInsertFormat::CsvWithNames => {
                     database.try_ingest_csv_with_names(&table, body, limits.csv_ingest_limits)
                 }
+                TableInsertFormat::TabSeparated => {
+                    database.try_ingest_tsv(&table, body, limits.tsv_ingest_limits)
+                }
                 TableInsertFormat::TabSeparatedWithNames => {
                     database.try_ingest_tsv_with_names(&table, body, limits.tsv_ingest_limits)
                 }
@@ -785,6 +790,10 @@ fn handle_http_query_exchange(
                 QueryResponseFormat::TabSeparatedWithNames => {
                     (write_tsv(&mut body, &result).is_err(), CONTENT_TYPE_TSV)
                 }
+                QueryResponseFormat::TabSeparated => (
+                    write_tsv_rows(&mut body, &result).is_err(),
+                    CONTENT_TYPE_TSV,
+                ),
                 QueryResponseFormat::JsonEachRow => (
                     write_json_each_row_with_limit(&mut body, &result, limits.max_response_bytes)
                         .is_err(),
@@ -904,12 +913,14 @@ fn read_request(
                     limits.max_sql_bytes,
                     limits.csv_ingest_limits,
                 )?,
-                TableInsertFormat::TabSeparatedWithNames => read_tsv_body(
-                    input,
-                    request.content_length,
-                    limits.max_sql_bytes,
-                    limits.tsv_ingest_limits,
-                )?,
+                TableInsertFormat::TabSeparated | TableInsertFormat::TabSeparatedWithNames => {
+                    read_tsv_body(
+                        input,
+                        request.content_length,
+                        limits.max_sql_bytes,
+                        limits.tsv_ingest_limits,
+                    )?
+                }
             };
             Ok(HttpRequest::TableInsert {
                 table,
@@ -1175,6 +1186,7 @@ enum QueryResponseFormat {
     Json,
     Csv,
     CsvWithNames,
+    TabSeparated,
     TabSeparatedWithNames,
     JsonEachRow,
     JsonCompactEachRow,
@@ -1193,6 +1205,7 @@ enum RequestKind {
 enum TableInsertFormat {
     Csv,
     CsvWithNames,
+    TabSeparated,
     TabSeparatedWithNames,
 }
 
@@ -1423,6 +1436,7 @@ fn parse_headers(
             None => None,
             Some(b"CSV") => Some(QueryResponseFormat::Csv),
             Some(b"CSVWithNames") => Some(QueryResponseFormat::CsvWithNames),
+            Some(b"TabSeparated") => Some(QueryResponseFormat::TabSeparated),
             Some(b"TabSeparatedWithNames") => Some(QueryResponseFormat::TabSeparatedWithNames),
             Some(b"JSONEachRow") => Some(QueryResponseFormat::JsonEachRow),
             Some(b"JSONCompactEachRow") => Some(QueryResponseFormat::JsonCompactEachRow),
@@ -1448,6 +1462,7 @@ fn parse_headers(
         match clickhouse_format {
             None | Some(b"CSVWithNames") => TableInsertFormat::CsvWithNames,
             Some(b"CSV") => TableInsertFormat::Csv,
+            Some(b"TabSeparated") => TableInsertFormat::TabSeparated,
             Some(b"TabSeparatedWithNames") => TableInsertFormat::TabSeparatedWithNames,
             Some(_) => {
                 return Err(RequestFailure::new(
@@ -1707,6 +1722,7 @@ fn decode_query_parameters(
                     b"JSON" => QueryResponseFormat::Json,
                     b"CSV" => QueryResponseFormat::Csv,
                     b"CSVWithNames" => QueryResponseFormat::CsvWithNames,
+                    b"TabSeparated" => QueryResponseFormat::TabSeparated,
                     b"TabSeparatedWithNames" => QueryResponseFormat::TabSeparatedWithNames,
                     b"JSONEachRow" => QueryResponseFormat::JsonEachRow,
                     b"JSONCompactEachRow" => QueryResponseFormat::JsonCompactEachRow,
