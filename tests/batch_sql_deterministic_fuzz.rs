@@ -118,6 +118,7 @@ fn generate_select(rng: &mut SplitMix64) -> String {
         "COUNT(*) AS rows",
         "SUM(amount) AS total",
         "LOWER(name) AS folded",
+        "UPPER(name) AS capitalized",
     ];
     const OPERATORS: &[&str] = &["=", "!=", "<>", "<", "<=", ">", ">="];
 
