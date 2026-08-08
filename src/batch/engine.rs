@@ -1004,7 +1004,13 @@ impl Database {
             .as_ref()
             .map(|having| resolve_having(&result_columns, &items, &aggregate_specs, having))
             .transpose()?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        let ordering = resolve_ordering(
+            table,
+            &items,
+            &aggregate_specs,
+            &result_columns,
+            &select.order_by,
+        )?;
         if let Some(prefix) = result_prefix {
             // Reject a UNION schema mismatch before scanning or materializing
             // any rows from its right operand.
@@ -3347,15 +3353,40 @@ struct ResolvedOrder {
     descending: bool,
 }
 
-fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
+fn resolve_ordering(
+    table: &Table,
+    items: &[ResolvedItem],
+    aggregate_specs: &[AggregateSpec],
+    columns: &[ResultColumn],
+    requested: &[OrderBy],
+) -> Result<Vec<ResolvedOrder>> {
+    debug_assert_eq!(items.len(), columns.len());
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let expression_names = items
+        .iter()
+        .map(|item| resolved_expression_name(table, item, aggregate_specs))
+        .collect::<Vec<_>>();
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let matches = columns
+        let output_matches = columns
             .iter()
             .enumerate()
             .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
+        let matches = if output_matches.is_empty() {
+            expression_names
+                .iter()
+                .enumerate()
+                .filter(|(_, expression)| expression.eq_ignore_ascii_case(&order.name))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        } else {
+            output_matches
+        };
         match matches.as_slice() {
             [index] => ordering.push(ResolvedOrder {
                 output: *index,
@@ -3376,6 +3407,61 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
         }
     }
     Ok(ordering)
+}
+
+fn resolved_expression_name(
+    table: &Table,
+    item: &ResolvedItem,
+    aggregate_specs: &[AggregateSpec],
+) -> String {
+    match item {
+        ResolvedItem::Column { source, .. } => table.schema()[*source].name.clone(),
+        ResolvedItem::Int64Subtract { source, literal } => {
+            sql::int64_subtraction_name(&table.schema()[*source].name, *literal)
+        }
+        ResolvedItem::CastInt64ToFloat64 { source } => {
+            format!("CAST({} AS Float64)", table.schema()[*source].name)
+        }
+        ResolvedItem::CastFloat64ToInt64 { source } | ResolvedItem::CastBoolToInt64 { source } => {
+            format!("CAST({} AS Int64)", table.schema()[*source].name)
+        }
+        ResolvedItem::CastInt64ToBool { source } | ResolvedItem::CastFloat64ToBool { source } => {
+            format!("CAST({} AS Bool)", table.schema()[*source].name)
+        }
+        ResolvedItem::CastInt64ToString { source } | ResolvedItem::CastBoolToString { source } => {
+            format!("CAST({} AS String)", table.schema()[*source].name)
+        }
+        ResolvedItem::StringLength { source } => {
+            format!("LENGTH({})", table.schema()[*source].name)
+        }
+        ResolvedItem::StringLower { source } => {
+            format!("LOWER({})", table.schema()[*source].name)
+        }
+        ResolvedItem::StringUpper { source } => {
+            format!("UPPER({})", table.schema()[*source].name)
+        }
+        ResolvedItem::Int64Abs { source } => {
+            format!("ABS({})", table.schema()[*source].name)
+        }
+        ResolvedItem::Float64Round { source } => {
+            format!("ROUND({})", table.schema()[*source].name)
+        }
+        ResolvedItem::Float64Floor { source } => {
+            format!("FLOOR({})", table.schema()[*source].name)
+        }
+        ResolvedItem::Float64Ceil { source } => {
+            format!("CEIL({})", table.schema()[*source].name)
+        }
+        ResolvedItem::RowNumber => "ROW_NUMBER()".to_owned(),
+        ResolvedItem::Aggregate { state } => {
+            let spec = &aggregate_specs[*state];
+            let argument = spec
+                .argument
+                .map(|source| table.schema()[source].name.as_str())
+                .unwrap_or("*");
+            format!("{}({argument})", spec.function.name())
+        }
+    }
 }
 
 fn order_source_rows(

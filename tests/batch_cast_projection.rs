@@ -513,6 +513,31 @@ fn int64_to_string_uses_canonical_decimal_text_and_lexicographic_ordering() {
         ]
     );
 
+    let expression_ordered = query(
+        &mut database,
+        "SELECT CAST(reading AS String) AS text FROM samples \
+         ORDER BY CAST(reading AS String)",
+    );
+    assert_eq!(
+        expression_ordered.columns,
+        [ResultColumn {
+            name: "text".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert_eq!(
+        expression_ordered.rows,
+        [
+            vec![Value::String("-1".to_owned())],
+            vec![Value::String("-10".to_owned())],
+            vec![Value::String("-9223372036854775808".to_owned())],
+            vec![Value::String("0".to_owned())],
+            vec![Value::String("1".to_owned())],
+            vec![Value::String("10".to_owned())],
+            vec![Value::String("9223372036854775807".to_owned())],
+        ]
+    );
+
     assert_eq!(
         query(
             &mut database,
