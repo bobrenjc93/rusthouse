@@ -43,7 +43,7 @@ pub struct HttpQueryLimits {
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub csv_ingest_limits: CsvIngestLimits,
     /// Byte, row, and value limits for one `POST /insert/<table>`
-    /// `TabSeparatedWithNames` body.
+    /// `TabSeparated` or `TabSeparatedWithNames` body.
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub tsv_ingest_limits: TsvIngestLimits,
@@ -147,13 +147,14 @@ impl StdError for HttpQueryError {
 /// write-lock attempt. Exact
 /// `POST /insert/<table>` requests treat the bounded body as `CSVWithNames` by
 /// default. An exact `X-ClickHouse-Format: CSV` header selects headerless CSV
-/// input in physical schema order, while `TabSeparatedWithNames` selects TSV;
-/// `CSVWithNames` may also be selected explicitly. The corresponding
-/// independent ingestion limits and nonblocking [`SharedDatabase`] importer
-/// are used. Success returns an empty `200 OK` response. The unauthenticated
-/// handlers do not expose either route. The
-/// insertion-capable `X-ClickHouse-Key`-authenticated handlers expose the same
-/// route set. Both authenticated insert forms accept the same optional
+/// input in physical schema order. Exact `X-ClickHouse-Format: TabSeparated`
+/// similarly selects headerless TSV in physical schema order, while
+/// `TabSeparatedWithNames` selects named TSV; `CSVWithNames` may also be
+/// selected explicitly. The corresponding independent ingestion limits and
+/// nonblocking [`SharedDatabase`] importer are used. Success returns an empty
+/// `200 OK` response. The unauthenticated handlers do not expose either route.
+/// The insertion-capable `X-ClickHouse-Key`-authenticated handlers expose the
+/// same route set. Both authenticated insert forms accept the same optional
 /// `X-ClickHouse-Database: default` header as the query forms. The
 /// [`handle_http_query_read_only_with_bearer_token`] and
 /// [`handle_http_query_read_only_with_clickhouse_key`] families require the
@@ -728,6 +729,9 @@ fn handle_http_query_exchange(
                 TableInsertFormat::CsvWithNames => {
                     database.try_ingest_csv_with_names(&table, body, limits.csv_ingest_limits)
                 }
+                TableInsertFormat::TabSeparated => {
+                    database.try_ingest_tsv(&table, body, limits.tsv_ingest_limits)
+                }
                 TableInsertFormat::TabSeparatedWithNames => {
                     database.try_ingest_tsv_with_names(&table, body, limits.tsv_ingest_limits)
                 }
@@ -904,12 +908,14 @@ fn read_request(
                     limits.max_sql_bytes,
                     limits.csv_ingest_limits,
                 )?,
-                TableInsertFormat::TabSeparatedWithNames => read_tsv_body(
-                    input,
-                    request.content_length,
-                    limits.max_sql_bytes,
-                    limits.tsv_ingest_limits,
-                )?,
+                TableInsertFormat::TabSeparated | TableInsertFormat::TabSeparatedWithNames => {
+                    read_tsv_body(
+                        input,
+                        request.content_length,
+                        limits.max_sql_bytes,
+                        limits.tsv_ingest_limits,
+                    )?
+                }
             };
             Ok(HttpRequest::TableInsert {
                 table,
@@ -1193,6 +1199,7 @@ enum RequestKind {
 enum TableInsertFormat {
     Csv,
     CsvWithNames,
+    TabSeparated,
     TabSeparatedWithNames,
 }
 
@@ -1448,6 +1455,7 @@ fn parse_headers(
         match clickhouse_format {
             None | Some(b"CSVWithNames") => TableInsertFormat::CsvWithNames,
             Some(b"CSV") => TableInsertFormat::Csv,
+            Some(b"TabSeparated") => TableInsertFormat::TabSeparated,
             Some(b"TabSeparatedWithNames") => TableInsertFormat::TabSeparatedWithNames,
             Some(_) => {
                 return Err(RequestFailure::new(

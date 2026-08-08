@@ -645,24 +645,26 @@ Success returns `200 OK` with an empty plain-text body. The route is not
 recognized by `handle_http_query` or `handle_http_query_with_limits`.
 
 Those insertion-capable handlers also expose exact `POST /insert/<table>` for
-`CSV`, `CSVWithNames`, or `TabSeparatedWithNames` ingestion. `<table>` is one
-literal RustHouse SQL identifier; extra path segments, query strings, and
-percent-encoded names are not accepted. The request requires one decimal
-`Content-Length`. With no format header the body remains `CSVWithNames`, so
+`CSV`, `CSVWithNames`, `TabSeparated`, or `TabSeparatedWithNames` ingestion.
+`<table>` is one literal RustHouse SQL identifier; extra path segments, query
+strings, and percent-encoded names are not accepted. The request requires one
+decimal `Content-Length`. With no format header the body remains `CSVWithNames`, so
 `POST /insert/events` with `label,id\n"one, quoted",1\n` imports one CSV row.
 An exact, case-sensitive `X-ClickHouse-Format: CSV` selects headerless CSV:
 every logical record is data and must supply every physical schema column in
-order. `X-ClickHouse-Format: CSVWithNames` may select named CSV explicitly,
-while `TabSeparatedWithNames` selects TSV. Named CSV and TSV bodies start with
-a matching-case column-name header. Their headers may contain any nonempty
+order. Exact `X-ClickHouse-Format: TabSeparated` likewise selects headerless
+TSV in physical schema order and treats every physical line as data.
+`X-ClickHouse-Format: CSVWithNames` may select named CSV explicitly, while
+`TabSeparatedWithNames` selects named TSV. Named CSV and TSV bodies start with a
+matching-case column-name header. Their headers may contain any nonempty
 target-column subset without duplicates and in any order; omitted columns
 receive `0`, `0.0`, `false`, or an empty string according to their schema type.
 Duplicate, differently cased, and other format values return `400 Bad Request`.
 The route calls the corresponding nonblocking `SharedDatabase::try_ingest_*`
 method, so typed input, schema, capacity, and format-specific limit failures
-return `400 Bad Request` and append no rows. Empty headerless CSV is a successful
-zero-row insert. Success returns the same empty `200 OK` response as the SQL
-insert route. The unauthenticated handlers do not recognize it.
+return `400 Bad Request` and append no rows. Empty headerless CSV and TSV are
+successful zero-row inserts. Success returns the same empty `200 OK` response as
+the SQL insert route. The unauthenticated handlers do not recognize it.
 
 HTTP read admission never waits for the database lock. After request parsing,
 authentication, optional database-header and query-parameter validation, SQL
@@ -678,8 +680,8 @@ HTTP insert admission likewise never waits. After authentication and optional
 database-header validation, the bounded body or URL query is read and decoded.
 Standard authenticated POST insertion is disabled when an output format was
 selected. The standard and explicit SQL routes complete SQL parsing before
-their immediate write-lock attempt; the headerless CSV, named CSV, and TSV
-routes pass their bounded bytes to the selected ingestion API, which attempts
+their immediate write-lock attempt; the headerless and named CSV and TSV routes
+pass their bounded bytes to the selected ingestion API, which attempts
 the lock before table lookup or parsing. Any active reader or writer returns
 the same deterministic `503 Service Unavailable`; a poisoned lock returns `500
 Internal Server Error`. Validation and commit occur under the acquired write
