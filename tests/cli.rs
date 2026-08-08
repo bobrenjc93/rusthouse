@@ -154,6 +154,27 @@ fn json_cli_executes_float64_alter_update_silently() {
 }
 
 #[test]
+fn json_cli_executes_documented_string_alter_update_silently() {
+    let output = run(
+        &["--format", "json"],
+        "CREATE TABLE events (id Int64, label String, category String); \
+         INSERT INTO events VALUES (1, 'waiting', 'queued'), (2, 'keep', 'done'); \
+         ALTER TABLE events UPDATE label = 'it''s 🚀' WHERE category = 'queued'; \
+         ALTER TABLE EVENTS UPDATE CATEGORY = '' WHERE ID = 2; \
+         SELECT id, label, category FROM events ORDER BY id;"
+            .as_bytes(),
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        "{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"label\",\"type\":\"String\"},{\"name\":\"category\",\"type\":\"String\"}],\"rows\":[[1,\"it's 🚀\",\"queued\"],[2,\"keep\",\"\"]]}\n"
+            .as_bytes()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_exposes_typed_defaults_from_reordered_insert_subsets() {
     let output = run(
         &["--format", "json"],

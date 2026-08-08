@@ -32,6 +32,15 @@ fn float64_column(database: &Database, table: &str, column: &str) -> Vec<f64> {
     values.clone()
 }
 
+fn string_column(database: &Database, table: &str, column: &str) -> Vec<String> {
+    let table = database.catalog().table(table).expect("table exists");
+    let index = table.column_index(column).expect("column exists");
+    let Column::String(values) = &table.columns()[index] else {
+        panic!("column is String");
+    };
+    values.clone()
+}
+
 #[test]
 fn parses_int64_bool_and_finite_float64_alter_update_literals() {
     assert_eq!(
@@ -90,6 +99,30 @@ fn parses_int64_bool_and_finite_float64_alter_update_literals() {
 }
 
 #[test]
+fn parses_empty_unicode_and_doubled_quote_string_literals() {
+    assert_eq!(
+        parse("ALTER TABLE Events UPDATE Label = 'it''s 🚀' WHERE Category = 'café'"),
+        Ok(vec![Statement::AlterUpdateTyped {
+            table: "Events".to_owned(),
+            target_column: "Label".to_owned(),
+            value: AlterUpdateLiteral::String("it's 🚀".to_owned()),
+            predicate_column: "Category".to_owned(),
+            predicate_value: AlterUpdateLiteral::String("café".to_owned()),
+        }])
+    );
+    assert_eq!(
+        parse("ALTER TABLE Events UPDATE Label = '' WHERE Category = ''"),
+        Ok(vec![Statement::AlterUpdateTyped {
+            table: "Events".to_owned(),
+            target_column: "Label".to_owned(),
+            value: AlterUpdateLiteral::String(String::new()),
+            predicate_column: "Category".to_owned(),
+            predicate_value: AlterUpdateLiteral::String(String::new()),
+        }])
+    );
+}
+
+#[test]
 fn original_public_int64_ast_shape_remains_directly_executable() {
     let mut database = Database::new();
     database
@@ -127,18 +160,157 @@ fn rejects_non_exact_alter_update_syntax_and_unsupported_literals() {
         "ALTER TABLE events UPDATE value = 1 WHERE selector != 2",
         "ALTER TABLE events UPDATE value = 1 WHERE selector = 2 AND value = 0",
         "ALTER TABLE events UPDATE value = 1 WHERE selector = 2 LIMIT 1",
-        "ALTER TABLE events UPDATE value = '1' WHERE selector = 2",
         "ALTER TABLE events UPDATE value = 1 WHERE selector = NULL",
         "ALTER TABLE events UPDATE value = +true WHERE selector = 2",
-        "ALTER TABLE events UPDATE value = true WHERE selector = 'false'",
         "ALTER TABLE events UPDATE value = 9223372036854775808 WHERE selector = 2",
         "ALTER TABLE events UPDATE value = 1 WHERE selector = -9223372036854775809",
         "ALTER TABLE events UPDATE value = 1e309 WHERE selector = 2",
         "ALTER TABLE events UPDATE value = 1.0 WHERE selector = -1e309",
         "ALTER TABLE events UPDATE value = 1e WHERE selector = 2",
+        "ALTER TABLE events UPDATE value = 'unterminated WHERE selector = 2",
     ] {
         assert!(parse(sql).is_err(), "{sql:?} must be rejected");
     }
+}
+
+#[test]
+fn string_targets_and_predicates_compose_with_every_existing_physical_type() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, score Float64, active Bool, label String, category String); \
+             INSERT INTO events VALUES \
+                 (1, 1.5, false, 'one', 'queued'), \
+                 (2, 2.5, false, 'two', 'queued'), \
+                 (3, 3.5, true, 'three', 'done'), \
+                 (4, 4.5, false, 'four', 'apostrophe''s');",
+        )
+        .expect("setup succeeds");
+    let retained_before = database
+        .catalog()
+        .table("events")
+        .unwrap()
+        .retained_value_bytes();
+
+    assert_eq!(
+        database.execute(
+            "ALTER TABLE EVENTS UPDATE LABEL = 'it''s 🚀' WHERE CATEGORY = 'queued'; \
+             ALTER TABLE events UPDATE label = '' WHERE id = 3; \
+             ALTER TABLE events UPDATE category = 'float match' WHERE score = 4.5; \
+             ALTER TABLE events UPDATE category = 'bool match' WHERE active = true; \
+             ALTER TABLE events UPDATE id = -7 WHERE label = 'it''s 🚀'; \
+             ALTER TABLE events UPDATE score = -0.25 WHERE category = 'float match'; \
+             ALTER TABLE events UPDATE active = false WHERE label = '';"
+        ),
+        Ok(vec![
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 2,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 1,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 1,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 1,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 2,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 1,
+            },
+            StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 1,
+            },
+        ])
+    );
+
+    assert_eq!(int64_column(&database, "events", "ID"), vec![-7, -7, 3, 4]);
+    assert_eq!(
+        float64_column(&database, "events", "score"),
+        vec![1.5, 2.5, 3.5, -0.25]
+    );
+    assert_eq!(bool_column(&database, "events", "active"), vec![false; 4]);
+    assert_eq!(
+        string_column(&database, "EVENTS", "LABEL"),
+        vec!["it's 🚀", "it's 🚀", "", "four"]
+    );
+    assert_eq!(
+        string_column(&database, "events", "category"),
+        vec!["queued", "queued", "bool match", "float match"]
+    );
+    assert_eq!(
+        database
+            .catalog()
+            .table("events")
+            .unwrap()
+            .retained_value_bytes(),
+        retained_before + 12
+    );
+}
+
+#[test]
+fn string_validation_failures_roll_back_values_and_retained_bytes() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String, category String); \
+             INSERT INTO events VALUES (1, 'one', 'queued'), (2, 'two', 'done');",
+        )
+        .expect("setup succeeds");
+    let retained_before = database
+        .catalog()
+        .table("events")
+        .unwrap()
+        .retained_value_bytes();
+
+    assert_eq!(
+        database.execute("ALTER TABLE events UPDATE id = 'changed' WHERE label = 'one';"),
+        Err(Error::TypeMismatch {
+            context: "ALTER TABLE UPDATE target column 'events.id'".to_owned(),
+            expected: "String".to_owned(),
+            actual: "Int64".to_owned(),
+        })
+    );
+    assert_eq!(
+        database.execute("ALTER TABLE events UPDATE label = 'changed' WHERE id = '1';"),
+        Err(Error::TypeMismatch {
+            context: "ALTER TABLE UPDATE WHERE column 'events.id'".to_owned(),
+            expected: "String".to_owned(),
+            actual: "Int64".to_owned(),
+        })
+    );
+    assert!(matches!(
+        database.execute("ALTER TABLE events UPDATE label = 'unterminated WHERE id = 1;"),
+        Err(Error::Sql { .. })
+    ));
+
+    assert_eq!(int64_column(&database, "events", "id"), vec![1, 2]);
+    assert_eq!(
+        string_column(&database, "events", "label"),
+        vec!["one", "two"]
+    );
+    assert_eq!(
+        string_column(&database, "events", "category"),
+        vec!["queued", "done"]
+    );
+    assert_eq!(
+        database
+            .catalog()
+            .table("events")
+            .unwrap()
+            .retained_value_bytes(),
+        retained_before
+    );
 }
 
 #[test]
@@ -491,6 +663,32 @@ fn full_table_scan_limit_is_checked_after_names_and_types_and_before_mutation() 
         vec![1.5, 2.5, 3.5]
     );
 
+    let retained_before = database
+        .catalog()
+        .table("events")
+        .unwrap()
+        .retained_value_bytes();
+    assert_eq!(
+        database.execute("ALTER TABLE EVENTS UPDATE LABEL = 'changed' WHERE label = 'three';"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "ALTER TABLE UPDATE scanned rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+    assert_eq!(
+        string_column(&database, "events", "label"),
+        vec!["one", "two", "three"]
+    );
+    assert_eq!(
+        database
+            .catalog()
+            .table("events")
+            .unwrap()
+            .retained_value_bytes(),
+        retained_before
+    );
+
     assert_eq!(
         database.execute_statement(Statement::AlterUpdateTyped {
             table: "events".to_owned(),
@@ -605,4 +803,39 @@ fn shared_database_executes_bool_alter_update_under_the_write_api() {
             .rows,
         vec![vec![Value::Bool(false)]]
     );
+}
+
+#[test]
+fn shared_database_metrics_track_string_replacement_bytes() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (1, 'a'), (2, 'é');",
+        )
+        .expect("setup succeeds");
+    let before = database.metrics_snapshot().expect("metrics are available");
+
+    assert_eq!(
+        database.execute("ALTER TABLE EVENTS UPDATE LABEL = '🚀' WHERE ID = 1;"),
+        Ok(vec![StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 1,
+        }])
+    );
+    assert_eq!(
+        database
+            .query("SELECT id, label FROM events ORDER BY id;")
+            .expect("updated strings are visible")
+            .rows,
+        vec![
+            vec![Value::Int64(1), Value::String("🚀".to_owned())],
+            vec![Value::Int64(2), Value::String("é".to_owned())],
+        ]
+    );
+    let after = database.metrics_snapshot().expect("metrics are available");
+    assert_eq!(after.retained_value_bytes, before.retained_value_bytes + 3);
+    assert_eq!(after.table_count, before.table_count);
+    assert_eq!(after.column_count, before.column_count);
+    assert_eq!(after.retained_row_count, before.retained_row_count);
 }

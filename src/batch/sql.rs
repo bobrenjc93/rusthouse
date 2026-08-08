@@ -85,7 +85,8 @@ pub enum Statement {
         predicate_column: String,
         predicate_value: i64,
     },
-    /// The same exact mutation shape when either literal is Boolean or Float64.
+    /// The same exact mutation shape when either literal is String, Boolean,
+    /// or Float64.
     AlterUpdateTyped {
         table: String,
         target_column: String,
@@ -160,12 +161,13 @@ pub enum Statement {
     },
 }
 
-/// A non-allocating literal accepted by the exact `ALTER TABLE UPDATE` form.
-#[derive(Debug, Clone, Copy)]
+/// A typed literal accepted by the exact `ALTER TABLE UPDATE` form.
+#[derive(Debug, Clone)]
 pub enum AlterUpdateLiteral {
     Int64(i64),
     Float64(f64),
     Bool(bool),
+    String(String),
 }
 
 impl PartialEq for AlterUpdateLiteral {
@@ -176,6 +178,7 @@ impl PartialEq for AlterUpdateLiteral {
                 left == right || left.total_cmp(right).is_eq()
             }
             (Self::Bool(left), Self::Bool(right)) => left == right,
+            (Self::String(left), Self::String(right)) => left == right,
             _ => false,
         }
     }
@@ -185,20 +188,22 @@ impl Eq for AlterUpdateLiteral {}
 
 impl AlterUpdateLiteral {
     #[must_use]
-    pub const fn data_type(self) -> DataType {
+    pub const fn data_type(&self) -> DataType {
         match self {
             Self::Int64(_) => DataType::Int64,
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
+            Self::String(_) => DataType::String,
         }
     }
 
     #[must_use]
-    pub const fn value(self) -> Value {
+    pub fn value(self) -> Value {
         match self {
             Self::Int64(value) => Value::Int64(value),
             Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
+            Self::String(value) => Value::String(value),
         }
     }
 }
@@ -1960,6 +1965,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_alter_update_literal(&mut self, context: &str) -> Result<AlterUpdateLiteral> {
+        if matches!(self.peek(), TokenKind::String(_)) {
+            let TokenKind::String(value) = self.take_kind() else {
+                unreachable!("matched string token")
+            };
+            return Ok(AlterUpdateLiteral::String(value));
+        }
         if self.eat_keyword("TRUE") {
             return Ok(AlterUpdateLiteral::Bool(true));
         }
@@ -1977,7 +1988,7 @@ impl<'a> Parser<'a> {
         };
         let number = self.take_number().ok_or_else(|| Error::Sql {
             position,
-            message: format!("expected an Int64, Float64, or Bool literal in {context}"),
+            message: format!("expected an Int64, Float64, Bool, or String literal in {context}"),
         })?;
         let literal = format!("{sign}{number}");
         if literal.contains(['.', 'e', 'E']) {

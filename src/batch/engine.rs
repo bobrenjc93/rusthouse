@@ -1095,8 +1095,13 @@ impl Database {
             let target_index = target.column_index(&target_column)?;
             let predicate_index = target.column_index(&predicate_column)?;
             for (column, index, literal, role) in [
-                (&target_column, target_index, value, "target"),
-                (&predicate_column, predicate_index, predicate_value, "WHERE"),
+                (&target_column, target_index, &value, "target"),
+                (
+                    &predicate_column,
+                    predicate_index,
+                    &predicate_value,
+                    "WHERE",
+                ),
             ] {
                 let actual = target.schema()[index].data_type;
                 let expected = literal.data_type();
@@ -1111,7 +1116,7 @@ impl Database {
                     });
                 }
             }
-            for (literal, role) in [(value, "assignment"), (predicate_value, "WHERE")] {
+            for (literal, role) in [(&value, "assignment"), (&predicate_value, "WHERE")] {
                 if matches!(literal, AlterUpdateLiteral::Float64(value) if !value.is_finite()) {
                     return Err(Error::InvalidQuery(format!(
                         "ALTER TABLE UPDATE {role} Float64 literal must be finite"
@@ -1154,6 +1159,15 @@ impl Database {
                         (*current == predicate_value).then_some((row, replacement.clone()))
                     })
                     .collect::<Vec<_>>(),
+                (Column::String(predicate_values), AlterUpdateLiteral::String(predicate_value)) => {
+                    predicate_values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, current)| {
+                            (current == &predicate_value).then_some((row, replacement.clone()))
+                        })
+                        .collect::<Vec<_>>()
+                }
                 _ => unreachable!(
                     "the ALTER TABLE UPDATE WHERE column was validated against its literal"
                 ),
