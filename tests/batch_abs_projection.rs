@@ -4,7 +4,10 @@ use rusthouse::batch::engine::{
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{BatchSqlLimits, SelectItem, Statement, parse, parse_with_limits};
 use rusthouse::batch::value::{DataType, Value};
-use rusthouse::batch::{run_csv_batch, run_json_batch};
+use rusthouse::batch::{
+    run_csv_batch, run_json_batch, run_json_compact_each_row_batch, run_json_each_row_batch,
+    run_table_batch, run_tsv_batch,
+};
 
 fn query(database: &mut Database, sql: &str) -> QueryResult {
     let results = database.execute(sql).expect("query succeeds");
@@ -101,6 +104,94 @@ fn projects_checked_int64_absolute_values_with_aliases_filters_and_limits() {
 }
 
 #[test]
+fn projects_float64_fractions_and_canonicalizes_signed_zero() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (reading Float64); \
+             INSERT INTO samples VALUES (-2.75), (-0.0), (0.0), (1.5);",
+        )
+        .expect("setup");
+
+    let absolute = query(&mut database, "SELECT ABS(reading) FROM samples");
+    assert_eq!(
+        absolute.columns,
+        [ResultColumn {
+            name: "ABS(reading)".to_owned(),
+            data_type: DataType::Float64,
+        }]
+    );
+    assert_eq!(
+        absolute.rows,
+        [
+            vec![Value::Float64(2.75)],
+            vec![Value::Float64(0.0)],
+            vec![Value::Float64(0.0)],
+            vec![Value::Float64(1.5)],
+        ]
+    );
+    for row in &absolute.rows[1..=2] {
+        let Value::Float64(zero) = row[0] else {
+            panic!("ABS(Float64) returns Float64");
+        };
+        assert_eq!(zero.to_bits(), 0.0_f64.to_bits());
+    }
+}
+
+#[test]
+fn preserves_float64_extreme_magnitudes() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (reading Float64); \
+             INSERT INTO samples VALUES \
+             (-1.7976931348623157e308), (1.7976931348623157e308);",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(&mut database, "SELECT ABS(reading) FROM samples").rows,
+        [
+            vec![Value::Float64(f64::MAX)],
+            vec![Value::Float64(f64::MAX)],
+        ]
+    );
+}
+
+#[test]
+fn filters_orders_and_pages_float64_abs_with_an_alias() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (reading Float64, keep Bool); \
+             INSERT INTO samples VALUES \
+             (-3.5, true), (-0.0, true), (2.25, true), (-1.5, false);",
+        )
+        .expect("setup");
+
+    let selected = query(
+        &mut database,
+        "SELECT ABS(reading) AS magnitude FROM samples \
+         WHERE keep = true ORDER BY ABS(reading) LIMIT 2 OFFSET 1",
+    );
+    assert_eq!(selected.columns[0].name, "magnitude");
+    assert_eq!(
+        selected.rows,
+        [vec![Value::Float64(2.25)], vec![Value::Float64(3.5)]]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT ABS(reading) AS magnitude FROM samples \
+             WHERE keep = true ORDER BY magnitude DESC LIMIT 1 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Float64(2.25)]]
+    );
+}
+
+#[test]
 fn reports_overflow_only_when_int64_min_survives_row_selection() {
     let mut database = Database::new();
     database
@@ -144,7 +235,7 @@ fn reports_overflow_only_when_int64_min_survives_row_selection() {
 }
 
 #[test]
-fn rejects_unknown_non_int64_and_grouped_abs_inputs_with_typed_errors() {
+fn rejects_unknown_non_numeric_and_grouped_abs_inputs_with_typed_errors() {
     let mut database = Database::new();
     database
         .execute(
@@ -161,28 +252,30 @@ fn rejects_unknown_non_int64_and_grouped_abs_inputs_with_typed_errors() {
         })
     );
 
-    for (name, actual) in [
-        ("f", DataType::Float64),
-        ("b", DataType::Bool),
-        ("s", DataType::String),
-    ] {
+    for (name, actual) in [("b", DataType::Bool), ("s", DataType::String)] {
         assert_eq!(
             database.execute(&format!("SELECT ABS({name}) FROM samples")),
             Err(Error::TypeMismatch {
                 context: format!("ABS argument '{name}'"),
-                expected: "Int64".to_owned(),
+                expected: "Int64 or Float64".to_owned(),
                 actual: actual.to_string(),
             }),
             "column {name}"
         );
     }
 
-    assert_eq!(
-        database.execute("SELECT ABS(i), COUNT(*) FROM samples GROUP BY i"),
-        Err(Error::InvalidQuery(
-            "ABS projections are only supported in ungrouped SELECT queries".to_owned()
-        ))
-    );
+    for sql in [
+        "SELECT ABS(i), COUNT(*) FROM samples GROUP BY i",
+        "SELECT ABS(f), COUNT(*) FROM samples GROUP BY f",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::InvalidQuery(
+                "ABS projections are only supported in ungrouped SELECT queries".to_owned()
+            )),
+            "{sql}"
+        );
+    }
 }
 
 #[test]
@@ -215,14 +308,14 @@ fn abs_projection_obeys_result_caps() {
     let mut database = Database::with_query_result_limits(limits);
     database
         .execute(
-            "CREATE TABLE samples (reading Int64); \
-             INSERT INTO samples VALUES (-1), (-2), (-3);",
+            "CREATE TABLE samples (reading Float64); \
+             INSERT INTO samples VALUES (-1.25), (-2.5), (-3.75);",
         )
         .expect("setup");
 
     assert_eq!(
         query(&mut database, "SELECT ABS(reading) FROM samples LIMIT 2").rows,
-        [vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        [vec![Value::Float64(1.25)], vec![Value::Float64(2.5)]]
     );
     assert_eq!(
         database.execute("SELECT ABS(reading) FROM samples"),
@@ -241,8 +334,8 @@ fn abs_projection_obeys_result_caps() {
     });
     value_limited
         .execute(
-            "CREATE TABLE samples (reading Int64); \
-             INSERT INTO samples VALUES (-1), (-2), (-3);",
+            "CREATE TABLE samples (reading Float64); \
+             INSERT INTO samples VALUES (-1.25), (-2.5), (-3.75);",
         )
         .expect("setup");
     assert_eq!(
@@ -253,22 +346,82 @@ fn abs_projection_obeys_result_caps() {
             max: 5,
         })
     );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    byte_limited
+        .execute(
+            "CREATE TABLE samples (reading Float64); \
+             INSERT INTO samples VALUES (-1.25);",
+        )
+        .expect("setup");
+    assert!(matches!(
+        byte_limited.execute("SELECT ABS(reading) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            max: 0,
+            ..
+        })
+    ));
 }
 
 #[test]
-fn emits_abs_as_int64_in_csv_and_json() {
-    let sql = "CREATE TABLE samples (reading Int64); \
-               INSERT INTO samples VALUES (-7), (0), (12); \
+fn emits_float64_abs_in_all_cli_formats() {
+    let sql = "CREATE TABLE samples (reading Float64); \
+               INSERT INTO samples VALUES (-2.5), (-0.0), (1.25); \
                SELECT ABS(reading) AS magnitude FROM samples ORDER BY magnitude;";
+
+    let mut table = Vec::new();
+    run_table_batch(sql.as_bytes(), &mut table).expect("table batch succeeds");
+    assert_eq!(
+        String::from_utf8(table).unwrap(),
+        "+-----------+\n\
+         | magnitude |\n\
+         +-----------+\n\
+         | 0.0       |\n\
+         | 1.25      |\n\
+         | 2.5       |\n\
+         +-----------+\n"
+    );
 
     let mut csv = Vec::new();
     run_csv_batch(sql.as_bytes(), &mut csv).expect("CSV batch succeeds");
-    assert_eq!(String::from_utf8(csv).unwrap(), "magnitude\n0\n7\n12\n");
+    assert_eq!(
+        String::from_utf8(csv).unwrap(),
+        "magnitude\n0.0\n1.25\n2.5\n"
+    );
+
+    let mut tsv = Vec::new();
+    run_tsv_batch(sql.as_bytes(), &mut tsv).expect("TSV batch succeeds");
+    assert_eq!(
+        String::from_utf8(tsv).unwrap(),
+        "magnitude\n0.0\n1.25\n2.5\n"
+    );
 
     let mut json = Vec::new();
     run_json_batch(sql.as_bytes(), &mut json).expect("JSON batch succeeds");
     assert_eq!(
         String::from_utf8(json).unwrap(),
-        "{\"columns\":[{\"name\":\"magnitude\",\"type\":\"Int64\"}],\"rows\":[[0],[7],[12]]}\n"
+        "{\"columns\":[{\"name\":\"magnitude\",\"type\":\"Float64\"}],\"rows\":[[0.0],[1.25],[2.5]]}\n"
+    );
+
+    let mut json_each_row = Vec::new();
+    run_json_each_row_batch(sql.as_bytes(), &mut json_each_row)
+        .expect("JSONEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_each_row).unwrap(),
+        "{\"magnitude\":0.0}\n{\"magnitude\":1.25}\n{\"magnitude\":2.5}\n"
+    );
+
+    let mut json_compact_each_row = Vec::new();
+    run_json_compact_each_row_batch(sql.as_bytes(), &mut json_compact_each_row)
+        .expect("JSONCompactEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_compact_each_row).unwrap(),
+        "[0.0]\n[1.25]\n[2.5]\n"
     );
 }
