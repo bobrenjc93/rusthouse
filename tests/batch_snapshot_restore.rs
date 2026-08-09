@@ -4,13 +4,14 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusthouse::batch::engine::{QueryResult, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::value::Value;
 use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
     Database, DatabaseMetrics, DatabaseSnapshotRestoreError, Int64Table, Int64TablePayloadCodec,
-    Int64TablePayloadFileRestoreError, Schema, SharedDatabase, SnapshotCodec, SnapshotError,
-    TableLimits,
+    Int64TablePayloadError, Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError,
+    Schema, SharedDatabase, SnapshotCodec, SnapshotError, TableLimits,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -70,6 +71,156 @@ fn assert_empty(database: &Database) {
     assert_eq!(database.catalog().column_count(), 0);
     assert_eq!(database.catalog().retained_row_count(), 0);
     assert_eq!(database.catalog().retained_value_bytes(), 0);
+}
+
+fn cached_metrics(database: &mut Database) -> QueryResult {
+    let mut results = database
+        .execute("SELECT metric, value FROM system.metrics")
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    match results.pop().unwrap() {
+        StatementResult::Query(result) => result,
+        StatementResult::Command { .. } => {
+            unreachable!("system.metrics always returns one query result")
+        }
+    }
+}
+
+#[test]
+fn backup_restore_prefers_a_valid_primary_without_inspecting_the_backup() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&primary_path, "reading", false, 2, &[Some(11)]);
+    let mut database = Database::with_table_limits(TableLimits::new(2, 1, 2));
+
+    let source = database
+        .restore_int64_table_from_file_with_backup(
+            "Readings",
+            primary_path,
+            directory.join("missing-backup.snapshot"),
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+
+    assert_eq!(source, Int64TablePayloadFileRecoverySource::Primary);
+    assert_eq!(database.catalog().table("readings").unwrap().row_count(), 1);
+    let mut results = database.execute("SELECT reading FROM readings").unwrap();
+    assert_eq!(results.len(), 1);
+    let StatementResult::Query(result) = results.pop().unwrap() else {
+        unreachable!("SELECT always returns one query result")
+    };
+    assert_eq!(result.rows, [[Value::Int64(11)]]);
+}
+
+#[test]
+fn corrupt_and_missing_primaries_recover_the_explicit_backup() {
+    let directory = TestDirectory::new();
+    let backup_path = directory.join("backup.snapshot");
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&backup_path, "reading", false, 2, &[Some(22)]);
+
+    let mut missing_primary = Database::with_table_limits(TableLimits::new(2, 1, 2));
+    assert_eq!(
+        missing_primary
+            .restore_int64_table_from_file_with_backup(
+                "missing_recovery",
+                directory.join("missing-primary.snapshot"),
+                &backup_path,
+                snapshot_codec,
+                payload_codec,
+            )
+            .unwrap(),
+        Int64TablePayloadFileRecoverySource::Backup
+    );
+    assert_eq!(
+        missing_primary
+            .catalog()
+            .table("missing_recovery")
+            .unwrap()
+            .row_count(),
+        1
+    );
+
+    let corrupt_path = directory.join("corrupt-primary.snapshot");
+    let mut corrupt = fs::read(&backup_path).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&corrupt_path, corrupt).unwrap();
+    let mut corrupt_primary = Database::with_table_limits(TableLimits::new(2, 1, 2));
+    assert_eq!(
+        corrupt_primary
+            .restore_int64_table_from_file_with_backup(
+                "corrupt_recovery",
+                corrupt_path,
+                backup_path,
+                snapshot_codec,
+                payload_codec,
+            )
+            .unwrap(),
+        Int64TablePayloadFileRecoverySource::Backup
+    );
+}
+
+#[test]
+fn backup_restore_preserves_both_failures_and_cached_metrics() {
+    let directory = TestDirectory::new();
+    let corrupt_backup_path = directory.join("corrupt-backup.snapshot");
+    let valid_path = directory.join("valid.snapshot");
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&valid_path, "reading", false, 2, &[Some(22)]);
+    let mut corrupt_payload = payload_codec
+        .encode(&Int64Table::new(Schema::int64("reading", false), 2))
+        .unwrap();
+    corrupt_payload[0] ^= 1;
+    fs::write(
+        &corrupt_backup_path,
+        snapshot_codec.encode(&corrupt_payload).unwrap(),
+    )
+    .unwrap();
+
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE existing (id Int64); INSERT INTO existing VALUES (7);")
+        .unwrap();
+    let metrics_before = cached_metrics(&mut database);
+    let error = database
+        .restore_int64_table_from_file_with_backup(
+            "recovered",
+            directory.join("missing-primary.snapshot"),
+            corrupt_backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap_err();
+
+    let DatabaseSnapshotRestoreError::Recovery(recovery) = error else {
+        panic!("expected dual recovery error, got {error:?}");
+    };
+    assert!(matches!(
+        recovery.primary_error(),
+        Int64TablePayloadFileRestoreError::Open(source)
+            if source.kind() == ErrorKind::NotFound
+    ));
+    assert!(matches!(
+        recovery.backup_error(),
+        Int64TablePayloadFileRestoreError::Payload(
+            Int64TablePayloadError::IncompatibleMagic { .. }
+        )
+    ));
+    let (primary, backup) = recovery.into_errors();
+    assert!(matches!(
+        primary,
+        Int64TablePayloadFileRestoreError::Open(_)
+    ));
+    assert!(matches!(
+        backup,
+        Int64TablePayloadFileRestoreError::Payload(
+            Int64TablePayloadError::IncompatibleMagic { .. }
+        )
+    ));
+    assert_eq!(database.catalog().table_count(), 1);
+    assert_eq!(cached_metrics(&mut database), metrics_before);
 }
 
 #[test]
@@ -161,9 +312,10 @@ fn corruption_nullability_and_duplicate_names_leave_existing_state_unchanged() {
         .restore_int64_table_from_file("Readings", &valid_path, snapshot_codec, payload_codec)
         .unwrap();
     assert!(matches!(
-        database.restore_int64_table_from_file(
+        database.restore_int64_table_from_file_with_backup(
             "READINGS",
             directory.join("does-not-exist.snapshot"),
+            directory.join("backup-does-not-exist.snapshot"),
             snapshot_codec,
             payload_codec,
         ),
@@ -184,7 +336,13 @@ fn row_cap_column_and_cell_limit_failures_are_atomic() {
 
     let mut row_limited = Database::with_table_limits(TableLimits::new(2, 1, 2));
     assert!(matches!(
-        row_limited.restore_int64_table_from_file("limited", &path, snapshot_codec, payload_codec,),
+        row_limited.restore_int64_table_from_file_with_backup(
+            "limited",
+            directory.join("missing-row-primary.snapshot"),
+            &path,
+            snapshot_codec,
+            payload_codec,
+        ),
         Err(DatabaseSnapshotRestoreError::Table(
             Error::ResourceLimitExceeded {
                 resource: "table row cap",
@@ -197,8 +355,9 @@ fn row_cap_column_and_cell_limit_failures_are_atomic() {
 
     let mut column_limited = Database::with_table_limits(TableLimits::new(3, 0, 2));
     assert!(matches!(
-        column_limited.restore_int64_table_from_file(
+        column_limited.restore_int64_table_from_file_with_backup(
             "limited",
+            directory.join("missing-column-primary.snapshot"),
             &path,
             snapshot_codec,
             payload_codec,
@@ -215,7 +374,13 @@ fn row_cap_column_and_cell_limit_failures_are_atomic() {
 
     let mut cell_limited = Database::with_table_limits(TableLimits::new(3, 1, 1));
     assert!(matches!(
-        cell_limited.restore_int64_table_from_file("limited", path, snapshot_codec, payload_codec,),
+        cell_limited.restore_int64_table_from_file_with_backup(
+            "limited",
+            directory.join("missing-cell-primary.snapshot"),
+            path,
+            snapshot_codec,
+            payload_codec,
+        ),
         Err(DatabaseSnapshotRestoreError::Table(
             Error::ResourceLimitExceeded {
                 resource: "table cells",
