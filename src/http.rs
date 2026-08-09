@@ -1,9 +1,10 @@
-//! Transport-neutral handling for one bounded HTTP query, insert, health, or metrics exchange.
+//! Bounded HTTP exchanges and sequential read-only TCP serving.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::net::{Shutdown, TcpListener};
 
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
 use crate::batch::format::{
@@ -102,6 +103,185 @@ impl StdError for HttpQueryError {
             Self::ResponseLimitExceeded { .. } => None,
         }
     }
+}
+
+/// Listener and exchange bounds for [`serve_http_read_only_with_limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpListenerLimits {
+    /// Maximum number of accepted connections before the listener returns.
+    ///
+    /// Each accepted connection consumes one slot even when its exchange fails.
+    /// Zero makes the listener return without calling [`TcpListener::accept`].
+    pub max_connections: usize,
+    /// Resource limits applied independently to every accepted connection.
+    pub query_limits: HttpQueryLimits,
+}
+
+impl HttpListenerLimits {
+    /// Creates an accepted-connection bound and per-exchange resource limits.
+    pub const fn new(max_connections: usize, query_limits: HttpQueryLimits) -> Self {
+        Self {
+            max_connections,
+            query_limits,
+        }
+    }
+}
+
+/// A connection-local transport failure observed by the bounded HTTP listener.
+///
+/// Protocol and query failures that the exchange handler represents with an
+/// HTTP response are successful exchanges and do not appear here.
+#[derive(Debug)]
+pub struct HttpConnectionFailure {
+    /// One-based position of this connection in the listener run.
+    pub connection: usize,
+    /// Typed transport failure returned by the single-exchange handler.
+    pub source: HttpQueryError,
+}
+
+impl fmt::Display for HttpConnectionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "HTTP connection {} failed: {}",
+            self.connection, self.source
+        )
+    }
+}
+
+impl StdError for HttpConnectionFailure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Outcome of a finite [`serve_http_read_only_with_limits`] run.
+#[derive(Debug, Default)]
+pub struct HttpListenerReport {
+    /// Number of connections accepted from the listener.
+    pub accepted_connections: usize,
+    /// Number of exchanges that completed without a transport failure.
+    ///
+    /// This includes protocol and query errors successfully sent as HTTP error
+    /// responses.
+    pub successful_exchanges: usize,
+    /// Typed connection-local failures, in acceptance order.
+    ///
+    /// This vector is bounded by the configured maximum connection count.
+    pub connection_failures: Vec<HttpConnectionFailure>,
+}
+
+/// A listener-wide failure from [`serve_http_read_only_with_limits`].
+#[derive(Debug)]
+pub enum HttpListenerError {
+    /// Accepting the next TCP connection failed.
+    Accept {
+        /// Work completed before the accept failure.
+        report: HttpListenerReport,
+        /// Operating-system accept error.
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for HttpListenerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accept { report, source } => write!(
+                formatter,
+                "could not accept HTTP connection after {} accepted connections: {source}",
+                report.accepted_connections
+            ),
+        }
+    }
+}
+
+impl StdError for HttpListenerError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Accept { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Serves a finite number of sequential, read-only HTTP connections.
+///
+/// This is the TCP listener counterpart to [`handle_http_query`]. Every
+/// accepted connection uses the same [`SharedDatabase`], is dispatched through
+/// the existing read-only exchange handler with default exchange limits, and
+/// is closed after at most one response. A connection-local read, write, or
+/// response-limit failure is recorded in the returned report and does not stop
+/// later connections.
+///
+/// The function blocks until `max_connections` connections have been accepted
+/// or the listener returns a non-interrupted accept error. Passing zero returns
+/// immediately. Connections are deliberately handled one at a time; the
+/// listener does not add authentication, TLS, or socket timeouts.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Interrupted accepts are retried.
+pub fn serve_http_read_only(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    max_connections: usize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_read_only_with_limits(
+        listener,
+        database,
+        HttpListenerLimits::new(max_connections, HttpQueryLimits::default()),
+    )
+}
+
+/// Serves bounded sequential read-only HTTP connections with explicit limits.
+///
+/// The accepted-connection limit bounds both the run and the maximum number of
+/// retained [`HttpConnectionFailure`] values. [`HttpListenerLimits::query_limits`]
+/// is applied afresh to each connection. Regardless of exchange success, the
+/// stream is shut down and dropped before another connection is accepted, so
+/// HTTP pipelining cannot extend a connection past its first exchange.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Connection-local failures are returned in
+/// [`HttpListenerReport::connection_failures`] instead.
+pub fn serve_http_read_only_with_limits(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    limits: HttpListenerLimits,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    let mut report = HttpListenerReport::default();
+
+    while report.accepted_connections < limits.max_connections {
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(source) => return Err(HttpListenerError::Accept { report, source }),
+            }
+        };
+
+        report.accepted_connections += 1;
+        let connection = report.accepted_connections;
+        let exchange =
+            handle_http_query_with_limits(database, &stream, &stream, limits.query_limits);
+
+        // Half-close the response direction first so a peer can observe the
+        // complete response and its terminating FIN. Dropping the stream then
+        // closes the read direction even when malformed or pipelined request
+        // bytes remain unread.
+        let _ = stream.shutdown(Shutdown::Write);
+
+        match exchange {
+            Ok(()) => report.successful_exchanges += 1,
+            Err(source) => report
+                .connection_failures
+                .push(HttpConnectionFailure { connection, source }),
+        }
+    }
+
+    Ok(report)
 }
 
 /// Handles one strict, bounded HTTP/1.1 exchange.
