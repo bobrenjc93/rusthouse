@@ -25,7 +25,9 @@ pub use batch::{
     TableLimits,
 };
 #[cfg(unix)]
-pub use batch::{DatabaseSnapshotSaveError, SharedDatabaseSnapshotSaveError};
+pub use batch::{
+    DatabaseSnapshotSaveError, SharedDatabaseSnapshotRestoreError, SharedDatabaseSnapshotSaveError,
+};
 pub use catalog::{
     Catalog, CatalogCsvIngestError, CatalogCsvReaderIngestError, CatalogError, CatalogLimits,
     CatalogSnapshotRestoreError,

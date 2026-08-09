@@ -7,12 +7,12 @@ use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use super::csv::{CsvIngestError, CsvIngestLimits};
-#[cfg(unix)]
-use super::engine::DatabaseSnapshotSaveError;
 use super::engine::{
     DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, QueryResult, QueryResultLimits, StatementResult,
     TableLimits,
 };
+#[cfg(unix)]
+use super::engine::{DatabaseSnapshotRestoreError, DatabaseSnapshotSaveError};
 use super::error::Error;
 use super::sql::{self, Statement};
 use super::tsv::{TsvIngestError, TsvIngestLimits};
@@ -118,6 +118,51 @@ impl From<TsvIngestError> for SharedDatabaseError {
     }
 }
 
+/// A failure while nonblockingly restoring a snapshot into a [`SharedDatabase`].
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum SharedDatabaseSnapshotRestoreError {
+    /// A reader or writer prevented immediate acquisition of the database write lock.
+    DatabaseBusy,
+    /// A thread panicked while it held the database write lock.
+    LockPoisoned,
+    /// Snapshot decoding or database validation failed.
+    Snapshot(DatabaseSnapshotRestoreError),
+}
+
+#[cfg(unix)]
+impl fmt::Display for SharedDatabaseSnapshotRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseBusy => write!(formatter, "shared database is busy"),
+            Self::LockPoisoned => write!(formatter, "shared database lock is poisoned"),
+            Self::Snapshot(error) => {
+                write!(
+                    formatter,
+                    "shared database snapshot restore failed: {error}"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl StdError for SharedDatabaseSnapshotRestoreError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::DatabaseBusy | Self::LockPoisoned => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<DatabaseSnapshotRestoreError> for SharedDatabaseSnapshotRestoreError {
+    fn from(error: DatabaseSnapshotRestoreError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 /// A failure while nonblockingly saving a [`SharedDatabase`] table snapshot.
 #[cfg(unix)]
 #[derive(Debug)]
@@ -187,12 +232,17 @@ impl From<DatabaseSnapshotSaveError> for SharedDatabaseSnapshotSaveError {
 /// [`SharedDatabaseError::DatabaseBusy`] instead of waiting for a writer.
 #[cfg_attr(
     unix,
-    doc = "On Unix, [`Self::try_save_int64_table_to_file`] likewise attempts one read"
+    doc = "On Unix, [`Self::try_restore_int64_table_from_file`] attempts one write lock"
 )]
 #[cfg_attr(
     unix,
-    doc = "lock and atomically saves a supported table without copying its column."
+    doc = "before bounded snapshot reading and atomic database restore, while"
 )]
+#[cfg_attr(
+    unix,
+    doc = "[`Self::try_save_int64_table_to_file`] attempts one read lock and atomically"
+)]
+#[cfg_attr(unix, doc = "saves a supported table without copying its column.")]
 /// [`Self::try_execute_insert_batch`] similarly attempts
 /// one nonblocking write lock for an atomic `INSERT`-only batch, and
 /// [`Self::try_ingest_csv`], [`Self::try_ingest_csv_with_names`],
@@ -279,6 +329,37 @@ impl SharedDatabase {
     /// Returns the persistent resource limits applied to each created table.
     pub fn table_limits(&self) -> Result<TableLimits, SharedDatabaseError> {
         Ok(self.read()?.table_limits())
+    }
+
+    /// Attempts to restore one self-describing, non-nullable `Int64` snapshot on Unix.
+    ///
+    /// Exactly one nonblocking write-lock attempt occurs before the source path
+    /// is accessed. An active reader or writer returns
+    /// [`SharedDatabaseSnapshotRestoreError::DatabaseBusy`] without reading the
+    /// source. Once acquired, the guard is retained while the existing
+    /// [`Database::restore_int64_table_from_file`] path performs bounded file
+    /// reading, decoding, validation, and atomic catalog registration. Snapshot
+    /// failures therefore leave all catalog data and cached metrics unchanged.
+    #[cfg(unix)]
+    pub fn try_restore_int64_table_from_file(
+        &self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: Int64TablePayloadCodec,
+    ) -> Result<(), SharedDatabaseSnapshotRestoreError> {
+        let mut database = match self.inner.try_write() {
+            Ok(database) => database,
+            Err(TryLockError::WouldBlock) => {
+                return Err(SharedDatabaseSnapshotRestoreError::DatabaseBusy);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(SharedDatabaseSnapshotRestoreError::LockPoisoned);
+            }
+        };
+        database
+            .restore_int64_table_from_file(table_name, path, snapshot_codec, payload_codec)
+            .map_err(Into::into)
     }
 
     /// Attempts to atomically save one non-nullable, one-column `Int64` table on Unix.
