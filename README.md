@@ -1314,6 +1314,14 @@ database's configured `TableLimits`, preserves the persisted row cap, and
 registers the table plus its cached metrics only after all decoding and storage
 validation succeeds. Duplicate names resolve case-insensitively just like SQL
 table names and leave the existing catalog unchanged.
+`Database::replace_int64_table_from_file` applies the same bounded decoding and
+table validation to one existing caller-named table. Lookup is
+case-insensitive, but the catalog's stored table-name spelling is preserved;
+the snapshot replaces the column schema, rows, and persisted row cap. A missing
+target is rejected before file access, and corruption, nullability, invalid
+column identifiers, or configured table-limit failures leave the old table and
+cached metrics unchanged. Success performs one catalog swap and adjusts the
+cached column, row, and retained-value-byte totals to the replacement exactly.
 `Database::restore_int64_tables_from_files` restores a caller-bounded slice of
 `DatabaseSnapshotRestoreEntry` values as one atomic catalog change. The
 inclusive entry-count limit and the complete case-insensitive destination-name
