@@ -194,40 +194,48 @@ fn show_databases_accepts_exact_and_rejects_exceeded_query_result_limits() {
                 max_rows: 0,
                 ..QueryResultLimits::default()
             },
-            Error::ResourceLimitExceeded {
-                resource: "SHOW DATABASES result rows",
-                actual: 1,
-                max: 0,
-            },
+            "SHOW DATABASES result rows",
+            "SELECT result rows",
+            1,
+            0,
         ),
         (
             QueryResultLimits {
                 max_values: 0,
                 ..QueryResultLimits::default()
             },
-            Error::ResourceLimitExceeded {
-                resource: "SHOW DATABASES result values",
-                actual: 1,
-                max: 0,
-            },
+            "SHOW DATABASES result values",
+            "SELECT result values",
+            1,
+            0,
         ),
         (
             QueryResultLimits {
                 max_bytes: exact_bytes - 1,
                 ..QueryResultLimits::default()
             },
-            Error::ResourceLimitExceeded {
-                resource: "SHOW DATABASES result bytes",
-                actual: exact_bytes,
-                max: exact_bytes - 1,
-            },
+            "SHOW DATABASES result bytes",
+            "SELECT result bytes",
+            exact_bytes,
+            exact_bytes - 1,
         ),
     ];
 
-    for (limits, expected) in cases {
-        for sql in ["SHOW DATABASES", SYSTEM_DATABASES_QUERY] {
+    for (limits, show_resource, select_resource, actual, max) in cases {
+        for (sql, resource) in [
+            ("SHOW DATABASES", show_resource),
+            (SYSTEM_DATABASES_QUERY, select_resource),
+        ] {
             let mut database = Database::with_query_result_limits(limits);
-            assert_eq!(database.execute(sql), Err(expected.clone()), "{sql}");
+            assert_eq!(
+                database.execute(sql),
+                Err(Error::ResourceLimitExceeded {
+                    resource,
+                    actual,
+                    max,
+                }),
+                "{sql}"
+            );
         }
     }
 }
@@ -344,16 +352,25 @@ fn http_emits_show_databases_in_every_supported_wire_format() {
 }
 
 #[test]
-fn http_reports_show_databases_result_limits_on_the_wire() {
+fn http_reports_distinct_database_metadata_resource_names_on_the_wire() {
     let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
         max_rows: 0,
         ..QueryResultLimits::default()
     });
-    let response = http_exchange(&database, None, SYSTEM_DATABASES_QUERY.as_bytes());
+    let cases: [(&[u8], &[u8]); 2] = [
+        (
+            b"SHOW DATABASES",
+            b"{\"error\":\"SHOW DATABASES result rows requires at least 1, exceeding the limit of 0\"}",
+        ),
+        (
+            SYSTEM_DATABASES_QUERY.as_bytes(),
+            b"{\"error\":\"SELECT result rows requires at least 1, exceeding the limit of 0\"}",
+        ),
+    ];
 
-    assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
-    assert_eq!(
-        http_body(&response),
-        b"{\"error\":\"SHOW DATABASES result rows requires at least 1, exceeding the limit of 0\"}"
-    );
+    for (sql, expected) in cases {
+        let response = http_exchange(&database, None, sql);
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        assert_eq!(http_body(&response), expected);
+    }
 }
