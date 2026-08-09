@@ -1343,6 +1343,14 @@ target is rejected before file access, and corruption, nullability, invalid
 column identifiers, or configured table-limit failures leave the old table and
 cached metrics unchanged. Success performs one catalog swap and adjusts the
 cached column, row, and retained-value-byte totals to the replacement exactly.
+`Database::replace_int64_table_from_file_with_backup` adds explicit recovery
+to that atomic replacement. It decodes the primary first and consults the
+backup only after a typed primary file, envelope, or table-payload failure;
+success reports which source supplied the replacement, while a dual failure
+retains both typed causes. Database validation runs only after a source has
+decoded and does not trigger fallback. A dual recovery, schema-validation, or
+configured-limit failure preserves the target's display name, data, and cached
+metrics.
 `Database::restore_int64_tables_from_files` restores a caller-bounded slice of
 `DatabaseSnapshotRestoreEntry` values as one atomic catalog change. The
 inclusive entry-count limit and the complete case-insensitive destination-name
