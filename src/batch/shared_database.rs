@@ -117,8 +117,8 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// Each SQL batch is completely parsed before the database lock is acquired.
 /// [`Self::execute`] retains one write lock while every statement executes, so
 /// statements from concurrent mutating batches cannot interleave. [`Self::query`]
-/// executes one `SELECT` (including the exact `system.tables` and
-/// `system.columns` metadata queries),
+/// executes one `SELECT` (including the exact `system.tables`,
+/// `system.columns`, and `system.metrics` metadata queries),
 /// `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW FUNCTIONS`, `SHOW TABLES`, `SHOW
 /// CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` under a shared read lock.
 /// [`Self::try_query`] accepts the same input but returns
@@ -666,6 +666,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         | Statement::CurrentDatabaseSelect(_)
         | Statement::SystemTables
         | Statement::SystemColumns
+        | Statement::SystemMetrics
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }

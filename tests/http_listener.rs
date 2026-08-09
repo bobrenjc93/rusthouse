@@ -1,0 +1,384 @@
+use std::error::Error as StdError;
+use std::io::{Cursor, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use rusthouse::{
+    HttpListenerError, HttpListenerLimits, HttpListenerReport, HttpQueryError, HttpQueryLimits,
+    SharedDatabase, handle_http_query, serve_http_read_only, serve_http_read_only_with_limits,
+};
+
+const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const STALLED_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
+const STALLED_RESPONSE_BYTES: usize = 15 * 1024 * 1024;
+const TRICKLE_INTERVAL: Duration = Duration::from_millis(20);
+const TRICKLE_BYTES: usize = 20;
+
+fn start_listener(
+    database: SharedDatabase,
+    limits: HttpListenerLimits,
+) -> (
+    SocketAddr,
+    JoinHandle<Result<HttpListenerReport, HttpListenerError>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let worker =
+        thread::spawn(move || serve_http_read_only_with_limits(&listener, &database, limits));
+    (address, worker)
+}
+
+fn exchange(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(address).expect("connect to loopback listener");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set client read timeout");
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set client write timeout");
+    stream.write_all(request).expect("write complete request");
+    stream
+        .shutdown(Shutdown::Write)
+        .expect("finish request stream");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("listener closes the connection after its response");
+    response
+}
+
+fn post_query(sql: &str) -> Vec<u8> {
+    format!(
+        "POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{sql}",
+        sql.len()
+    )
+    .into_bytes()
+}
+
+fn body(response: &[u8]) -> &[u8] {
+    let body_offset = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response has a header terminator")
+        + 4;
+    &response[body_offset..]
+}
+
+#[test]
+fn sequential_connections_share_one_read_only_database_and_stop_at_the_limit() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE readings (value Int64); INSERT INTO readings VALUES (7), (11);")
+        .unwrap();
+    let (address, worker) = start_listener(
+        database.clone(),
+        HttpListenerLimits::new(3, HttpQueryLimits::default()),
+    );
+
+    let first = exchange(
+        address,
+        &post_query("SELECT value FROM readings ORDER BY value;"),
+    );
+    assert!(first.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        body(&first),
+        br#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7],[11]]}"#
+    );
+    assert!(
+        first
+            .windows(19)
+            .any(|window| window == b"Connection: close\r\n")
+    );
+
+    let mutation = exchange(address, &post_query("INSERT INTO readings VALUES (99);"));
+    assert!(mutation.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert!(String::from_utf8_lossy(body(&mutation)).contains("read-only query"));
+
+    let final_query = exchange(address, &post_query("SELECT COUNT(*) FROM readings;"));
+    assert!(final_query.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        body(&final_query),
+        br#"{"columns":[{"name":"COUNT(*)","type":"Int64"}],"rows":[[2]]}"#
+    );
+
+    let report = worker
+        .join()
+        .expect("listener thread did not panic")
+        .expect("listener completed its connection budget");
+    assert_eq!(report.accepted_connections, 3);
+    assert_eq!(report.successful_exchanges, 3);
+    assert!(report.connection_failures.is_empty());
+
+    let rows = database
+        .query("SELECT value FROM readings ORDER BY value;")
+        .unwrap();
+    assert_eq!(rows.rows.len(), 2);
+}
+
+#[test]
+fn sequential_connections_observe_updated_cached_system_metrics() {
+    let database = SharedDatabase::default();
+    let (address, worker) = start_listener(
+        database.clone(),
+        HttpListenerLimits::new(2, HttpQueryLimits::default()),
+    );
+    let request = post_query("SELECT metric, value FROM system.metrics;");
+
+    let empty = exchange(address, &request);
+    assert!(empty.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        body(&empty),
+        br#"{"columns":[{"name":"metric","type":"String"},{"name":"value","type":"Int64"}],"rows":[["rusthouse_tables",0],["rusthouse_columns",0],["rusthouse_retained_rows",0],["rusthouse_retained_value_bytes",0]]}"#
+    );
+
+    database
+        .execute(
+            "CREATE TABLE readings (value Int64, label String); \
+             INSERT INTO readings VALUES (7, 'x'), (11, 'é');",
+        )
+        .unwrap();
+
+    let populated = exchange(address, &request);
+    assert!(populated.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        body(&populated),
+        br#"{"columns":[{"name":"metric","type":"String"},{"name":"value","type":"Int64"}],"rows":[["rusthouse_tables",1],["rusthouse_columns",2],["rusthouse_retained_rows",2],["rusthouse_retained_value_bytes",19]]}"#
+    );
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn one_connection_receives_only_one_response_even_when_requests_are_pipelined() {
+    let database = SharedDatabase::default();
+    let (address, worker) = start_listener(
+        database,
+        HttpListenerLimits::new(1, HttpQueryLimits::default()),
+    );
+    let requests = b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\nGET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    let response = exchange(address, requests);
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&response), b"Ok.\n");
+    assert_eq!(
+        response
+            .windows(b"HTTP/1.1".len())
+            .filter(|window| *window == b"HTTP/1.1")
+            .count(),
+        1
+    );
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 1);
+    assert_eq!(report.successful_exchanges, 1);
+}
+
+#[test]
+fn malformed_client_is_closed_without_preventing_the_next_request() {
+    let database = SharedDatabase::default();
+    let (address, worker) = start_listener(
+        database,
+        HttpListenerLimits::new(2, HttpQueryLimits::default()),
+    );
+
+    let malformed = exchange(address, b"GET /ping HTTP/1.1\nHost: localhost\n\n");
+    assert!(malformed.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+
+    let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&healthy), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn stalled_request_times_out_without_preventing_the_next_connection() {
+    let limits = HttpListenerLimits {
+        read_timeout: STALLED_CONNECTION_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let (address, worker) = start_listener(SharedDatabase::default(), limits);
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost")
+        .expect("write incomplete request without closing it");
+
+    let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&healthy), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 1);
+    assert_eq!(report.connection_failures.len(), 1);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        &report.connection_failures[0].source,
+        HttpQueryError::Read(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
+}
+
+#[test]
+fn trickling_request_cannot_renew_the_absolute_read_deadline() {
+    let limits = HttpListenerLimits {
+        read_timeout: STALLED_CONNECTION_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let (address, worker) = start_listener(SharedDatabase::default(), limits);
+
+    let mut trickling = TcpStream::connect(address).expect("connect trickling client");
+    trickling
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set trickling client write timeout");
+    trickling
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-Slow: ")
+        .expect("write incomplete request prefix");
+    let trickler = thread::spawn(move || {
+        for _ in 0..TRICKLE_BYTES {
+            thread::sleep(TRICKLE_INTERVAL);
+            if trickling.write_all(b"a").is_err() {
+                return;
+            }
+        }
+        let _ = trickling.shutdown(Shutdown::Write);
+    });
+
+    let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&healthy), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    trickler.join().expect("trickling client did not panic");
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 1);
+    assert_eq!(report.connection_failures.len(), 1);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        &report.connection_failures[0].source,
+        HttpQueryError::Read(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
+}
+
+#[test]
+fn stalled_response_times_out_without_preventing_the_next_connection() {
+    let database = SharedDatabase::default();
+    database
+        .execute(&format!(
+            "CREATE TABLE payloads (value String); INSERT INTO payloads VALUES ('{}');",
+            "x".repeat(STALLED_RESPONSE_BYTES)
+        ))
+        .expect("create a response larger than the loopback socket buffers");
+    let limits = HttpListenerLimits {
+        read_timeout: IO_TIMEOUT,
+        write_timeout: STALLED_CONNECTION_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let (address, worker) = start_listener(database, limits);
+
+    let mut stalled = TcpStream::connect(address).expect("connect non-reading client");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set non-reading client write timeout");
+    stalled
+        .write_all(&post_query("SELECT value FROM payloads;"))
+        .expect("write request for large response");
+    stalled
+        .shutdown(Shutdown::Write)
+        .expect("finish large-response request");
+
+    let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&healthy), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 1);
+    assert_eq!(report.connection_failures.len(), 1);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        &report.connection_failures[0].source,
+        HttpQueryError::Write(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
+}
+
+#[test]
+fn connection_local_limit_failure_is_typed_and_the_listener_continues() {
+    let database = SharedDatabase::default();
+    let ping_request = b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let mut expected_ping = Vec::new();
+    handle_http_query(&database, Cursor::new(ping_request), &mut expected_ping).unwrap();
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_ping.len(),
+        ..HttpQueryLimits::default()
+    };
+    let (address, worker) = start_listener(database, HttpListenerLimits::new(2, limits));
+
+    let oversized = post_query(&format!("SELECT '{}' AS value;", "x".repeat(1_000)));
+    assert!(exchange(address, &oversized).is_empty());
+    assert_eq!(exchange(address, ping_request), expected_ping);
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 1);
+    assert_eq!(report.connection_failures.len(), 1);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        report.connection_failures[0].source,
+        HttpQueryError::ResponseLimitExceeded { max_bytes, .. }
+            if max_bytes == expected_ping.len()
+    ));
+}
+
+#[test]
+fn zero_connection_limit_returns_without_accepting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let report = serve_http_read_only(&listener, &SharedDatabase::default(), 0).unwrap();
+
+    assert_eq!(report.accepted_connections, 0);
+    assert_eq!(report.successful_exchanges, 0);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn listener_accept_failures_return_a_typed_error_and_partial_report() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let error = serve_http_read_only(&listener, &SharedDatabase::default(), 1)
+        .expect_err("a nonblocking listener with no client cannot accept");
+    match &error {
+        HttpListenerError::Accept { report, source } => {
+            assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(report.accepted_connections, 0);
+            assert_eq!(report.successful_exchanges, 0);
+            assert!(report.connection_failures.is_empty());
+        }
+    }
+    assert!(error.source().is_some());
+}

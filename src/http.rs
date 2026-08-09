@@ -1,9 +1,11 @@
-//! Transport-neutral handling for one bounded HTTP query, insert, health, or metrics exchange.
+//! Bounded HTTP exchanges and sequential read-only TCP serving.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
 use crate::batch::format::{
@@ -28,6 +30,12 @@ pub const DEFAULT_MAX_HTTP_SQL_BYTES: usize = 1024 * 1024;
 
 /// Default maximum size of the complete HTTP response, including headers.
 pub const DEFAULT_MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default absolute read-deadline duration for an accepted listener connection.
+pub const DEFAULT_HTTP_CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default absolute write-deadline duration for an accepted listener connection.
+pub const DEFAULT_HTTP_CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resource limits for a single [`handle_http_query`] exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +110,304 @@ impl StdError for HttpQueryError {
             Self::ResponseLimitExceeded { .. } => None,
         }
     }
+}
+
+/// Listener and exchange bounds for [`serve_http_read_only_with_limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpListenerLimits {
+    /// Maximum number of accepted connections before the listener returns.
+    ///
+    /// Each accepted connection consumes one slot even when its exchange fails.
+    /// Zero makes the listener return without calling [`TcpListener::accept`].
+    pub max_connections: usize,
+    /// Absolute duration from acceptance in which the request must be read.
+    ///
+    /// Before every socket read, the listener applies only the time remaining
+    /// until this deadline, so incremental request progress cannot renew it.
+    /// The duration must be nonzero and supported by the operating system.
+    /// Invalid deadlines, configuration failures, and expired reads are
+    /// recorded as connection-local [`HttpQueryError::Read`] failures.
+    pub read_timeout: Duration,
+    /// Absolute duration from acceptance in which the response must be written.
+    ///
+    /// Before every socket write, the listener applies only the time remaining
+    /// until this deadline, so incremental response progress cannot renew it.
+    /// The duration must be nonzero and supported by the operating system.
+    /// Invalid deadlines, configuration failures, and expired writes are
+    /// recorded as connection-local [`HttpQueryError::Write`] failures.
+    pub write_timeout: Duration,
+    /// Resource limits applied independently to every accepted connection.
+    pub query_limits: HttpQueryLimits,
+}
+
+impl HttpListenerLimits {
+    /// Creates an accepted-connection bound and per-exchange resource limits.
+    pub const fn new(max_connections: usize, query_limits: HttpQueryLimits) -> Self {
+        Self {
+            max_connections,
+            read_timeout: DEFAULT_HTTP_CONNECTION_READ_TIMEOUT,
+            write_timeout: DEFAULT_HTTP_CONNECTION_WRITE_TIMEOUT,
+            query_limits,
+        }
+    }
+}
+
+/// A connection-local transport failure observed by the bounded HTTP listener.
+///
+/// Protocol and query failures that the exchange handler represents with an
+/// HTTP response are successful exchanges and do not appear here.
+#[derive(Debug)]
+pub struct HttpConnectionFailure {
+    /// One-based position of this connection in the listener run.
+    pub connection: usize,
+    /// Typed transport failure returned by the single-exchange handler.
+    pub source: HttpQueryError,
+}
+
+impl fmt::Display for HttpConnectionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "HTTP connection {} failed: {}",
+            self.connection, self.source
+        )
+    }
+}
+
+impl StdError for HttpConnectionFailure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Outcome of a finite [`serve_http_read_only_with_limits`] run.
+#[derive(Debug, Default)]
+pub struct HttpListenerReport {
+    /// Number of connections accepted from the listener.
+    pub accepted_connections: usize,
+    /// Number of exchanges that completed without a transport failure.
+    ///
+    /// This includes protocol and query errors successfully sent as HTTP error
+    /// responses.
+    pub successful_exchanges: usize,
+    /// Typed connection-local failures, in acceptance order.
+    ///
+    /// This vector is bounded by the configured maximum connection count.
+    pub connection_failures: Vec<HttpConnectionFailure>,
+}
+
+/// A listener-wide failure from [`serve_http_read_only_with_limits`].
+#[derive(Debug)]
+pub enum HttpListenerError {
+    /// Accepting the next TCP connection failed.
+    Accept {
+        /// Work completed before the accept failure.
+        report: HttpListenerReport,
+        /// Operating-system accept error.
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for HttpListenerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accept { report, source } => write!(
+                formatter,
+                "could not accept HTTP connection after {} accepted connections: {source}",
+                report.accepted_connections
+            ),
+        }
+    }
+}
+
+impl StdError for HttpListenerError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Accept { source, .. } => Some(source),
+        }
+    }
+}
+
+struct DeadlineTcpReader<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl<'a> DeadlineTcpReader<'a> {
+    fn new(stream: &'a TcpStream, accepted_at: Instant, timeout: Duration) -> io::Result<Self> {
+        Ok(Self {
+            stream,
+            deadline: deadline_after(accepted_at, timeout, "HTTP request read")?,
+        })
+    }
+}
+
+impl Read for DeadlineTcpReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        self.stream.set_read_timeout(Some(deadline_remaining(
+            self.deadline,
+            "HTTP request read",
+        )?))?;
+        Read::read(&mut self.stream, buffer)
+    }
+}
+
+struct DeadlineTcpWriter<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl<'a> DeadlineTcpWriter<'a> {
+    fn new(stream: &'a TcpStream, accepted_at: Instant, timeout: Duration) -> io::Result<Self> {
+        Ok(Self {
+            stream,
+            deadline: deadline_after(accepted_at, timeout, "HTTP response write")?,
+        })
+    }
+
+    fn apply_remaining_timeout(&self) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(deadline_remaining(
+            self.deadline,
+            "HTTP response write",
+        )?))
+    }
+}
+
+impl Write for DeadlineTcpWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        self.apply_remaining_timeout()?;
+        Write::write(&mut self.stream, buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.apply_remaining_timeout()?;
+        Write::flush(&mut self.stream)
+    }
+}
+
+fn deadline_after(start: Instant, timeout: Duration, operation: &str) -> io::Result<Instant> {
+    start.checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{operation} timeout exceeds the supported clock range"),
+        )
+    })
+}
+
+fn deadline_remaining(deadline: Instant, operation: &str) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{operation} deadline expired"),
+        ));
+    }
+    Ok(remaining)
+}
+
+fn handle_http_listener_connection(
+    database: &SharedDatabase,
+    stream: &TcpStream,
+    accepted_at: Instant,
+    limits: HttpListenerLimits,
+) -> Result<(), HttpQueryError> {
+    let input = DeadlineTcpReader::new(stream, accepted_at, limits.read_timeout)
+        .map_err(HttpQueryError::Read)?;
+    let output = DeadlineTcpWriter::new(stream, accepted_at, limits.write_timeout)
+        .map_err(HttpQueryError::Write)?;
+    handle_http_query_with_limits(database, input, output, limits.query_limits)
+}
+
+/// Serves a finite number of sequential, read-only HTTP connections.
+///
+/// This is the TCP listener counterpart to [`handle_http_query`]. Every
+/// accepted connection uses the same [`SharedDatabase`], is dispatched through
+/// the existing read-only exchange handler with default exchange limits, and
+/// is closed after at most one response. A connection-local read, write, or
+/// response-limit failure is recorded in the returned report and does not stop
+/// later connections.
+///
+/// The function blocks until `max_connections` connections have been accepted
+/// or the listener returns a non-interrupted accept error. Passing zero returns
+/// immediately. Connections are deliberately handled one at a time; the
+/// listener does not add authentication or TLS. Default per-connection read and
+/// write deadlines prevent one stalled peer from blocking later connections
+/// indefinitely.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Interrupted accepts are retried.
+pub fn serve_http_read_only(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    max_connections: usize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_read_only_with_limits(
+        listener,
+        database,
+        HttpListenerLimits::new(max_connections, HttpQueryLimits::default()),
+    )
+}
+
+/// Serves bounded sequential read-only HTTP connections with explicit limits.
+///
+/// The accepted-connection limit bounds both the run and the maximum number of
+/// retained [`HttpConnectionFailure`] values. [`HttpListenerLimits::query_limits`]
+/// is applied afresh to each connection. The configured absolute socket read
+/// and write deadlines start immediately after each accept, and every I/O call
+/// receives only its deadline's remaining duration. Regardless of exchange
+/// success, the stream is shut down and dropped before another connection is
+/// accepted, so HTTP pipelining cannot extend a connection past its first
+/// exchange.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Connection-local failures are returned in
+/// [`HttpListenerReport::connection_failures`] instead.
+pub fn serve_http_read_only_with_limits(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    limits: HttpListenerLimits,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    let mut report = HttpListenerReport::default();
+
+    while report.accepted_connections < limits.max_connections {
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(source) => return Err(HttpListenerError::Accept { report, source }),
+            }
+        };
+
+        report.accepted_connections += 1;
+        let connection = report.accepted_connections;
+        let accepted_at = Instant::now();
+        let exchange = handle_http_listener_connection(database, &stream, accepted_at, limits);
+
+        // Half-close the response direction first so a peer can observe the
+        // complete response and its terminating FIN. Dropping the stream then
+        // closes the read direction even when malformed or pipelined request
+        // bytes remain unread.
+        let _ = stream.shutdown(Shutdown::Write);
+
+        match exchange {
+            Ok(()) => report.successful_exchanges += 1,
+            Err(source) => report
+                .connection_failures
+                .push(HttpConnectionFailure { connection, source }),
+        }
+    }
+
+    Ok(report)
 }
 
 /// Handles one strict, bounded HTTP/1.1 exchange.

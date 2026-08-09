@@ -268,6 +268,20 @@ are visible on the next query. Other shapes and trailing clauses are rejected.
 The complete row, value, byte, and retained-result bounds are preflighted before
 result storage is allocated, and the query is available through the normal
 `Database`, `SharedDatabase`, CLI, and HTTP paths in every supported format.
+The exact case-insensitive query
+`SELECT metric, value FROM system.metrics` returns the four cached database
+totals also exposed as unlabeled Prometheus gauges: `rusthouse_tables`,
+`rusthouse_columns`, `rusthouse_retained_rows`, and
+`rusthouse_retained_value_bytes`. Rows remain in that order and contain a
+`String` metric name plus a checked `Int64` value. The totals track table,
+column, retained-row, and retained scalar payload-byte lifecycle changes; the
+byte definition matches `GET /metrics`. Other projections, aliases, filters,
+ordering, limits, and trailing clauses are rejected. The fixed result shape,
+metric-name payload, row/value/byte bounds, retained-result bound, and all
+integer conversions are checked before result storage is allocated. The query
+reads constant-time cached database measurements without scanning tables or
+values and is available through the normal `Database`, `SharedDatabase`, CLI,
+and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
 bounded `String`, preserving the stored table and column display names and
 schema order while normalizing type spellings.
@@ -599,8 +613,8 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes plus the exact `system.tables` and
-`system.columns` metadata queries),
+and `currentDatabase()` probes plus the exact `system.tables`, `system.columns`,
+and `system.metrics` metadata queries),
 `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,
@@ -871,8 +885,36 @@ authenticated handler's `*_and_limits` variant with `HttpQueryLimits` to set
 explicit insertion limits. Each call reads exactly one header block and, only
 for a POST query or authenticated insert, exactly its declared body; it emits at
 most one final `Connection: close` response and never reads or handles a
-subsequent request. This single-exchange API deliberately leaves listener,
-connection, timeout, and shutdown lifecycle to the embedding application.
+subsequent request.
+
+For a built-in read-only TCP lifecycle, `serve_http_read_only` accepts a
+caller-bound `TcpListener`, one `SharedDatabase`, and an explicit maximum number
+of connections. It accepts and handles connections sequentially, dispatches
+each through the same unauthenticated read-only `handle_http_query` path, and
+closes each stream after at most one response. Every connection observes the
+same synchronized database. A malformed protocol or SQL request receives its
+normal bounded HTTP error response and does not stop the listener. A local read,
+write, or unrepresentable-response-limit failure is retained as a typed
+`HttpConnectionFailure` in the final `HttpListenerReport`, and later clients
+are still accepted. An accept failure returns the typed `HttpListenerError`
+with the partial report and operating-system error.
+
+The connection count is an inclusive run bound: a failed connection consumes
+one slot, reaching the configured count returns the report, and zero returns
+without accepting. Callers can run finite serving batches repeatedly on the
+same borrowed listener for a long-lived service. Use
+`serve_http_read_only_with_limits` and `HttpListenerLimits` to apply an explicit
+`HttpQueryLimits` value and configurable absolute read and write deadlines
+independently to every connection. Both deadlines start at acceptance and
+default to 30 seconds. Every socket operation receives only the remaining time,
+so incremental progress cannot renew either deadline. Expiration is retained as
+a connection-local read or write failure so later clients are still accepted.
+The connection bound also limits the number of retained failures.
+This listener is deliberately single-threaded and adds neither authentication
+nor TLS; bind it only to an appropriate trusted interface and place it behind
+those controls when needed. The single-exchange functions remain available
+when an embedding needs a different connection, concurrency, authentication,
+timeout, or shutdown policy.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or
