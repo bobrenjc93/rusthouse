@@ -4963,23 +4963,23 @@ fn execute_grouped<'a>(
                 ..
             }]
         );
-    let paired_global_count_sum_int = if group_columns.is_empty() {
-        paired_global_count_sum_int64(aggregate_specs)
+    let paired_global_count_int_aggregate = if group_columns.is_empty() {
+        paired_global_count_int64_aggregate(aggregate_specs)
     } else {
         None
     };
 
     if group_columns.is_empty() {
-        if let Some((count_state, sum_state)) = paired_global_count_sum_int {
-            let sum = global_int64_sum_partial(
+        if let Some((count_state, aggregate_state, function)) = paired_global_count_int_aggregate {
+            let partial = global_int64_sum_partial(
                 table,
                 matching_rows,
-                &aggregate_specs[sum_state],
+                &aggregate_specs[aggregate_state],
                 parallelism,
             )?;
             aggregate_states[count_state][0] =
                 AggregateState::Count(count_matched_rows(matching_rows.len())?);
-            aggregate_states[sum_state][0] = sum.into_state(AggregateFunction::Sum);
+            aggregate_states[aggregate_state][0] = partial.into_state(function);
         } else {
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
                 if spec.function == AggregateFunction::CountIf {
@@ -5042,7 +5042,7 @@ fn execute_grouped<'a>(
                     || sole_global_min_int
                     || sole_global_min_float
                     || sole_global_max_int
-                    || paired_global_count_sum_int.is_some())
+                    || paired_global_count_int_aggregate.is_some())
             {
                 continue;
             }
@@ -5070,7 +5070,9 @@ fn execute_grouped<'a>(
     Ok(GroupedData { keys, aggregates })
 }
 
-fn paired_global_count_sum_int64(aggregate_specs: &[AggregateSpec]) -> Option<(usize, usize)> {
+fn paired_global_count_int64_aggregate(
+    aggregate_specs: &[AggregateSpec],
+) -> Option<(usize, usize, AggregateFunction)> {
     if aggregate_specs.len() != 2 {
         return None;
     }
@@ -5080,10 +5082,14 @@ fn paired_global_count_sum_int64(aggregate_specs: &[AggregateSpec]) -> Option<(u
             && spec.argument.is_none()
             && spec.input_type.is_none()
     })?;
-    let sum_state = aggregate_specs.iter().position(|spec| {
-        spec.function == AggregateFunction::Sum && spec.input_type == Some(DataType::Int64)
+    let aggregate_state = aggregate_specs.iter().position(|spec| {
+        matches!(
+            spec.function,
+            AggregateFunction::Sum | AggregateFunction::Avg
+        ) && spec.input_type == Some(DataType::Int64)
     })?;
-    (count_state != sum_state).then_some((count_state, sum_state))
+    let function = aggregate_specs[aggregate_state].function;
+    (count_state != aggregate_state).then_some((count_state, aggregate_state, function))
 }
 
 fn count_matched_rows(matched_rows: usize) -> Result<i64> {
@@ -7856,6 +7862,27 @@ mod tests {
     }
 
     #[test]
+    fn global_count_avg_int64_forced_workers_preserve_empty_results_and_pagination() {
+        let mut database = avg_int64_database(0, |_| unreachable!("empty input"));
+        let first_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT COUNT(*) AS rows, AVG(value) AS mean FROM empty_avg_values \
+             HAVING mean IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(
+            first_page.rows,
+            [vec![Value::Int64(0), Value::Null(DataType::Float64)]]
+        );
+
+        let second_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT AVG(value) AS mean, COUNT() AS rows FROM empty_avg_values \
+             HAVING mean IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 1",
+        );
+        assert!(second_page.rows.is_empty());
+    }
+
+    #[test]
     fn global_avg_int64_forced_workers_match_filtered_extrema_and_having() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
         let mut database = avg_int64_database(row_count, |id| match id {
@@ -7876,7 +7903,55 @@ mod tests {
     }
 
     #[test]
-    fn global_avg_int64_parallel_boundary_uses_shared_budget_with_sequential_fallback() {
+    fn global_count_avg_int64_forced_workers_match_filtered_projection_orders_and_aliases() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
+        let mut database = avg_int64_database(row_count, |id| match id {
+            1 => (i64::MIN, true),
+            2 => (i64::MAX, false),
+            id if id == row_count - 1 => (i64::MIN, false),
+            id if id == row_count => (i64::MAX, true),
+            _ => (0, true),
+        });
+        let matched_rows = row_count - 2;
+        let expected_mean = -1.0 / matched_rows as f64;
+
+        let count_first = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT COUNT(*) AS matched, AVG(value) AS mean FROM values_to_avg \
+             WHERE included = true HAVING mean < 0 \
+             ORDER BY matched DESC LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(count_first.columns[0].name, "matched");
+        assert_eq!(count_first.columns[1].name, "mean");
+        assert_eq!(
+            count_first.rows,
+            [vec![
+                Value::Int64(i64::try_from(matched_rows).unwrap()),
+                Value::Float64(expected_mean),
+            ]]
+        );
+
+        let avg_first = assert_global_aggregate_worker_differential(
+            &mut database,
+            &format!(
+                "SELECT AVG(value) AS mean, COUNT() AS matched FROM values_to_avg \
+                 WHERE included = true HAVING matched = {matched_rows} \
+                 ORDER BY mean DESC LIMIT 1 OFFSET 0"
+            ),
+        );
+        assert_eq!(avg_first.columns[0].name, "mean");
+        assert_eq!(avg_first.columns[1].name, "matched");
+        assert_eq!(
+            avg_first.rows,
+            [vec![
+                Value::Float64(expected_mean),
+                Value::Int64(i64::try_from(matched_rows).unwrap()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn global_count_avg_int64_parallel_boundary_uses_shared_budget_with_sequential_fallback() {
         static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
             GlobalAggregateWorkerBudget::new(0);
         static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
@@ -7889,9 +7964,18 @@ mod tests {
         ] {
             let result = assert_global_aggregate_worker_differential(
                 &mut database,
-                &format!("SELECT AVG(value) FROM values_to_avg WHERE id <= {matched_rows}"),
+                &format!(
+                    "SELECT COUNT(*) AS rows, AVG(value) AS mean FROM values_to_avg \
+                     WHERE id <= {matched_rows}"
+                ),
             );
-            assert_eq!(result.rows, [vec![Value::Float64(7.0)]]);
+            assert_eq!(
+                result.rows,
+                [vec![
+                    Value::Int64(i64::try_from(matched_rows).unwrap()),
+                    Value::Float64(7.0),
+                ]]
+            );
         }
 
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
@@ -7899,8 +7983,15 @@ mod tests {
             &UNAVAILABLE_BUDGET,
         );
         assert_eq!(
-            query(&mut database, "SELECT AVG(value) FROM values_to_avg").rows,
-            [vec![Value::Float64(7.0)]],
+            query(
+                &mut database,
+                "SELECT AVG(value) AS mean, COUNT() AS rows FROM values_to_avg"
+            )
+            .rows,
+            [vec![
+                Value::Float64(7.0),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]],
             "an unavailable helper budget falls back to the query thread"
         );
 
@@ -7925,6 +8016,30 @@ mod tests {
         assert_eq!(
             query(
                 &mut database,
+                &format!(
+                    "SELECT COUNT(*) AS rows, AVG(value) AS mean FROM values_to_avg \
+                     WHERE id <= {}",
+                    GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+                ),
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD).unwrap()),
+                Value::Float64(7.0),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "the paired shape stays sequential at the threshold"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
                 "SELECT AVG(value), COUNT(*) FROM values_to_avg"
             )
             .rows,
@@ -7933,14 +8048,35 @@ mod tests {
                 Value::Int64(i64::try_from(row_count).unwrap()),
             ]]
         );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "the paired COUNT(*) and AVG(Int64) shape uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(id), AVG(value) FROM values_to_avg"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Float64(7.0),
+            ]]
+        );
         assert_eq!(
             OBSERVED_BUDGET
                 .peak_helpers_in_use
                 .load(AtomicOrdering::Acquire),
             0,
-            "AVG(Int64) in a multi-aggregate projection stays sequential"
+            "COUNT(column) plus AVG(Int64) remains on the sequential fallback"
         );
 
+        OBSERVED_BUDGET.reset_peak();
         assert_eq!(
             query(
                 &mut database,
@@ -7955,6 +8091,38 @@ mod tests {
                 .load(AtomicOrdering::Acquire),
             0,
             "grouped AVG(Int64) stays sequential"
+        );
+    }
+
+    #[test]
+    fn global_count_avg_int64_worker_failure_repeats_the_complete_pair_locally() {
+        let values = [1, 17];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        let partial = reduce_global_int64_sum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            AggregateFunction::Avg,
+            |values, rows, function| {
+                if std::thread::current().name() == Some("rusthouse-avg-int64-1") {
+                    panic!("injected paired COUNT/AVG worker failure");
+                }
+                sum_int64_chunk(values, rows, function)
+            },
+        )
+        .expect("worker failure falls back to a complete local AVG");
+
+        assert_eq!(partial.count, u64::try_from(row_count).unwrap());
+        assert_eq!(
+            partial.sum,
+            i128::try_from(row_count).unwrap().saturating_sub(1) + 17
+        );
+        assert_eq!(
+            count_matched_rows(matching_rows.len()),
+            Ok(i64::try_from(row_count).unwrap())
         );
     }
 
