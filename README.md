@@ -757,12 +757,13 @@ Protocol and SQL failures return deterministic JSON error objects with an
 appropriate HTTP status. All other targets and query-string shapes are rejected.
 
 As a SQL-level alternative to HTTP format metadata, every query form recognizes
-a terminal `FORMAT JSON`, `FORMAT CSVWithNames`, `FORMAT TabSeparated`, `FORMAT
-JSONEachRow`, or `FORMAT JSONCompactEachRow` clause on exactly one read-only
-query. The keywords and format names are case-insensitive, one trailing
-semicolon is optional, and the response uses the corresponding existing
-bounded writer and content type described below. `FORMAT JSON` selects the
-default compact column-metadata and positional-row JSON shape explicitly.
+a terminal `FORMAT JSON`, `FORMAT CSV`, `FORMAT CSVWithNames`, `FORMAT
+TabSeparated`, `FORMAT TabSeparatedWithNames`, `FORMAT JSONEachRow`, or `FORMAT
+JSONCompactEachRow` clause on exactly one read-only query. The keywords and
+format names are case-insensitive, one trailing semicolon is optional, and the
+response uses the corresponding existing bounded writer and content type
+described below. `FORMAT JSON` selects the default compact column-metadata and
+positional-row JSON shape explicitly.
 Single-quoted text (including doubled quote escapes) and `--` line comments are
 scanned using the SQL lexer rules and are never mistaken for the clause. A real
 clause cannot be combined with `X-ClickHouse-Format` or `default_format`; the
@@ -1257,6 +1258,15 @@ database's configured `TableLimits`, preserves the persisted row cap, and
 registers the table plus its cached metrics only after all decoding and storage
 validation succeeds. Duplicate names resolve case-insensitively just like SQL
 table names and leave the existing catalog unchanged.
+`Database::restore_int64_tables_from_files` restores a caller-bounded slice of
+`DatabaseSnapshotRestoreEntry` values as one atomic catalog change. The
+inclusive entry-count limit and the complete case-insensitive destination-name
+set are checked before any source file is opened. Each entry has independent
+envelope and self-describing payload codec bounds; decoded tables remain staged
+until every file passes corruption, non-nullability, and configured table-limit
+checks. Success makes the complete subset queryable and updates cached metrics;
+failure reports the zero-based entry and caller table name while preserving all
+prior catalog data and gauges.
 `Database::restore_int64_table_from_file_with_backup` adds explicit recovery:
 it tries the primary self-describing snapshot first, falls back to the supplied
 backup only when bounded snapshot decoding fails, and reports which file

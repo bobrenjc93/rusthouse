@@ -2237,6 +2237,50 @@ fn terminal_csv_with_names_format_wires_get_and_post_with_escaped_and_empty_resu
 }
 
 #[test]
+fn terminal_csv_format_wires_get_and_post_with_typed_escaped_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE typed_csv (id Int64, score Float64, active Bool, label String); \
+             INSERT INTO typed_csv VALUES \
+                 (-7, 2.0, false, 'comma, \"quoted\"\nline'), \
+                 (0, -1.25, true, '');",
+        )
+        .unwrap();
+    let expected = concat!(
+        "-7,2.0,false,\"comma, \"\"quoted\"\"\nline\"\n",
+        "0,-1.25,true,\n",
+    );
+    let requests = [
+        request_for_target(
+            "/",
+            b"SELECT id, score, active, label FROM typed_csv ORDER BY id FORMAT CSV;",
+        ),
+        b"GET /?query=SELECT+id%2C+score%2C+active%2C+label+FROM+typed_csv+ORDER+BY+id+FoRmAt+CsV HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        b"POST /?query=SELECT+id%2C+score%2C+active%2C+label+FROM+typed_csv+ORDER+BY+id+format+csv%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    ];
+
+    for request in requests {
+        assert_response_with_content_type(
+            &exchange(&database, &request),
+            "HTTP/1.1 200 OK",
+            "text/csv; charset=utf-8",
+            expected.as_bytes(),
+        );
+    }
+
+    assert_response_with_content_type(
+        &exchange(
+            &database,
+            &request(b"SELECT id FROM typed_csv WHERE id = 99 FORMAT CSV;"),
+        ),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"",
+    );
+}
+
+#[test]
 fn terminal_json_format_wires_get_and_post_with_typed_and_empty_results() {
     let database = SharedDatabase::default();
     database
@@ -2412,6 +2456,51 @@ fn terminal_tab_separated_format_wires_get_and_post_with_typed_escaped_rows() {
 }
 
 #[test]
+fn terminal_tab_separated_with_names_wires_typed_escaped_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE named_tsv (id Int64, score Float64, active Bool, label String); \
+             INSERT INTO named_tsv VALUES \
+                 (-7, 2.0, false, 'slash\\tab\tcarriage\rline\napostrophe'' 雪'), \
+                 (0, -1.25, true, '');",
+        )
+        .unwrap();
+    let expected = concat!(
+        "id\tscore\tactive\tlabel\n",
+        "-7\t2.0\tfalse\tslash\\\\tab\\tcarriage\\rline\\napostrophe\\' 雪\n",
+        "0\t-1.25\ttrue\t\n",
+    );
+    let requests = [
+        request_for_target(
+            "/query",
+            b"SELECT id, score, active, label FROM named_tsv ORDER BY id FORMAT TabSeparatedWithNames;",
+        ),
+        b"GET /?query=SELECT+id%2C+score%2C+active%2C+label+FROM+named_tsv+ORDER+BY+id+FoRmAt+TaBsEpArAtEdWiThNaMeS HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        b"POST /?query=SELECT+id%2C+score%2C+active%2C+label+FROM+named_tsv+ORDER+BY+id+format+tabseparatedwithnames%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    ];
+
+    for request in requests {
+        assert_response_with_content_type(
+            &exchange(&database, &request),
+            "HTTP/1.1 200 OK",
+            "text/tab-separated-values; charset=utf-8",
+            expected.as_bytes(),
+        );
+    }
+
+    assert_response_with_content_type(
+        &exchange(
+            &database,
+            &request(b"SELECT id FROM named_tsv WHERE id = 99 FORMAT TabSeparatedWithNames;"),
+        ),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"id\n",
+    );
+}
+
+#[test]
 fn terminal_json_format_preserves_quote_and_comment_scanning() {
     let database = SharedDatabase::default();
 
@@ -2546,6 +2635,162 @@ fn terminal_tab_separated_format_rejects_selectors_after_authentication() {
         r#"{"error":"X-ClickHouse-Key authentication required"}"#,
     );
     assert_clickhouse_key_response_is_not_cacheable(&missing_key_response);
+}
+
+#[test]
+fn terminal_csv_and_named_tsv_preserve_quote_and_comment_scanning() {
+    let database = SharedDatabase::default();
+
+    for format in ["CSV", "TabSeparatedWithNames"] {
+        let quoted = format!("SELECT 'FORMAT {format}' AS value;");
+        assert_response(
+            &exchange(&database, &request(quoted.as_bytes())),
+            "HTTP/1.1 200 OK",
+            &format!(
+                r#"{{"columns":[{{"name":"value","type":"String"}}],"rows":[["FORMAT {format}"]]}}"#
+            ),
+        );
+
+        let commented = format!("SELECT 1 AS value; -- FORMAT {format}");
+        assert_response(
+            &exchange(&database, &request(commented.as_bytes())),
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[1]]}"#,
+        );
+
+        let escaped = format!("SELECT 'escaped ''FORMAT {format}''' AS value;");
+        assert_response(
+            &exchange(&database, &request(escaped.as_bytes())),
+            "HTTP/1.1 200 OK",
+            &format!(
+                r#"{{"columns":[{{"name":"value","type":"String"}}],"rows":[["escaped 'FORMAT {format}'"]]}}"#
+            ),
+        );
+    }
+}
+
+#[test]
+fn terminal_csv_and_named_tsv_formats_authenticate_and_reject_selector_conflicts() {
+    let database = SharedDatabase::default();
+
+    for (format, content_type, expected) in [
+        ("CSV", "text/csv; charset=utf-8", b"7\n".as_slice()),
+        (
+            "TabSeparatedWithNames",
+            "text/tab-separated-values; charset=utf-8",
+            b"value\n7\n".as_slice(),
+        ),
+    ] {
+        let sql = format!("SELECT 7 AS value FORMAT {format};");
+        let bearer = request_for_target_with_headers(
+            "/query",
+            sql.as_bytes(),
+            "Authorization: Bearer correct-token\r\n",
+        );
+        assert_response_with_content_type(
+            &authenticated_exchange(&database, "correct-token", &bearer),
+            "HTTP/1.1 200 OK",
+            content_type,
+            expected,
+        );
+
+        let key_request = format!(
+            "GET /?query=SELECT+7+AS+value+FORMAT+{format} HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n"
+        );
+        let key_response =
+            clickhouse_key_exchange(&database, "correct-key", key_request.as_bytes());
+        assert_response_with_content_type(&key_response, "HTTP/1.1 200 OK", content_type, expected);
+        assert_clickhouse_key_response_is_not_cacheable(&key_response);
+
+        let conflict_error = format!(
+            r#"{{"error":"FORMAT {format} clause cannot be combined with X-ClickHouse-Format header or default_format parameter"}}"#
+        );
+        let header_conflict = request_for_target_with_headers(
+            "/query",
+            sql.as_bytes(),
+            "X-ClickHouse-Format: JSONEachRow\r\n",
+        );
+        assert_response(
+            &exchange(&database, &header_conflict),
+            "HTTP/1.1 400 Bad Request",
+            &conflict_error,
+        );
+
+        let parameter_conflict = format!(
+            "GET /?query=SELECT+7+FORMAT+{format}&default_format={format} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, parameter_conflict.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            &conflict_error,
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", parameter_conflict.as_bytes()),
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"bearer authentication required"}"#,
+        );
+        let missing_key_response =
+            clickhouse_key_exchange(&database, "correct-key", parameter_conflict.as_bytes());
+        assert_response(
+            &missing_key_response,
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+        );
+        assert_clickhouse_key_response_is_not_cacheable(&missing_key_response);
+    }
+}
+
+#[test]
+fn terminal_csv_and_named_tsv_formats_remain_read_only_and_response_bounded() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+
+    for format in ["CSV", "TabSeparatedWithNames"] {
+        let multiple = format!("SELECT 1; SELECT 2 FORMAT {format};");
+        assert_response(
+            &exchange(&database, &request(multiple.as_bytes())),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"read-only query requires exactly one statement; found 2"}"#,
+        );
+
+        let insert = format!("INSERT INTO events VALUES (1) FORMAT {format};");
+        let authenticated_insert = request_for_target_with_headers(
+            "/query",
+            insert.as_bytes(),
+            "Authorization: Bearer correct-token\r\n",
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &authenticated_insert),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+        );
+
+        let oversized = format!("SELECT '{}' AS value FORMAT {format};", "x".repeat(1_000));
+        let limits = HttpQueryLimits {
+            max_response_bytes: 512,
+            ..HttpQueryLimits::default()
+        };
+        let mut response = Vec::new();
+        handle_http_query_with_limits(
+            &database,
+            Cursor::new(request(oversized.as_bytes())),
+            &mut response,
+            limits,
+        )
+        .unwrap();
+        assert!(response.len() <= limits.max_response_bytes);
+        assert_response(
+            &response,
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"error":"response exceeds configured byte limit"}"#,
+        );
+    }
+
+    assert_response(
+        &exchange(&database, &request(b"SELECT id FROM events;")),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
 }
 
 #[test]
