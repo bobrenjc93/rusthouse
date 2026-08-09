@@ -100,6 +100,17 @@ impl Catalog {
         Ok(())
     }
 
+    /// Registers a completely constructed table using case-insensitive name
+    /// resolution. An existing table is never replaced.
+    pub(crate) fn register_table(&mut self, table: Table) -> Result<()> {
+        let key = normalize(table.name());
+        if self.tables.contains_key(&key) {
+            return Err(Error::TableAlreadyExists(table.name().to_owned()));
+        }
+        self.tables.insert(key, table);
+        Ok(())
+    }
+
     /// Removes one table using the catalog's case-insensitive name resolution.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         if self.drop_table_if_exists(name) {

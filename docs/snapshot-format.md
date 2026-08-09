@@ -83,6 +83,13 @@ destination was already replaced. The matching bounded reopen operation is
 `restore_int64_table_payload_from_file` and requires no caller-supplied schema
 or row cap.
 
+The batch `Database::restore_int64_table_from_file` API registers one decoded
+self-describing payload under a caller-supplied table name. It currently
+accepts only a non-nullable column and validates the database's row, column, and
+cell limits before changing the catalog or metrics. The payload is strictly a
+single-table format: it contains one column and no database name, batch table
+name, additional tables, or catalog metadata.
+
 `save_int64_table_to_file` is the Unix-only composed table save operation. It
 first encodes an existing `Int64Table` through `NullableI64PayloadCodec`, then
 passes the complete payload to `SnapshotCodec::replace_file`. Its typed error

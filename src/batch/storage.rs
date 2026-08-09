@@ -342,6 +342,29 @@ impl Table {
         })
     }
 
+    /// Builds one fully validated, non-nullable `Int64` table without
+    /// materializing a temporary vector for every row.
+    pub(crate) fn with_int64_values(
+        name: String,
+        column_name: String,
+        values: Vec<i64>,
+        limits: TableLimits,
+    ) -> Result<Self> {
+        let mut table = Self::with_limits(
+            name,
+            vec![ColumnDef {
+                name: column_name,
+                data_type: DataType::Int64,
+            }],
+            limits,
+        )?;
+        table.validate_row_capacity(values.len())?;
+        table.row_count = values.len();
+        table.retained_value_bytes = (values.len() as u128).saturating_mul(8);
+        table.columns = vec![Column::Int64(values)];
+        Ok(table)
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name

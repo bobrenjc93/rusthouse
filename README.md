@@ -1208,6 +1208,14 @@ self-describing save helper is the metadata-preserving counterpart and reopens
 with `restore_int64_table_payload_from_file`. The codec also composes directly
 with the envelope's lower-level `encode`, `create_new_file`, and Unix
 `replace_file` APIs.
+`Database::restore_int64_table_from_file` connects that bounded,
+self-describing reopen path to the typed batch SQL database. The caller chooses
+the batch table name; the snapshot supplies its `Int64` column name, persisted
+row cap, and rows. The API accepts only a non-nullable column, enforces the
+database's configured `TableLimits`, preserves the persisted row cap, and
+registers the table plus its cached metrics only after all decoding and storage
+validation succeeds. Duplicate names resolve case-insensitively just like SQL
+table names and leave the existing catalog unchanged.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary
