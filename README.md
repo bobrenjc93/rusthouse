@@ -255,6 +255,17 @@ ordering, limits, and trailing clauses are deliberately unsupported. This is a
 bounded metadata query rather than a general virtual-table engine: it uses the
 normal read-only `Database` and `SharedDatabase` paths and the usual query row,
 value, byte, retained-result, CLI, and HTTP formatting limits.
+The exact case-insensitive query
+`SELECT database, table, name, type, position FROM system.columns` exposes every
+catalog column as five typed columns. Tables use deterministic case-insensitive
+name order, columns retain schema order, and each row contains `default`, the
+stored table and column display names, the canonical type spelling, and a
+checked one-based `Int64` position. An empty catalog returns the five-column
+schema with no rows; create, add, rename, drop, and table rename/drop changes
+are visible on the next query. Other shapes and trailing clauses are rejected.
+The complete row, value, byte, and retained-result bounds are preflighted before
+result storage is allocated, and the query is available through the normal
+`Database`, `SharedDatabase`, CLI, and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
 bounded `String`, preserving the stored table and column display names and
 schema order while normalizing type spellings.
@@ -586,7 +597,8 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes plus the exact `system.tables` metadata query),
+and `currentDatabase()` probes plus the exact `system.tables` and
+`system.columns` metadata queries),
 `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,

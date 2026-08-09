@@ -167,6 +167,8 @@ pub enum Statement {
     CurrentDatabaseSelect(CurrentDatabaseSelect),
     /// Exact bounded metadata query for the current in-memory catalog.
     SystemTables,
+    /// Exact bounded column metadata query for the current in-memory catalog.
+    SystemColumns,
     Select(Select),
     /// A deliberately narrow, two-table Cartesian product.
     CrossJoin(CrossJoin),
@@ -927,6 +929,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_statement(&mut self) -> Result<Statement> {
+        if self.at_system_columns_select_start() {
+            return self.parse_system_columns_select();
+        }
         if self.at_system_tables_select_start() {
             return self.parse_system_tables_select();
         }
@@ -999,6 +1004,64 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Statement::SystemTables)
+    }
+
+    fn parse_system_columns_select(&mut self) -> Result<Statement> {
+        const SHAPE: &str = "system.columns metadata supports exactly SELECT database, table, name, type, position FROM system.columns with no trailing clauses";
+
+        for (index, column) in ["DATABASE", "TABLE", "NAME", "TYPE", "POSITION"]
+            .into_iter()
+            .enumerate()
+        {
+            self.reserve_ast_list_item()?;
+            self.expect_keyword(column)?;
+            if index != 4 {
+                self.expect(&TokenKind::Comma, "',' between system.columns columns")?;
+            }
+        }
+        self.expect_keyword("FROM")?;
+        self.expect_keyword("SYSTEM")?;
+        self.expect(&TokenKind::Dot, "'.' in system.columns")?;
+        self.expect_keyword("COLUMNS")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::SystemColumns)
+    }
+
+    fn at_system_columns_select_start(&self) -> bool {
+        fn is_keyword(token: &Token, expected: &str) -> bool {
+            matches!(&token.kind, TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+        }
+
+        fn next_is_keyword(lexer: &mut Lexer<'_>, expected: &str) -> bool {
+            lexer
+                .next_token()
+                .is_ok_and(|token| is_keyword(&token, expected))
+        }
+
+        fn next_is_token(lexer: &mut Lexer<'_>, expected: TokenKind) -> bool {
+            lexer.next_token().is_ok_and(|token| token.kind == expected)
+        }
+
+        if !is_keyword(&self.current, "DATABASE") {
+            return false;
+        }
+
+        let mut lexer = self.lexer;
+        next_is_token(&mut lexer, TokenKind::Comma)
+            && next_is_keyword(&mut lexer, "TABLE")
+            && next_is_token(&mut lexer, TokenKind::Comma)
+            && next_is_keyword(&mut lexer, "NAME")
+            && next_is_token(&mut lexer, TokenKind::Comma)
+            && next_is_keyword(&mut lexer, "TYPE")
+            && next_is_token(&mut lexer, TokenKind::Comma)
+            && next_is_keyword(&mut lexer, "POSITION")
+            && next_is_keyword(&mut lexer, "FROM")
+            && next_is_keyword(&mut lexer, "SYSTEM")
+            && next_is_token(&mut lexer, TokenKind::Dot)
+            && next_is_keyword(&mut lexer, "COLUMNS")
     }
 
     fn at_system_tables_select_start(&self) -> bool {
