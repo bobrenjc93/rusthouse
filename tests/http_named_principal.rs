@@ -7,12 +7,13 @@ use rusthouse::batch::csv::CsvIngestLimits;
 use rusthouse::batch::engine::Database;
 use rusthouse::batch::tsv::TsvIngestLimits;
 use rusthouse::{
-    HttpQueryError, HttpQueryLimits, SharedDatabase,
-    handle_http_query_read_only_with_clickhouse_key,
+    ClickHousePrincipal, ClickHousePrincipalRole, HttpQueryError, HttpQueryLimits,
+    MAX_HTTP_NAMED_PRINCIPALS, SharedDatabase, handle_http_query_read_only_with_clickhouse_key,
     handle_http_query_read_only_with_clickhouse_principal,
     handle_http_query_read_only_with_clickhouse_principal_and_limits,
     handle_http_query_with_clickhouse_principal,
     handle_http_query_with_clickhouse_principal_and_limits,
+    handle_http_query_with_clickhouse_principal_set,
 };
 
 const USER: &str = "reporting";
@@ -486,6 +487,180 @@ fn named_principal_configuration_is_validated_before_input() {
         );
         assert_private(&response);
     }
+}
+
+#[test]
+fn principal_set_reader_rejects_writes_while_writer_ingests() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let principals = [
+        ClickHousePrincipal::new("reader", "reader-key", ClickHousePrincipalRole::ReadOnly),
+        ClickHousePrincipal::new("writer", "writer-key", ClickHousePrincipalRole::ReadWrite),
+    ];
+
+    let (reader_request, reader_body_offset) = request(
+        "/insert/events",
+        b"id\n1\n",
+        "X-ClickHouse-User: reader\r\nX-ClickHouse-Key: reader-key\r\n",
+    );
+    let mut reader_input = Cursor::new(reader_request);
+    let mut reader_response = Vec::new();
+    handle_http_query_with_clickhouse_principal_set(
+        &database,
+        &principals,
+        &mut reader_input,
+        &mut reader_response,
+    )
+    .unwrap();
+    assert_eq!(reader_input.position(), reader_body_offset);
+    assert_status(&reader_response, "HTTP/1.1 404 Not Found");
+    assert_private(&reader_response);
+
+    let (writer_request, _) = request(
+        "/insert/events",
+        b"id\n2\n",
+        "X-ClickHouse-User: writer\r\nX-ClickHouse-Key: writer-key\r\n",
+    );
+    let mut writer_response = Vec::new();
+    handle_http_query_with_clickhouse_principal_set(
+        &database,
+        &principals,
+        Cursor::new(writer_request),
+        &mut writer_response,
+    )
+    .unwrap();
+    assert_status(&writer_response, "HTTP/1.1 200 OK");
+    assert_eq!(body(&writer_response), b"");
+    assert_private(&writer_response);
+
+    let mut query_response = Vec::new();
+    handle_http_query_with_clickhouse_principal_set(
+        &database,
+        &principals,
+        Cursor::new(
+            b"GET /?query=SELECT+id+FROM+events%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-User: reader\r\nX-ClickHouse-Key: reader-key\r\n\r\n",
+        ),
+        &mut query_response,
+    )
+    .unwrap();
+    assert_status(&query_response, "HTTP/1.1 200 OK");
+    assert_eq!(
+        body(&query_response),
+        br#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[2]]}"#
+    );
+}
+
+#[test]
+fn principal_set_credential_failures_are_indistinguishable() {
+    let database = SharedDatabase::default();
+    let principals = [
+        ClickHousePrincipal::new("reader", "reader-key", ClickHousePrincipalRole::ReadOnly),
+        ClickHousePrincipal::new("writer", "writer-key", ClickHousePrincipalRole::ReadWrite),
+    ];
+    let rejected_headers = [
+        "",
+        "X-ClickHouse-User: reader\r\n",
+        "X-ClickHouse-Key: reader-key\r\n",
+        "X-ClickHouse-User: reader\r\nX-ClickHouse-Key: writer-key\r\n",
+        "X-ClickHouse-User: unknown\r\nX-ClickHouse-Key: unknown\r\n",
+        "X-ClickHouse-User: reader\r\nx-clickhouse-user: reader\r\nX-ClickHouse-Key: reader-key\r\n",
+        "X-ClickHouse-User: reader\r\nX-ClickHouse-Key: reader-key\r\nx-clickhouse-key: reader-key\r\n",
+    ];
+    let mut expected_response = None;
+
+    for headers in rejected_headers {
+        let (request, body_offset) = request("/insert/events", b"id\n9\n", headers);
+        let mut input = Cursor::new(request);
+        let mut response = Vec::new();
+        handle_http_query_with_clickhouse_principal_set(
+            &database,
+            &principals,
+            &mut input,
+            &mut response,
+        )
+        .unwrap();
+
+        assert_eq!(input.position(), body_offset);
+        assert_status(&response, "HTTP/1.1 401 Unauthorized");
+        assert_eq!(
+            body(&response),
+            br#"{"error":"X-ClickHouse-User and X-ClickHouse-Key authentication required"}"#
+        );
+        assert_private(&response);
+        if let Some(expected) = &expected_response {
+            assert_eq!(&response, expected);
+        } else {
+            expected_response = Some(response);
+        }
+    }
+}
+
+#[test]
+fn principal_set_rejects_duplicate_configuration_before_input() {
+    let database = SharedDatabase::default();
+    let principals = [
+        ClickHousePrincipal::new("same", "key", ClickHousePrincipalRole::ReadOnly),
+        ClickHousePrincipal::new("same", "key", ClickHousePrincipalRole::ReadWrite),
+    ];
+    let mut response = Vec::new();
+
+    handle_http_query_with_clickhouse_principal_set(
+        &database,
+        &principals,
+        FailingReader,
+        &mut response,
+    )
+    .unwrap();
+
+    assert_status(&response, "HTTP/1.1 500 Internal Server Error");
+    assert_eq!(
+        body(&response),
+        br#"{"error":"configured ClickHouse principal set contains a duplicate user/key pair"}"#
+    );
+    assert_private(&response);
+}
+
+#[test]
+fn principal_set_enforces_its_count_limit_before_input() {
+    let database = SharedDatabase::default();
+    let users = (0..=MAX_HTTP_NAMED_PRINCIPALS)
+        .map(|index| format!("user-{index}"))
+        .collect::<Vec<_>>();
+    let keys = (0..=MAX_HTTP_NAMED_PRINCIPALS)
+        .map(|index| format!("key-{index}"))
+        .collect::<Vec<_>>();
+    let principals = users
+        .iter()
+        .zip(&keys)
+        .map(|(user, key)| ClickHousePrincipal::new(user, key, ClickHousePrincipalRole::ReadOnly))
+        .collect::<Vec<_>>();
+
+    let mut at_limit_response = Vec::new();
+    handle_http_query_with_clickhouse_principal_set(
+        &database,
+        &principals[..MAX_HTTP_NAMED_PRINCIPALS],
+        Cursor::new(
+            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-User: user-0\r\nX-ClickHouse-Key: key-0\r\n\r\n",
+        ),
+        &mut at_limit_response,
+    )
+    .unwrap();
+    assert_status(&at_limit_response, "HTTP/1.1 200 OK");
+
+    let mut over_limit_response = Vec::new();
+    handle_http_query_with_clickhouse_principal_set(
+        &database,
+        &principals,
+        FailingReader,
+        &mut over_limit_response,
+    )
+    .unwrap();
+    assert_status(&over_limit_response, "HTTP/1.1 500 Internal Server Error");
+    assert_eq!(
+        body(&over_limit_response),
+        br#"{"error":"configured ClickHouse principal set exceeds the principal limit"}"#
+    );
+    assert_private(&over_limit_response);
 }
 
 #[test]

@@ -1123,9 +1123,21 @@ the same `401 Unauthorized` response before a body is read or the database is
 accessed. Successful requests remain read-only: explicit insertion targets are
 rejected before their bodies are read, and INSERT statements on query routes
 are rejected by read-only statement validation. All responses include
-`Cache-Control: private, no-store`. Neither named-principal boundary adds roles,
-grants, or credential storage. The existing bearer, key-only, and named
-read-only APIs retain their documented behavior.
+`Cache-Control: private, no-store`.
+
+For a small role-bearing identity set,
+`handle_http_query_with_clickhouse_principal_set` accepts from one through 64
+borrowed `ClickHousePrincipal` configurations. Each exact, case-sensitive
+user/key pair has either `ClickHousePrincipalRole::ReadOnly` or
+`ClickHousePrincipalRole::ReadWrite`; duplicate pairs, invalid values, empty
+sets, and oversized sets are rejected before request input is read. Every
+authentication attempt compares both supplied values against every configured
+pair without stopping on a match. One exact match enters the same read-only or
+read-write boundary used by the single-principal handlers, while all missing,
+duplicate, partial, and unknown credentials produce the same bounded `401`
+response. The handler uses the default HTTP, CSV, TSV, and response bounds and
+does not retain credentials. The existing bearer, key-only, and
+single-principal APIs retain their documented behavior.
 
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before
@@ -1314,6 +1326,14 @@ database's configured `TableLimits`, preserves the persisted row cap, and
 registers the table plus its cached metrics only after all decoding and storage
 validation succeeds. Duplicate names resolve case-insensitively just like SQL
 table names and leave the existing catalog unchanged.
+`Database::replace_int64_table_from_file` applies the same bounded decoding and
+table validation to one existing caller-named table. Lookup is
+case-insensitive, but the catalog's stored table-name spelling is preserved;
+the snapshot replaces the column schema, rows, and persisted row cap. A missing
+target is rejected before file access, and corruption, nullability, invalid
+column identifiers, or configured table-limit failures leave the old table and
+cached metrics unchanged. Success performs one catalog swap and adjusts the
+cached column, row, and retained-value-byte totals to the replacement exactly.
 `Database::restore_int64_tables_from_files` restores a caller-bounded slice of
 `DatabaseSnapshotRestoreEntry` values as one atomic catalog change. The
 inclusive entry-count limit and the complete case-insensitive destination-name
