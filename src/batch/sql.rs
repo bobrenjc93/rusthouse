@@ -21,7 +21,8 @@ pub const DEFAULT_MAX_AST_LIST_ITEMS: usize = 100_000;
 /// Canonical names of every function executable by the batch SQL engine.
 ///
 /// Names are ordered by their ASCII case-insensitive spelling. This is the
-/// deterministic inventory returned by `SHOW FUNCTIONS`.
+/// deterministic inventory returned by both `SHOW FUNCTIONS` and
+/// `SELECT name FROM system.functions`.
 pub const SUPPORTED_FUNCTION_NAMES: &[&str] = &[
     "ABS",
     "AVG",
@@ -173,6 +174,8 @@ pub enum Statement {
     SystemMetrics,
     /// Exact settings inventory query mirroring `SHOW SETTINGS`.
     SystemSettings,
+    /// Exact function inventory query mirroring `SHOW FUNCTIONS`.
+    SystemFunctions,
     Select(Select),
     /// A deliberately narrow, two-table Cartesian product.
     CrossJoin(CrossJoin),
@@ -933,6 +936,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_statement(&mut self) -> Result<Statement> {
+        if self.at_system_functions_select_start() {
+            return self.parse_system_functions_select();
+        }
         if self.at_system_settings_select_start() {
             return self.parse_system_settings_select();
         }
@@ -1080,6 +1086,48 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Statement::SystemSettings)
+    }
+
+    fn parse_system_functions_select(&mut self) -> Result<Statement> {
+        const SHAPE: &str = "system.functions supports exactly SELECT name FROM system.functions with no trailing clauses";
+
+        self.reserve_ast_list_item()?;
+        self.expect_keyword("NAME")?;
+        self.expect_keyword("FROM")?;
+        self.expect_keyword("SYSTEM")?;
+        self.expect(&TokenKind::Dot, "'.' in system.functions")?;
+        self.expect_keyword("FUNCTIONS")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::SystemFunctions)
+    }
+
+    fn at_system_functions_select_start(&self) -> bool {
+        fn is_keyword(token: &Token, expected: &str) -> bool {
+            matches!(&token.kind, TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+        }
+
+        fn next_is_keyword(lexer: &mut Lexer<'_>, expected: &str) -> bool {
+            lexer
+                .next_token()
+                .is_ok_and(|token| is_keyword(&token, expected))
+        }
+
+        fn next_is_token(lexer: &mut Lexer<'_>, expected: TokenKind) -> bool {
+            lexer.next_token().is_ok_and(|token| token.kind == expected)
+        }
+
+        if !is_keyword(&self.current, "NAME") {
+            return false;
+        }
+
+        let mut lexer = self.lexer;
+        next_is_keyword(&mut lexer, "FROM")
+            && next_is_keyword(&mut lexer, "SYSTEM")
+            && next_is_token(&mut lexer, TokenKind::Dot)
+            && next_is_keyword(&mut lexer, "FUNCTIONS")
     }
 
     fn at_system_settings_select_start(&self) -> bool {
