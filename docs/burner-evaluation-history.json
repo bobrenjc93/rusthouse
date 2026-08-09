@@ -2241,6 +2241,22 @@
         "eval_c88a7f3d": 80,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:687",
+      "recordedAt": "2026-08-09T12:02:57.973Z",
+      "label": "PR #687",
+      "kind": "composite",
+      "prNumber": 687,
+      "title": "YOLO generation 102: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 80,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
