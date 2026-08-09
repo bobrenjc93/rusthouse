@@ -172,6 +172,15 @@ the envelope and RLE codecs. The existing `restore_int64_table_from_file`
 helper is not format-detecting and continues to expect
 `NullableI64PayloadCodec` bytes.
 
+`Database::restore_int64_table_rle_from_file` registers one such restored table
+under a caller-supplied batch table name. It rejects a case-insensitive catalog
+duplicate before opening the file, then stages the bounded RLE restore and all
+batch schema and `TableLimits` validation before updating the catalog and
+cached metrics. The format remains row-only: the file does not store or
+authenticate the caller's column name, nullability, row cap, destination table
+name, or any other catalog metadata. Batch storage therefore requires callers
+to provide a non-nullable one-column `Int64` schema and an appropriate row cap.
+
 ## Nullable Int64 row payload
 
 `NullableI64PayloadCodec` defines a deterministic payload for one nullable
@@ -340,6 +349,12 @@ validates the exact envelope and complete RLE run stream before atomically
 appending all decoded rows to a new table. Open, read, oversized-file,
 envelope, RLE-payload, schema-nullability, and table-capacity failures remain
 typed; no error returns a partially populated table.
+
+The `Database` method of the same name adds a caller-named batch catalog
+registration around this exact decoder. It preserves catalog contents and
+cached metrics on typed file corruption, nullability, caller row-cap, or
+configured table-limit failures; success registers only the fully validated
+table.
 
 `Catalog::restore_int64_table_from_file` applies the catalog's per-table row
 cap and registers the restored table under a caller-supplied exact name only
