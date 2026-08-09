@@ -4108,6 +4108,15 @@ fn execute_grouped<'a>(
                 ..
             }]
         );
+    let sole_global_avg_int = group_columns.is_empty()
+        && matches!(
+            aggregate_specs,
+            [AggregateSpec {
+                function: AggregateFunction::Avg,
+                input_type: Some(DataType::Int64),
+                ..
+            }]
+        );
     let sole_global_min_int = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -4136,8 +4145,8 @@ fn execute_grouped<'a>(
                     spec,
                     parallelism,
                 )?);
-            } else if sole_global_sum_int {
-                states[0] = sum_global_int64(table, matching_rows, spec, parallelism)?;
+            } else if sole_global_sum_int || sole_global_avg_int {
+                states[0] = sum_or_avg_global_int64(table, matching_rows, spec, parallelism)?;
             } else if sole_global_min_int {
                 states[0] = min_global_int64(table, matching_rows, spec, parallelism);
             } else if sole_global_max_int {
@@ -4182,6 +4191,7 @@ fn execute_grouped<'a>(
             if group_columns.is_empty()
                 && (spec.function == AggregateFunction::CountIf
                     || sole_global_sum_int
+                    || sole_global_avg_int
                     || sole_global_min_int
                     || sole_global_max_int)
             {
@@ -4322,47 +4332,68 @@ struct SumIntPartial {
     count: u64,
 }
 
-fn sum_global_int64(
+fn sum_or_avg_global_int64(
     table: &Table,
     matching_rows: &[usize],
     spec: &AggregateSpec,
     parallelism: GlobalAggregateParallelism,
 ) -> Result<AggregateState> {
-    debug_assert_eq!(spec.function, AggregateFunction::Sum);
+    debug_assert!(matches!(
+        spec.function,
+        AggregateFunction::Sum | AggregateFunction::Avg
+    ));
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
-    let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")] else {
-        unreachable!("SUM input type is resolved")
+    let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM or AVG argument")]
+    else {
+        unreachable!("SUM or AVG input type is resolved")
     };
     let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return sum_int64_chunk(values, matching_rows).map(SumIntPartial::into_state);
+        return sum_int64_chunk(values, matching_rows, spec.function)
+            .map(|partial| partial.into_state(spec.function));
     };
 
     // As with countIf, every lane receives a deterministic contiguous slice
     // of the filtered row indices. Partials are reduced in that same order.
-    // A worker failure discards all partials and repeats the complete sum on
-    // the query thread after releasing its process-wide admission.
-    let parallel_result = try_parallel_sum_int64(values, matching_rows, admission.helper_threads());
+    // A worker failure discards all partials and repeats the complete SUM or
+    // AVG sum/count computation on the query thread after releasing its
+    // process-wide admission.
+    let parallel_result = try_parallel_sum_int64(
+        values,
+        matching_rows,
+        admission.helper_threads(),
+        spec.function,
+    );
     drop(admission);
     parallel_result
-        .unwrap_or_else(|| sum_int64_chunk(values, matching_rows))
-        .map(SumIntPartial::into_state)
+        .unwrap_or_else(|| sum_int64_chunk(values, matching_rows, spec.function))
+        .map(|partial| partial.into_state(spec.function))
 }
 
 fn try_parallel_sum_int64(
     values: &[i64],
     matching_rows: &[usize],
     helper_threads: usize,
+    function: AggregateFunction,
 ) -> Option<Result<SumIntPartial>> {
     debug_assert!(helper_threads > 0);
+    debug_assert!(matches!(
+        function,
+        AggregateFunction::Sum | AggregateFunction::Avg
+    ));
     let worker_count = helper_threads.saturating_add(1);
+    let thread_label = match function {
+        AggregateFunction::Sum => "sum",
+        AggregateFunction::Avg => "avg",
+        _ => unreachable!("only SUM and AVG share Int64 sum/count workers"),
+    };
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(helper_threads);
         let mut worker_failed = false;
         for chunk_index in 1..worker_count {
             let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
             let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-sum-int64-{chunk_index}"))
-                .spawn_scoped(scope, move || sum_int64_chunk(values, rows));
+                .name(format!("rusthouse-{thread_label}-int64-{chunk_index}"))
+                .spawn_scoped(scope, move || sum_int64_chunk(values, rows, function));
             match spawn {
                 Ok(handle) => handles.push(handle),
                 Err(_) => {
@@ -4376,6 +4407,7 @@ fn try_parallel_sum_int64(
         partial_results.push(sum_int64_chunk(
             values,
             parallel_aggregate_partition(matching_rows, worker_count, 0),
+            function,
         ));
         for handle in handles {
             match handle.join() {
@@ -4391,12 +4423,16 @@ fn try_parallel_sum_int64(
             partial_results
                 .into_iter()
                 .collect::<Result<Vec<_>>>()
-                .and_then(reduce_sum_int64_partials),
+                .and_then(|partials| reduce_sum_int64_partials(partials, function)),
         )
     })
 }
 
-fn sum_int64_chunk(values: &[i64], matching_rows: &[usize]) -> Result<SumIntPartial> {
+fn sum_int64_chunk(
+    values: &[i64],
+    matching_rows: &[usize],
+    function: AggregateFunction,
+) -> Result<SumIntPartial> {
     matching_rows
         .iter()
         .try_fold(SumIntPartial::default(), |partial, row| {
@@ -4404,37 +4440,62 @@ fn sum_int64_chunk(values: &[i64], matching_rows: &[usize]) -> Result<SumIntPart
                 sum: partial
                     .sum
                     .checked_add(i128::from(values[*row]))
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?,
-                count: partial
-                    .count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?,
+                    .ok_or_else(|| {
+                        Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
+                    })?,
+                count: partial.count.checked_add(1).ok_or_else(|| {
+                    Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
+                })?,
             })
         })
 }
 
-fn reduce_sum_int64_partials(partials: Vec<SumIntPartial>) -> Result<SumIntPartial> {
+fn reduce_sum_int64_partials(
+    partials: Vec<SumIntPartial>,
+    function: AggregateFunction,
+) -> Result<SumIntPartial> {
     partials
         .into_iter()
         .try_fold(SumIntPartial::default(), |total, partial| {
             Ok(SumIntPartial {
-                sum: total
-                    .sum
-                    .checked_add(partial.sum)
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?,
-                count: total
-                    .count
-                    .checked_add(partial.count)
-                    .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?,
+                sum: total.sum.checked_add(partial.sum).ok_or_else(|| {
+                    Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
+                })?,
+                count: total.count.checked_add(partial.count).ok_or_else(|| {
+                    Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
+                })?,
             })
         })
 }
 
+fn int64_sum_overflow_context(function: AggregateFunction) -> &'static str {
+    match function {
+        AggregateFunction::Sum => "SUM(Int64) exact sum",
+        AggregateFunction::Avg => "AVG(Int64) sum",
+        _ => unreachable!("only SUM and AVG share Int64 sum/count partials"),
+    }
+}
+
+fn int64_count_overflow_context(function: AggregateFunction) -> &'static str {
+    match function {
+        AggregateFunction::Sum => "SUM count",
+        AggregateFunction::Avg => "AVG count",
+        _ => unreachable!("only SUM and AVG share Int64 sum/count partials"),
+    }
+}
+
 impl SumIntPartial {
-    fn into_state(self) -> AggregateState {
-        AggregateState::SumInt {
-            sum: self.sum,
-            count: self.count,
+    fn into_state(self, function: AggregateFunction) -> AggregateState {
+        match function {
+            AggregateFunction::Sum => AggregateState::SumInt {
+                sum: self.sum,
+                count: self.count,
+            },
+            AggregateFunction::Avg => AggregateState::AvgInt {
+                sum: self.sum,
+                count: self.count,
+            },
+            _ => unreachable!("only SUM and AVG share Int64 sum/count partials"),
         }
     }
 }
@@ -6279,6 +6340,32 @@ mod tests {
         database
     }
 
+    fn avg_int64_database(row_count: usize, row_values: impl Fn(usize) -> (i64, bool)) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE empty_avg_values (value Int64); \
+                 CREATE TABLE values_to_avg (id Int64, value Int64, included Bool);",
+            )
+            .expect("AVG(Int64) differential setup");
+        if row_count > 0 {
+            for first_id in (1..=row_count).step_by(50_000) {
+                let last_id = first_id.saturating_add(49_999).min(row_count);
+                let rows = (first_id..=last_id)
+                    .map(|id| {
+                        let (value, included) = row_values(id);
+                        format!("({id}, {value}, {included})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                database
+                    .execute(&format!("INSERT INTO values_to_avg VALUES {rows}"))
+                    .expect("AVG(Int64) differential rows");
+            }
+        }
+        database
+    }
+
     fn min_int64_database(row_count: usize, row_values: impl Fn(usize) -> (i64, bool)) -> Database {
         let mut database = Database::new();
         database
@@ -6623,6 +6710,123 @@ mod tests {
     }
 
     #[test]
+    fn global_avg_int64_forced_workers_match_empty_null_having_and_pagination() {
+        let mut database = avg_int64_database(0, |_| unreachable!("empty input"));
+        let first_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT AVG(value) AS mean FROM empty_avg_values \
+             HAVING mean IS NULL ORDER BY mean LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(first_page.rows, [vec![Value::Null(DataType::Float64)]]);
+
+        let second_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT AVG(value) AS mean FROM empty_avg_values \
+             HAVING mean IS NULL ORDER BY mean LIMIT 1 OFFSET 1",
+        );
+        assert!(second_page.rows.is_empty());
+    }
+
+    #[test]
+    fn global_avg_int64_forced_workers_match_filtered_extrema_and_having() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
+        let mut database = avg_int64_database(row_count, |id| match id {
+            1 => (i64::MIN, true),
+            2 => (i64::MAX, false),
+            id if id == row_count - 1 => (i64::MIN, false),
+            id if id == row_count => (i64::MAX, true),
+            _ => (0, true),
+        });
+        let matched_rows = row_count - 2;
+        let expected = -1.0 / matched_rows as f64;
+        let result = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT AVG(value) AS mean FROM values_to_avg WHERE included = true \
+             HAVING mean < 0 ORDER BY mean DESC LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(result.rows, [vec![Value::Float64(expected)]]);
+    }
+
+    #[test]
+    fn global_avg_int64_parallel_boundary_uses_shared_budget_with_sequential_fallback() {
+        static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::new(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = avg_int64_database(row_count, |_| (7, true));
+        for matched_rows in [
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD,
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1,
+        ] {
+            let result = assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!("SELECT AVG(value) FROM values_to_avg WHERE id <= {matched_rows}"),
+            );
+            assert_eq!(result.rows, [vec![Value::Float64(7.0)]]);
+        }
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::Budgeted(&UNAVAILABLE_BUDGET);
+        assert_eq!(
+            query(&mut database, "SELECT AVG(value) FROM values_to_avg").rows,
+            [vec![Value::Float64(7.0)]],
+            "an unavailable helper budget falls back to the query thread"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::Budgeted(&OBSERVED_BUDGET);
+        assert_eq!(
+            query(&mut database, "SELECT AVG(value) FROM values_to_avg").rows,
+            [vec![Value::Float64(7.0)]]
+        );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "sole AVG(Int64) uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT AVG(value), COUNT(*) FROM values_to_avg"
+            )
+            .rows,
+            [vec![
+                Value::Float64(7.0),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "AVG(Int64) in a multi-aggregate projection stays sequential"
+        );
+
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT included, AVG(value) FROM values_to_avg GROUP BY included"
+            )
+            .rows,
+            [vec![Value::Bool(true), Value::Float64(7.0)]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "grouped AVG(Int64) stays sequential"
+        );
+    }
+
+    #[test]
     fn global_min_int64_forced_workers_match_empty_null_having_and_pagination() {
         let mut database = min_int64_database(0, |_| unreachable!("empty input"));
         let first_page = assert_global_aggregate_worker_differential(
@@ -6945,14 +7149,43 @@ mod tests {
             Err(Error::NumericOverflow("countIf".to_owned()))
         );
         assert_eq!(
-            reduce_sum_int64_partials(vec![
-                SumIntPartial {
-                    sum: i128::MAX,
-                    count: 1,
-                },
-                SumIntPartial { sum: 1, count: 1 },
-            ]),
+            reduce_sum_int64_partials(
+                vec![
+                    SumIntPartial {
+                        sum: i128::MAX,
+                        count: 1,
+                    },
+                    SumIntPartial { sum: 1, count: 1 },
+                ],
+                AggregateFunction::Sum,
+            ),
             Err(Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))
+        );
+        assert_eq!(
+            reduce_sum_int64_partials(
+                vec![
+                    SumIntPartial {
+                        sum: i128::MAX,
+                        count: 1,
+                    },
+                    SumIntPartial { sum: 1, count: 1 },
+                ],
+                AggregateFunction::Avg,
+            ),
+            Err(Error::NumericOverflow("AVG(Int64) sum".to_owned()))
+        );
+        assert_eq!(
+            reduce_sum_int64_partials(
+                vec![
+                    SumIntPartial {
+                        sum: 0,
+                        count: u64::MAX,
+                    },
+                    SumIntPartial { sum: 0, count: 1 },
+                ],
+                AggregateFunction::Avg,
+            ),
+            Err(Error::NumericOverflow("AVG count".to_owned()))
         );
         assert_eq!(reduce_min_int64_partials(None, None), None);
         assert_eq!(reduce_min_int64_partials(Some(4), None), Some(4));
