@@ -11,6 +11,8 @@ pub mod storage;
 pub mod tsv;
 pub mod value;
 
+#[cfg(unix)]
+pub use engine::DatabaseSnapshotSaveError;
 pub use engine::{Database, DatabaseSnapshotRestoreError};
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 pub use shared_database::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
