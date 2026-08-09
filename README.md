@@ -250,6 +250,13 @@ named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
 `UPPER`, and `version`. Arguments and trailing clauses are rejected. The result
 uses the normal query row, value, byte, retained-result, and formatted-output
 limits.
+The exact case-insensitive query `SELECT name FROM system.functions` returns
+the identical typed rows in the same deterministic order as `SHOW FUNCTIONS`.
+Other projections, aliases, functions, predicates, ordering, limits, and
+trailing clauses are deliberately unsupported. The query uses the normal
+bounded `SELECT` result construction and is available through `Database`,
+`SharedDatabase`, the CLI, and authenticated or unauthenticated read-only HTTP
+handlers in every supported output format.
 The case-insensitive forms `SHOW TABLES`, `SHOW TABLES FROM default`, and
 `SHOW TABLES IN default` return the catalog's display names in deterministic,
 case-insensitive order as one `String` column. RustHouse has no other logical
@@ -624,7 +631,7 @@ poisoning is reported separately.
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
 and `currentDatabase()` probes plus the exact `system.tables`, `system.columns`,
-`system.metrics`, and `system.settings` metadata queries),
+`system.metrics`, `system.settings`, and `system.functions` metadata queries),
 `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,

@@ -1139,6 +1139,7 @@ impl Database {
             | Statement::SystemColumns
             | Statement::SystemMetrics
             | Statement::SystemSettings
+            | Statement::SystemFunctions
             | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
@@ -1174,6 +1175,7 @@ impl Database {
             Statement::SystemColumns => self.execute_system_columns(query_result_limits),
             Statement::SystemMetrics => self.execute_system_metrics(query_result_limits),
             Statement::SystemSettings => self.execute_system_settings(query_result_limits),
+            Statement::SystemFunctions => self.execute_system_functions(query_result_limits),
             Statement::Select(select) => self.execute_select(select, query_result_limits),
             Statement::CrossJoin(cross_join) => {
                 self.execute_cross_join(cross_join, query_result_limits)
@@ -1602,6 +1604,21 @@ impl Database {
         &self,
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
+        self.execute_functions(query_result_limits, SHOW_FUNCTIONS_RESULT_RESOURCES)
+    }
+
+    fn execute_system_functions(
+        &self,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        self.execute_functions(query_result_limits, SELECT_RESULT_RESOURCES)
+    }
+
+    fn execute_functions(
+        &self,
+        query_result_limits: QueryResultLimits,
+        result_resources: QueryResultResources,
+    ) -> Result<QueryResult> {
         const RESULT_COLUMN_NAME: &str = "name";
 
         let fixed_bytes = validate_result_shape_parts(
@@ -1610,14 +1627,14 @@ impl Database {
             1,
             RESULT_COLUMN_NAME.len(),
             query_result_limits,
-            SHOW_FUNCTIONS_RESULT_RESOURCES,
+            result_resources,
         )?;
         let function_name_bytes = SUPPORTED_FUNCTION_NAMES
             .iter()
             .map(|name| name.len())
             .fold(0_usize, usize::saturating_add);
         enforce_resource_limit(
-            SHOW_FUNCTIONS_RESULT_RESOURCES.bytes,
+            result_resources.bytes,
             fixed_bytes.saturating_add(function_name_bytes),
             query_result_limits.max_bytes,
         )?;
@@ -2310,6 +2327,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::SystemColumns
         | Statement::SystemMetrics
         | Statement::SystemSettings
+        | Statement::SystemFunctions
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
