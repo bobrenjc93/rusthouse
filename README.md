@@ -63,17 +63,18 @@ unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` and
 non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
 global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
-Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, and a sole ungrouped
-`MIN(Int64)` with more than 262,144 matched rows use deterministic contiguous
+Global `countIf(Bool)` and a sole ungrouped `SUM(Int64)`, `MIN(Int64)`, or
+`MAX(Int64)` with more than 262,144 matched rows use deterministic contiguous
 chunks, targeting about 131,072 rows per computation lane. Release-mode
 crossover measurements kept smaller inputs sequential. Helper threads share one
 nonblocking process-wide admission budget; total lanes are capped at both 16 and
 the process's available parallelism. Checked count partials and checked i128 SUM
-partials are reduced in chunk order; optional Int64 minima are reduced directly
+partials are reduced in chunk order; optional Int64 extrema are reduced directly
 without allocating a partial-results collection. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
-or below the threshold, grouped aggregates, `SUM` or `MIN` in a multi-aggregate
-projection, non-Int64 `MIN`, and other aggregate functions remain sequential.
+or below the threshold, grouped aggregates, `SUM`, `MIN`, or `MAX` in a
+multi-aggregate projection, non-Int64 extrema, and other aggregate functions
+remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
@@ -662,9 +663,10 @@ case-insensitive, permit one optional trailing semicolon, and otherwise must be
 exact: an explicit column list, another format, or any extra SQL is not
 accepted as query-plus-data. Both parameterized request forms also accept one
 optional `database=default` parameter, one optional decimal `max_result_rows`
-parameter, one optional decimal `max_result_bytes` parameter, and one optional
-`default_format` parameter in any order with `query`, including percent-encoded
-parameter names and values. All
+parameter, one optional decimal `max_result_bytes` parameter, one optional
+decimal `max_rows_to_read` parameter, and one optional `default_format`
+parameter in any order with `query`, including percent-encoded parameter names
+and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
 `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
@@ -681,17 +683,22 @@ retained-result byte limit for that request; a larger value never relaxes
 either limit. This limit accounts for estimated owned result columns, rows,
 values, column names, and String payloads, independently of the complete HTTP
 response-byte limit.
+`max_rows_to_read` also accepts ASCII decimal digits. A nonzero value tightens
+the database's configured source-scan row limit for that request, while zero
+retains the configured limit. A larger value never relaxes the configured
+limit. The complete source table is charged before row inspection, so `WHERE`
+and `LIMIT` cannot reduce the charged row count.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
-same SQL byte limit as a POST body; the database, result-limit, and format
+same SQL byte limit as a POST body; the database, workload-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
-duplicate `query`, `database`, `max_result_rows`, `max_result_bytes`, or
-`default_format` parameters, malformed or overflowing result limits, unknown
-parameters, malformed escapes, non-default database values, unsupported
-formats, and invalid SQL UTF-8 are rejected.
+duplicate `query`, `database`, `max_result_rows`, `max_result_bytes`,
+`max_rows_to_read`, or `default_format` parameters, malformed or overflowing
+workload limits, unknown parameters, malformed escapes, non-default database
+values, unsupported formats, and invalid SQL UTF-8 are rejected.
 Parameter validation follows configured authentication and precedes database
 lock admission. GET requests and every request handled by any read-only API use
 the read-only, exactly-one-statement nonblocking `SharedDatabase::try_query`
-family, including the combined parameterized-result-limit path. A POST through
+family, including the combined parameterized-workload-limit path. A POST through
 an insertion-capable
 authenticated handler without an explicit output-format selector additionally
 accepts a nonempty `INSERT`-only batch and uses the atomic
@@ -777,8 +784,8 @@ shared-lock attempt. Concurrent readers are admitted; an active writer returns
 `503 Service Unavailable` with the deterministic JSON body
 `{"error":"database is unavailable"}`. A poisoned lock remains a `500 Internal
 Server Error`, and SQL errors remain `400 Bad Request`. Authentication, database
-and format header validation, SQL/result resource limits, and the complete HTTP
-response limit retain their documented ordering and behavior.
+and format header validation, SQL/result/scan resource limits, and the complete
+HTTP response limit retain their documented ordering and behavior.
 
 HTTP insert admission likewise never waits. After authentication and optional
 database-header validation, the bounded body or URL query is read and decoded.

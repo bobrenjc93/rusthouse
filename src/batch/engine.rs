@@ -877,24 +877,27 @@ impl Database {
         statement: Statement,
         max_result_bytes: usize,
     ) -> Result<QueryResult> {
-        self.execute_query_statement_with_result_limits(
+        self.execute_query_statement_with_parameterized_limits(
             statement,
             max_result_bytes,
             self.query_result_limits.max_rows,
+            0,
         )
     }
 
-    /// Executes one already-parsed read-only query with caller-supplied result limits.
+    /// Executes one already-parsed read-only query with caller-supplied limits.
     ///
-    /// Caller limits may only tighten the database's configured byte and row
-    /// limits. For the row limit specifically, zero leaves the configured limit
-    /// in place. Result-shape validation applies both effective limits before
-    /// result rows are materialized.
-    pub(crate) fn execute_query_statement_with_result_limits(
+    /// Caller limits may only tighten the database's configured result-byte,
+    /// result-row, and scan-row limits. Zero leaves the corresponding configured
+    /// limit in place. Result-shape validation applies both effective result
+    /// limits before result rows are materialized; the effective scan limit is
+    /// charged against the complete source table independently of `LIMIT`.
+    pub(crate) fn execute_query_statement_with_parameterized_limits(
         &self,
         statement: Statement,
         max_result_bytes: usize,
         max_result_rows: usize,
+        max_scan_rows: usize,
     ) -> Result<QueryResult> {
         let tightened_result_limit = max_result_bytes < self.query_result_limits.max_bytes;
         let max_rows = if max_result_rows == 0 {
@@ -902,7 +905,13 @@ impl Database {
         } else {
             self.query_result_limits.max_rows.min(max_result_rows)
         };
+        let max_scan_rows = if max_scan_rows == 0 {
+            self.query_result_limits.max_scan_rows
+        } else {
+            self.query_result_limits.max_scan_rows.min(max_scan_rows)
+        };
         let query_limits = QueryResultLimits {
+            max_scan_rows,
             max_rows,
             max_bytes: self.query_result_limits.max_bytes.min(max_result_bytes),
             ..self.query_result_limits
@@ -4090,6 +4099,15 @@ fn execute_grouped<'a>(
                 ..
             }]
         );
+    let sole_global_max_int = group_columns.is_empty()
+        && matches!(
+            aggregate_specs,
+            [AggregateSpec {
+                function: AggregateFunction::Max,
+                input_type: Some(DataType::Int64),
+                ..
+            }]
+        );
 
     if group_columns.is_empty() {
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -4104,6 +4122,8 @@ fn execute_grouped<'a>(
                 states[0] = sum_global_int64(table, matching_rows, spec, parallelism)?;
             } else if sole_global_min_int {
                 states[0] = min_global_int64(table, matching_rows, spec, parallelism);
+            } else if sole_global_max_int {
+                states[0] = max_global_int64(table, matching_rows, spec, parallelism);
             }
         }
     }
@@ -4144,7 +4164,8 @@ fn execute_grouped<'a>(
             if group_columns.is_empty()
                 && (spec.function == AggregateFunction::CountIf
                     || sole_global_sum_int
-                    || sole_global_min_int)
+                    || sole_global_min_int
+                    || sole_global_max_int)
             {
                 continue;
             }
@@ -4506,6 +4527,113 @@ fn reduce_min_int64_partials(left: Option<i64>, right: Option<i64>) -> Option<i6
 
 fn min_int64_state(minimum: Option<i64>) -> AggregateState {
     AggregateState::Min(minimum.map(Value::Int64))
+}
+
+fn max_global_int64(
+    table: &Table,
+    matching_rows: &[usize],
+    spec: &AggregateSpec,
+    parallelism: GlobalAggregateParallelism,
+) -> AggregateState {
+    debug_assert_eq!(spec.function, AggregateFunction::Max);
+    debug_assert_eq!(spec.input_type, Some(DataType::Int64));
+    let Column::Int64(values) = &table.columns()[spec.argument.expect("MAX argument")] else {
+        unreachable!("MAX input type is resolved")
+    };
+    max_int64_state(reduce_global_max_int64(
+        values,
+        matching_rows,
+        parallelism,
+        max_int64_chunk,
+    ))
+}
+
+fn reduce_global_max_int64<F>(
+    values: &[i64],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    chunk_maximum: F,
+) -> Option<i64>
+where
+    F: Fn(&[i64], &[usize]) -> Option<i64> + Sync,
+{
+    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
+        return chunk_maximum(values, matching_rows);
+    };
+
+    // MAX shares the same deterministic contiguous partitions and global
+    // admission budget as the other parallel aggregates. A failed spawn or
+    // panic discards every partial and repeats the complete maximum locally.
+    let parallel_result = try_parallel_max_int64(
+        values,
+        matching_rows,
+        admission.helper_threads(),
+        &chunk_maximum,
+    );
+    drop(admission);
+    parallel_result.unwrap_or_else(|| chunk_maximum(values, matching_rows))
+}
+
+fn try_parallel_max_int64<F>(
+    values: &[i64],
+    matching_rows: &[usize],
+    helper_threads: usize,
+    chunk_maximum: &F,
+) -> Option<Option<i64>>
+where
+    F: Fn(&[i64], &[usize]) -> Option<i64> + Sync,
+{
+    debug_assert!(helper_threads > 0);
+    let worker_count = helper_threads.saturating_add(1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(helper_threads);
+        let mut worker_failed = false;
+        for chunk_index in 1..worker_count {
+            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
+            let spawn = std::thread::Builder::new()
+                .name(format!("rusthouse-max-int64-{chunk_index}"))
+                .spawn_scoped(scope, move || chunk_maximum(values, rows));
+            match spawn {
+                Ok(handle) => handles.push(handle),
+                Err(_) => {
+                    worker_failed = true;
+                    break;
+                }
+            }
+        }
+
+        let mut maximum = chunk_maximum(
+            values,
+            parallel_aggregate_partition(matching_rows, worker_count, 0),
+        );
+        for handle in handles {
+            match handle.join() {
+                Ok(partial) => {
+                    // Optional scalar partials are reduced in place, without
+                    // allocating a partial-results collection.
+                    maximum = reduce_max_int64_partials(maximum, partial);
+                }
+                Err(_) => worker_failed = true,
+            }
+        }
+        (!worker_failed).then_some(maximum)
+    })
+}
+
+fn max_int64_chunk(values: &[i64], matching_rows: &[usize]) -> Option<i64> {
+    matching_rows.iter().map(|row| values[*row]).max()
+}
+
+fn reduce_max_int64_partials(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn max_int64_state(maximum: Option<i64>) -> AggregateState {
+    AggregateState::Max(maximum.map(Value::Int64))
 }
 
 #[derive(Debug)]
@@ -6159,6 +6287,32 @@ mod tests {
         database
     }
 
+    fn max_int64_database(row_count: usize, row_values: impl Fn(usize) -> (i64, bool)) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE empty_max_values (value Int64); \
+                 CREATE TABLE values_to_max (id Int64, value Int64, included Bool);",
+            )
+            .expect("MAX(Int64) differential setup");
+        if row_count > 0 {
+            for first_id in (1..=row_count).step_by(50_000) {
+                let last_id = first_id.saturating_add(49_999).min(row_count);
+                let rows = (first_id..=last_id)
+                    .map(|id| {
+                        let (value, included) = row_values(id);
+                        format!("({id}, {value}, {included})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                database
+                    .execute(&format!("INSERT INTO values_to_max VALUES {rows}"))
+                    .expect("MAX(Int64) differential rows");
+            }
+        }
+        database
+    }
+
     fn force_global_aggregate_workers(
         database: &mut Database,
         workers: usize,
@@ -6603,6 +6757,154 @@ mod tests {
     }
 
     #[test]
+    fn global_max_int64_forced_workers_match_empty_null_having_and_pagination() {
+        let mut database = max_int64_database(0, |_| unreachable!("empty input"));
+        let first_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MAX(value) AS maximum FROM empty_max_values \
+             HAVING maximum IS NULL ORDER BY maximum LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(first_page.rows, [vec![Value::Null(DataType::Int64)]]);
+
+        let second_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MAX(value) AS maximum FROM empty_max_values \
+             HAVING maximum IS NULL ORDER BY maximum LIMIT 1 OFFSET 1",
+        );
+        assert!(second_page.rows.is_empty());
+    }
+
+    #[test]
+    fn global_max_int64_forced_workers_match_after_filtering_and_having() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+            .saturating_add(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD / 2)
+            .saturating_add(5);
+        let value_for = |id: usize| i64::try_from(id % 1_003).unwrap() - 501;
+        let mut database = max_int64_database(row_count, |id| (value_for(id), id % 3 != 0));
+        let expected = (1..=row_count)
+            .filter(|id| id % 3 != 0)
+            .map(value_for)
+            .max()
+            .unwrap();
+        let result = assert_global_aggregate_worker_differential(
+            &mut database,
+            &format!(
+                "SELECT MAX(value) AS maximum FROM values_to_max WHERE included = true \
+                 HAVING maximum = {expected} ORDER BY maximum DESC LIMIT 1 OFFSET 0"
+            ),
+        );
+        assert_eq!(result.rows, [vec![Value::Int64(expected)]]);
+    }
+
+    #[test]
+    fn global_max_int64_forced_workers_match_at_parallel_boundary_and_use_shared_budget() {
+        static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::new(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = max_int64_database(row_count, |id| (i64::try_from(id).unwrap(), true));
+        for matched_rows in [
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD,
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1,
+        ] {
+            let result = assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!("SELECT MAX(value) FROM values_to_max WHERE id <= {matched_rows}"),
+            );
+            assert_eq!(
+                result.rows,
+                [vec![Value::Int64(i64::try_from(matched_rows).unwrap())]]
+            );
+        }
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::Budgeted(&UNAVAILABLE_BUDGET);
+        assert_eq!(
+            query(&mut database, "SELECT MAX(value) FROM values_to_max").rows,
+            [vec![Value::Int64(i64::try_from(row_count).unwrap())]],
+            "an unavailable helper budget falls back to the query thread"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::Budgeted(&OBSERVED_BUDGET);
+        assert_eq!(
+            query(&mut database, "SELECT MAX(value) FROM values_to_max").rows,
+            [vec![Value::Int64(i64::try_from(row_count).unwrap())]]
+        );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "sole MAX(Int64) uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT MAX(value), COUNT(*) FROM values_to_max"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "MAX(Int64) in a multi-aggregate projection stays sequential"
+        );
+    }
+
+    #[test]
+    fn global_max_int64_forced_workers_match_extreme_values() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 2;
+        let mut database = max_int64_database(row_count, |id| {
+            let value = if id == 1 {
+                i64::MIN
+            } else if id == row_count {
+                i64::MAX
+            } else {
+                0
+            };
+            (value, true)
+        });
+        let result = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MAX(value) FROM values_to_max WHERE included = true",
+        );
+        assert_eq!(result.rows, [vec![Value::Int64(i64::MAX)]]);
+    }
+
+    #[test]
+    fn global_max_int64_worker_failure_repeats_the_complete_maximum_locally() {
+        let values = [-9, -7, -5, -3, -1, 1, 3, 5, i64::MAX, i64::MIN];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 8;
+        let maximum = reduce_global_max_int64(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::Fixed(2),
+            |values, rows| {
+                if rows.first() == Some(&8) {
+                    panic!("injected MAX worker failure");
+                }
+                max_int64_chunk(values, rows)
+            },
+        );
+
+        assert_eq!(maximum, Some(i64::MAX));
+    }
+
+    #[test]
     fn global_aggregate_worker_selection_partitioning_and_reduction_are_checked() {
         let boundary = COUNT_IF_PARALLEL_ROW_THRESHOLD;
         assert_eq!(
@@ -6638,6 +6940,10 @@ mod tests {
         assert_eq!(reduce_min_int64_partials(Some(4), None), Some(4));
         assert_eq!(reduce_min_int64_partials(None, Some(-7)), Some(-7));
         assert_eq!(reduce_min_int64_partials(Some(4), Some(-7)), Some(-7));
+        assert_eq!(reduce_max_int64_partials(None, None), None);
+        assert_eq!(reduce_max_int64_partials(Some(4), None), Some(4));
+        assert_eq!(reduce_max_int64_partials(None, Some(-7)), Some(-7));
+        assert_eq!(reduce_max_int64_partials(Some(4), Some(-7)), Some(4));
         let rows = [2, 4, 6, 8, 10, 12, 14];
         assert_eq!(parallel_aggregate_partition(&rows, 3, 0), [2, 4, 6]);
         assert_eq!(parallel_aggregate_partition(&rows, 3, 1), [8, 10]);

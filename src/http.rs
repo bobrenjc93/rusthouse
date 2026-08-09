@@ -417,11 +417,12 @@ pub fn serve_http_read_only_with_limits(
 /// `POST /?query=<percent-encoded SQL>` carry the same SQL in a required
 /// form-style query parameter and optionally accept one `database=default`
 /// parameter, one decimal `max_result_rows` parameter, one decimal
-/// `max_result_bytes` parameter, and one `default_format` parameter in any
-/// order. Nonzero result limits can tighten but never relax the database's
-/// configured query-result limits; `max_result_bytes` also cannot relax the
-/// default retained-result byte limit. Zero disables the corresponding
-/// request-level limit while retaining the configured defaults. `default_format`
+/// `max_result_bytes` parameter, one decimal `max_rows_to_read` parameter, and
+/// one `default_format` parameter in any order. Nonzero result and scan limits
+/// can tighten but never relax the database's configured query limits;
+/// `max_result_bytes` also cannot relax the default retained-result byte limit.
+/// Zero disables the corresponding request-level limit while retaining the
+/// configured defaults. `default_format`
 /// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, and `+` becomes a space. An
@@ -432,8 +433,8 @@ pub fn serve_http_read_only_with_limits(
 /// the same bounded, atomic, nonblocking importer as `POST /insert/<table>`.
 /// All other parameterized queries require an absent or zero `Content-Length`.
 /// Empty, duplicate, unknown, and unsupported parameters, plus malformed or
-/// overflowing result-limit values, are rejected after authentication and before
-/// database lock admission. A
+/// overflowing workload-limit values, are rejected after authentication and
+/// before database lock admission. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
 /// may instead end in a case-insensitive SQL `FORMAT CSVWithNames`, `FORMAT
@@ -918,7 +919,8 @@ fn handle_http_query_exchange(
         }
     };
 
-    let (sql, response_format, max_result_bytes, max_result_rows) = match request {
+    let (sql, response_format, max_result_bytes, max_result_rows, max_rows_to_read) = match request
+    {
         HttpRequest::Ping => {
             return write_response(
                 &mut output,
@@ -1126,16 +1128,25 @@ fn handle_http_query_exchange(
             response_format,
             max_result_bytes,
             max_result_rows,
-        } => (sql, response_format, max_result_bytes, max_result_rows),
+            max_rows_to_read,
+        } => (
+            sql,
+            response_format,
+            max_result_bytes,
+            max_result_rows,
+            max_rows_to_read,
+        ),
     };
 
-    let query_result = match (max_result_bytes, max_result_rows) {
-        (None, None) => database.try_query(&sql),
-        (max_result_bytes, max_result_rows) => database.try_query_with_parameterized_result_limits(
-            &sql,
-            max_result_bytes.unwrap_or(0),
-            max_result_rows.unwrap_or(0),
-        ),
+    let query_result = match (max_result_bytes, max_result_rows, max_rows_to_read) {
+        (None, None, None) => database.try_query(&sql),
+        (max_result_bytes, max_result_rows, max_rows_to_read) => database
+            .try_query_with_parameterized_workload_limits(
+                &sql,
+                max_result_bytes.unwrap_or(0),
+                max_result_rows.unwrap_or(0),
+                max_rows_to_read.unwrap_or(0),
+            ),
     };
     match query_result {
         Ok(result) => {
@@ -1264,6 +1275,7 @@ fn read_request(
                 request.response_format,
                 None,
                 None,
+                None,
                 access.allows_insert() && !output_format_selected,
             )
         }
@@ -1346,6 +1358,7 @@ fn read_request(
                 response_format,
                 decoded.max_result_bytes,
                 decoded.max_result_rows,
+                decoded.max_rows_to_read,
                 access.allows_insert()
                     && matches!(method, ParameterizedQueryMethod::Post)
                     && !output_format_selected,
@@ -1388,6 +1401,7 @@ fn classify_standard_query_request(
     response_format: Option<QueryResponseFormat>,
     max_result_bytes: Option<usize>,
     max_result_rows: Option<usize>,
+    max_rows_to_read: Option<usize>,
     insert_enabled: bool,
 ) -> Result<HttpRequest, RequestReadError> {
     let sql_format = take_terminal_query_format(&mut sql);
@@ -1431,6 +1445,7 @@ fn classify_standard_query_request(
             response_format,
             max_result_bytes,
             max_result_rows,
+            max_rows_to_read,
         })
     }
 }
@@ -1765,6 +1780,7 @@ enum HttpRequest {
         response_format: QueryResponseFormat,
         max_result_bytes: Option<usize>,
         max_result_rows: Option<usize>,
+        max_rows_to_read: Option<usize>,
     },
     Insert {
         sql: String,
@@ -1869,6 +1885,7 @@ struct DecodedQuery {
     response_format: Option<QueryResponseFormat>,
     max_result_bytes: Option<usize>,
     max_result_rows: Option<usize>,
+    max_rows_to_read: Option<usize>,
 }
 
 fn parse_headers(
@@ -2206,6 +2223,7 @@ fn parse_request_line(
                 || target.starts_with(b"/?database=")
                 || target.starts_with(b"/?max_result_bytes=")
                 || target.starts_with(b"/?max_result_rows=")
+                || target.starts_with(b"/?max_rows_to_read=")
                 || target.starts_with(b"/?default_format=") =>
         {
             Err(RequestFailure::with_headers(
@@ -2282,6 +2300,7 @@ fn decode_query_parameters(
     let mut response_format = None;
     let mut max_result_bytes = None;
     let mut max_result_rows = None;
+    let mut max_rows_to_read = None;
 
     for encoded_parameter in encoded_parameters.split(|byte| *byte == b'&') {
         let Some(equals) = encoded_parameter.iter().position(|byte| *byte == b'=') else {
@@ -2374,6 +2393,17 @@ fn decode_query_parameters(
                 let value = decode_form_component(encoded_value, None)?;
                 max_result_bytes = Some(parse_decimal_max_result_bytes(&value)?);
             }
+            b"max_rows_to_read" => {
+                if max_rows_to_read.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate max_rows_to_read parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                max_rows_to_read = Some(parse_decimal_max_rows_to_read(&value)?);
+            }
             _ => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
@@ -2395,11 +2425,12 @@ fn decode_query_parameters(
         response_format,
         max_result_bytes,
         max_result_rows,
+        max_rows_to_read,
     })
 }
 
 fn parse_decimal_max_result_bytes(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_result_limit(
+    parse_decimal_workload_limit(
         value,
         "max_result_bytes parameter must be a decimal integer",
         "max_result_bytes parameter is out of range",
@@ -2407,14 +2438,22 @@ fn parse_decimal_max_result_bytes(value: &[u8]) -> Result<usize, RequestReadErro
 }
 
 fn parse_decimal_max_result_rows(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_result_limit(
+    parse_decimal_workload_limit(
         value,
         "max_result_rows parameter must be a decimal integer",
         "max_result_rows parameter is out of range",
     )
 }
 
-fn parse_decimal_result_limit(
+fn parse_decimal_max_rows_to_read(value: &[u8]) -> Result<usize, RequestReadError> {
+    parse_decimal_workload_limit(
+        value,
+        "max_rows_to_read parameter must be a decimal integer",
+        "max_rows_to_read parameter is out of range",
+    )
+}
+
+fn parse_decimal_workload_limit(
     value: &[u8],
     malformed_message: &'static str,
     overflow_message: &'static str,
