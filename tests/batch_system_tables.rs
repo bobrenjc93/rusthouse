@@ -362,3 +362,27 @@ fn cli_and_http_expose_system_tables_through_normal_query_formats() {
         b"{\"error\":\"SELECT result rows requires at least 1, exceeding the limit of 0\"}"
     );
 }
+
+#[test]
+fn parameterized_http_max_result_rows_bounds_system_tables() {
+    let shared = SharedDatabase::default();
+    shared
+        .execute("CREATE TABLE Alpha (id Int64); CREATE TABLE beta (id Int64);")
+        .expect("HTTP database setup");
+
+    let mut response = Vec::new();
+    handle_http_query(
+        &shared,
+        Cursor::new(
+            "GET /?max_result_rows=1&query=SELECT+database%2C+name%2C+engine%2C+total_rows+FROM+system.tables HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        &mut response,
+    )
+    .expect("HTTP exchange");
+
+    assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert_eq!(
+        http_body(&response),
+        b"{\"error\":\"SELECT result rows requires at least 2, exceeding the limit of 1\"}"
+    );
+}
