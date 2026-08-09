@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusthouse::{
     HttpConnectionError, HttpListenerError, HttpListenerLimits, HttpListenerReport, HttpQueryError,
@@ -133,31 +133,45 @@ fn closes_each_connection_after_exactly_one_response() {
 }
 
 #[test]
-fn transport_failure_is_typed_and_does_not_stop_the_next_client() {
+fn drip_fed_client_cannot_renew_the_deadline_or_stop_the_next_client() {
     let limits = HttpListenerLimits {
         max_connections: 2,
-        connection_timeout: Duration::from_millis(100),
+        connection_timeout: Duration::from_millis(250),
         ..HttpListenerLimits::default()
     };
-    let (address, server) = spawn_listener(&SharedDatabase::default(), limits);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind drip-feed listener");
+    let address = listener.local_addr().expect("listener address");
+    let mut drip_stream = TcpStream::connect(address).expect("queue drip-fed client first");
+    drip_stream
+        .write_all(b"POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\r\nS")
+        .expect("write drip-fed request headers and first body byte");
+    let drip_client = thread::spawn(move || {
+        for _ in 0..39 {
+            thread::sleep(Duration::from_millis(50));
+            if drip_stream.write_all(b"x").is_err() {
+                return;
+            }
+        }
+        let _ = drip_stream.shutdown(Shutdown::Write);
+    });
+    let database = SharedDatabase::default();
+    let server =
+        thread::spawn(move || serve_http_read_only_with_limits(&database, listener, limits));
 
-    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
-    stalled
-        .set_read_timeout(Some(CLIENT_TIMEOUT))
-        .expect("set stalled-client timeout");
-    let mut response = Vec::new();
-    stalled
-        .read_to_end(&mut response)
-        .expect("server closes timed-out connection");
-    assert!(response.is_empty());
-
+    let started = Instant::now();
     let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let elapsed = started.elapsed();
     assert!(response_text(&healthy).starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(
+        elapsed < Duration::from_millis(1_200),
+        "healthy client waited {elapsed:?} behind a drip-fed request"
+    );
 
     let report = server
         .join()
         .expect("listener thread does not panic")
         .expect("listener continues after connection failure");
+    drip_client.join().expect("drip-fed client does not panic");
     assert_eq!(report.accepted_connections, 2);
     assert_eq!(report.completed_connections, 1);
     assert_eq!(report.connection_failures.len(), 1);

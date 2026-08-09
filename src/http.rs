@@ -5,7 +5,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
 use crate::batch::format::{
@@ -35,7 +35,7 @@ pub const DEFAULT_MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// [`serve_http_read_only`].
 pub const DEFAULT_MAX_HTTP_CONNECTIONS: usize = 1024;
 
-/// Default read and write timeout for each accepted TCP connection.
+/// Default absolute exchange deadline for each accepted TCP connection.
 pub const DEFAULT_HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resource limits for a single [`handle_http_query`] exchange.
@@ -119,7 +119,8 @@ pub struct HttpListenerLimits {
     /// Maximum number of sequential TCP connections to accept before the
     /// listener is dropped and the function returns.
     pub max_connections: usize,
-    /// Read and write timeout installed on every accepted connection.
+    /// Absolute elapsed-time budget for every accepted connection's complete
+    /// HTTP exchange.
     ///
     /// A zero duration is rejected before the listener accepts a connection.
     pub connection_timeout: Duration,
@@ -300,11 +301,15 @@ pub fn serve_http_read_only(
 ///
 /// Connections are accepted and handled sequentially against the same
 /// [`SharedDatabase`]. Each accepted stream receives the configured read and
-/// write timeout, is dispatched through [`handle_http_query_with_limits`], and
-/// is explicitly closed after at most one response. A protocol failure that
-/// can be represented as an HTTP response counts as a completed exchange. A
-/// transport or socket failure is recorded in the returned report, its stream
-/// is dropped, and the listener continues with the next connection.
+/// write deadline for the complete exchange, is dispatched through
+/// [`handle_http_query_with_limits`], and is explicitly closed after at most
+/// one response. The remaining socket timeout is reduced before every read and
+/// write, so incremental client progress cannot renew the connection's budget.
+/// A protocol failure that can be represented as an HTTP response counts as a
+/// completed exchange. A transport or socket failure is recorded in the
+/// returned report, its stream is dropped, and the listener continues with the
+/// next connection. Interrupted, connection-aborted, and connection-reset
+/// accept attempts are retried without consuming the connection budget.
 ///
 /// The function returns after exactly [`HttpListenerLimits::max_connections`]
 /// accepts; a zero connection limit returns immediately. It does not create
@@ -333,11 +338,12 @@ pub fn serve_http_read_only_with_limits(
 
     let mut report = HttpListenerReport::default();
     while report.accepted_connections < limits.max_connections {
-        let (stream, _) = listener
-            .accept()
-            .map_err(|source| HttpListenerError::Accept {
-                accepted_connections: report.accepted_connections,
-                source,
+        let (stream, _) =
+            retry_transient_accept_errors(|| listener.accept()).map_err(|source| {
+                HttpListenerError::Accept {
+                    accepted_connections: report.accepted_connections,
+                    source,
+                }
             })?;
         report.accepted_connections += 1;
         match serve_http_read_only_connection(database, stream, limits) {
@@ -352,22 +358,85 @@ pub fn serve_http_read_only_with_limits(
     Ok(report)
 }
 
+fn retry_transient_accept_errors<T>(mut accept: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match accept() {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                ) => {}
+            result => return result,
+        }
+    }
+}
+
+struct DeadlineTcpStream {
+    stream: TcpStream,
+    started: Instant,
+    timeout: Duration,
+}
+
+impl DeadlineTcpStream {
+    fn new(stream: TcpStream, timeout: Duration) -> Self {
+        Self {
+            stream,
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP exchange deadline exceeded")
+            })
+    }
+}
+
+impl Read for &DeadlineTcpStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        (&self.stream).read(buffer)
+    }
+}
+
+impl Write for &DeadlineTcpStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        (&self.stream).write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        (&self.stream).flush()
+    }
+}
+
 fn serve_http_read_only_connection(
     database: &SharedDatabase,
     stream: TcpStream,
     limits: HttpListenerLimits,
 ) -> Result<(), HttpConnectionError> {
+    let stream = DeadlineTcpStream::new(stream, limits.connection_timeout);
     let exchange = (|| {
         stream
+            .stream
             .set_read_timeout(Some(limits.connection_timeout))
             .map_err(HttpConnectionError::SetReadTimeout)?;
         stream
+            .stream
             .set_write_timeout(Some(limits.connection_timeout))
             .map_err(HttpConnectionError::SetWriteTimeout)?;
         handle_http_query_with_limits(database, &stream, &stream, limits.query_limits)
             .map_err(HttpConnectionError::Exchange)
     })();
     let shutdown = stream
+        .stream
         .shutdown(Shutdown::Write)
         .map_err(HttpConnectionError::Shutdown);
     exchange.and(shutdown)
@@ -2878,5 +2947,43 @@ impl Write for BoundedVec {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+
+    #[test]
+    fn transient_accept_errors_are_retried_until_a_connection_is_available() {
+        let mut errors = [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+        ]
+        .into_iter();
+        let mut attempts = 0;
+
+        let connection = retry_transient_accept_errors(|| {
+            attempts += 1;
+            match errors.next() {
+                Some(kind) => Err(io::Error::from(kind)),
+                None => Ok(17),
+            }
+        })
+        .expect("transient accept failures are retried");
+
+        assert_eq!(connection, 17);
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn nontransient_accept_error_is_returned() {
+        let error = retry_transient_accept_errors::<()>(|| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("fatal listener error is returned");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }
