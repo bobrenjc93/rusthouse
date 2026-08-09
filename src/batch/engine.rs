@@ -16,7 +16,7 @@ use crate::batch::sql::{
     HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, SUPPORTED_FUNCTION_NAMES, Select,
     SelectItem, Statement, VersionSelect,
 };
-use crate::batch::storage::{Column, Table};
+use crate::batch::storage::{Column, Table, validate_table_name};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
 #[cfg(unix)]
@@ -426,6 +426,16 @@ impl DatabaseMeasurements {
         self.subtract(before);
         self.add(after);
     }
+
+    fn add_totals(&mut self, measurements: Self) {
+        self.column_count = self.column_count.saturating_add(measurements.column_count);
+        self.retained_row_count = self
+            .retained_row_count
+            .saturating_add(measurements.retained_row_count);
+        self.retained_value_bytes = self
+            .retained_value_bytes
+            .saturating_add(measurements.retained_value_bytes);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -536,6 +546,113 @@ pub enum DatabaseSnapshotRestoreError {
     Table(Error),
 }
 
+/// One caller-named self-describing `Int64` snapshot in an atomic database
+/// restore set.
+#[derive(Debug, Clone, Copy)]
+pub struct DatabaseSnapshotRestoreEntry<'a> {
+    table_name: &'a str,
+    path: &'a Path,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: Int64TablePayloadCodec,
+}
+
+impl<'a> DatabaseSnapshotRestoreEntry<'a> {
+    /// Describes one bounded snapshot file and its destination table name.
+    pub fn new<P: AsRef<Path> + ?Sized>(
+        table_name: &'a str,
+        path: &'a P,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: Int64TablePayloadCodec,
+    ) -> Self {
+        Self {
+            table_name,
+            path: path.as_ref(),
+            snapshot_codec,
+            payload_codec,
+        }
+    }
+
+    /// Returns the caller-supplied database table name.
+    #[must_use]
+    pub const fn table_name(self) -> &'a str {
+        self.table_name
+    }
+
+    /// Returns the snapshot source path.
+    #[must_use]
+    pub const fn path(self) -> &'a Path {
+        self.path
+    }
+
+    /// Returns the envelope codec, including its payload-byte bound.
+    #[must_use]
+    pub const fn snapshot_codec(self) -> SnapshotCodec {
+        self.snapshot_codec
+    }
+
+    /// Returns the self-describing table codec and its schema, row, and byte bounds.
+    #[must_use]
+    pub const fn payload_codec(self) -> Int64TablePayloadCodec {
+        self.payload_codec
+    }
+}
+
+/// A failure while atomically restoring a bounded set of `Int64` snapshots.
+#[derive(Debug)]
+pub enum DatabaseSnapshotSetRestoreError {
+    /// The input contains more entries than the caller-authorized inclusive limit.
+    EntryLimitExceeded {
+        /// Zero-based index of the first entry beyond the limit.
+        entry_index: usize,
+        /// Caller-supplied name of the first entry beyond the limit.
+        table_name: String,
+        /// Complete number of supplied entries.
+        entries: usize,
+        /// Maximum number of entries authorized by the caller.
+        max_entries: usize,
+    },
+    /// One identified entry failed name, file, schema, or table validation.
+    Entry {
+        /// Zero-based entry index in caller order.
+        entry_index: usize,
+        /// Caller-supplied destination table name.
+        table_name: String,
+        /// Typed single-snapshot failure.
+        error: DatabaseSnapshotRestoreError,
+    },
+}
+
+impl DatabaseSnapshotSetRestoreError {
+    /// Returns the zero-based index of the rejected entry.
+    #[must_use]
+    pub const fn entry_index(&self) -> usize {
+        match self {
+            Self::EntryLimitExceeded { entry_index, .. } | Self::Entry { entry_index, .. } => {
+                *entry_index
+            }
+        }
+    }
+
+    /// Returns the caller-supplied table name of the rejected entry.
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        match self {
+            Self::EntryLimitExceeded { table_name, .. } | Self::Entry { table_name, .. } => {
+                table_name
+            }
+        }
+    }
+
+    /// Returns the typed per-entry failure, or `None` for a set count failure.
+    #[must_use]
+    pub const fn entry_error(&self) -> Option<&DatabaseSnapshotRestoreError> {
+        match self {
+            Self::Entry { error, .. } => Some(error),
+            Self::EntryLimitExceeded { .. } => None,
+        }
+    }
+}
+
 impl fmt::Display for DatabaseSnapshotRestoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -546,6 +663,30 @@ impl fmt::Display for DatabaseSnapshotRestoreError {
                 "snapshot column '{column}' is nullable; batch snapshot restore requires a non-nullable Int64 column"
             ),
             Self::Table(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl fmt::Display for DatabaseSnapshotSetRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EntryLimitExceeded {
+                entry_index,
+                table_name,
+                entries,
+                max_entries,
+            } => write!(
+                formatter,
+                "snapshot restore entry {entry_index} ('{table_name}') exceeds the caller limit: supplied {entries} entries, maximum {max_entries}"
+            ),
+            Self::Entry {
+                entry_index,
+                table_name,
+                error,
+            } => write!(
+                formatter,
+                "could not restore snapshot entry {entry_index} ('{table_name}'): {error}"
+            ),
         }
     }
 }
@@ -620,6 +761,15 @@ impl std::error::Error for DatabaseSnapshotRestoreError {
             Self::Recovery(error) => Some(error),
             Self::Table(error) => Some(error),
             Self::NullableColumn { .. } => None,
+        }
+    }
+}
+
+impl std::error::Error for DatabaseSnapshotSetRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Entry { error, .. } => Some(error),
+            Self::EntryLimitExceeded { .. } => None,
         }
     }
 }
@@ -821,6 +971,94 @@ impl Database {
         self.register_restored_int64_table(table_name, restored)
     }
 
+    /// Atomically reopens a caller-bounded set of named, self-describing,
+    /// non-nullable `Int64` snapshots.
+    ///
+    /// `max_entries` is an inclusive bound on the number of source files. The
+    /// count is checked before name validation or file access. All destination
+    /// names are then validated against the existing catalog and against each
+    /// other using case-insensitive SQL resolution before any file is opened.
+    /// Each entry retains its own envelope, column-name, row, and payload-byte
+    /// codec bounds.
+    ///
+    /// Files are decoded and converted into fully validated batch tables in
+    /// input order, but remain staged outside the catalog until every entry
+    /// succeeds. Excess counts, invalid or colliding names, file corruption,
+    /// nullable columns, and configured [`TableLimits`] therefore leave all
+    /// catalog data and cached metrics unchanged. Every error identifies the
+    /// zero-based input entry and its caller-supplied table name.
+    pub fn restore_int64_tables_from_files(
+        &mut self,
+        entries: &[DatabaseSnapshotRestoreEntry<'_>],
+        max_entries: usize,
+    ) -> std::result::Result<(), DatabaseSnapshotSetRestoreError> {
+        if entries.len() > max_entries {
+            let rejected = entries[max_entries];
+            return Err(DatabaseSnapshotSetRestoreError::EntryLimitExceeded {
+                entry_index: max_entries,
+                table_name: rejected.table_name.to_owned(),
+                entries: entries.len(),
+                max_entries,
+            });
+        }
+
+        let mut incoming_names = HashSet::with_capacity(entries.len());
+        for (entry_index, entry) in entries.iter().copied().enumerate() {
+            let name_error = validate_table_name(entry.table_name).err().or_else(|| {
+                let normalized = entry.table_name.to_ascii_lowercase();
+                if self.catalog.table_exists(entry.table_name) || !incoming_names.insert(normalized)
+                {
+                    Some(Error::TableAlreadyExists(entry.table_name.to_owned()))
+                } else {
+                    None
+                }
+            });
+            if let Some(error) = name_error {
+                return Err(DatabaseSnapshotSetRestoreError::Entry {
+                    entry_index,
+                    table_name: entry.table_name.to_owned(),
+                    error: error.into(),
+                });
+            }
+        }
+
+        let mut staged = Vec::with_capacity(entries.len());
+        let mut staged_measurements = DatabaseMeasurements::default();
+        for (entry_index, entry) in entries.iter().copied().enumerate() {
+            let restored = restore_int64_table_payload_from_file(
+                entry.path,
+                entry.snapshot_codec,
+                entry.payload_codec,
+            )
+            .map_err(|error| DatabaseSnapshotSetRestoreError::Entry {
+                entry_index,
+                table_name: entry.table_name.to_owned(),
+                error: error.into(),
+            })?;
+            let table = self
+                .prepare_restored_int64_table(entry.table_name, restored)
+                .map_err(|error| DatabaseSnapshotSetRestoreError::Entry {
+                    entry_index,
+                    table_name: entry.table_name.to_owned(),
+                    error,
+                })?;
+            staged_measurements.add(TableMeasurements::read(&table));
+            staged.push(table);
+        }
+
+        self.catalog
+            .register_tables(staged)
+            .map_err(
+                |(entry_index, error)| DatabaseSnapshotSetRestoreError::Entry {
+                    entry_index,
+                    table_name: entries[entry_index].table_name.to_owned(),
+                    error: error.into(),
+                },
+            )?;
+        self.measurements.add_totals(staged_measurements);
+        Ok(())
+    }
+
     /// Reopens one self-describing, non-nullable `Int64` snapshot from a
     /// primary or caller-supplied backup file as a named batch table.
     ///
@@ -865,6 +1103,18 @@ impl Database {
         table_name: &str,
         restored: Int64Table,
     ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
+        let table = self.prepare_restored_int64_table(table_name, restored)?;
+        let measurements = TableMeasurements::read(&table);
+        self.catalog.register_table(table)?;
+        self.measurements.add(measurements);
+        Ok(())
+    }
+
+    fn prepare_restored_int64_table(
+        &self,
+        table_name: &str,
+        restored: Int64Table,
+    ) -> std::result::Result<Table, DatabaseSnapshotRestoreError> {
         let column = restored.schema().column();
         if column.is_nullable() {
             return Err(DatabaseSnapshotRestoreError::NullableColumn {
@@ -891,12 +1141,8 @@ impl Database {
             .into_iter()
             .map(|value| value.expect("the decoded snapshot column is non-nullable"))
             .collect();
-        let table =
-            Table::with_int64_values(table_name.to_owned(), column_name, values, restored_limits)?;
-        let measurements = TableMeasurements::read(&table);
-        self.catalog.register_table(table)?;
-        self.measurements.add(measurements);
-        Ok(())
+        Table::with_int64_values(table_name.to_owned(), column_name, values, restored_limits)
+            .map_err(Into::into)
     }
 
     /// Atomically saves one non-nullable, one-column `Int64` batch table on Unix.
