@@ -244,6 +244,17 @@ case-insensitive order as one `String` column. RustHouse has no other logical
 database, so non-default database names and trailing clauses are rejected. All
 three forms use the normal query row, value, byte, retained-result, and
 formatted-output limits.
+The exact case-insensitive query
+`SELECT database, name, engine, total_rows FROM system.tables` exposes the same
+current catalog as four typed columns. Rows are ordered deterministically by
+case-insensitive table name and contain `default`, the stored display name,
+`Memory`, and the table's checked `Int64` row count. An empty catalog returns
+the four-column schema with no rows; create, insert, truncate, and drop
+changes are visible on the next query. Other projections, aliases, predicates,
+ordering, limits, and trailing clauses are deliberately unsupported. This is a
+bounded metadata query rather than a general virtual-table engine: it uses the
+normal read-only `Database` and `SharedDatabase` paths and the usual query row,
+value, byte, retained-result, CLI, and HTTP formatting limits.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
 bounded `String`, preserving the stored table and column display names and
 schema order while normalizing type spellings.
@@ -575,7 +586,8 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes), `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
+and `currentDatabase()` probes plus the exact `system.tables` metadata query),
+`SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,
 so cloned handles can run analytical reads concurrently. `try_query` and

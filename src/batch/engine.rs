@@ -1126,6 +1126,7 @@ impl Database {
             statement @ (Statement::LiteralSelect(_)
             | Statement::VersionSelect(_)
             | Statement::CurrentDatabaseSelect(_)
+            | Statement::SystemTables
             | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
@@ -1157,6 +1158,7 @@ impl Database {
             Statement::CurrentDatabaseSelect(select) => {
                 self.execute_current_database_select(select, query_result_limits)
             }
+            Statement::SystemTables => self.execute_system_tables(query_result_limits),
             Statement::Select(select) => self.execute_select(select, query_result_limits),
             Statement::CrossJoin(cross_join) => {
                 self.execute_cross_join(cross_join, query_result_limits)
@@ -1635,6 +1637,65 @@ impl Database {
         })
     }
 
+    fn execute_system_tables(&self, query_result_limits: QueryResultLimits) -> Result<QueryResult> {
+        const DATABASE_NAME: &str = "default";
+        const ENGINE_NAME: &str = "Memory";
+
+        let table_count = self.catalog.table_count();
+        let columns = vec![
+            ResultColumn {
+                name: "database".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "name".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "engine".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "total_rows".to_owned(),
+                data_type: DataType::Int64,
+            },
+        ];
+        let fixed_bytes = validate_result_shape(
+            table_count,
+            columns.len(),
+            &columns,
+            query_result_limits,
+            SELECT_RESULT_RESOURCES,
+        )?;
+        let string_bytes = self.catalog.table_name_bytes().saturating_add(
+            table_count.saturating_mul(DATABASE_NAME.len().saturating_add(ENGINE_NAME.len())),
+        );
+        enforce_resource_limit(
+            SELECT_RESULT_RESOURCES.bytes,
+            fixed_bytes.saturating_add(string_bytes),
+            query_result_limits.max_bytes,
+        )?;
+
+        let rows = self
+            .catalog
+            .table_row_counts()
+            .into_iter()
+            .map(|(name, row_count)| {
+                let row_count = i64::try_from(row_count)
+                    .map_err(|_| Error::NumericOverflow("system.tables total_rows".to_owned()))?;
+                Ok(vec![
+                    Value::String(DATABASE_NAME.to_owned()),
+                    Value::String(name.to_owned()),
+                    Value::String(ENGINE_NAME.to_owned()),
+                    Value::Int64(row_count),
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        debug_assert_eq!(rows.len(), table_count);
+
+        Ok(QueryResult { columns, rows })
+    }
+
     fn execute_show_create_table(
         &self,
         name: &str,
@@ -2067,6 +2128,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
         | Statement::CurrentDatabaseSelect(_)
+        | Statement::SystemTables
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
