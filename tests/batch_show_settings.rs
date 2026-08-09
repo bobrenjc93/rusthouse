@@ -298,6 +298,38 @@ fn returns_every_custom_query_and_table_limit_in_stable_order() {
 }
 
 #[test]
+fn runtime_worker_cap_setters_return_the_previous_cap_and_update_settings() {
+    let initial = NonZeroUsize::new(7).unwrap();
+    let one = NonZeroUsize::new(1).unwrap();
+    let two = NonZeroUsize::new(2).unwrap();
+
+    let mut database = Database::with_global_aggregate_worker_cap(initial);
+    assert_eq!(database.set_global_aggregate_worker_cap(one), initial);
+    assert_eq!(database.global_aggregate_worker_cap(), one);
+    let expected_one = expected_result_with_worker_cap(
+        QueryResultLimits::default(),
+        TableLimits::default(),
+        one.get(),
+    );
+    assert_eq!(query(&mut database, "SHOW SETTINGS"), expected_one);
+    assert_eq!(query(&mut database, SYSTEM_SETTINGS_QUERY), expected_one);
+
+    let shared = SharedDatabase::with_global_aggregate_worker_cap(initial);
+    assert_eq!(
+        shared.try_set_global_aggregate_worker_cap(two).unwrap(),
+        initial
+    );
+    assert_eq!(shared.global_aggregate_worker_cap().unwrap(), two);
+    let expected_two = expected_result_with_worker_cap(
+        QueryResultLimits::default(),
+        TableLimits::default(),
+        two.get(),
+    );
+    assert_eq!(shared.query("SHOW SETTINGS").unwrap(), expected_two);
+    assert_eq!(shared.query(SYSTEM_SETTINGS_QUERY).unwrap(), expected_two);
+}
+
+#[test]
 fn accepts_exact_and_rejects_exceeded_query_result_limits() {
     let table_limits = TableLimits::default();
     let mut exact_limits = QueryResultLimits {

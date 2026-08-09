@@ -71,7 +71,13 @@ Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
 existing construction retains the same behavior; a cap of one disables helper
-threads. Concurrent queries still share the process-wide budget. Checked count
+threads. `Database::set_global_aggregate_worker_cap` changes the cap at runtime
+and returns its previous nonzero value; the new value immediately appears in
+`SHOW SETTINGS` and `system.settings` and applies to subsequent supported
+aggregates. `SharedDatabase::try_set_global_aggregate_worker_cap` provides the
+same update with one nonblocking write-lock attempt, returning `DatabaseBusy`
+for contention and `LockPoisoned` for a poisoned lock. Concurrent queries still
+share the process-wide budget. Checked count
 partials and checked i128 SUM/AVG sum-and-count partials are reduced in chunk
 order; optional Int64 extrema are reduced directly without allocating a
 partial-results collection. A sequential fallback preserves the same result
@@ -613,7 +619,10 @@ constructor configure the scan and output limits.
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
 parallel global aggregates. The configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
-the fixed 16-lane ceiling may reduce the effective lane count.
+the fixed 16-lane ceiling may reduce the effective lane count. The matching
+runtime setters are `Database::set_global_aggregate_worker_cap` and the
+nonblocking `SharedDatabase::try_set_global_aggregate_worker_cap`; both return
+the previous nonzero cap.
 `Database::with_max_rows_per_table` and its shared counterpart configure the
 row cap while retaining the default column and cell caps. `TableLimits` with
 `Database::with_table_limits` or `SharedDatabase::with_table_limits` configures
