@@ -799,11 +799,12 @@ fn serve_http_connections(
 /// before database lock admission. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
-/// may instead end in a case-insensitive SQL `FORMAT CSVWithNames`, `FORMAT
-/// TabSeparated`, or `FORMAT JSONEachRow` clause, with an optional trailing
-/// semicolon. The clause selects the corresponding existing bounded writer and
-/// cannot be combined with either HTTP format selector. Quoted strings and line
-/// comments are not interpreted as format clauses. GET
+/// may instead end in a case-insensitive SQL `FORMAT JSON`, `FORMAT
+/// CSVWithNames`, `FORMAT TabSeparated`, or `FORMAT JSONEachRow` clause, with
+/// an optional trailing semicolon. The clause selects the corresponding
+/// existing bounded writer and cannot be combined with either HTTP format
+/// selector. Quoted strings and line comments are not interpreted as format
+/// clauses. GET
 /// requests and every request made through a
 /// read-only handler pass the SQL to [`SharedDatabase::try_query`], which
 /// accepts exactly one read-only statement and makes one nonblocking read-lock
@@ -1771,6 +1772,9 @@ fn classify_standard_query_request(
     let sql_format = take_terminal_query_format(&mut sql);
     if let (Some(sql_format), Some(_)) = (sql_format, response_format) {
         let message = match sql_format {
+            QueryResponseFormat::Json => {
+                "FORMAT JSON clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
+            }
             QueryResponseFormat::CsvWithNames => {
                 "FORMAT CSVWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
             }
@@ -1938,7 +1942,9 @@ fn terminal_query_format(sql: &str) -> Option<(usize, QueryResponseFormat)> {
     {
         return None;
     }
-    let response_format = if format_name.text.eq_ignore_ascii_case("CSVWithNames") {
+    let response_format = if format_name.text.eq_ignore_ascii_case("JSON") {
+        QueryResponseFormat::Json
+    } else if format_name.text.eq_ignore_ascii_case("CSVWithNames") {
         QueryResponseFormat::CsvWithNames
     } else if format_name.text.eq_ignore_ascii_case("TabSeparated") {
         QueryResponseFormat::TabSeparated
