@@ -917,11 +917,27 @@ default to 30 seconds. Every socket operation receives only the remaining time,
 so incremental progress cannot renew either deadline. Expiration is retained as
 a connection-local read or write failure so later clients are still accepted.
 The connection bound also limits the number of retained failures.
-This listener is deliberately single-threaded and adds neither authentication
-nor TLS; bind it only to an appropriate trusted interface and place it behind
-those controls when needed. The single-exchange functions remain available
-when an embedding needs a different connection, concurrency, authentication,
-timeout, or shutdown policy.
+The original listener APIs remain unauthenticated for compatibility.
+
+`serve_http_read_only_with_clickhouse_key` composes the same finite,
+single-threaded lifecycle with the existing least-privilege
+`X-ClickHouse-Key` handler. It takes an expected key and a connection maximum;
+`serve_http_read_only_with_clickhouse_key_and_limits` instead accepts the same
+explicit `HttpListenerLimits` used by the unauthenticated listener. Each
+connection independently requires exactly one matching key, and correctly
+authenticated requests remain read-only. Missing, duplicate, empty, and
+incorrect keys receive the ordinary indistinguishable bounded `401` exchange,
+consume one connection slot, and count as successful exchanges rather than
+transport failures. Later clients are still served. The shared connection
+budget, absolute deadlines, per-exchange limits, one-response stream shutdown,
+failure isolation, and typed final report are otherwise unchanged.
+
+Neither listener mode terminates TLS or adds concurrency, sessions, or daemon
+lifecycle management. In particular, the authenticated listener sends its key
+and query contents in plaintext unless the embedding places the bound listener
+behind TLS; do not expose it directly to an untrusted network. The
+single-exchange functions remain available when an embedding needs a different
+connection, concurrency, transport-security, timeout, or shutdown policy.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or

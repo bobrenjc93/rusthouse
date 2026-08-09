@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use rusthouse::{
     HttpListenerError, HttpListenerLimits, HttpListenerReport, HttpQueryError, HttpQueryLimits,
-    SharedDatabase, handle_http_query, serve_http_read_only, serve_http_read_only_with_limits,
+    SharedDatabase, handle_http_query, serve_http_read_only,
+    serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_clickhouse_key_and_limits,
+    serve_http_read_only_with_limits,
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -52,6 +54,14 @@ fn exchange(address: SocketAddr, request: &[u8]) -> Vec<u8> {
 fn post_query(sql: &str) -> Vec<u8> {
     format!(
         "POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{sql}",
+        sql.len()
+    )
+    .into_bytes()
+}
+
+fn post_query_with_clickhouse_key(sql: &str, key: &str) -> Vec<u8> {
+    format!(
+        "POST /query HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: {key}\r\nContent-Length: {}\r\n\r\n{sql}",
         sql.len()
     )
     .into_bytes()
@@ -115,6 +125,136 @@ fn sequential_connections_share_one_read_only_database_and_stop_at_the_limit() {
         .query("SELECT value FROM readings ORDER BY value;")
         .unwrap();
     assert_eq!(rows.rows.len(), 2);
+}
+
+#[test]
+fn authenticated_listener_isolates_rejected_keys_and_preserves_read_only_state() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE readings (value Int64); INSERT INTO readings VALUES (7), (11);")
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let served_database = database.clone();
+    let worker = thread::spawn(move || {
+        serve_http_read_only_with_clickhouse_key(&listener, &served_database, "correct-key", 4)
+    });
+
+    let missing = exchange(
+        address,
+        &post_query("SELECT value FROM readings ORDER BY value;"),
+    );
+    assert!(missing.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+    assert!(
+        missing
+            .windows(b"WWW-Authenticate: X-ClickHouse-Key\r\n".len())
+            .any(|window| window == b"WWW-Authenticate: X-ClickHouse-Key\r\n")
+    );
+
+    let incorrect = exchange(
+        address,
+        &post_query_with_clickhouse_key(
+            "SELECT value FROM readings ORDER BY value;",
+            "incorrect-key",
+        ),
+    );
+    assert_eq!(incorrect, missing);
+
+    let correct = exchange(
+        address,
+        &post_query_with_clickhouse_key(
+            "SELECT value FROM readings ORDER BY value;",
+            "correct-key",
+        ),
+    );
+    assert!(correct.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        body(&correct),
+        br#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7],[11]]}"#
+    );
+    assert!(
+        correct
+            .windows(b"Cache-Control: private, no-store\r\n".len())
+            .any(|window| window == b"Cache-Control: private, no-store\r\n")
+    );
+
+    let mutation = exchange(
+        address,
+        &post_query_with_clickhouse_key("INSERT INTO readings VALUES (99);", "correct-key"),
+    );
+    assert!(mutation.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert!(String::from_utf8_lossy(body(&mutation)).contains("read-only query"));
+
+    let report = worker
+        .join()
+        .expect("listener thread did not panic")
+        .expect("listener completed its connection budget");
+    assert_eq!(report.accepted_connections, 4);
+    assert_eq!(report.successful_exchanges, 4);
+    assert!(report.connection_failures.is_empty());
+
+    let rows = database
+        .query("SELECT value FROM readings ORDER BY value;")
+        .unwrap();
+    assert_eq!(rows.rows.len(), 2);
+}
+
+#[test]
+fn authenticated_listener_explicit_limits_keep_deadline_failures_connection_local() {
+    let limits = HttpListenerLimits {
+        read_timeout: STALLED_CONNECTION_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        query_limits: HttpQueryLimits {
+            max_sql_bytes: 8,
+            ..HttpQueryLimits::default()
+        },
+        ..HttpListenerLimits::new(3, HttpQueryLimits::default())
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let worker = thread::spawn(move || {
+        serve_http_read_only_with_clickhouse_key_and_limits(
+            &listener,
+            &SharedDatabase::default(),
+            "correct-key",
+            limits,
+        )
+    });
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+        .expect("write incomplete authenticated request");
+
+    let limited = exchange(
+        address,
+        &post_query_with_clickhouse_key("SELECT 123;", "correct-key"),
+    );
+    assert!(limited.starts_with(b"HTTP/1.1 413 Payload Too Large\r\n"));
+
+    let healthy = exchange(
+        address,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+    );
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&healthy), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 3);
+    assert_eq!(report.successful_exchanges, 2);
+    assert_eq!(report.connection_failures.len(), 1);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        &report.connection_failures[0].source,
+        HttpQueryError::Read(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
 }
 
 #[test]
