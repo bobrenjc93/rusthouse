@@ -2,6 +2,7 @@
 
 use std::error::Error as StdError;
 use std::fmt;
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
@@ -245,6 +246,15 @@ impl SharedDatabase {
         Self::new(Database::with_query_result_limits(query_result_limits))
     }
 
+    /// Creates an empty shared database with an explicit nonzero computation-lane
+    /// cap for supported global aggregates.
+    #[must_use]
+    pub fn with_global_aggregate_worker_cap(global_aggregate_worker_cap: NonZeroUsize) -> Self {
+        Self::new(Database::with_global_aggregate_worker_cap(
+            global_aggregate_worker_cap,
+        ))
+    }
+
     /// Creates an empty shared database with an explicit row cap and default column and cell caps.
     #[must_use]
     pub fn with_max_rows_per_table(max_rows_per_table: usize) -> Self {
@@ -279,6 +289,11 @@ impl SharedDatabase {
     /// Returns the persistent resource limits applied to each created table.
     pub fn table_limits(&self) -> Result<TableLimits, SharedDatabaseError> {
         Ok(self.read()?.table_limits())
+    }
+
+    /// Returns the configured computation-lane cap for supported global aggregates.
+    pub fn global_aggregate_worker_cap(&self) -> Result<NonZeroUsize, SharedDatabaseError> {
+        Ok(self.read()?.global_aggregate_worker_cap())
     }
 
     /// Attempts to atomically save one non-nullable, one-column `Int64` table on Unix.

@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -75,6 +76,11 @@ pub const GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER: usize = 128 * 1024;
 /// The executor also caps this value by [`std::thread::available_parallelism`]
 /// and admits helper threads through one process-wide budget.
 pub const MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS: usize = 16;
+/// Default per-database computation-lane cap for supported global aggregates.
+///
+/// The process-wide admission budget and available hardware may lower the
+/// effective lane count further.
+pub const DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP: usize = MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS;
 
 /// Backwards-compatible name for [`GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD`].
 pub const COUNT_IF_PARALLEL_ROW_THRESHOLD: usize = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD;
@@ -203,7 +209,13 @@ pub struct Database {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum GlobalAggregateParallelism {
+struct GlobalAggregateParallelism {
+    worker_cap: NonZeroUsize,
+    source: GlobalAggregateParallelismSource,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GlobalAggregateParallelismSource {
     System,
     #[cfg(test)]
     Fixed(usize),
@@ -212,20 +224,49 @@ enum GlobalAggregateParallelism {
 }
 
 impl GlobalAggregateParallelism {
+    const fn system(worker_cap: NonZeroUsize) -> Self {
+        Self {
+            worker_cap,
+            source: GlobalAggregateParallelismSource::System,
+        }
+    }
+
+    #[cfg(test)]
+    fn fixed(workers: usize) -> Self {
+        Self {
+            worker_cap: NonZeroUsize::new(workers).expect("fixed workers must be nonzero"),
+            source: GlobalAggregateParallelismSource::Fixed(workers),
+        }
+    }
+
+    #[cfg(test)]
+    const fn budgeted(
+        worker_cap: NonZeroUsize,
+        budget: &'static GlobalAggregateWorkerBudget,
+    ) -> Self {
+        Self {
+            worker_cap,
+            source: GlobalAggregateParallelismSource::Budgeted(budget),
+        }
+    }
+
     fn worker_count(self, matched_rows: usize) -> usize {
         if matched_rows <= GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD {
             return 1;
         }
 
-        let worker_limit = match self {
-            Self::System => global_aggregate_worker_budget().worker_limit(),
+        let worker_limit = match self.source {
+            GlobalAggregateParallelismSource::System => {
+                global_aggregate_worker_budget().worker_limit()
+            }
             #[cfg(test)]
-            Self::Fixed(workers) => workers,
+            GlobalAggregateParallelismSource::Fixed(workers) => workers,
             #[cfg(test)]
-            Self::Budgeted(budget) => budget.worker_limit(),
+            GlobalAggregateParallelismSource::Budgeted(budget) => budget.worker_limit(),
         };
         let useful_workers = matched_rows.div_ceil(GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER);
         worker_limit
+            .min(self.worker_cap.get())
             .clamp(1, MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS)
             .min(useful_workers)
             .min(matched_rows)
@@ -237,14 +278,16 @@ impl GlobalAggregateParallelism {
             return None;
         }
 
-        match self {
-            Self::System => global_aggregate_worker_budget()
+        match self.source {
+            GlobalAggregateParallelismSource::System => global_aggregate_worker_budget()
                 .try_acquire(helper_threads)
                 .map(GlobalAggregateWorkerAdmission::Budgeted),
             #[cfg(test)]
-            Self::Fixed(_) => Some(GlobalAggregateWorkerAdmission::Fixed(helper_threads)),
+            GlobalAggregateParallelismSource::Fixed(_) => {
+                Some(GlobalAggregateWorkerAdmission::Fixed(helper_threads))
+            }
             #[cfg(test)]
-            Self::Budgeted(budget) => budget
+            GlobalAggregateParallelismSource::Budgeted(budget) => budget
                 .try_acquire(helper_threads)
                 .map(GlobalAggregateWorkerAdmission::Budgeted),
         }
@@ -449,7 +492,10 @@ impl Default for Database {
             measurements: DatabaseMeasurements::default(),
             query_result_limits: QueryResultLimits::default(),
             table_limits: TableLimits::default(),
-            global_aggregate_parallelism: GlobalAggregateParallelism::System,
+            global_aggregate_parallelism: GlobalAggregateParallelism::system(
+                NonZeroUsize::new(DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP)
+                    .expect("the default aggregate worker cap is nonzero"),
+            ),
         }
     }
 }
@@ -634,7 +680,35 @@ impl Database {
             measurements: DatabaseMeasurements::default(),
             query_result_limits,
             table_limits: TableLimits::default(),
-            global_aggregate_parallelism: GlobalAggregateParallelism::System,
+            global_aggregate_parallelism: GlobalAggregateParallelism::system(
+                NonZeroUsize::new(DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP)
+                    .expect("the default aggregate worker cap is nonzero"),
+            ),
+        }
+    }
+
+    /// Creates an empty database with an explicit nonzero computation-lane cap
+    /// for supported global aggregates.
+    ///
+    /// A cap of one keeps those aggregates sequential. Higher caps remain
+    /// subject to the process-wide worker budget, available hardware, and the
+    /// fixed [`MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS`] ceiling.
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use rusthouse::Database;
+    ///
+    /// let cap = NonZeroUsize::new(2).unwrap();
+    /// let database = Database::with_global_aggregate_worker_cap(cap);
+    /// assert_eq!(database.global_aggregate_worker_cap(), cap);
+    /// ```
+    #[must_use]
+    pub fn with_global_aggregate_worker_cap(global_aggregate_worker_cap: NonZeroUsize) -> Self {
+        Self {
+            global_aggregate_parallelism: GlobalAggregateParallelism::system(
+                global_aggregate_worker_cap,
+            ),
+            ..Self::default()
         }
     }
 
@@ -709,6 +783,12 @@ impl Database {
     #[must_use]
     pub const fn table_limits(&self) -> TableLimits {
         self.table_limits
+    }
+
+    /// Returns the configured computation-lane cap for supported global aggregates.
+    #[must_use]
+    pub const fn global_aggregate_worker_cap(&self) -> NonZeroUsize {
+        self.global_aggregate_parallelism.worker_cap
     }
 
     /// Reopens one self-describing, non-nullable `Int64` snapshot as a named
@@ -1846,6 +1926,7 @@ impl Database {
 
         let configured_query_limits = self.query_result_limits;
         let configured_table_limits = self.table_limits;
+        let global_aggregate_worker_cap = self.global_aggregate_worker_cap().get();
         let settings = [
             (
                 "query_result_limits.max_scan_rows",
@@ -1893,6 +1974,7 @@ impl Database {
                 configured_table_limits.max_columns,
             ),
             ("table_limits.max_cells", configured_table_limits.max_cells),
+            ("global_aggregate_worker_cap", global_aggregate_worker_cap),
         ];
 
         let fixed_bytes = validate_result_shape_parts(
@@ -6570,7 +6652,15 @@ mod tests {
     }
 
     fn count_if_database(row_count: usize) -> Database {
-        let mut database = Database::new();
+        count_if_database_with_worker_cap(
+            row_count,
+            NonZeroUsize::new(DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP)
+                .expect("the default aggregate worker cap is nonzero"),
+        )
+    }
+
+    fn count_if_database_with_worker_cap(row_count: usize, worker_cap: NonZeroUsize) -> Database {
+        let mut database = Database::with_global_aggregate_worker_cap(worker_cap);
         database
             .execute(
                 "CREATE TABLE empty_events (active Bool); \
@@ -6701,7 +6791,7 @@ mod tests {
         workers: usize,
         sql: &str,
     ) -> QueryResult {
-        database.global_aggregate_parallelism = GlobalAggregateParallelism::Fixed(workers);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(workers);
         query(database, sql)
     }
 
@@ -6926,8 +7016,10 @@ mod tests {
             );
         }
 
-        database.global_aggregate_parallelism =
-            GlobalAggregateParallelism::Budgeted(&UNAVAILABLE_BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &UNAVAILABLE_BUDGET,
+        );
         assert_eq!(
             query(&mut database, "SELECT SUM(value) FROM values_to_sum").rows,
             [vec![Value::Int64(i64::try_from(row_count).unwrap())]],
@@ -6935,8 +7027,10 @@ mod tests {
         );
 
         OBSERVED_BUDGET.reset_peak();
-        database.global_aggregate_parallelism =
-            GlobalAggregateParallelism::Budgeted(&OBSERVED_BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &OBSERVED_BUDGET,
+        );
         assert_eq!(
             query(
                 &mut database,
@@ -6976,9 +7070,9 @@ mod tests {
         );
         assert_eq!(boundary.rows, [vec![Value::Int64(i64::MAX)]]);
 
-        database.global_aggregate_parallelism = GlobalAggregateParallelism::Fixed(1);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
         let single_worker = database.execute("SELECT SUM(value) FROM values_to_sum");
-        database.global_aggregate_parallelism = GlobalAggregateParallelism::Fixed(4);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
         let multi_worker = database.execute("SELECT SUM(value) FROM values_to_sum");
         assert_eq!(single_worker, multi_worker, "overflow worker differential");
         assert_eq!(
@@ -7044,8 +7138,10 @@ mod tests {
             assert_eq!(result.rows, [vec![Value::Float64(7.0)]]);
         }
 
-        database.global_aggregate_parallelism =
-            GlobalAggregateParallelism::Budgeted(&UNAVAILABLE_BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &UNAVAILABLE_BUDGET,
+        );
         assert_eq!(
             query(&mut database, "SELECT AVG(value) FROM values_to_avg").rows,
             [vec![Value::Float64(7.0)]],
@@ -7053,8 +7149,10 @@ mod tests {
         );
 
         OBSERVED_BUDGET.reset_peak();
-        database.global_aggregate_parallelism =
-            GlobalAggregateParallelism::Budgeted(&OBSERVED_BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &OBSERVED_BUDGET,
+        );
         assert_eq!(
             query(&mut database, "SELECT AVG(value) FROM values_to_avg").rows,
             [vec![Value::Float64(7.0)]]
@@ -7170,8 +7268,10 @@ mod tests {
             );
         }
 
-        database.global_aggregate_parallelism =
-            GlobalAggregateParallelism::Budgeted(&UNAVAILABLE_BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &UNAVAILABLE_BUDGET,
+        );
         assert_eq!(
             query(&mut database, "SELECT MIN(value) FROM values_to_min").rows,
             [vec![Value::Int64(0)]],
@@ -7179,8 +7279,10 @@ mod tests {
         );
 
         OBSERVED_BUDGET.reset_peak();
-        database.global_aggregate_parallelism =
-            GlobalAggregateParallelism::Budgeted(&OBSERVED_BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &OBSERVED_BUDGET,
+        );
         assert_eq!(
             query(&mut database, "SELECT MIN(value) FROM values_to_min").rows,
             [vec![Value::Int64(0)]]
@@ -7244,7 +7346,7 @@ mod tests {
         let minimum = reduce_global_int64_extremum(
             &values,
             &matching_rows,
-            GlobalAggregateParallelism::Fixed(2),
+            GlobalAggregateParallelism::fixed(2),
             "min",
             |left, right| {
                 if std::thread::current().name() == Some("rusthouse-min-int64-1") {
@@ -7319,8 +7421,10 @@ mod tests {
             );
         }
 
-        database.global_aggregate_parallelism =
-            GlobalAggregateParallelism::Budgeted(&UNAVAILABLE_BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &UNAVAILABLE_BUDGET,
+        );
         assert_eq!(
             query(&mut database, "SELECT MAX(value) FROM values_to_max").rows,
             [vec![Value::Int64(i64::try_from(row_count).unwrap())]],
@@ -7328,8 +7432,10 @@ mod tests {
         );
 
         OBSERVED_BUDGET.reset_peak();
-        database.global_aggregate_parallelism =
-            GlobalAggregateParallelism::Budgeted(&OBSERVED_BUDGET);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &OBSERVED_BUDGET,
+        );
         assert_eq!(
             query(&mut database, "SELECT MAX(value) FROM values_to_max").rows,
             [vec![Value::Int64(i64::try_from(row_count).unwrap())]]
@@ -7393,7 +7499,7 @@ mod tests {
         let maximum = reduce_global_int64_extremum(
             &values,
             &matching_rows,
-            GlobalAggregateParallelism::Fixed(2),
+            GlobalAggregateParallelism::fixed(2),
             "max",
             |left, right| {
                 if std::thread::current().name() == Some("rusthouse-max-int64-1") {
@@ -7410,17 +7516,25 @@ mod tests {
     fn global_aggregate_worker_selection_partitioning_and_reduction_are_checked() {
         let boundary = COUNT_IF_PARALLEL_ROW_THRESHOLD;
         assert_eq!(
-            GlobalAggregateParallelism::Fixed(4).worker_count(boundary),
+            GlobalAggregateParallelism::fixed(1).worker_count(usize::MAX),
             1
         );
         assert_eq!(
-            GlobalAggregateParallelism::Fixed(4).worker_count(boundary + 1),
+            GlobalAggregateParallelism::fixed(2).worker_count(usize::MAX),
+            2
+        );
+        assert_eq!(
+            GlobalAggregateParallelism::fixed(4).worker_count(boundary),
+            1
+        );
+        assert_eq!(
+            GlobalAggregateParallelism::fixed(4).worker_count(boundary + 1),
             3
         );
         let enough_rows_for_every_worker =
             COUNT_IF_PARALLEL_ROWS_PER_WORKER.saturating_mul(MAX_COUNT_IF_PARALLEL_WORKERS + 1);
         assert_eq!(
-            GlobalAggregateParallelism::Fixed(MAX_COUNT_IF_PARALLEL_WORKERS + 1)
+            GlobalAggregateParallelism::fixed(MAX_COUNT_IF_PARALLEL_WORKERS + 1)
                 .worker_count(enough_rows_for_every_worker),
             MAX_COUNT_IF_PARALLEL_WORKERS
         );
@@ -7500,6 +7614,76 @@ mod tests {
     }
 
     #[test]
+    fn configured_cap_one_is_a_deterministic_sequential_differential() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(8);
+
+        let cap = NonZeroUsize::new(1).unwrap();
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = count_if_database_with_worker_cap(row_count, cap);
+        assert_eq!(database.global_aggregate_worker_cap(), cap);
+        BUDGET.reset_peak();
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
+        let capped = query(&mut database, "SELECT countIf(active) FROM events");
+        assert_eq!(
+            BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+            0,
+            "a one-lane cap never admits a helper"
+        );
+
+        let sequential =
+            force_global_aggregate_workers(&mut database, 1, "SELECT countIf(active) FROM events");
+        assert_eq!(capped, sequential);
+        assert_eq!(capped.rows, [vec![Value::Int64((row_count / 2) as i64)]]);
+    }
+
+    #[test]
+    fn configured_cap_two_is_a_deterministic_parallel_differential() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(8);
+
+        let cap = NonZeroUsize::new(2).unwrap();
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = count_if_database_with_worker_cap(row_count, cap);
+        assert_eq!(database.global_aggregate_worker_cap(), cap);
+        BUDGET.reset_peak();
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
+        let capped = query(&mut database, "SELECT countIf(active) FROM events");
+        assert_eq!(
+            BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+            1,
+            "a two-lane cap admits exactly one helper"
+        );
+
+        let sequential =
+            force_global_aggregate_workers(&mut database, 1, "SELECT countIf(active) FROM events");
+        assert_eq!(capped, sequential);
+    }
+
+    #[test]
+    fn oversized_configured_cap_preserves_the_hard_ceiling_and_results() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(31);
+
+        let cap = NonZeroUsize::new(usize::MAX).unwrap();
+        let parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
+        assert_eq!(
+            parallelism.worker_count(usize::MAX),
+            MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS
+        );
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = count_if_database_with_worker_cap(row_count, cap);
+        assert_eq!(database.global_aggregate_worker_cap(), cap);
+        BUDGET.reset_peak();
+        database.global_aggregate_parallelism = parallelism;
+        let capped = query(&mut database, "SELECT countIf(active) FROM events");
+        let peak_helpers = BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire);
+        assert_eq!(peak_helpers, parallelism.worker_count(row_count) - 1);
+
+        let sequential =
+            force_global_aggregate_workers(&mut database, 1, "SELECT countIf(active) FROM events");
+        assert_eq!(capped, sequential);
+    }
+
+    #[test]
     fn global_count_if_budget_caps_concurrent_admission() {
         use std::sync::{Arc, Barrier};
 
@@ -7539,16 +7723,19 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_large_shared_count_if_queries_obey_the_process_budget() {
+    fn concurrent_cap_two_queries_match_sequential_and_obey_the_process_budget() {
         use crate::batch::shared_database::SharedDatabase;
         use std::sync::{Arc, Barrier};
 
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
-        BUDGET.reset_peak();
         let row_count =
             COUNT_IF_PARALLEL_ROW_THRESHOLD.saturating_add(COUNT_IF_PARALLEL_ROWS_PER_WORKER);
-        let mut database = count_if_database(row_count);
-        database.global_aggregate_parallelism = GlobalAggregateParallelism::Budgeted(&BUDGET);
+        let cap = NonZeroUsize::new(2).unwrap();
+        let mut database = count_if_database_with_worker_cap(row_count, cap);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+        let sequential = query(&mut database, "SELECT countIf(active) FROM events");
+        BUDGET.reset_peak();
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
         let database = SharedDatabase::new(database);
         let query_count = 8;
         let started = Arc::new(Barrier::new(query_count));
@@ -7567,7 +7754,7 @@ mod tests {
 
         for handle in handles {
             let result = handle.join().expect("query worker joins");
-            assert_eq!(result.rows, [vec![Value::Int64((row_count / 2) as i64)]]);
+            assert_eq!(result, sequential, "concurrent cap-two differential");
         }
         let peak_helpers = BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire);
         assert!((2..=BUDGET.helper_limit).contains(&peak_helpers));
