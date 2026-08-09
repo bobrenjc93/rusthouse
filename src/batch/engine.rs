@@ -137,10 +137,10 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// Checked `Int64` column-minus-literal expressions, `CAST`, `LENGTH`,
-/// `lengthUTF8`, `LOWER`, `UPPER`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, and the
-/// minimal unpartitioned `ROW_NUMBER` window forms provide bounded projections
-/// in ungrouped queries.
+/// Checked `Int64` column-minus-literal expressions, `CAST`, `toString`,
+/// `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`, `ABS`, `ROUND`, `FLOOR`, `CEIL`,
+/// and the minimal unpartitioned `ROW_NUMBER` window forms provide bounded
+/// projections in ungrouped queries.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
