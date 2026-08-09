@@ -881,20 +881,23 @@ impl Database {
             statement,
             max_result_bytes,
             self.query_result_limits.max_rows,
+            0,
         )
     }
 
-    /// Executes one already-parsed read-only query with caller-supplied result limits.
+    /// Executes one already-parsed read-only query with caller-supplied limits.
     ///
-    /// Caller limits may only tighten the database's configured byte and row
-    /// limits. For the row limit specifically, zero leaves the configured limit
-    /// in place. Result-shape validation applies both effective limits before
-    /// result rows are materialized.
+    /// Caller limits may only tighten the database's configured result-byte,
+    /// result-row, and scan-row limits. Zero leaves the corresponding configured
+    /// limit in place. Result-shape validation applies both effective result
+    /// limits before result rows are materialized; the effective scan limit is
+    /// charged against the complete source table independently of `LIMIT`.
     pub(crate) fn execute_query_statement_with_result_limits(
         &self,
         statement: Statement,
         max_result_bytes: usize,
         max_result_rows: usize,
+        max_scan_rows: usize,
     ) -> Result<QueryResult> {
         let tightened_result_limit = max_result_bytes < self.query_result_limits.max_bytes;
         let max_rows = if max_result_rows == 0 {
@@ -902,7 +905,13 @@ impl Database {
         } else {
             self.query_result_limits.max_rows.min(max_result_rows)
         };
+        let max_scan_rows = if max_scan_rows == 0 {
+            self.query_result_limits.max_scan_rows
+        } else {
+            self.query_result_limits.max_scan_rows.min(max_scan_rows)
+        };
         let query_limits = QueryResultLimits {
+            max_scan_rows,
             max_rows,
             max_bytes: self.query_result_limits.max_bytes.min(max_result_bytes),
             ..self.query_result_limits

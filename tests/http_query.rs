@@ -1316,7 +1316,7 @@ fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
 }
 
 #[test]
-fn parameterized_get_and_post_combine_result_limits_database_and_format_parameters() {
+fn parameterized_get_and_post_combine_workload_limits_database_and_format_parameters() {
     let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
         max_rows: 2,
         ..QueryResultLimits::default()
@@ -1330,12 +1330,12 @@ fn parameterized_get_and_post_combine_result_limits_database_and_format_paramete
 
     let exact_requests: &[(&[u8], &str, &[u8])] = &[
         (
-            b"GET /?database=default&max_result_bytes=%31%30%32%34&max_result_rows=%32&default_format=CSVWithNames&query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET /?database=default&max_result_bytes=%31%30%32%34&max_result_rows=%32&max_rows_to_read=%33&default_format=CSVWithNames&query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "text/csv; charset=utf-8",
             b"value\n1\n2\n",
         ),
         (
-            b"POST /?query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&max_result_bytes=1024&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            b"POST /?query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&max_rows_to_read=3&max_result_bytes=1024&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
             "text/tab-separated-values; charset=utf-8",
             b"value\n1\n2\n",
         ),
@@ -1454,6 +1454,190 @@ fn parameterized_max_result_rows_rejects_empty_duplicate_malformed_and_overflowi
             );
         }
     }
+}
+
+#[test]
+fn parameterized_max_rows_to_read_enforces_exact_get_and_post_scan_boundaries() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+
+    for method in ["GET", "POST"] {
+        let exact = format!(
+            "{method} /?database=default&query=SELECT+value+FROM+samples+WHERE+value+%3D+1+LIMIT+1%3B&max_rows_to_read=3 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, exact.as_bytes()),
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[1]]}"#,
+        );
+
+        let exceeded = format!(
+            "{method} /?max_rows_to_read=2&query=SELECT+value+FROM+samples+WHERE+value+%3D+1+LIMIT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, exceeded.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"SELECT scanned rows requires at least 3, exceeding the limit of 2"}"#,
+        );
+    }
+}
+
+#[test]
+fn parameterized_max_rows_to_read_zero_and_larger_values_never_relax_defaults() {
+    let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
+        max_scan_rows: 2,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+
+    for (method, requested_max) in [
+        ("GET", "0".to_owned()),
+        ("POST", "3".to_owned()),
+        ("GET", usize::MAX.to_string()),
+    ] {
+        let request = format!(
+            "{method} /?query=SELECT+value+FROM+samples+LIMIT+1%3B&max_rows_to_read={requested_max} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, request.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"SELECT scanned rows requires at least 3, exceeding the limit of 2"}"#,
+        );
+    }
+
+    let default_database = SharedDatabase::default();
+    for (method, requested_max) in [("GET", "0".to_owned()), ("POST", usize::MAX.to_string())] {
+        let request = format!(
+            "{method} /?max_rows_to_read={requested_max}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&default_database, request.as_bytes()),
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"1","type":"Int64"}],"rows":[[1]]}"#,
+        );
+    }
+}
+
+#[test]
+fn parameterized_max_rows_to_read_rejects_invalid_values_for_get_and_post() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_rows_to_read= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_rows_to_read=1&query=SELECT+1%3B&max%5Frows%5Fto%5Fread=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_rows_to_read parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_rows_to_read=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_rows_to_read parameter must be a decimal integer"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_rows_to_read={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_rows_to_read parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn max_rows_to_read_validation_follows_authentication_and_precedes_lock_admission() {
+    let poisoned_inner = Arc::new(RwLock::new(Database::new()));
+    let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = poisoned_inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let invalid_without_credentials =
+        b"GET /?query=SELECT+1%3B&max_rows_to_read=nope HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(
+            &poisoned_database,
+            "correct-token",
+            invalid_without_credentials,
+        ),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    assert_response(
+        &authenticated_exchange(
+            &poisoned_database,
+            "correct-token",
+            b"GET /?query=SELECT+1%3B&max_rows_to_read=nope HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"max_rows_to_read parameter must be a decimal integer"}"#,
+    );
+
+    let contended_inner = Arc::new(RwLock::new(Database::new()));
+    let contended_database = SharedDatabase::from_arc(Arc::clone(&contended_inner));
+    let mut writer = Some(contended_inner.write().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let invalid = exchange(
+            &contended_database,
+            b"GET /?query=SELECT+1%3B&max_rows_to_read=-1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let valid = exchange(
+            &contended_database,
+            b"POST /?max_rows_to_read=1&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        sender.send((invalid, valid)).unwrap();
+    });
+    let (invalid, valid) = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(responses) => responses,
+        Err(error) => {
+            drop(writer.take());
+            worker.join().unwrap();
+            panic!("max_rows_to_read admission blocked behind a writer: {error}");
+        }
+    };
+    assert_response(
+        &invalid,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"max_rows_to_read parameter must be a decimal integer"}"#,
+    );
+    assert_response(
+        &valid,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    drop(writer.take());
+    worker.join().unwrap();
 }
 
 fn single_string_result_bytes() -> usize {
