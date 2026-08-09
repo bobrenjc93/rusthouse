@@ -111,6 +111,24 @@ impl Catalog {
         Ok(())
     }
 
+    /// Swaps one completely constructed table into an existing catalog slot.
+    ///
+    /// The caller is responsible for constructing the replacement with the
+    /// existing table's display name. Lookup remains case-insensitive, and a
+    /// missing target leaves the catalog unchanged.
+    pub(crate) fn replace_table(&mut self, name: &str, replacement: Table) -> Result<Table> {
+        let target = self
+            .tables
+            .get_mut(&normalize(name))
+            .ok_or_else(|| Error::TableNotFound(name.to_owned()))?;
+        debug_assert_eq!(
+            normalize(target.name()),
+            normalize(replacement.name()),
+            "a catalog replacement must retain the target name"
+        );
+        Ok(std::mem::replace(target, replacement))
+    }
+
     /// Registers a completely constructed set of tables after preflighting
     /// every existing and intra-set case-insensitive name collision.
     ///

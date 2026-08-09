@@ -90,6 +90,15 @@ cell limits before changing the catalog or metrics. The payload is strictly a
 single-table format: it contains one column and no database name, batch table
 name, additional tables, or catalog metadata.
 
+`Database::replace_int64_table_from_file` instead requires that the
+case-insensitively resolved target already exist. It checks that requirement
+before opening the snapshot, preserves the target's stored display name, and
+stages the decoded column schema, rows, and persisted row cap through the same
+non-nullability, identifier, and configured table-limit validation. Only then
+does it swap the catalog entry once and replace the cached measurements. A
+missing target, corrupt snapshot, nullable or invalid column, or limit failure
+leaves the prior table and metrics unchanged.
+
 `Database::restore_int64_tables_from_files` transactionally composes those
 single-table payloads into a caller-bounded catalog subset. Each
 `DatabaseSnapshotRestoreEntry` supplies a table name, source path, and its own

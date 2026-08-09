@@ -1014,6 +1014,38 @@ impl Database {
         self.register_restored_int64_table(table_name, restored)
     }
 
+    /// Atomically replaces one existing table from a self-describing,
+    /// non-nullable `Int64` snapshot.
+    ///
+    /// `table_name` uses the catalog's case-insensitive lookup, while the
+    /// replacement retains the target's stored display name. The snapshot
+    /// supplies the new column name, rows, and persisted row cap. The envelope
+    /// and payload codecs bound all file and decoding work.
+    ///
+    /// Target existence is checked before the source is opened. The snapshot
+    /// is then fully decoded and staged as a batch table, including
+    /// non-nullability, SQL identifier, row-cap, column, and cell validation,
+    /// before one catalog swap. Every failure preserves the old table and its
+    /// cached metrics; success replaces those metrics with the staged table's
+    /// exact measurements.
+    pub fn replace_int64_table_from_file(
+        &mut self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: Int64TablePayloadCodec,
+    ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
+        let display_name = self.catalog.table(table_name)?.name().to_owned();
+        let restored = restore_int64_table_payload_from_file(path, snapshot_codec, payload_codec)?;
+        let replacement = self.prepare_restored_int64_table(&display_name, restored)?;
+        let replacement_measurements = TableMeasurements::read(&replacement);
+
+        let previous = self.catalog.replace_table(table_name, replacement)?;
+        self.measurements
+            .replace(TableMeasurements::read(&previous), replacement_measurements);
+        Ok(())
+    }
+
     /// Atomically reopens a caller-bounded set of named, self-describing,
     /// non-nullable `Int64` snapshots.
     ///
