@@ -1176,6 +1176,16 @@ path. It encodes all table metadata and rows with `Int64TablePayloadCodec`, then
 atomically replaces a checksummed envelope. Its typed error separates payload
 encoding from replacement failures, preserves an existing destination on every
 pre-rename failure, and identifies post-rename directory-sync uncertainty.
+`Database::save_int64_table_to_file` connects that operation to one named batch
+table. It accepts exactly one non-nullable `Int64` column, preserves the stored
+column name, row order, and table row cap, and intentionally omits the batch
+table name and every other catalog table. Missing tables, multi-column tables,
+and other physical column types are rejected before filesystem access. Files it
+writes remain compatible with `restore_int64_table_payload_from_file`; payload
+encoding and atomic-replacement errors retain their existing typed causes and
+destination-preservation reporting. Codec bounds are checked against borrowed
+batch storage before payload allocation; the adapter does not clone the column
+into a second table representation.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries
@@ -1208,6 +1218,14 @@ self-describing save helper is the metadata-preserving counterpart and reopens
 with `restore_int64_table_payload_from_file`. The codec also composes directly
 with the envelope's lower-level `encode`, `create_new_file`, and Unix
 `replace_file` APIs.
+`Database::restore_int64_table_from_file` connects that bounded,
+self-describing reopen path to the typed batch SQL database. The caller chooses
+the batch table name; the snapshot supplies its `Int64` column name, persisted
+row cap, and rows. The API accepts only a non-nullable column, enforces the
+database's configured `TableLimits`, preserves the persisted row cap, and
+registers the table plus its cached metrics only after all decoding and storage
+validation succeeds. Duplicate names resolve case-insensitively just like SQL
+table names and leave the existing catalog unchanged.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary
