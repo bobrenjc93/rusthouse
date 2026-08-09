@@ -416,3 +416,31 @@ fn http_request_row_limit_bounds_system_columns_before_formatting() {
         b"{\"error\":\"SELECT result rows requires at least 2, exceeding the limit of 1\"}"
     );
 }
+
+#[test]
+fn http_request_byte_limit_bounds_system_columns_before_formatting() {
+    let shared = SharedDatabase::default();
+    shared
+        .execute("CREATE TABLE Events (id Int64, label String)")
+        .expect("HTTP setup");
+    let expected = metadata_result(&[
+        ("Events", "id", DataType::Int64, 1),
+        ("Events", "label", DataType::String, 2),
+    ]);
+    let exact_bytes = retained_bytes(&expected);
+    let max_result_bytes = exact_bytes - 1;
+    let request = format!(
+        "GET /?max_result_bytes={max_result_bytes}&query=SELECT+database%2C+table%2C+name%2C+type%2C+position+FROM+system.columns HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    let mut response = Vec::new();
+    handle_http_query(&shared, Cursor::new(request), &mut response).expect("HTTP exchange");
+
+    assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert_eq!(
+        http_body(&response),
+        format!(
+            "{{\"error\":\"retained query results require at least {exact_bytes} bytes, exceeding the limit of {max_result_bytes} bytes\"}}"
+        )
+        .as_bytes()
+    );
+}
