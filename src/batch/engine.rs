@@ -1139,6 +1139,7 @@ impl Database {
             | Statement::SystemColumns
             | Statement::SystemMetrics
             | Statement::SystemSettings
+            | Statement::SystemFunctions
             | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
@@ -1174,6 +1175,7 @@ impl Database {
             Statement::SystemColumns => self.execute_system_columns(query_result_limits),
             Statement::SystemMetrics => self.execute_system_metrics(query_result_limits),
             Statement::SystemSettings => self.execute_system_settings(query_result_limits),
+            Statement::SystemFunctions => self.execute_system_functions(query_result_limits),
             Statement::Select(select) => self.execute_select(select, query_result_limits),
             Statement::CrossJoin(cross_join) => {
                 self.execute_cross_join(cross_join, query_result_limits)
@@ -1602,6 +1604,21 @@ impl Database {
         &self,
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
+        self.execute_functions(query_result_limits, SHOW_FUNCTIONS_RESULT_RESOURCES)
+    }
+
+    fn execute_system_functions(
+        &self,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        self.execute_functions(query_result_limits, SELECT_RESULT_RESOURCES)
+    }
+
+    fn execute_functions(
+        &self,
+        query_result_limits: QueryResultLimits,
+        result_resources: QueryResultResources,
+    ) -> Result<QueryResult> {
         const RESULT_COLUMN_NAME: &str = "name";
 
         let fixed_bytes = validate_result_shape_parts(
@@ -1610,14 +1627,14 @@ impl Database {
             1,
             RESULT_COLUMN_NAME.len(),
             query_result_limits,
-            SHOW_FUNCTIONS_RESULT_RESOURCES,
+            result_resources,
         )?;
         let function_name_bytes = SUPPORTED_FUNCTION_NAMES
             .iter()
             .map(|name| name.len())
             .fold(0_usize, usize::saturating_add);
         enforce_resource_limit(
-            SHOW_FUNCTIONS_RESULT_RESOURCES.bytes,
+            result_resources.bytes,
             fixed_bytes.saturating_add(function_name_bytes),
             query_result_limits.max_bytes,
         )?;
@@ -2310,6 +2327,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::SystemColumns
         | Statement::SystemMetrics
         | Statement::SystemSettings
+        | Statement::SystemFunctions
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
@@ -4511,60 +4529,46 @@ fn min_global_int64(
     let Column::Int64(values) = &table.columns()[spec.argument.expect("MIN argument")] else {
         unreachable!("MIN input type is resolved")
     };
-    min_int64_state(reduce_global_min_int64(
+    min_int64_state(reduce_global_int64_extremum(
         values,
         matching_rows,
         parallelism,
-        min_int64_chunk,
+        "min",
+        i64::min,
     ))
 }
 
-fn reduce_global_min_int64<F>(
+fn reduce_global_int64_extremum<C>(
     values: &[i64],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
-    chunk_minimum: F,
+    worker_label: &'static str,
+    compare: C,
 ) -> Option<i64>
 where
-    F: Fn(&[i64], &[usize]) -> Option<i64> + Sync,
+    C: Fn(i64, i64) -> i64 + Sync,
 {
     let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return chunk_minimum(values, matching_rows);
+        return int64_extremum_chunk(values, matching_rows, &compare);
     };
 
-    // Each lane receives the same deterministic contiguous partitions used by
-    // countIf and SUM. A failed spawn or panic discards every partial and
-    // repeats the complete minimum on the query thread after admission is
-    // released.
-    let parallel_result = try_parallel_min_int64(
-        values,
-        matching_rows,
-        admission.helper_threads(),
-        &chunk_minimum,
-    );
-    drop(admission);
-    parallel_result.unwrap_or_else(|| chunk_minimum(values, matching_rows))
-}
-
-fn try_parallel_min_int64<F>(
-    values: &[i64],
-    matching_rows: &[usize],
-    helper_threads: usize,
-    chunk_minimum: &F,
-) -> Option<Option<i64>>
-where
-    F: Fn(&[i64], &[usize]) -> Option<i64> + Sync,
-{
+    // Each lane receives the same deterministic contiguous partition used by
+    // the other global aggregates. Optional scalar partials are combined in
+    // place, without allocating a partial-results collection. A failed spawn
+    // or panic discards every partial and repeats the complete extremum on the
+    // query thread after releasing process-wide admission.
+    let helper_threads = admission.helper_threads();
     debug_assert!(helper_threads > 0);
     let worker_count = helper_threads.saturating_add(1);
-    std::thread::scope(|scope| {
+    let compare = &compare;
+    let parallel_result = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(helper_threads);
         let mut worker_failed = false;
         for chunk_index in 1..worker_count {
             let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
             let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-min-int64-{chunk_index}"))
-                .spawn_scoped(scope, move || chunk_minimum(values, rows));
+                .name(format!("rusthouse-{worker_label}-int64-{chunk_index}"))
+                .spawn_scoped(scope, move || int64_extremum_chunk(values, rows, compare));
             match spawn {
                 Ok(handle) => handles.push(handle),
                 Err(_) => {
@@ -4574,31 +4578,42 @@ where
             }
         }
 
-        let mut minimum = chunk_minimum(
+        let mut extremum = int64_extremum_chunk(
             values,
             parallel_aggregate_partition(matching_rows, worker_count, 0),
+            compare,
         );
         for handle in handles {
             match handle.join() {
                 Ok(partial) => {
-                    // Reduce optional scalar partials directly. Unlike the
-                    // checked SUM path, MIN needs no allocated partial vector.
-                    minimum = reduce_min_int64_partials(minimum, partial);
+                    extremum = reduce_int64_extremum_partials(extremum, partial, compare);
                 }
                 Err(_) => worker_failed = true,
             }
         }
-        (!worker_failed).then_some(minimum)
-    })
+        (!worker_failed).then_some(extremum)
+    });
+    drop(admission);
+    parallel_result.unwrap_or_else(|| int64_extremum_chunk(values, matching_rows, compare))
 }
 
-fn min_int64_chunk(values: &[i64], matching_rows: &[usize]) -> Option<i64> {
-    matching_rows.iter().map(|row| values[*row]).min()
+fn int64_extremum_chunk<C>(values: &[i64], matching_rows: &[usize], compare: &C) -> Option<i64>
+where
+    C: Fn(i64, i64) -> i64,
+{
+    matching_rows.iter().map(|row| values[*row]).reduce(compare)
 }
 
-fn reduce_min_int64_partials(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+fn reduce_int64_extremum_partials<C>(
+    left: Option<i64>,
+    right: Option<i64>,
+    compare: &C,
+) -> Option<i64>
+where
+    C: Fn(i64, i64) -> i64,
+{
     match (left, right) {
-        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), Some(right)) => Some(compare(left, right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     }
@@ -4619,96 +4634,13 @@ fn max_global_int64(
     let Column::Int64(values) = &table.columns()[spec.argument.expect("MAX argument")] else {
         unreachable!("MAX input type is resolved")
     };
-    max_int64_state(reduce_global_max_int64(
+    max_int64_state(reduce_global_int64_extremum(
         values,
         matching_rows,
         parallelism,
-        max_int64_chunk,
+        "max",
+        i64::max,
     ))
-}
-
-fn reduce_global_max_int64<F>(
-    values: &[i64],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    chunk_maximum: F,
-) -> Option<i64>
-where
-    F: Fn(&[i64], &[usize]) -> Option<i64> + Sync,
-{
-    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return chunk_maximum(values, matching_rows);
-    };
-
-    // MAX shares the same deterministic contiguous partitions and global
-    // admission budget as the other parallel aggregates. A failed spawn or
-    // panic discards every partial and repeats the complete maximum locally.
-    let parallel_result = try_parallel_max_int64(
-        values,
-        matching_rows,
-        admission.helper_threads(),
-        &chunk_maximum,
-    );
-    drop(admission);
-    parallel_result.unwrap_or_else(|| chunk_maximum(values, matching_rows))
-}
-
-fn try_parallel_max_int64<F>(
-    values: &[i64],
-    matching_rows: &[usize],
-    helper_threads: usize,
-    chunk_maximum: &F,
-) -> Option<Option<i64>>
-where
-    F: Fn(&[i64], &[usize]) -> Option<i64> + Sync,
-{
-    debug_assert!(helper_threads > 0);
-    let worker_count = helper_threads.saturating_add(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(helper_threads);
-        let mut worker_failed = false;
-        for chunk_index in 1..worker_count {
-            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
-            let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-max-int64-{chunk_index}"))
-                .spawn_scoped(scope, move || chunk_maximum(values, rows));
-            match spawn {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    worker_failed = true;
-                    break;
-                }
-            }
-        }
-
-        let mut maximum = chunk_maximum(
-            values,
-            parallel_aggregate_partition(matching_rows, worker_count, 0),
-        );
-        for handle in handles {
-            match handle.join() {
-                Ok(partial) => {
-                    // Optional scalar partials are reduced in place, without
-                    // allocating a partial-results collection.
-                    maximum = reduce_max_int64_partials(maximum, partial);
-                }
-                Err(_) => worker_failed = true,
-            }
-        }
-        (!worker_failed).then_some(maximum)
-    })
-}
-
-fn max_int64_chunk(values: &[i64], matching_rows: &[usize]) -> Option<i64> {
-    matching_rows.iter().map(|row| values[*row]).max()
-}
-
-fn reduce_max_int64_partials(left: Option<i64>, right: Option<i64>) -> Option<i64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
 }
 
 fn max_int64_state(maximum: Option<i64>) -> AggregateState {
@@ -6963,15 +6895,16 @@ mod tests {
         let mut matching_rows = vec![0; row_count];
         let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
         matching_rows[second_partition] = 8;
-        let minimum = reduce_global_min_int64(
+        let minimum = reduce_global_int64_extremum(
             &values,
             &matching_rows,
             GlobalAggregateParallelism::Fixed(2),
-            |values, rows| {
-                if rows.first() == Some(&8) {
+            "min",
+            |left, right| {
+                if std::thread::current().name() == Some("rusthouse-min-int64-1") {
                     panic!("injected MIN worker failure");
                 }
-                min_int64_chunk(values, rows)
+                left.min(right)
             },
         );
 
@@ -7111,15 +7044,16 @@ mod tests {
         let mut matching_rows = vec![0; row_count];
         let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
         matching_rows[second_partition] = 8;
-        let maximum = reduce_global_max_int64(
+        let maximum = reduce_global_int64_extremum(
             &values,
             &matching_rows,
             GlobalAggregateParallelism::Fixed(2),
-            |values, rows| {
-                if rows.first() == Some(&8) {
+            "max",
+            |left, right| {
+                if std::thread::current().name() == Some("rusthouse-max-int64-1") {
                     panic!("injected MAX worker failure");
                 }
-                max_int64_chunk(values, rows)
+                left.max(right)
             },
         );
 
@@ -7187,14 +7121,32 @@ mod tests {
             ),
             Err(Error::NumericOverflow("AVG count".to_owned()))
         );
-        assert_eq!(reduce_min_int64_partials(None, None), None);
-        assert_eq!(reduce_min_int64_partials(Some(4), None), Some(4));
-        assert_eq!(reduce_min_int64_partials(None, Some(-7)), Some(-7));
-        assert_eq!(reduce_min_int64_partials(Some(4), Some(-7)), Some(-7));
-        assert_eq!(reduce_max_int64_partials(None, None), None);
-        assert_eq!(reduce_max_int64_partials(Some(4), None), Some(4));
-        assert_eq!(reduce_max_int64_partials(None, Some(-7)), Some(-7));
-        assert_eq!(reduce_max_int64_partials(Some(4), Some(-7)), Some(4));
+        assert_eq!(reduce_int64_extremum_partials(None, None, &i64::min), None);
+        assert_eq!(
+            reduce_int64_extremum_partials(Some(4), None, &i64::min),
+            Some(4)
+        );
+        assert_eq!(
+            reduce_int64_extremum_partials(None, Some(-7), &i64::min),
+            Some(-7)
+        );
+        assert_eq!(
+            reduce_int64_extremum_partials(Some(4), Some(-7), &i64::min),
+            Some(-7)
+        );
+        assert_eq!(reduce_int64_extremum_partials(None, None, &i64::max), None);
+        assert_eq!(
+            reduce_int64_extremum_partials(Some(4), None, &i64::max),
+            Some(4)
+        );
+        assert_eq!(
+            reduce_int64_extremum_partials(None, Some(-7), &i64::max),
+            Some(-7)
+        );
+        assert_eq!(
+            reduce_int64_extremum_partials(Some(4), Some(-7), &i64::max),
+            Some(4)
+        );
         let rows = [2, 4, 6, 8, 10, 12, 14];
         assert_eq!(parallel_aggregate_partition(&rows, 3, 0), [2, 4, 6]);
         assert_eq!(parallel_aggregate_partition(&rows, 3, 1), [8, 10]);
