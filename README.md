@@ -65,9 +65,8 @@ global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
 Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `MIN(Int64)`,
 `MIN(Float64)`, `MAX(Int64)`, `MAX(Float64)`, or `AVG(Int64)`, and an exact
-two-item ungrouped
-projection containing `COUNT(*)` or `COUNT()` plus either `SUM(Int64)` or
-`AVG(Int64)` use
+two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
+`SUM(Int64)` or `AVG(Int64)` use
 deterministic contiguous chunks when more than 262,144 rows match. The paired
 shape preserves either projection order and derives its row count with a
 checked conversion of the filtered cardinality while the existing checked
