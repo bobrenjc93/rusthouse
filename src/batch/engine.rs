@@ -4945,6 +4945,15 @@ fn execute_grouped<'a>(
                 ..
             }]
         );
+    let sole_global_min_float = group_columns.is_empty()
+        && matches!(
+            aggregate_specs,
+            [AggregateSpec {
+                function: AggregateFunction::Min,
+                input_type: Some(DataType::Float64),
+                ..
+            }]
+        );
     let sole_global_max_int = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -4968,6 +4977,8 @@ fn execute_grouped<'a>(
                 states[0] = sum_or_avg_global_int64(table, matching_rows, spec, parallelism)?;
             } else if sole_global_min_int {
                 states[0] = min_global_int64(table, matching_rows, spec, parallelism);
+            } else if sole_global_min_float {
+                states[0] = min_global_float64(table, matching_rows, spec, parallelism);
             } else if sole_global_max_int {
                 states[0] = max_global_int64(table, matching_rows, spec, parallelism);
             }
@@ -5012,6 +5023,7 @@ fn execute_grouped<'a>(
                     || sole_global_sum_int
                     || sole_global_avg_int
                     || sole_global_min_int
+                    || sole_global_min_float
                     || sole_global_max_int)
             {
                 continue;
@@ -5349,8 +5361,30 @@ fn reduce_global_int64_extremum<C>(
 where
     C: Fn(i64, i64) -> i64 + Sync,
 {
+    reduce_global_scalar_extremum(
+        values,
+        matching_rows,
+        parallelism,
+        worker_label,
+        "int64",
+        compare,
+    )
+}
+
+fn reduce_global_scalar_extremum<T, C>(
+    values: &[T],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    worker_label: &'static str,
+    worker_type_label: &'static str,
+    compare: C,
+) -> Option<T>
+where
+    T: Copy + Send + Sync,
+    C: Fn(T, T) -> T + Sync,
+{
     let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return int64_extremum_chunk(values, matching_rows, &compare);
+        return scalar_extremum_chunk(values, matching_rows, &compare);
     };
 
     // Each lane receives the same deterministic contiguous partition used by
@@ -5368,8 +5402,10 @@ where
         for chunk_index in 1..worker_count {
             let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
             let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-{worker_label}-int64-{chunk_index}"))
-                .spawn_scoped(scope, move || int64_extremum_chunk(values, rows, compare));
+                .name(format!(
+                    "rusthouse-{worker_label}-{worker_type_label}-{chunk_index}"
+                ))
+                .spawn_scoped(scope, move || scalar_extremum_chunk(values, rows, compare));
             match spawn {
                 Ok(handle) => handles.push(handle),
                 Err(_) => {
@@ -5379,7 +5415,7 @@ where
             }
         }
 
-        let mut extremum = int64_extremum_chunk(
+        let mut extremum = scalar_extremum_chunk(
             values,
             parallel_aggregate_partition(matching_rows, worker_count, 0),
             compare,
@@ -5387,7 +5423,7 @@ where
         for handle in handles {
             match handle.join() {
                 Ok(partial) => {
-                    extremum = reduce_int64_extremum_partials(extremum, partial, compare);
+                    extremum = reduce_scalar_extremum_partials(extremum, partial, compare);
                 }
                 Err(_) => worker_failed = true,
             }
@@ -5395,23 +5431,24 @@ where
         (!worker_failed).then_some(extremum)
     });
     drop(admission);
-    parallel_result.unwrap_or_else(|| int64_extremum_chunk(values, matching_rows, compare))
+    parallel_result.unwrap_or_else(|| scalar_extremum_chunk(values, matching_rows, compare))
 }
 
-fn int64_extremum_chunk<C>(values: &[i64], matching_rows: &[usize], compare: &C) -> Option<i64>
+fn scalar_extremum_chunk<T, C>(values: &[T], matching_rows: &[usize], compare: &C) -> Option<T>
 where
-    C: Fn(i64, i64) -> i64,
+    T: Copy,
+    C: Fn(T, T) -> T,
 {
     matching_rows.iter().map(|row| values[*row]).reduce(compare)
 }
 
-fn reduce_int64_extremum_partials<C>(
-    left: Option<i64>,
-    right: Option<i64>,
+fn reduce_scalar_extremum_partials<T, C>(
+    left: Option<T>,
+    right: Option<T>,
     compare: &C,
-) -> Option<i64>
+) -> Option<T>
 where
-    C: Fn(i64, i64) -> i64,
+    C: Fn(T, T) -> T,
 {
     match (left, right) {
         (Some(left), Some(right)) => Some(compare(left, right)),
@@ -5422,6 +5459,50 @@ where
 
 fn min_int64_state(minimum: Option<i64>) -> AggregateState {
     AggregateState::Min(minimum.map(Value::Int64))
+}
+
+fn min_global_float64(
+    table: &Table,
+    matching_rows: &[usize],
+    spec: &AggregateSpec,
+    parallelism: GlobalAggregateParallelism,
+) -> AggregateState {
+    debug_assert_eq!(spec.function, AggregateFunction::Min);
+    debug_assert_eq!(spec.input_type, Some(DataType::Float64));
+    let Column::Float64(values) = &table.columns()[spec.argument.expect("MIN argument")] else {
+        unreachable!("MIN input type is resolved")
+    };
+    AggregateState::Min(
+        reduce_global_float64_minimum(values, matching_rows, parallelism, first_float64_minimum)
+            .map(Value::Float64),
+    )
+}
+
+fn reduce_global_float64_minimum<C>(
+    values: &[f64],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    compare: C,
+) -> Option<f64>
+where
+    C: Fn(f64, f64) -> f64 + Sync,
+{
+    reduce_global_scalar_extremum(
+        values,
+        matching_rows,
+        parallelism,
+        "min",
+        "float64",
+        compare,
+    )
+}
+
+fn first_float64_minimum(left: f64, right: f64) -> f64 {
+    if ValueRef::Float64(right) < ValueRef::Float64(left) {
+        right
+    } else {
+        left
+    }
 }
 
 fn max_global_int64(
@@ -7052,14 +7133,14 @@ mod tests {
         database
             .execute(
                 "CREATE TABLE empty_events (active Bool); \
-                 CREATE TABLE events (id Int64, active Bool, included Bool);",
+                 CREATE TABLE events (id Int64, score Float64, active Bool, included Bool);",
             )
             .expect("countIf differential setup");
         if row_count > 0 {
             for first_id in (1..=row_count).step_by(50_000) {
                 let last_id = first_id.saturating_add(49_999).min(row_count);
                 let rows = (first_id..=last_id)
-                    .map(|id| format!("({id}, {}, {})", id % 2 == 0, id % 3 != 0))
+                    .map(|id| format!("({id}, {id}.0, {}, {})", id % 2 == 0, id % 3 != 0))
                     .collect::<Vec<_>>()
                     .join(",");
                 database
@@ -7143,6 +7224,36 @@ mod tests {
                 database
                     .execute(&format!("INSERT INTO values_to_min VALUES {rows}"))
                     .expect("MIN(Int64) differential rows");
+            }
+        }
+        database
+    }
+
+    fn min_float64_database(
+        row_count: usize,
+        row_values: impl Fn(usize) -> (f64, bool),
+    ) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE empty_float_min_values (value Float64); \
+                 CREATE TABLE float_values_to_min (id Int64, value Float64, included Bool);",
+            )
+            .expect("MIN(Float64) differential setup");
+        if row_count > 0 {
+            for first_id in (1..=row_count).step_by(50_000) {
+                let last_id = first_id.saturating_add(49_999).min(row_count);
+                let rows = (first_id..=last_id)
+                    .map(|id| {
+                        let (value, included) = row_values(id);
+                        let value = Value::Float64(value).as_display_string();
+                        format!("({id}, {value}, {included})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                database
+                    .execute(&format!("INSERT INTO float_values_to_min VALUES {rows}"))
+                    .expect("MIN(Float64) differential rows");
             }
         }
         database
@@ -7748,6 +7859,200 @@ mod tests {
     }
 
     #[test]
+    fn global_min_float64_forced_workers_match_empty_null_having_and_pagination() {
+        let mut database = min_float64_database(0, |_| unreachable!("empty input"));
+        let first_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MIN(value) AS minimum FROM empty_float_min_values \
+             HAVING minimum IS NULL ORDER BY minimum LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(first_page.rows, [vec![Value::Null(DataType::Float64)]]);
+
+        let second_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MIN(value) AS minimum FROM empty_float_min_values \
+             HAVING minimum IS NULL ORDER BY minimum LIMIT 1 OFFSET 1",
+        );
+        assert!(second_page.rows.is_empty());
+    }
+
+    #[test]
+    fn global_min_float64_forced_workers_preserve_filtering_extrema_and_first_signed_zero() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
+        let mut database = min_float64_database(row_count, |id| match id {
+            1 => (f64::MAX, true),
+            2 => (-0.0, true),
+            id if id == row_count / 2 => (f64::MIN, false),
+            id if id == row_count => (0.0, true),
+            _ => ((id % 1_003 + 1) as f64, true),
+        });
+        let sql = "SELECT MIN(value) AS minimum FROM float_values_to_min \
+                   WHERE included = true HAVING minimum = 0.0 \
+                   ORDER BY minimum LIMIT 1 OFFSET 0";
+
+        let single_worker = force_global_aggregate_workers(&mut database, 1, sql);
+        let multi_worker = force_global_aggregate_workers(&mut database, 4, sql);
+        assert_eq!(
+            single_worker, multi_worker,
+            "signed-zero worker differential"
+        );
+        let Value::Float64(single_minimum) = &single_worker.rows[0][0] else {
+            panic!("single-worker minimum must be Float64")
+        };
+        let Value::Float64(multi_minimum) = &multi_worker.rows[0][0] else {
+            panic!("multi-worker minimum must be Float64")
+        };
+        assert_eq!(single_minimum.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(multi_minimum.to_bits(), single_minimum.to_bits());
+
+        let finite_extreme = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MIN(value) FROM float_values_to_min",
+        );
+        assert_eq!(finite_extreme.rows, [vec![Value::Float64(f64::MIN)]]);
+    }
+
+    #[test]
+    fn global_min_float64_parallel_boundary_uses_shared_budget_only_for_the_sole_global_shape() {
+        static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::new(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = min_float64_database(row_count, |_| (7.25, true));
+        for matched_rows in [
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD,
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1,
+        ] {
+            let result = assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!("SELECT MIN(value) FROM float_values_to_min WHERE id <= {matched_rows}"),
+            );
+            assert_eq!(result.rows, [vec![Value::Float64(7.25)]]);
+        }
+
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &UNAVAILABLE_BUDGET,
+        );
+        assert_eq!(
+            query(&mut database, "SELECT MIN(value) FROM float_values_to_min").rows,
+            [vec![Value::Float64(7.25)]],
+            "failed admission falls back to the query thread"
+        );
+
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &OBSERVED_BUDGET,
+        );
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                &format!(
+                    "SELECT MIN(value) FROM float_values_to_min \
+                     WHERE id <= {}",
+                    GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+                ),
+            )
+            .rows,
+            [vec![Value::Float64(7.25)]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "the threshold itself stays sequential"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, "SELECT MIN(value) FROM float_values_to_min").rows,
+            [vec![Value::Float64(7.25)]]
+        );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "sole MIN(Float64) above the threshold uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT MIN(value), COUNT(*) FROM float_values_to_min"
+            )
+            .rows,
+            [vec![
+                Value::Float64(7.25),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "MIN(Float64) in a multi-aggregate projection stays sequential"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT included, MIN(value) FROM float_values_to_min GROUP BY included"
+            )
+            .rows,
+            [vec![Value::Bool(true), Value::Float64(7.25)]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "grouped MIN(Float64) stays sequential"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, "SELECT MAX(value) FROM float_values_to_min").rows,
+            [vec![Value::Float64(7.25)]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "MAX(Float64) stays sequential"
+        );
+    }
+
+    #[test]
+    fn global_min_float64_worker_failure_repeats_the_complete_minimum_locally() {
+        let values = [9.0, 7.0, 5.0, 3.0, 1.0, 0.0, -0.0, -5.0, f64::MIN];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 8;
+        let minimum = reduce_global_float64_minimum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            |left, right| {
+                if std::thread::current().name() == Some("rusthouse-min-float64-1") {
+                    panic!("injected MIN(Float64) worker failure");
+                }
+                first_float64_minimum(left, right)
+            },
+        );
+
+        assert_eq!(minimum, Some(f64::MIN));
+    }
+
+    #[test]
     fn global_max_int64_forced_workers_match_empty_null_having_and_pagination() {
         let mut database = max_int64_database(0, |_| unreachable!("empty input"));
         let first_page = assert_global_aggregate_worker_differential(
@@ -7969,30 +8274,30 @@ mod tests {
             ),
             Err(Error::NumericOverflow("AVG count".to_owned()))
         );
-        assert_eq!(reduce_int64_extremum_partials(None, None, &i64::min), None);
+        assert_eq!(reduce_scalar_extremum_partials(None, None, &i64::min), None);
         assert_eq!(
-            reduce_int64_extremum_partials(Some(4), None, &i64::min),
+            reduce_scalar_extremum_partials(Some(4), None, &i64::min),
             Some(4)
         );
         assert_eq!(
-            reduce_int64_extremum_partials(None, Some(-7), &i64::min),
+            reduce_scalar_extremum_partials(None, Some(-7), &i64::min),
             Some(-7)
         );
         assert_eq!(
-            reduce_int64_extremum_partials(Some(4), Some(-7), &i64::min),
+            reduce_scalar_extremum_partials(Some(4), Some(-7), &i64::min),
             Some(-7)
         );
-        assert_eq!(reduce_int64_extremum_partials(None, None, &i64::max), None);
+        assert_eq!(reduce_scalar_extremum_partials(None, None, &i64::max), None);
         assert_eq!(
-            reduce_int64_extremum_partials(Some(4), None, &i64::max),
+            reduce_scalar_extremum_partials(Some(4), None, &i64::max),
             Some(4)
         );
         assert_eq!(
-            reduce_int64_extremum_partials(None, Some(-7), &i64::max),
+            reduce_scalar_extremum_partials(None, Some(-7), &i64::max),
             Some(-7)
         );
         assert_eq!(
-            reduce_int64_extremum_partials(Some(4), Some(-7), &i64::max),
+            reduce_scalar_extremum_partials(Some(4), Some(-7), &i64::max),
             Some(4)
         );
         let rows = [2, 4, 6, 8, 10, 12, 14];
@@ -8062,6 +8367,7 @@ mod tests {
             "SELECT SUM(id) FROM events",
             "SELECT AVG(id) FROM events",
             "SELECT MIN(id) FROM events",
+            "SELECT MIN(score) FROM events",
             "SELECT MAX(id) FROM events",
             "SELECT countIf(active) FROM events",
         ]
@@ -8111,6 +8417,7 @@ mod tests {
             "SELECT SUM(id) FROM events",
             "SELECT AVG(id) FROM events",
             "SELECT MIN(id) FROM events",
+            "SELECT MIN(score) FROM events",
             "SELECT MAX(id) FROM events",
             "SELECT countIf(active) FROM events",
         ] {
