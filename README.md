@@ -1123,9 +1123,21 @@ the same `401 Unauthorized` response before a body is read or the database is
 accessed. Successful requests remain read-only: explicit insertion targets are
 rejected before their bodies are read, and INSERT statements on query routes
 are rejected by read-only statement validation. All responses include
-`Cache-Control: private, no-store`. Neither named-principal boundary adds roles,
-grants, or credential storage. The existing bearer, key-only, and named
-read-only APIs retain their documented behavior.
+`Cache-Control: private, no-store`.
+
+For a small role-bearing identity set,
+`handle_http_query_with_clickhouse_principal_set` accepts from one through 64
+borrowed `ClickHousePrincipal` configurations. Each exact, case-sensitive
+user/key pair has either `ClickHousePrincipalRole::ReadOnly` or
+`ClickHousePrincipalRole::ReadWrite`; duplicate pairs, invalid values, empty
+sets, and oversized sets are rejected before request input is read. Every
+authentication attempt compares both supplied values against every configured
+pair without stopping on a match. One exact match enters the same read-only or
+read-write boundary used by the single-principal handlers, while all missing,
+duplicate, partial, and unknown credentials produce the same bounded `401`
+response. The handler uses the default HTTP, CSV, TSV, and response bounds and
+does not retain credentials. The existing bearer, key-only, and
+single-principal APIs retain their documented behavior.
 
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before

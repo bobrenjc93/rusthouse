@@ -29,6 +29,10 @@ pub const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 /// Default maximum number of request header fields.
 pub const DEFAULT_MAX_HTTP_HEADER_COUNT: usize = 64;
 
+/// Maximum number of entries accepted by
+/// [`handle_http_query_with_clickhouse_principal_set`].
+pub const MAX_HTTP_NAMED_PRINCIPALS: usize = 64;
+
 /// Default maximum size of the decoded SQL request.
 pub const DEFAULT_MAX_HTTP_SQL_BYTES: usize = 1024 * 1024;
 
@@ -75,6 +79,46 @@ impl Default for HttpQueryLimits {
             tsv_ingest_limits: TsvIngestLimits::default(),
             max_response_bytes: DEFAULT_MAX_HTTP_RESPONSE_BYTES,
         }
+    }
+}
+
+/// Access granted to one [`ClickHousePrincipal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickHousePrincipalRole {
+    /// Allows queries and operational routes, but never ingestion.
+    ReadOnly,
+    /// Allows queries, operational routes, and the existing ingestion paths.
+    ReadWrite,
+}
+
+/// One exact user/key pair and its HTTP access role.
+///
+/// The handler borrows these values and does not retain or store credentials.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ClickHousePrincipal<'a> {
+    /// Exact, case-sensitive value required in `X-ClickHouse-User`.
+    pub user: &'a str,
+    /// Exact, case-sensitive value required in `X-ClickHouse-Key`.
+    pub key: &'a str,
+    /// Access granted after both values match.
+    pub role: ClickHousePrincipalRole,
+}
+
+impl fmt::Debug for ClickHousePrincipal<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClickHousePrincipal")
+            .field("user", &self.user)
+            .field("key", &"[REDACTED]")
+            .field("role", &self.role)
+            .finish()
+    }
+}
+
+impl<'a> ClickHousePrincipal<'a> {
+    /// Creates one named principal configuration.
+    pub const fn new(user: &'a str, key: &'a str, role: ClickHousePrincipalRole) -> Self {
+        Self { user, key, role }
     }
 }
 
@@ -1332,6 +1376,62 @@ pub fn handle_http_query_read_only_with_clickhouse_principal_and_limits(
     )
 }
 
+/// Handles one bounded HTTP exchange using a set of role-bearing ClickHouse
+/// principals.
+///
+/// `principals` must contain between one and
+/// [`MAX_HTTP_NAMED_PRINCIPALS`] entries. Every user and key must satisfy the
+/// same validation as the single-principal handlers, and no exact user/key
+/// pair may occur more than once. The complete configuration is validated
+/// before request input is read.
+///
+/// Every request must contain exactly one `X-ClickHouse-User` and exactly one
+/// `X-ClickHouse-Key` header. Authentication compares the supplied user and
+/// key against every configured pair, without stopping after a match, then
+/// dispatches the exact match through the existing read-only or read-write
+/// access boundary according to its [`ClickHousePrincipalRole`]. Missing,
+/// duplicate, empty, partially matching, and unknown credentials all receive
+/// the same `401 Unauthorized` response before a request body is read or the
+/// database is accessed.
+///
+/// The exchange uses [`HttpQueryLimits::default`] and includes `Cache-Control:
+/// private, no-store` on every response. This API neither stores credentials
+/// nor provides transport security; the embedding application must provide
+/// TLS on untrusted networks.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`]. Invalid principal-set configurations are represented
+/// by a bounded `500 Internal Server Error` response.
+pub fn handle_http_query_with_clickhouse_principal_set(
+    database: &SharedDatabase,
+    principals: &[ClickHousePrincipal<'_>],
+    input: impl Read,
+    mut output: impl Write,
+) -> Result<(), HttpQueryError> {
+    let limits = HttpQueryLimits::default();
+    if let Err(message) = validate_clickhouse_principal_set_configuration(principals) {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            CLICKHOUSE_KEY_RESPONSE_HEADERS,
+            message,
+            limits.max_response_bytes,
+        );
+    }
+
+    handle_http_query_exchange(
+        database,
+        input,
+        output,
+        limits,
+        Authentication::ClickHousePrincipalSet(principals),
+        HttpAccess::ReadOnly,
+    )
+}
+
 fn handle_http_query_with_clickhouse_principal_access_and_limits(
     database: &SharedDatabase,
     expected_clickhouse_user: &str,
@@ -1425,6 +1525,7 @@ enum Authentication<'a> {
     Bearer(&'a [u8]),
     ClickHouseKey(&'a [u8]),
     ClickHousePrincipal { user: &'a [u8], key: &'a [u8] },
+    ClickHousePrincipalSet(&'a [ClickHousePrincipal<'a>]),
 }
 
 impl Authentication<'_> {
@@ -1434,9 +1535,9 @@ impl Authentication<'_> {
 
     const fn response_headers(self) -> &'static [&'static [u8]] {
         match self {
-            Self::ClickHouseKey(_) | Self::ClickHousePrincipal { .. } => {
-                CLICKHOUSE_KEY_RESPONSE_HEADERS
-            }
+            Self::ClickHouseKey(_)
+            | Self::ClickHousePrincipal { .. }
+            | Self::ClickHousePrincipalSet(_) => CLICKHOUSE_KEY_RESPONSE_HEADERS,
             Self::None | Self::Bearer(_) => &[],
         }
     }
@@ -1792,7 +1893,8 @@ fn read_request(
     access: HttpAccess,
 ) -> Result<HttpRequest, RequestReadError> {
     let header = read_header_block(input, limits.max_header_bytes)?;
-    let request = parse_headers(&header, limits.max_header_count, authentication, access)?;
+    let (request, access) =
+        parse_headers(&header, limits.max_header_count, authentication, access)?;
 
     match request.kind {
         RequestKind::Ping => {
@@ -2471,8 +2573,8 @@ fn parse_headers(
     header: &[u8],
     max_header_count: usize,
     authentication: Authentication<'_>,
-    access: HttpAccess,
-) -> Result<ParsedRequest, RequestReadError> {
+    mut access: HttpAccess,
+) -> Result<(ParsedRequest, HttpAccess), RequestReadError> {
     let Some(without_terminator) = header.strip_suffix(b"\r\n\r\n") else {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "malformed HTTP headers").into());
     };
@@ -2546,14 +2648,18 @@ fn parse_headers(
             && authorization.replace(value).is_some()
         {
             duplicate_authorization = true;
-        } else if matches!(authentication, Authentication::ClickHousePrincipal { .. })
-            && name.eq_ignore_ascii_case(b"x-clickhouse-user")
+        } else if matches!(
+            authentication,
+            Authentication::ClickHousePrincipal { .. } | Authentication::ClickHousePrincipalSet(_)
+        ) && name.eq_ignore_ascii_case(b"x-clickhouse-user")
             && clickhouse_user.replace(value).is_some()
         {
             duplicate_clickhouse_user = true;
         } else if matches!(
             authentication,
-            Authentication::ClickHouseKey(_) | Authentication::ClickHousePrincipal { .. }
+            Authentication::ClickHouseKey(_)
+                | Authentication::ClickHousePrincipal { .. }
+                | Authentication::ClickHousePrincipalSet(_)
         ) && name.eq_ignore_ascii_case(b"x-clickhouse-key")
             && clickhouse_key.replace(value).is_some()
         {
@@ -2613,6 +2719,41 @@ fn parse_headers(
                 )
                 .into());
             }
+        }
+        Authentication::ClickHousePrincipalSet(principals) => {
+            let provided_user = clickhouse_user.unwrap_or(&[]);
+            let provided_key = clickhouse_key.unwrap_or(&[]);
+            let mut read_only_match = false;
+            let mut read_write_match = false;
+
+            // Compare both values for every configured pair. In particular,
+            // do not return early after an exact or partial match.
+            for principal in principals {
+                let user_matches = constant_work_eq(provided_user, principal.user.as_bytes());
+                let key_matches = constant_work_eq(provided_key, principal.key.as_bytes());
+                let pair_matches = user_matches & key_matches;
+                match principal.role {
+                    ClickHousePrincipalRole::ReadOnly => read_only_match |= pair_matches,
+                    ClickHousePrincipalRole::ReadWrite => read_write_match |= pair_matches,
+                }
+            }
+
+            let authorized = (read_only_match | read_write_match)
+                & !duplicate_clickhouse_user
+                & !duplicate_clickhouse_key;
+            if !authorized {
+                return Err(RequestFailure::with_headers(
+                    Status::UNAUTHORIZED,
+                    "X-ClickHouse-User and X-ClickHouse-Key authentication required",
+                    &[b"WWW-Authenticate: X-ClickHouse-User, X-ClickHouse-Key\r\n"],
+                )
+                .into());
+            }
+            access = if read_write_match {
+                HttpAccess::ReadWrite
+            } else {
+                HttpAccess::ReadOnly
+            };
         }
     }
 
@@ -2709,12 +2850,15 @@ fn parse_headers(
     } else {
         TableInsertFormat::CsvWithNames
     };
-    Ok(ParsedRequest {
-        kind,
-        content_length,
-        response_format,
-        table_insert_format,
-    })
+    Ok((
+        ParsedRequest {
+            kind,
+            content_length,
+            response_format,
+            table_insert_format,
+        },
+        access,
+    ))
 }
 
 fn parse_bearer_token(value: &[u8]) -> Option<&[u8]> {
@@ -2764,6 +2908,31 @@ fn validate_clickhouse_principal_configuration(
     }
     if !is_valid_clickhouse_credential(key) {
         return Err("configured ClickHouse key is not a valid HTTP header value");
+    }
+    Ok(())
+}
+
+fn validate_clickhouse_principal_set_configuration(
+    principals: &[ClickHousePrincipal<'_>],
+) -> Result<(), &'static str> {
+    if principals.is_empty() {
+        return Err("configured ClickHouse principal set must not be empty");
+    }
+    if principals.len() > MAX_HTTP_NAMED_PRINCIPALS {
+        return Err("configured ClickHouse principal set exceeds the principal limit");
+    }
+
+    for (index, principal) in principals.iter().enumerate() {
+        validate_clickhouse_principal_configuration(
+            principal.user.as_bytes(),
+            principal.key.as_bytes(),
+        )?;
+        if principals[..index]
+            .iter()
+            .any(|configured| configured.user == principal.user && configured.key == principal.key)
+        {
+            return Err("configured ClickHouse principal set contains a duplicate user/key pair");
+        }
     }
     Ok(())
 }
