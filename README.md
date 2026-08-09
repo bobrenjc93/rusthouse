@@ -233,6 +233,14 @@ their respective struct declaration order, and values are unsigned decimal
 strings. Arguments and trailing clauses are rejected. The metadata result is
 itself subject to the configured query row, value, and byte limits plus the
 normal retained-result and formatted-output limits.
+The exact case-insensitive query
+`SELECT name, value FROM system.settings` returns the identical typed rows in
+the same stable order as `SHOW SETTINGS`. Other projections, aliases,
+functions, predicates, ordering, limits, and trailing clauses are deliberately
+unsupported. The query uses the normal bounded `SELECT` result construction
+and is available through `Database`, `SharedDatabase`, the CLI, and
+authenticated or unauthenticated read-only HTTP handlers in every supported
+output format.
 The exact case-insensitive `SHOW FUNCTIONS` returns every executable scalar,
 aggregate, compatibility-probe, and window function as one `String` column
 named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
@@ -615,7 +623,7 @@ poisoning is reported separately.
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
 and `currentDatabase()` probes plus the exact `system.tables`, `system.columns`,
-and `system.metrics` metadata queries),
+`system.metrics`, and `system.settings` metadata queries),
 `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,
