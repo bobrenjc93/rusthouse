@@ -1962,6 +1962,46 @@ fn terminal_csv_with_names_format_wires_get_and_post_with_escaped_and_empty_resu
 }
 
 #[test]
+fn terminal_json_format_wires_get_and_post_with_typed_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE typed_json (id Int64, score Float64, active Bool, label String); \
+             INSERT INTO typed_json VALUES (-7, 2.0, false, 'quote\"\\line\nsnow 雪'), \
+                                           (0, -1.25, true, '');",
+        )
+        .unwrap();
+    let expected = concat!(
+        "{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},",
+        "{\"name\":\"score\",\"type\":\"Float64\"},",
+        "{\"name\":\"active\",\"type\":\"Bool\"},",
+        "{\"name\":\"label\",\"type\":\"String\"}],",
+        "\"rows\":[[-7,2.0,false,\"quote\\\"\\\\line\\nsnow 雪\"],",
+        "[0,-1.25,true,\"\"]]}"
+    );
+
+    let requests = [
+        b"GET /?query=SELECT+id%2C+score%2C+active%2C+label+FROM+typed_json+ORDER+BY+id+FoRmAt+JsOn%3B HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        request_for_target(
+            "/query",
+            b"SELECT id, score, active, label FROM typed_json ORDER BY id format json",
+        ),
+    ];
+    for request in requests {
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT id FROM typed_json WHERE id = 99 FORMAT JSON;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
 fn terminal_json_each_row_format_wires_every_query_form_with_typed_and_escaped_rows() {
     let database = SharedDatabase::default();
     database
@@ -2052,6 +2092,72 @@ fn terminal_tab_separated_format_wires_get_and_post_with_typed_escaped_rows() {
         "text/tab-separated-values; charset=utf-8",
         b"",
     );
+}
+
+#[test]
+fn terminal_json_format_preserves_quote_and_comment_scanning() {
+    let database = SharedDatabase::default();
+
+    assert_response(
+        &exchange(&database, &request(b"SELECT 'FORMAT JSON' AS value;")),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"String"}],"rows":[["FORMAT JSON"]]}"#,
+    );
+    assert_response(
+        &exchange(&database, &request(b"SELECT 1 AS value; -- FORMAT JSON")),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[1]]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT 'escaped ''FORMAT JSON''' AS value;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"String"}],"rows":[["escaped 'FORMAT JSON'"]]}"#,
+    );
+}
+
+#[test]
+fn terminal_json_format_rejects_selectors_after_authentication() {
+    let database = SharedDatabase::default();
+    let conflict_error = r#"{"error":"FORMAT JSON clause cannot be combined with X-ClickHouse-Format header or default_format parameter"}"#;
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target_with_headers(
+                "/query",
+                b"SELECT 1 FORMAT JSON;",
+                "X-ClickHouse-Format: JSONEachRow\r\n",
+            ),
+        ),
+        "HTTP/1.1 400 Bad Request",
+        conflict_error,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+1+FORMAT+JSON&default_format=JSON HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        conflict_error,
+    );
+
+    let unauthorized =
+        b"GET /?query=SELECT+1+FORMAT+JSON&default_format=JSON HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", unauthorized),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    let missing_key_response = clickhouse_key_exchange(&database, "correct-key", unauthorized);
+    assert_response(
+        &missing_key_response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&missing_key_response);
 }
 
 #[test]
@@ -2342,6 +2448,32 @@ fn terminal_csv_with_names_format_preserves_single_read_only_query_and_response_
         limits,
     )
     .unwrap();
+    assert!(response.len() <= limits.max_response_bytes);
+    assert_response(
+        &response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
+fn terminal_json_format_retains_the_complete_response_limit() {
+    let database = SharedDatabase::default();
+    let sql = format!("SELECT '{}' AS value FORMAT JSON;", "x".repeat(1_000));
+    let limits = HttpQueryLimits {
+        max_response_bytes: 512,
+        ..HttpQueryLimits::default()
+    };
+    let mut response = Vec::new();
+
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request(sql.as_bytes())),
+        &mut response,
+        limits,
+    )
+    .unwrap();
+
     assert!(response.len() <= limits.max_response_bytes);
     assert_response(
         &response,
