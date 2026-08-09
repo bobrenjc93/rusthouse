@@ -166,6 +166,8 @@ pub enum Statement {
     VersionSelect(VersionSelect),
     /// Exact ClickHouse-compatible `SELECT currentDatabase() [AS alias]` probe.
     CurrentDatabaseSelect(CurrentDatabaseSelect),
+    /// Exact database inventory query mirroring `SHOW DATABASES`.
+    SystemDatabases,
     /// Exact bounded metadata query for the current in-memory catalog.
     SystemTables,
     /// Exact bounded column metadata query for the current in-memory catalog.
@@ -936,6 +938,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_statement(&mut self) -> Result<Statement> {
+        if self.at_system_databases_select_start() {
+            return self.parse_system_databases_select();
+        }
         if self.at_system_functions_select_start() {
             return self.parse_system_functions_select();
         }
@@ -996,6 +1001,22 @@ impl<'a> Parser<'a> {
         } else {
             Ok(Statement::UnionAll { left, right })
         }
+    }
+
+    fn parse_system_databases_select(&mut self) -> Result<Statement> {
+        const SHAPE: &str = "system.databases supports exactly SELECT name FROM system.databases with no trailing clauses";
+
+        self.reserve_ast_list_item()?;
+        self.expect_keyword("NAME")?;
+        self.expect_keyword("FROM")?;
+        self.expect_keyword("SYSTEM")?;
+        self.expect(&TokenKind::Dot, "'.' in system.databases")?;
+        self.expect_keyword("DATABASES")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::SystemDatabases)
     }
 
     fn parse_system_tables_select(&mut self) -> Result<Statement> {
@@ -1128,6 +1149,32 @@ impl<'a> Parser<'a> {
             && next_is_keyword(&mut lexer, "SYSTEM")
             && next_is_token(&mut lexer, TokenKind::Dot)
             && next_is_keyword(&mut lexer, "FUNCTIONS")
+    }
+
+    fn at_system_databases_select_start(&self) -> bool {
+        fn is_keyword(token: &Token, expected: &str) -> bool {
+            matches!(&token.kind, TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+        }
+
+        fn next_is_keyword(lexer: &mut Lexer<'_>, expected: &str) -> bool {
+            lexer
+                .next_token()
+                .is_ok_and(|token| is_keyword(&token, expected))
+        }
+
+        fn next_is_token(lexer: &mut Lexer<'_>, expected: TokenKind) -> bool {
+            lexer.next_token().is_ok_and(|token| token.kind == expected)
+        }
+
+        if !is_keyword(&self.current, "NAME") {
+            return false;
+        }
+
+        let mut lexer = self.lexer;
+        next_is_keyword(&mut lexer, "FROM")
+            && next_is_keyword(&mut lexer, "SYSTEM")
+            && next_is_token(&mut lexer, TokenKind::Dot)
+            && next_is_keyword(&mut lexer, "DATABASES")
     }
 
     fn at_system_settings_select_start(&self) -> bool {
