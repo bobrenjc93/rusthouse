@@ -1127,6 +1127,7 @@ impl Database {
             | Statement::VersionSelect(_)
             | Statement::CurrentDatabaseSelect(_)
             | Statement::SystemTables
+            | Statement::SystemColumns
             | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
@@ -1159,6 +1160,7 @@ impl Database {
                 self.execute_current_database_select(select, query_result_limits)
             }
             Statement::SystemTables => self.execute_system_tables(query_result_limits),
+            Statement::SystemColumns => self.execute_system_columns(query_result_limits),
             Statement::Select(select) => self.execute_select(select, query_result_limits),
             Statement::CrossJoin(cross_join) => {
                 self.execute_cross_join(cross_join, query_result_limits)
@@ -1696,6 +1698,87 @@ impl Database {
         Ok(QueryResult { columns, rows })
     }
 
+    fn execute_system_columns(
+        &self,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const DATABASE_NAME: &str = "default";
+        const RESULT_COLUMN_COUNT: usize = 5;
+        const RESULT_COLUMN_NAME_BYTES: usize =
+            "database".len() + "table".len() + "name".len() + "type".len() + "position".len();
+
+        let row_count = self.catalog.column_count();
+        let fixed_bytes = validate_result_shape_parts(
+            row_count,
+            RESULT_COLUMN_COUNT,
+            RESULT_COLUMN_COUNT,
+            RESULT_COLUMN_NAME_BYTES,
+            query_result_limits,
+            SELECT_RESULT_RESOURCES,
+        )?;
+        let string_bytes = self.catalog.system_column_string_bytes(DATABASE_NAME);
+        enforce_resource_limit(
+            SELECT_RESULT_RESOURCES.bytes,
+            fixed_bytes.saturating_add(string_bytes),
+            query_result_limits.max_bytes,
+        )?;
+        i64::try_from(self.catalog.max_column_position())
+            .map_err(|_| Error::NumericOverflow("system.columns position".to_owned()))?;
+
+        // All result shape, payload, retained-result, and numeric conversion
+        // checks finish before allocating the result schema, ordering scratch,
+        // rows, or owned scalar payloads.
+        let columns = vec![
+            ResultColumn {
+                name: "database".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "table".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "name".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "type".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "position".to_owned(),
+                data_type: DataType::Int64,
+            },
+        ];
+        let rows = self
+            .catalog
+            .tables_in_name_order()
+            .into_iter()
+            .flat_map(|table| {
+                table
+                    .schema()
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, column)| {
+                        let position = index
+                            .checked_add(1)
+                            .and_then(|position| i64::try_from(position).ok())
+                            .expect("system.columns positions were preflighted");
+                        vec![
+                            Value::String(DATABASE_NAME.to_owned()),
+                            Value::String(table.name().to_owned()),
+                            Value::String(column.name.clone()),
+                            Value::String(column.data_type.as_str().to_owned()),
+                            Value::Int64(position),
+                        ]
+                    })
+            })
+            .collect::<Vec<_>>();
+        debug_assert_eq!(rows.len(), row_count);
+
+        Ok(QueryResult { columns, rows })
+    }
+
     fn execute_show_create_table(
         &self,
         name: &str,
@@ -2129,6 +2212,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::VersionSelect(_)
         | Statement::CurrentDatabaseSelect(_)
         | Statement::SystemTables
+        | Statement::SystemColumns
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }

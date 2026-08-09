@@ -4,8 +4,9 @@ use std::thread;
 use std::time::Duration;
 
 use rusthouse::batch::csv::CsvIngestLimits;
-use rusthouse::batch::engine::{Database, QueryResultLimits};
+use rusthouse::batch::engine::{Database, QueryResultLimits, ResultColumn};
 use rusthouse::batch::tsv::TsvIngestLimits;
+use rusthouse::batch::value::Value;
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
     handle_http_query_read_only_with_bearer_token,
@@ -1315,7 +1316,7 @@ fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
 }
 
 #[test]
-fn parameterized_get_and_post_tighten_result_rows_and_preserve_other_parameters() {
+fn parameterized_get_and_post_combine_result_limits_database_and_format_parameters() {
     let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
         max_rows: 2,
         ..QueryResultLimits::default()
@@ -1329,12 +1330,12 @@ fn parameterized_get_and_post_tighten_result_rows_and_preserve_other_parameters(
 
     let exact_requests: &[(&[u8], &str, &[u8])] = &[
         (
-            b"GET /?database=default&max_result_rows=%32&default_format=CSVWithNames&query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET /?database=default&max_result_bytes=%31%30%32%34&max_result_rows=%32&default_format=CSVWithNames&query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "text/csv; charset=utf-8",
             b"value\n1\n2\n",
         ),
         (
-            b"POST /?query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            b"POST /?query=SELECT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&max_result_bytes=1024&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
             "text/tab-separated-values; charset=utf-8",
             b"value\n1\n2\n",
         ),
@@ -1453,6 +1454,208 @@ fn parameterized_max_result_rows_rejects_empty_duplicate_malformed_and_overflowi
             );
         }
     }
+}
+
+fn single_string_result_bytes() -> usize {
+    std::mem::size_of::<ResultColumn>()
+        + "value".len()
+        + std::mem::size_of::<Vec<Value>>()
+        + std::mem::size_of::<Value>()
+        + "x".len()
+}
+
+#[test]
+fn parameterized_max_result_bytes_enforces_the_exact_get_and_post_boundary() {
+    let database = SharedDatabase::default();
+    let exact_bytes = single_string_result_bytes();
+    let below_boundary = exact_bytes - 1;
+    let expected = r#"{"columns":[{"name":"value","type":"String"}],"rows":[["x"]]}"#;
+
+    for method in ["GET", "POST"] {
+        let exact = format!(
+            "{method} /?query=SELECT+%27x%27+AS+value%3B&max_result_bytes={exact_bytes} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, exact.as_bytes()),
+            "HTTP/1.1 200 OK",
+            expected,
+        );
+
+        let exceeded = format!(
+            "{method} /?max_result_bytes={below_boundary}&query=SELECT+%27x%27+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, exceeded.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            &format!(
+                r#"{{"error":"retained query results require at least {exact_bytes} bytes, exceeding the limit of {below_boundary} bytes"}}"#
+            ),
+        );
+    }
+}
+
+#[test]
+fn parameterized_max_result_bytes_zero_and_larger_values_never_relax_defaults() {
+    let exact_bytes = single_string_result_bytes();
+    let configured_max = exact_bytes - 1;
+    let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
+        max_bytes: configured_max,
+        ..QueryResultLimits::default()
+    });
+
+    for (method, requested_max) in [
+        ("GET", "0".to_owned()),
+        ("POST", exact_bytes.to_string()),
+        ("GET", usize::MAX.to_string()),
+    ] {
+        let request = format!(
+            "{method} /?max_result_bytes={requested_max}&query=SELECT+%27x%27+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, request.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            &format!(
+                r#"{{"error":"SELECT result bytes requires at least {exact_bytes}, exceeding the limit of {configured_max}"}}"#
+            ),
+        );
+    }
+
+    let default_database = SharedDatabase::default();
+    for (method, requested_max) in [("GET", "0".to_owned()), ("POST", usize::MAX.to_string())] {
+        let request = format!(
+            "{method} /?query=SELECT+1%3B&max_result_bytes={requested_max} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&default_database, request.as_bytes()),
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"1","type":"Int64"}],"rows":[[1]]}"#,
+        );
+    }
+}
+
+#[test]
+fn parameterized_max_result_bytes_rejects_empty_duplicate_malformed_and_overflowing_values() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_result_bytes= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_result_bytes=1&query=SELECT+1%3B&max%5Fresult%5Fbytes=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_result_bytes parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_result_bytes=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_result_bytes parameter must be a decimal integer"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_result_bytes={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_result_bytes parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn max_result_bytes_validation_follows_authentication_and_precedes_lock_admission() {
+    let poisoned_inner = Arc::new(RwLock::new(Database::new()));
+    let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = poisoned_inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let invalid_without_credentials =
+        b"GET /?query=SELECT+1%3B&max_result_bytes=nope HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(
+            &poisoned_database,
+            "correct-token",
+            invalid_without_credentials,
+        ),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    let missing_key = clickhouse_key_exchange(
+        &poisoned_database,
+        "correct-key",
+        invalid_without_credentials,
+    );
+    assert_response(
+        &missing_key,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&missing_key);
+
+    for authorized in [
+        b"GET /?query=SELECT+1%3B&max_result_bytes=nope HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n".as_slice(),
+        b"POST /?max_result_bytes=nope&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n".as_slice(),
+    ] {
+        assert_response(
+            &authenticated_exchange(&poisoned_database, "correct-token", authorized),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"max_result_bytes parameter must be a decimal integer"}"#,
+        );
+    }
+
+    let contended_inner = Arc::new(RwLock::new(Database::new()));
+    let contended_database = SharedDatabase::from_arc(Arc::clone(&contended_inner));
+    let mut writer = Some(contended_inner.write().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = contended_database.clone();
+    let worker = thread::spawn(move || {
+        let invalid = exchange(
+            &worker_database,
+            b"GET /?query=SELECT+1%3B&max_result_bytes=-1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let valid = exchange(
+            &worker_database,
+            b"POST /?max_result_bytes=1&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        sender.send((invalid, valid)).unwrap();
+    });
+    let (invalid, valid) = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(responses) => responses,
+        Err(error) => {
+            drop(writer.take());
+            worker.join().unwrap();
+            panic!("max_result_bytes admission blocked behind a writer: {error}");
+        }
+    };
+    assert_response(
+        &invalid,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"max_result_bytes parameter must be a decimal integer"}"#,
+    );
+    assert_response(
+        &valid,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    drop(writer.take());
+    worker.join().unwrap();
 }
 
 #[test]
