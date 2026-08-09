@@ -63,17 +63,18 @@ unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` and
 non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
 global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
-Global `countIf(Bool)` and a sole ungrouped `SUM(Int64)`, `MIN(Int64)`, or
-`MAX(Int64)` with more than 262,144 matched rows use deterministic contiguous
-chunks, targeting about 131,072 rows per computation lane. Release-mode
-crossover measurements kept smaller inputs sequential. Helper threads share one
-nonblocking process-wide admission budget; total lanes are capped at both 16 and
-the process's available parallelism. Checked count partials and checked i128 SUM
-partials are reduced in chunk order; optional Int64 extrema are reduced directly
-without allocating a partial-results collection. A sequential fallback
-preserves the same result when budget or OS workers are unavailable. Inputs at
-or below the threshold, grouped aggregates, `SUM`, `MIN`, or `MAX` in a
-multi-aggregate projection, non-Int64 extrema, and other aggregate functions
+Global `countIf(Bool)` and a sole ungrouped `SUM(Int64)`, `MIN(Int64)`,
+`MAX(Int64)`, or `AVG(Int64)` with more than 262,144 matched rows use
+deterministic contiguous chunks, targeting about 131,072 rows per computation
+lane. Release-mode crossover measurements kept smaller inputs sequential.
+Helper threads share one nonblocking process-wide admission budget; total lanes
+are capped at both 16 and the process's available parallelism. Checked count
+partials and checked i128 SUM/AVG sum-and-count partials are reduced in chunk
+order; optional Int64 extrema are reduced directly without allocating a
+partial-results collection. A sequential fallback preserves the same result
+when budget or OS workers are unavailable. Inputs at or below the threshold,
+grouped aggregates, `SUM`, `MIN`, `MAX`, or `AVG` in a multi-aggregate
+projection, non-Int64 extrema, `AVG(Float64)`, and other aggregate functions
 remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
@@ -939,6 +940,23 @@ consume one connection slot, and count as successful exchanges rather than
 transport failures. Later clients are still served. The shared connection
 budget, absolute deadlines, per-exchange limits, one-response stream shutdown,
 failure isolation, and typed final report are otherwise unchanged.
+
+`serve_http_with_clickhouse_key` is the insertion-capable finite listener. It
+takes the same expected key and connection maximum but dispatches authenticated
+connections through `handle_http_query_with_clickhouse_key`, exposing the
+standard and explicit SQL insert routes plus bounded CSV and TabSeparated
+ingestion. A committed insert is visible to queries on later connections using
+the same `SharedDatabase`. The
+`serve_http_with_clickhouse_key_and_limits` variant accepts
+`HttpListenerLimits`, applying its HTTP, CSV, TSV, deadline, and connection
+bounds independently to every exchange. Authentication still precedes body
+reading and database admission; database reads and writes remain nonblocking,
+and contended writes return `503 Service Unavailable`. Insert batches and
+format ingestion retain their existing preflight and atomic rollback behavior.
+Rejected credentials and other representable HTTP errors consume a connection
+slot and count as successful exchanges, while transport failures remain typed
+entries in the final `HttpListenerReport`. Use the read-only key listener for
+credentials that should not have ingestion authority.
 
 `serve_http_read_only_concurrently_with_clickhouse_key` is the opt-in concurrent
 listener. In addition to the expected key and finite total connection budget,

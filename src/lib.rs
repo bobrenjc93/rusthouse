@@ -59,7 +59,8 @@ pub use http::{
     serve_http_read_only_concurrently_with_clickhouse_key,
     serve_http_read_only_concurrently_with_clickhouse_key_and_limits,
     serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_clickhouse_key_and_limits,
-    serve_http_read_only_with_limits,
+    serve_http_read_only_with_limits, serve_http_with_clickhouse_key,
+    serve_http_with_clickhouse_key_and_limits,
 };
 pub use join::{
     JoinError, JoinLimits, JoinRowPair, LeftOuterJoinRowPair, inner_equi_join_nullable_i64,
