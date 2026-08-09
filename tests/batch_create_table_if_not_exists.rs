@@ -48,6 +48,73 @@ fn parses_exact_modifier_case_insensitively_without_changing_ordinary_create() {
 }
 
 #[test]
+fn memory_engine_suffix_lowers_to_existing_create_statements() {
+    assert_eq!(
+        parse("CREATE TABLE events (id Int64) ENGINE = Memory").expect("Memory engine is valid"),
+        [Statement::CreateTable {
+            name: "events".to_owned(),
+            columns: vec![ColumnDef {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            }],
+        }]
+    );
+    assert_eq!(
+        parse("create table if not exists Events (id int64) engine=memory;")
+            .expect("case-insensitive Memory engine is valid"),
+        [Statement::CreateTableIfNotExists {
+            name: "Events".to_owned(),
+            columns: vec![ColumnDef {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            }],
+        }]
+    );
+}
+
+#[test]
+fn rejects_invalid_engine_clauses_before_any_batch_mutation() {
+    for suffix in [
+        "ENGINE Memory",
+        "ENGINE = MergeTree",
+        "ENGINE = Memory ENGINE = Memory",
+        "ENGINE = Memory trailing",
+    ] {
+        let mut database = Database::new();
+        let sql =
+            format!("CREATE TABLE first (id Int64); CREATE TABLE rejected (id Int64) {suffix};");
+        assert!(
+            matches!(database.execute(&sql), Err(Error::Sql { .. })),
+            "invalid engine suffix was accepted: {suffix:?}"
+        );
+        assert!(
+            database.catalog().table("first").is_err(),
+            "an earlier statement mutated the catalog before the parse failure: {suffix:?}"
+        );
+        assert!(database.catalog().table("rejected").is_err(), "{suffix:?}");
+    }
+}
+
+#[test]
+fn executes_memory_engine_creates_in_a_multi_statement_batch() {
+    let mut database = Database::new();
+    let results = database
+        .execute(
+            "CREATE TABLE events (id Int64) ENGINE = Memory; \
+             CREATE TABLE IF NOT EXISTS Events (ignored String) ENGINE = memory; \
+             INSERT INTO events VALUES (7); \
+             SELECT id FROM events;",
+        )
+        .expect("Memory engine suffix executes through the existing paths");
+
+    assert_eq!(results.len(), 4);
+    let StatementResult::Query(query) = &results[3] else {
+        panic!("last statement must be a query");
+    };
+    assert_eq!(query.rows, [vec![Value::Int64(7)]]);
+}
+
+#[test]
 fn catalog_no_op_keeps_the_existing_cap_instead_of_the_requested_cap() {
     let mut catalog = Catalog::new();
     catalog
