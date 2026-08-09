@@ -4011,6 +4011,15 @@ fn execute_grouped<'a>(
                 ..
             }]
         );
+    let sole_global_min_int = group_columns.is_empty()
+        && matches!(
+            aggregate_specs,
+            [AggregateSpec {
+                function: AggregateFunction::Min,
+                input_type: Some(DataType::Int64),
+                ..
+            }]
+        );
 
     if group_columns.is_empty() {
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -4023,6 +4032,8 @@ fn execute_grouped<'a>(
                 )?);
             } else if sole_global_sum_int {
                 states[0] = sum_global_int64(table, matching_rows, spec, parallelism)?;
+            } else if sole_global_min_int {
+                states[0] = min_global_int64(table, matching_rows, spec, parallelism);
             }
         }
     }
@@ -4061,7 +4072,9 @@ fn execute_grouped<'a>(
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
             if group_columns.is_empty()
-                && (spec.function == AggregateFunction::CountIf || sole_global_sum_int)
+                && (spec.function == AggregateFunction::CountIf
+                    || sole_global_sum_int
+                    || sole_global_min_int)
             {
                 continue;
             }
@@ -4315,6 +4328,114 @@ impl SumIntPartial {
             count: self.count,
         }
     }
+}
+
+fn min_global_int64(
+    table: &Table,
+    matching_rows: &[usize],
+    spec: &AggregateSpec,
+    parallelism: GlobalAggregateParallelism,
+) -> AggregateState {
+    debug_assert_eq!(spec.function, AggregateFunction::Min);
+    debug_assert_eq!(spec.input_type, Some(DataType::Int64));
+    let Column::Int64(values) = &table.columns()[spec.argument.expect("MIN argument")] else {
+        unreachable!("MIN input type is resolved")
+    };
+    min_int64_state(reduce_global_min_int64(
+        values,
+        matching_rows,
+        parallelism,
+        min_int64_chunk,
+    ))
+}
+
+fn reduce_global_min_int64<F>(
+    values: &[i64],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    chunk_minimum: F,
+) -> Option<i64>
+where
+    F: Fn(&[i64], &[usize]) -> Option<i64> + Sync,
+{
+    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
+        return chunk_minimum(values, matching_rows);
+    };
+
+    // Each lane receives the same deterministic contiguous partitions used by
+    // countIf and SUM. A failed spawn or panic discards every partial and
+    // repeats the complete minimum on the query thread after admission is
+    // released.
+    let parallel_result = try_parallel_min_int64(
+        values,
+        matching_rows,
+        admission.helper_threads(),
+        &chunk_minimum,
+    );
+    drop(admission);
+    parallel_result.unwrap_or_else(|| chunk_minimum(values, matching_rows))
+}
+
+fn try_parallel_min_int64<F>(
+    values: &[i64],
+    matching_rows: &[usize],
+    helper_threads: usize,
+    chunk_minimum: &F,
+) -> Option<Option<i64>>
+where
+    F: Fn(&[i64], &[usize]) -> Option<i64> + Sync,
+{
+    debug_assert!(helper_threads > 0);
+    let worker_count = helper_threads.saturating_add(1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(helper_threads);
+        let mut worker_failed = false;
+        for chunk_index in 1..worker_count {
+            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
+            let spawn = std::thread::Builder::new()
+                .name(format!("rusthouse-min-int64-{chunk_index}"))
+                .spawn_scoped(scope, move || chunk_minimum(values, rows));
+            match spawn {
+                Ok(handle) => handles.push(handle),
+                Err(_) => {
+                    worker_failed = true;
+                    break;
+                }
+            }
+        }
+
+        let mut minimum = chunk_minimum(
+            values,
+            parallel_aggregate_partition(matching_rows, worker_count, 0),
+        );
+        for handle in handles {
+            match handle.join() {
+                Ok(partial) => {
+                    // Reduce optional scalar partials directly. Unlike the
+                    // checked SUM path, MIN needs no allocated partial vector.
+                    minimum = reduce_min_int64_partials(minimum, partial);
+                }
+                Err(_) => worker_failed = true,
+            }
+        }
+        (!worker_failed).then_some(minimum)
+    })
+}
+
+fn min_int64_chunk(values: &[i64], matching_rows: &[usize]) -> Option<i64> {
+    matching_rows.iter().map(|row| values[*row]).min()
+}
+
+fn reduce_min_int64_partials(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn min_int64_state(minimum: Option<i64>) -> AggregateState {
+    AggregateState::Min(minimum.map(Value::Int64))
 }
 
 #[derive(Debug)]
@@ -5942,6 +6063,32 @@ mod tests {
         database
     }
 
+    fn min_int64_database(row_count: usize, row_values: impl Fn(usize) -> (i64, bool)) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE empty_min_values (value Int64); \
+                 CREATE TABLE values_to_min (id Int64, value Int64, included Bool);",
+            )
+            .expect("MIN(Int64) differential setup");
+        if row_count > 0 {
+            for first_id in (1..=row_count).step_by(50_000) {
+                let last_id = first_id.saturating_add(49_999).min(row_count);
+                let rows = (first_id..=last_id)
+                    .map(|id| {
+                        let (value, included) = row_values(id);
+                        format!("({id}, {value}, {included})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                database
+                    .execute(&format!("INSERT INTO values_to_min VALUES {rows}"))
+                    .expect("MIN(Int64) differential rows");
+            }
+        }
+        database
+    }
+
     fn force_global_aggregate_workers(
         database: &mut Database,
         workers: usize,
@@ -6234,6 +6381,158 @@ mod tests {
     }
 
     #[test]
+    fn global_min_int64_forced_workers_match_empty_null_having_and_pagination() {
+        let mut database = min_int64_database(0, |_| unreachable!("empty input"));
+        let first_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MIN(value) AS minimum FROM empty_min_values \
+             HAVING minimum IS NULL ORDER BY minimum LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(first_page.rows, [vec![Value::Null(DataType::Int64)]]);
+
+        let second_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MIN(value) AS minimum FROM empty_min_values \
+             HAVING minimum IS NULL ORDER BY minimum LIMIT 1 OFFSET 1",
+        );
+        assert!(second_page.rows.is_empty());
+    }
+
+    #[test]
+    fn global_min_int64_forced_workers_match_after_filtering_and_having() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+            .saturating_add(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD / 2)
+            .saturating_add(5);
+        let value_for = |id: usize| i64::try_from(id % 1_003).unwrap() - 501;
+        let mut database = min_int64_database(row_count, |id| (value_for(id), id % 3 != 0));
+        let expected = (1..=row_count)
+            .filter(|id| id % 3 != 0)
+            .map(value_for)
+            .min()
+            .unwrap();
+        let result = assert_global_aggregate_worker_differential(
+            &mut database,
+            &format!(
+                "SELECT MIN(value) AS minimum FROM values_to_min WHERE included = true \
+                 HAVING minimum = {expected} ORDER BY minimum LIMIT 1 OFFSET 0"
+            ),
+        );
+        assert_eq!(result.rows, [vec![Value::Int64(expected)]]);
+    }
+
+    #[test]
+    fn global_min_int64_forced_workers_match_at_parallel_boundary_and_use_shared_budget() {
+        static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::new(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = min_int64_database(row_count, |id| {
+            (i64::try_from(row_count - id).unwrap(), true)
+        });
+        for matched_rows in [
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD,
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1,
+        ] {
+            let result = assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!("SELECT MIN(value) FROM values_to_min WHERE id <= {matched_rows}"),
+            );
+            assert_eq!(
+                result.rows,
+                [vec![Value::Int64(
+                    i64::try_from(row_count - matched_rows).unwrap()
+                )]]
+            );
+        }
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::Budgeted(&UNAVAILABLE_BUDGET);
+        assert_eq!(
+            query(&mut database, "SELECT MIN(value) FROM values_to_min").rows,
+            [vec![Value::Int64(0)]],
+            "an unavailable helper budget falls back to the query thread"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::Budgeted(&OBSERVED_BUDGET);
+        assert_eq!(
+            query(&mut database, "SELECT MIN(value) FROM values_to_min").rows,
+            [vec![Value::Int64(0)]]
+        );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "sole MIN(Int64) uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT MIN(value), COUNT(*) FROM values_to_min"
+            )
+            .rows,
+            [vec![
+                Value::Int64(0),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "MIN(Int64) in a multi-aggregate projection stays sequential"
+        );
+    }
+
+    #[test]
+    fn global_min_int64_forced_workers_match_extreme_values() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 2;
+        let mut database = min_int64_database(row_count, |id| {
+            let value = if id == 1 {
+                i64::MAX
+            } else if id == row_count {
+                i64::MIN
+            } else {
+                0
+            };
+            (value, true)
+        });
+        let result = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MIN(value) FROM values_to_min WHERE included = true",
+        );
+        assert_eq!(result.rows, [vec![Value::Int64(i64::MIN)]]);
+    }
+
+    #[test]
+    fn global_min_int64_worker_failure_repeats_the_complete_minimum_locally() {
+        let values = [9, 7, 5, 3, 1, -1, -3, -5, i64::MIN, i64::MAX];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 8;
+        let minimum = reduce_global_min_int64(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::Fixed(2),
+            |values, rows| {
+                if rows.first() == Some(&8) {
+                    panic!("injected MIN worker failure");
+                }
+                min_int64_chunk(values, rows)
+            },
+        );
+
+        assert_eq!(minimum, Some(i64::MIN));
+    }
+
+    #[test]
     fn global_aggregate_worker_selection_partitioning_and_reduction_are_checked() {
         let boundary = COUNT_IF_PARALLEL_ROW_THRESHOLD;
         assert_eq!(
@@ -6265,6 +6564,10 @@ mod tests {
             ]),
             Err(Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))
         );
+        assert_eq!(reduce_min_int64_partials(None, None), None);
+        assert_eq!(reduce_min_int64_partials(Some(4), None), Some(4));
+        assert_eq!(reduce_min_int64_partials(None, Some(-7)), Some(-7));
+        assert_eq!(reduce_min_int64_partials(Some(4), Some(-7)), Some(-7));
         let rows = [2, 4, 6, 8, 10, 12, 14];
         assert_eq!(parallel_aggregate_partition(&rows, 3, 0), [2, 4, 6]);
         assert_eq!(parallel_aggregate_partition(&rows, 3, 1), [8, 10]);
