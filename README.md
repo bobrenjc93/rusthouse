@@ -940,6 +940,23 @@ transport failures. Later clients are still served. The shared connection
 budget, absolute deadlines, per-exchange limits, one-response stream shutdown,
 failure isolation, and typed final report are otherwise unchanged.
 
+`serve_http_with_clickhouse_key` is the insertion-capable finite listener. It
+takes the same expected key and connection maximum but dispatches authenticated
+connections through `handle_http_query_with_clickhouse_key`, exposing the
+standard and explicit SQL insert routes plus bounded CSV and TabSeparated
+ingestion. A committed insert is visible to queries on later connections using
+the same `SharedDatabase`. The
+`serve_http_with_clickhouse_key_and_limits` variant accepts
+`HttpListenerLimits`, applying its HTTP, CSV, TSV, deadline, and connection
+bounds independently to every exchange. Authentication still precedes body
+reading and database admission; database reads and writes remain nonblocking,
+and contended writes return `503 Service Unavailable`. Insert batches and
+format ingestion retain their existing preflight and atomic rollback behavior.
+Rejected credentials and other representable HTTP errors consume a connection
+slot and count as successful exchanges, while transport failures remain typed
+entries in the final `HttpListenerReport`. Use the read-only key listener for
+credentials that should not have ingestion authority.
+
 `serve_http_read_only_concurrently_with_clickhouse_key` is the opt-in concurrent
 listener. In addition to the expected key and finite total connection budget,
 it requires an explicit `NonZeroUsize` in-flight connection cap; the
