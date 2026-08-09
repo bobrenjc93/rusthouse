@@ -3,15 +3,18 @@ use std::io::{Cursor, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use rusthouse::batch::csv::CsvIngestLimits;
+use rusthouse::batch::engine::Database;
 use rusthouse::{
     HttpListenerError, HttpListenerLimits, HttpListenerReport, HttpQueryError, HttpQueryLimits,
     SharedDatabase, handle_http_query, handle_http_query_read_only_with_clickhouse_key,
     serve_http_read_only, serve_http_read_only_concurrently_with_clickhouse_key_and_limits,
-    serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_clickhouse_key_and_limits,
-    serve_http_read_only_with_limits,
+    serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_limits,
+    serve_http_with_clickhouse_key, serve_http_with_clickhouse_key_and_limits,
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -108,6 +111,16 @@ fn post_query_with_clickhouse_key(sql: &str, key: &str) -> Vec<u8> {
         sql.len()
     )
     .into_bytes()
+}
+
+fn post_target_with_clickhouse_key(target: &str, body: &[u8], key: &str) -> Vec<u8> {
+    let mut request = format!(
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: {key}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    request
 }
 
 fn body(response: &[u8]) -> &[u8] {
@@ -254,7 +267,144 @@ fn authenticated_listener_isolates_rejected_keys_and_preserves_read_only_state()
 }
 
 #[test]
-fn authenticated_listener_explicit_limits_keep_deadline_failures_connection_local() {
+fn authenticated_read_write_listener_commits_for_later_reads_and_rolls_back_failures() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE readings (value Int64);")
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let served_database = database.clone();
+    let worker = thread::spawn(move || {
+        serve_http_with_clickhouse_key(&listener, &served_database, "correct-key", 4)
+    });
+
+    let rejected = exchange(
+        address,
+        b"POST /insert HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: wrong-key\r\nX-ClickHouse-Database: other\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(rejected.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+    assert!(
+        rejected
+            .windows(b"WWW-Authenticate: X-ClickHouse-Key\r\n".len())
+            .any(|window| window == b"WWW-Authenticate: X-ClickHouse-Key\r\n")
+    );
+
+    let inserted = exchange(
+        address,
+        &post_target_with_clickhouse_key(
+            "/insert",
+            b"INSERT INTO readings VALUES (7), (11);",
+            "correct-key",
+        ),
+    );
+    assert!(inserted.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(body(&inserted).is_empty());
+
+    let rolled_back = exchange(
+        address,
+        &post_target_with_clickhouse_key(
+            "/insert",
+            b"INSERT INTO readings VALUES (13); INSERT INTO readings VALUES ('wrong');",
+            "correct-key",
+        ),
+    );
+    assert!(rolled_back.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+
+    let later_read = exchange(
+        address,
+        &post_query_with_clickhouse_key(
+            "SELECT value FROM readings ORDER BY value;",
+            "correct-key",
+        ),
+    );
+    assert!(later_read.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        body(&later_read),
+        br#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7],[11]]}"#
+    );
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 4);
+    assert_eq!(report.successful_exchanges, 4);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn authenticated_read_write_listener_limits_ingestion_and_never_waits_for_admission() {
+    let mut initial = Database::new();
+    initial
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let reader = inner.read().unwrap();
+    let limits = HttpListenerLimits::new(
+        4,
+        HttpQueryLimits {
+            csv_ingest_limits: CsvIngestLimits::new(1_024, 1, 2),
+            ..HttpQueryLimits::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let served_database = database.clone();
+    let worker = thread::spawn(move || {
+        serve_http_with_clickhouse_key_and_limits(
+            &listener,
+            &served_database,
+            "correct-key",
+            limits,
+        )
+    });
+
+    let contended = exchange(
+        address,
+        &post_target_with_clickhouse_key(
+            "/insert",
+            b"INSERT INTO events VALUES (9, 'blocked');",
+            "correct-key",
+        ),
+    );
+    assert!(contended.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    assert_eq!(body(&contended), br#"{"error":"database is unavailable"}"#);
+    assert_eq!(reader.catalog().table("events").unwrap().row_count(), 0);
+    drop(reader);
+
+    let over_limit = exchange(
+        address,
+        &post_target_with_clickhouse_key(
+            "/insert/events",
+            b"id,label\n1,one\n2,two\n",
+            "correct-key",
+        ),
+    );
+    assert!(over_limit.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert!(String::from_utf8_lossy(body(&over_limit)).contains("exceeding the limit of 1"));
+
+    let inserted = exchange(
+        address,
+        &post_target_with_clickhouse_key("/insert/events", b"id,label\n1,one\n", "correct-key"),
+    );
+    assert!(inserted.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+    let later_read = exchange(
+        address,
+        &post_query_with_clickhouse_key("SELECT id, label FROM events ORDER BY id;", "correct-key"),
+    );
+    assert_eq!(
+        body(&later_read),
+        br#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"]]}"#
+    );
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 4);
+    assert_eq!(report.successful_exchanges, 4);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn authenticated_read_write_listener_explicit_limits_keep_deadline_failures_connection_local() {
     let limits = HttpListenerLimits {
         read_timeout: STALLED_CONNECTION_TIMEOUT,
         write_timeout: IO_TIMEOUT,
@@ -267,7 +417,7 @@ fn authenticated_listener_explicit_limits_keep_deadline_failures_connection_loca
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let address = listener.local_addr().expect("read loopback address");
     let worker = thread::spawn(move || {
-        serve_http_read_only_with_clickhouse_key_and_limits(
+        serve_http_with_clickhouse_key_and_limits(
             &listener,
             &SharedDatabase::default(),
             "correct-key",

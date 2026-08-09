@@ -1,4 +1,4 @@
-//! Bounded HTTP exchanges and finite read-only TCP serving.
+//! Bounded HTTP exchanges and finite TCP serving.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
@@ -116,8 +116,8 @@ impl StdError for HttpQueryError {
     }
 }
 
-/// Listener and exchange bounds for the sequential and concurrent read-only
-/// listener APIs.
+/// Listener and exchange bounds for the sequential and concurrent listener
+/// APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpListenerLimits {
     /// Maximum number of accepted connections before the listener returns.
@@ -331,8 +331,17 @@ fn handle_http_listener_connection(
         HttpListenerHandler::Unauthenticated => {
             handle_http_query_with_limits(database, input, output, limits.query_limits)
         }
-        HttpListenerHandler::ClickHouseKey(expected_clickhouse_key) => {
+        HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key) => {
             handle_http_query_read_only_with_clickhouse_key_and_limits(
+                database,
+                expected_clickhouse_key,
+                input,
+                output,
+                limits.query_limits,
+            )
+        }
+        HttpListenerHandler::ClickHouseKeyReadWrite(expected_clickhouse_key) => {
+            handle_http_query_with_clickhouse_key_and_limits(
                 database,
                 expected_clickhouse_key,
                 input,
@@ -346,7 +355,8 @@ fn handle_http_listener_connection(
 #[derive(Clone, Copy)]
 enum HttpListenerHandler<'a> {
     Unauthenticated,
-    ClickHouseKey(&'a str),
+    ClickHouseKeyReadOnly(&'a str),
+    ClickHouseKeyReadWrite(&'a str),
 }
 
 /// Serves a finite number of sequential, read-only HTTP connections.
@@ -402,7 +412,7 @@ pub fn serve_http_read_only_with_limits(
     database: &SharedDatabase,
     limits: HttpListenerLimits,
 ) -> Result<HttpListenerReport, HttpListenerError> {
-    serve_http_read_only_connections(
+    serve_http_connections(
         listener,
         database,
         limits,
@@ -469,11 +479,80 @@ pub fn serve_http_read_only_with_clickhouse_key_and_limits(
     expected_clickhouse_key: &str,
     limits: HttpListenerLimits,
 ) -> Result<HttpListenerReport, HttpListenerError> {
-    serve_http_read_only_connections(
+    serve_http_connections(
         listener,
         database,
         limits,
-        HttpListenerHandler::ClickHouseKey(expected_clickhouse_key),
+        HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
+    )
+}
+
+/// Serves a finite number of sequential, read-write HTTP connections that
+/// require an `X-ClickHouse-Key` credential.
+///
+/// Every accepted connection is dispatched through
+/// [`handle_http_query_with_clickhouse_key`] with default exchange limits, so
+/// correctly authenticated SQL, CSV, and TabSeparated inserts use the same
+/// bounded, atomic, nonblocking ingestion paths as the single-exchange API.
+/// Later connections observe committed writes through the shared database.
+/// Missing, duplicate, empty, and incorrect credentials are ordinary bounded
+/// `401 Unauthorized` exchanges and are rejected before an insert body is read
+/// or the database is accessed.
+///
+/// The listener retains the sequential isolation, absolute default read and
+/// write deadlines, finite connection budget, stream shutdown, failure
+/// isolation, and typed reporting behavior of [`serve_http_read_only`]. It
+/// provides authentication but does not terminate TLS; callers must provide
+/// TLS before sending a key or query over an untrusted network.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Interrupted accepts are retried.
+pub fn serve_http_with_clickhouse_key(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    max_connections: usize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_with_clickhouse_key_and_limits(
+        listener,
+        database,
+        expected_clickhouse_key,
+        HttpListenerLimits::new(max_connections, HttpQueryLimits::default()),
+    )
+}
+
+/// Serves bounded sequential, read-write, `X-ClickHouse-Key`-authenticated
+/// HTTP connections with explicit limits.
+///
+/// Every accepted connection is dispatched through
+/// [`handle_http_query_with_clickhouse_key_and_limits`]. The configured
+/// [`HttpListenerLimits`] apply independently to each connection, including
+/// insertion byte, row, and value limits. Listener bounds, absolute deadlines,
+/// authentication precedence, stream lifecycle, failure isolation, and typed
+/// reporting are identical to [`serve_http_read_only_with_limits`].
+/// Authentication, protocol, query, and ingestion errors represented by an
+/// HTTP response count as successful exchanges; transport failures are
+/// retained in [`HttpListenerReport::connection_failures`]. This function does
+/// not provide TLS.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Connection-local failures are returned in
+/// [`HttpListenerReport::connection_failures`] instead.
+pub fn serve_http_with_clickhouse_key_and_limits(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    limits: HttpListenerLimits,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_connections(
+        listener,
+        database,
+        limits,
+        HttpListenerHandler::ClickHouseKeyReadWrite(expected_clickhouse_key),
     )
 }
 
@@ -570,7 +649,7 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
                         &stream,
                         accepted_at,
                         limits,
-                        HttpListenerHandler::ClickHouseKey(expected_clickhouse_key),
+                        HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
                     );
 
                     // Half-close the response direction first so the peer can
@@ -660,7 +739,7 @@ fn record_http_listener_exchange(
     }
 }
 
-fn serve_http_read_only_connections(
+fn serve_http_connections(
     listener: &TcpListener,
     database: &SharedDatabase,
     limits: HttpListenerLimits,
