@@ -64,13 +64,14 @@ non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
 global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
 Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `MIN(Int64)`,
-`MIN(Float64)`, `MAX(Int64)`, or `AVG(Int64)`, and an exact two-item ungrouped
-projection containing `COUNT(*)` or `COUNT()` plus `SUM(Int64)` use
+`MIN(Float64)`, `MAX(Int64)`, `MAX(Float64)`, or `AVG(Int64)`, and an exact
+two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
+`SUM(Int64)` or `AVG(Int64)` use
 deterministic contiguous chunks when more than 262,144 rows match. The paired
 shape preserves either projection order and derives its row count with a
-checked conversion of the filtered cardinality while the existing SUM lanes
-target about 131,072 rows each. Release-mode crossover measurements kept
-smaller inputs sequential.
+checked conversion of the filtered cardinality while the existing checked
+sum-and-count lanes target about 131,072 rows each. Release-mode crossover
+measurements kept smaller inputs sequential.
 Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
@@ -86,14 +87,14 @@ share the process-wide budget. Parameterized HTTP queries may additionally set
 retains the database cap, while a nonzero value can only tighten it. Checked count
 partials and checked i128 SUM/AVG sum-and-count partials are reduced in chunk
 order; the paired row count is checked independently from matched rows. Optional
-Int64 extrema and Float64 minimum partials are reduced directly without
+Int64 and Float64 extrema partials are reduced directly without
 allocating a partial-results collection. Ordered reduction preserves the first
-occurrence of equal Float64 minima, including signed zero. A sequential fallback
+occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
 or below the threshold, grouped aggregates, multi-aggregate projections other
-than the exact row-count/`SUM(Int64)` pair (including `COUNT(column)` pairs),
-`SUM(Float64)`, `MAX(Float64)`, Bool/String extrema, `AVG(Float64)`, and other
-aggregate functions remain sequential.
+than the exact row-count/`SUM(Int64)` or row-count/`AVG(Int64)` pairs (including
+`COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema,
+`AVG(Float64)`, and other aggregate functions remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
