@@ -801,11 +801,11 @@ fn serve_http_connections(
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
 /// may instead end in a case-insensitive SQL `FORMAT JSON`, `FORMAT
-/// CSVWithNames`, `FORMAT TabSeparated`, or `FORMAT JSONEachRow` clause, with
-/// an optional trailing semicolon. The clause selects the corresponding
-/// existing bounded writer and cannot be combined with either HTTP format
-/// selector. Quoted strings and line comments are not interpreted as format
-/// clauses. GET
+/// CSVWithNames`, `FORMAT TabSeparated`, `FORMAT JSONEachRow`, or `FORMAT
+/// JSONCompactEachRow` clause, with an optional trailing semicolon. The clause
+/// selects the corresponding existing bounded writer and cannot be combined
+/// with either HTTP format selector. Quoted strings and line comments are not
+/// interpreted as format clauses. GET
 /// requests and every request made through a
 /// read-only handler pass the SQL to [`SharedDatabase::try_query`], which
 /// accepts exactly one read-only statement and makes one nonblocking read-lock
@@ -1799,6 +1799,9 @@ fn classify_standard_query_request(
             QueryResponseFormat::JsonEachRow => {
                 "FORMAT JSONEachRow clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
             }
+            QueryResponseFormat::JsonCompactEachRow => {
+                "FORMAT JSONCompactEachRow clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
+            }
             QueryResponseFormat::TabSeparated => {
                 "FORMAT TabSeparated clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
             }
@@ -1969,6 +1972,8 @@ fn terminal_query_format(sql: &str) -> Option<(usize, QueryResponseFormat)> {
         QueryResponseFormat::TabSeparated
     } else if format_name.text.eq_ignore_ascii_case("JSONEachRow") {
         QueryResponseFormat::JsonEachRow
+    } else if format_name.text.eq_ignore_ascii_case("JSONCompactEachRow") {
+        QueryResponseFormat::JsonCompactEachRow
     } else {
         return None;
     };
