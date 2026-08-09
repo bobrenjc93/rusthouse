@@ -118,6 +118,25 @@ fn json_cli_outputs_mixed_case_string_to_bool_casts() {
 }
 
 #[test]
+fn json_cli_outputs_to_string_for_every_physical_type() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE values_table (i Int64, f Float64, b Bool, s String); \
+          INSERT INTO values_table VALUES (-7, -0.0, true, 'Tokyo'); \
+          SELECT TOSTRING(i) AS i_text, toString(f) AS f_text, \
+                 ToStRiNg(b) AS b_text, tostring(s) AS s_text \
+          FROM values_table;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"i_text\",\"type\":\"String\"},{\"name\":\"f_text\",\"type\":\"String\"},{\"name\":\"b_text\",\"type\":\"String\"},{\"name\":\"s_text\",\"type\":\"String\"}],\"rows\":[[\"-7\",\"-0\",\"true\",\"Tokyo\"]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_executes_int64_alter_update_silently() {
     let output = run(
         &["--format", "json"],

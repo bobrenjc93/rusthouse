@@ -3719,6 +3719,10 @@ enum ResolvedItem {
     CastBoolToString {
         source: usize,
     },
+    ToString {
+        source: usize,
+        input_type: DataType,
+    },
     StringLength {
         source: usize,
     },
@@ -3976,6 +3980,25 @@ fn resolve_select_items(
                         format!("CAST({} AS {target_type})", table.schema()[source].name)
                     }),
                     data_type: *target_type,
+                });
+            }
+            SelectItem::ToString { name, alias } => {
+                let source = table.column_index(name)?;
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "toString projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::ToString {
+                    source,
+                    input_type: table.schema()[source].data_type,
+                });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("toString({})", table.schema()[source].name)),
+                    data_type: DataType::String,
                 });
             }
             SelectItem::Length { name, alias } => {
@@ -4399,13 +4422,16 @@ fn execute_projection(
                             Value::Bool(checked_string_to_bool(string_at(table, *source, *row))?)
                         }
                         ResolvedItem::CastInt64ToString { source } => {
-                            Value::String(int64_at(table, *source, *row).to_string())
+                            stringify_value(table, *source, *row, DataType::Int64)
                         }
-                        ResolvedItem::CastFloat64ToString { source } => Value::String(
-                            render_float64_text(float64_at(table, *source, *row)).into_string(),
-                        ),
+                        ResolvedItem::CastFloat64ToString { source } => {
+                            stringify_value(table, *source, *row, DataType::Float64)
+                        }
                         ResolvedItem::CastBoolToString { source } => {
-                            Value::String(bool_string(bool_at(table, *source, *row)).to_owned())
+                            stringify_value(table, *source, *row, DataType::Bool)
+                        }
+                        ResolvedItem::ToString { source, input_type } => {
+                            stringify_value(table, *source, *row, *input_type)
                         }
                         ResolvedItem::StringLength { source } => Value::Int64(
                             string_length_to_i64(string_at(table, *source, *row).len())?,
@@ -4554,6 +4580,10 @@ fn validate_projection_result_limits(
                 ResolvedItem::Column { source, .. }
                 | ResolvedItem::StringLower { source }
                 | ResolvedItem::StringUpper { source } => Some(*source),
+                ResolvedItem::ToString {
+                    source,
+                    input_type: DataType::String,
+                } => Some(*source),
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
@@ -4567,6 +4597,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastInt64ToString { .. }
                 | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. }
+                | ResolvedItem::ToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::StringLengthUtf8 { .. }
                 | ResolvedItem::Int64Abs { .. }
@@ -4587,13 +4618,17 @@ fn validate_projection_result_limits(
             } else {
                 let cast_string_len = match item {
                     ResolvedItem::CastInt64ToString { source } => {
-                        Some(int64_text_len(int64_at(table, *source, *row)))
+                        Some(stringified_len(table, *source, *row, DataType::Int64))
                     }
                     ResolvedItem::CastFloat64ToString { source } => {
-                        Some(render_float64_text(float64_at(table, *source, *row)).len())
+                        Some(stringified_len(table, *source, *row, DataType::Float64))
                     }
                     ResolvedItem::CastBoolToString { source } => {
-                        Some(bool_string(bool_at(table, *source, *row)).len())
+                        Some(stringified_len(table, *source, *row, DataType::Bool))
+                    }
+                    ResolvedItem::ToString { source, input_type } => {
+                        debug_assert_ne!(*input_type, DataType::String);
+                        Some(stringified_len(table, *source, *row, *input_type))
                     }
                     _ => None,
                 };
@@ -4649,6 +4684,9 @@ fn validate_grouped_result_limits(
                 | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::ToString { .. } => {
+                    unreachable!("toString projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
@@ -5845,6 +5883,9 @@ impl GroupedData<'_> {
                         | ResolvedItem::CastBoolToString { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::ToString { .. } => {
+                            unreachable!("toString projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::StringLength { .. } => {
                             unreachable!("LENGTH projections are restricted to ungrouped queries")
                         }
@@ -6232,6 +6273,9 @@ fn resolved_expression_name(
         | ResolvedItem::CastBoolToString { source } => {
             format!("CAST({} AS String)", table.schema()[*source].name)
         }
+        ResolvedItem::ToString { source, .. } => {
+            format!("toString({})", table.schema()[*source].name)
+        }
         ResolvedItem::StringLength { source } => {
             format!("LENGTH({})", table.schema()[*source].name)
         }
@@ -6393,17 +6437,17 @@ fn order_source_rows(
                         .expect("String-to-Bool ordering syntax is validated");
                     left.cmp(&right)
                 }
-                ResolvedItem::CastInt64ToString { source } => int64_text_cmp(
-                    int64_at(table, source, left),
-                    int64_at(table, source, right),
-                ),
+                ResolvedItem::CastInt64ToString { source } => {
+                    stringified_cmp(table, source, left, right, DataType::Int64)
+                }
                 ResolvedItem::CastFloat64ToString { source } => {
-                    let left = render_float64_text(float64_at(table, source, left));
-                    let right = render_float64_text(float64_at(table, source, right));
-                    left.as_str().cmp(right.as_str())
+                    stringified_cmp(table, source, left, right, DataType::Float64)
                 }
                 ResolvedItem::CastBoolToString { source } => {
-                    bool_at(table, source, left).cmp(&bool_at(table, source, right))
+                    stringified_cmp(table, source, left, right, DataType::Bool)
+                }
+                ResolvedItem::ToString { source, input_type } => {
+                    stringified_cmp(table, source, left, right, input_type)
                 }
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
@@ -6615,6 +6659,9 @@ fn order_grouped_rows(
                 | ResolvedItem::CastFloat64ToString { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::ToString { .. } => {
+                    unreachable!("toString projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
@@ -6934,6 +6981,47 @@ fn string_at(table: &Table, source: usize, row: usize) -> &str {
         unreachable!("String scalar input type is resolved")
     };
     &values[row]
+}
+
+fn stringify_value(table: &Table, source: usize, row: usize, input_type: DataType) -> Value {
+    let value = match input_type {
+        DataType::Int64 => int64_at(table, source, row).to_string(),
+        DataType::Float64 => render_float64_text(float64_at(table, source, row)).into_string(),
+        DataType::Bool => bool_string(bool_at(table, source, row)).to_owned(),
+        DataType::String => string_at(table, source, row).to_owned(),
+    };
+    Value::String(value)
+}
+
+fn stringified_len(table: &Table, source: usize, row: usize, input_type: DataType) -> usize {
+    match input_type {
+        DataType::Int64 => int64_text_len(int64_at(table, source, row)),
+        DataType::Float64 => render_float64_text(float64_at(table, source, row)).len(),
+        DataType::Bool => bool_string(bool_at(table, source, row)).len(),
+        DataType::String => string_at(table, source, row).len(),
+    }
+}
+
+fn stringified_cmp(
+    table: &Table,
+    source: usize,
+    left: usize,
+    right: usize,
+    input_type: DataType,
+) -> Ordering {
+    match input_type {
+        DataType::Int64 => int64_text_cmp(
+            int64_at(table, source, left),
+            int64_at(table, source, right),
+        ),
+        DataType::Float64 => {
+            let left = render_float64_text(float64_at(table, source, left));
+            let right = render_float64_text(float64_at(table, source, right));
+            left.as_str().cmp(right.as_str())
+        }
+        DataType::Bool => bool_at(table, source, left).cmp(&bool_at(table, source, right)),
+        DataType::String => string_at(table, source, left).cmp(string_at(table, source, right)),
+    }
 }
 
 fn ascii_lower_cmp(left: &str, right: &str) -> Ordering {

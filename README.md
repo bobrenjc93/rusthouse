@@ -279,9 +279,9 @@ aggregate, compatibility-probe, and window function as one `String` column
 named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
 `ABS`, `AVG`, `CAST`, `CEIL`, `COUNT`, `countIf`, `currentDatabase`, `FLOOR`,
 `LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`, `ROUND`, `ROW_NUMBER`, `SUM`,
-`UPPER`, and `version`. Arguments and trailing clauses are rejected. The result
-uses the normal query row, value, byte, retained-result, and formatted-output
-limits.
+`toString`, `UPPER`, and `version`. Arguments and trailing clauses are rejected.
+The result uses the normal query row, value, byte, retained-result, and
+formatted-output limits.
 The exact case-insensitive query `SELECT name FROM system.functions` returns
 the identical typed rows in the same deterministic order as `SHOW FUNCTIONS`.
 Other projections, aliases, functions, predicates, ordering, limits, and
@@ -441,6 +441,18 @@ aggregate projections or `GROUP BY`. Generated `String` payload bytes—four or
 five for booleans, one through twenty for integers, and one through 327 for
 finite floats—are charged exactly against the result-byte limit before
 materialization. No other source/target type pairs are accepted.
+`toString(column)` is the case-insensitive ClickHouse-style String conversion
+for every physical type. `Int64`, `Float64`, and `Bool` inputs use exactly the
+same canonical formatting, lexicographic expression ordering, and generated
+payload-byte accounting as their `CAST(column AS String)` equivalents; a
+`String` input is an identity projection, including Unicode and empty values.
+It accepts an optional `AS alias`; otherwise, its result is named
+`toString(<column>)`. `WHERE` filtering and `ORDER BY` using either the
+normalized expression or its alias happen before `LIMIT`/`OFFSET` pagination
+and output materialization. Like `CAST`, `toString` is currently restricted to
+ungrouped scalar queries and cannot be combined with aggregate projections or
+`GROUP BY`. All normal result row, value, byte, retained-result, and formatted
+output limits apply.
 `LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named

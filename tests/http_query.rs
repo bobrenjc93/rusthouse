@@ -290,6 +290,31 @@ fn query_executes_filtered_count_if_over_http() {
 }
 
 #[test]
+fn query_executes_to_string_projection_over_http() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, reading Float64, active Bool, label String); \
+             INSERT INTO readings VALUES \
+             (1, -0.0, false, 'first'), (2, 12.5, true, 'second');",
+        )
+        .expect("setup");
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(
+                b"SELECT toString(id) AS id_text, TOSTRING(reading) AS reading_text, \
+                         ToStRiNg(active) AS active_text, tostring(label) AS label_text \
+                  FROM readings WHERE id >= 2 ORDER BY toString(id) LIMIT 1;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id_text","type":"String"},{"name":"reading_text","type":"String"},{"name":"active_text","type":"String"},{"name":"label_text","type":"String"}],"rows":[["2","12.5","true","second"]]}"#,
+    );
+}
+
+#[test]
 fn query_executes_empty_count_over_http_and_preserves_its_name() {
     let database = SharedDatabase::default();
     database
