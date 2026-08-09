@@ -634,8 +634,9 @@ case-insensitive, permit one optional trailing semicolon, and otherwise must be
 exact: an explicit column list, another format, or any extra SQL is not
 accepted as query-plus-data. Both parameterized request forms also accept one
 optional `database=default` parameter, one optional decimal `max_result_rows`
-parameter, and one optional `default_format` parameter in any order with
-`query`, including percent-encoded parameter names and values. All
+parameter, one optional decimal `max_result_bytes` parameter, and one optional
+`default_format` parameter in any order with `query`, including percent-encoded
+parameter names and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
 `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
@@ -646,17 +647,24 @@ database's configured query-result row limit for that request, while zero
 disables the request-level limit and retains the configured cap. A larger value
 never relaxes the configured limit. The effective row limit is checked with
 the other query-result shape limits before result rows are materialized.
+`max_result_bytes` has the same decimal syntax and zero behavior. A nonzero
+value tightens both the configured per-query result-byte limit and the default
+retained-result byte limit for that request; a larger value never relaxes
+either limit. This limit accounts for estimated owned result columns, rows,
+values, column names, and String payloads, independently of the complete HTTP
+response-byte limit.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
-same SQL byte limit as a POST body; the database, row-limit, and format
+same SQL byte limit as a POST body; the database, result-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
-duplicate `query`, `database`, `max_result_rows`, or `default_format`
-parameters, malformed or overflowing row limits, unknown parameters, malformed
-escapes, non-default database values, unsupported formats, and invalid SQL
-UTF-8 are rejected.
+duplicate `query`, `database`, `max_result_rows`, `max_result_bytes`, or
+`default_format` parameters, malformed or overflowing result limits, unknown
+parameters, malformed escapes, non-default database values, unsupported
+formats, and invalid SQL UTF-8 are rejected.
 Parameter validation follows configured authentication and precedes database
-lock admission. GET requests and every request handled by any
-read-only API use the read-only, exactly-one-statement
-`SharedDatabase::try_query` path. A POST through an insertion-capable
+lock admission. GET requests and every request handled by any read-only API use
+the read-only, exactly-one-statement nonblocking `SharedDatabase::try_query`
+family, including the combined parameterized-result-limit path. A POST through
+an insertion-capable
 authenticated handler without an explicit output-format selector additionally
 accepts a nonempty `INSERT`-only batch and uses the atomic
 `SharedDatabase::try_execute_insert_batch` path. Mixed batches, other mutations,

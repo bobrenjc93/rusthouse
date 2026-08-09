@@ -110,10 +110,12 @@ impl StdError for HttpQueryError {
 /// carry UTF-8 SQL in their body. `GET /?query=<percent-encoded SQL>` and
 /// `POST /?query=<percent-encoded SQL>` carry the same SQL in a required
 /// form-style query parameter and optionally accept one `database=default`
-/// parameter, one decimal `max_result_rows` parameter, and one `default_format`
-/// parameter in any order. A nonzero `max_result_rows` can tighten but never
-/// relax the database's configured result-row limit; zero disables the
-/// request-level limit while retaining the configured cap. `default_format`
+/// parameter, one decimal `max_result_rows` parameter, one decimal
+/// `max_result_bytes` parameter, and one `default_format` parameter in any
+/// order. Nonzero result limits can tighten but never relax the database's
+/// configured query-result limits; `max_result_bytes` also cannot relax the
+/// default retained-result byte limit. Zero disables the corresponding
+/// request-level limit while retaining the configured defaults. `default_format`
 /// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, and `+` becomes a space. An
@@ -124,8 +126,8 @@ impl StdError for HttpQueryError {
 /// the same bounded, atomic, nonblocking importer as `POST /insert/<table>`.
 /// All other parameterized queries require an absent or zero `Content-Length`.
 /// Empty, duplicate, unknown, and unsupported parameters, plus malformed or
-/// overflowing `max_result_rows` values, are rejected after authentication and
-/// before database lock admission. A
+/// overflowing result-limit values, are rejected after authentication and before
+/// database lock admission. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
 /// may instead end in a case-insensitive SQL `FORMAT CSVWithNames`, `FORMAT
@@ -610,7 +612,7 @@ fn handle_http_query_exchange(
         }
     };
 
-    let (sql, response_format, max_result_rows) = match request {
+    let (sql, response_format, max_result_bytes, max_result_rows) = match request {
         HttpRequest::Ping => {
             return write_response(
                 &mut output,
@@ -816,14 +818,19 @@ fn handle_http_query_exchange(
         HttpRequest::Query {
             sql,
             response_format,
+            max_result_bytes,
             max_result_rows,
-        } => (sql, response_format, max_result_rows),
+        } => (sql, response_format, max_result_bytes, max_result_rows),
     };
 
-    let query_result = max_result_rows.map_or_else(
-        || database.try_query(&sql),
-        |max_result_rows| database.try_query_with_result_row_limit(&sql, max_result_rows),
-    );
+    let query_result = match (max_result_bytes, max_result_rows) {
+        (None, None) => database.try_query(&sql),
+        (max_result_bytes, max_result_rows) => database.try_query_with_parameterized_result_limits(
+            &sql,
+            max_result_bytes.unwrap_or(0),
+            max_result_rows.unwrap_or(0),
+        ),
+    };
     match query_result {
         Ok(result) => {
             let mut body = BoundedVec::new(limits.max_response_bytes);
@@ -950,6 +957,7 @@ fn read_request(
                 sql,
                 request.response_format,
                 None,
+                None,
                 access.allows_insert() && !output_format_selected,
             )
         }
@@ -1030,6 +1038,7 @@ fn read_request(
             classify_standard_query_request(
                 sql,
                 response_format,
+                decoded.max_result_bytes,
                 decoded.max_result_rows,
                 access.allows_insert()
                     && matches!(method, ParameterizedQueryMethod::Post)
@@ -1071,6 +1080,7 @@ fn parse_parameterized_table_insert(sql: &str) -> Option<(String, TableInsertFor
 fn classify_standard_query_request(
     mut sql: String,
     response_format: Option<QueryResponseFormat>,
+    max_result_bytes: Option<usize>,
     max_result_rows: Option<usize>,
     insert_enabled: bool,
 ) -> Result<HttpRequest, RequestReadError> {
@@ -1113,6 +1123,7 @@ fn classify_standard_query_request(
         Ok(HttpRequest::Query {
             sql,
             response_format,
+            max_result_bytes,
             max_result_rows,
         })
     }
@@ -1446,6 +1457,7 @@ enum HttpRequest {
     Query {
         sql: String,
         response_format: QueryResponseFormat,
+        max_result_bytes: Option<usize>,
         max_result_rows: Option<usize>,
     },
     Insert {
@@ -1549,6 +1561,7 @@ impl ParameterizedQueryMethod {
 struct DecodedQuery {
     sql: Vec<u8>,
     response_format: Option<QueryResponseFormat>,
+    max_result_bytes: Option<usize>,
     max_result_rows: Option<usize>,
 }
 
@@ -1885,6 +1898,7 @@ fn parse_request_line(
         (_, target)
             if target.starts_with(b"/?query=")
                 || target.starts_with(b"/?database=")
+                || target.starts_with(b"/?max_result_bytes=")
                 || target.starts_with(b"/?max_result_rows=")
                 || target.starts_with(b"/?default_format=") =>
         {
@@ -1960,6 +1974,7 @@ fn decode_query_parameters(
     let mut query = None;
     let mut database_seen = false;
     let mut response_format = None;
+    let mut max_result_bytes = None;
     let mut max_result_rows = None;
 
     for encoded_parameter in encoded_parameters.split(|byte| *byte == b'&') {
@@ -2042,6 +2057,17 @@ fn decode_query_parameters(
                 let value = decode_form_component(encoded_value, None)?;
                 max_result_rows = Some(parse_decimal_max_result_rows(&value)?);
             }
+            b"max_result_bytes" => {
+                if max_result_bytes.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate max_result_bytes parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                max_result_bytes = Some(parse_decimal_max_result_bytes(&value)?);
+            }
             _ => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
@@ -2061,28 +2087,42 @@ fn decode_query_parameters(
     Ok(DecodedQuery {
         sql,
         response_format,
+        max_result_bytes,
         max_result_rows,
     })
 }
 
+fn parse_decimal_max_result_bytes(value: &[u8]) -> Result<usize, RequestReadError> {
+    parse_decimal_result_limit(
+        value,
+        "max_result_bytes parameter must be a decimal integer",
+        "max_result_bytes parameter is out of range",
+    )
+}
+
 fn parse_decimal_max_result_rows(value: &[u8]) -> Result<usize, RequestReadError> {
+    parse_decimal_result_limit(
+        value,
+        "max_result_rows parameter must be a decimal integer",
+        "max_result_rows parameter is out of range",
+    )
+}
+
+fn parse_decimal_result_limit(
+    value: &[u8],
+    malformed_message: &'static str,
+    overflow_message: &'static str,
+) -> Result<usize, RequestReadError> {
     let mut parsed = 0_usize;
     for byte in value {
         if !byte.is_ascii_digit() {
-            return Err(RequestFailure::new(
-                Status::BAD_REQUEST,
-                "max_result_rows parameter must be a decimal integer",
-            )
-            .into());
+            return Err(RequestFailure::new(Status::BAD_REQUEST, malformed_message).into());
         }
         parsed = parsed
             .checked_mul(10)
             .and_then(|parsed| parsed.checked_add(usize::from(byte - b'0')))
             .ok_or_else(|| {
-                RequestReadError::from(RequestFailure::new(
-                    Status::BAD_REQUEST,
-                    "max_result_rows parameter is out of range",
-                ))
+                RequestReadError::from(RequestFailure::new(Status::BAD_REQUEST, overflow_message))
             })?;
     }
     Ok(parsed)
