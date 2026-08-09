@@ -1078,6 +1078,23 @@ applying the same authenticated, pre-body insertion-route rejection as the
 read-only bearer APIs. Use these read-only variants for query or monitoring
 credentials that do not require ingestion authority.
 
+To bind a read-only key to an exact identity, use
+`handle_http_query_read_only_with_clickhouse_principal` or its `_and_limits`
+variant. These handlers require exactly one `X-ClickHouse-User` and exactly one
+`X-ClickHouse-Key` header on queries, `/ping`, `/ready`, and `/metrics`; header
+names are case-insensitive and both values are case-sensitive. The configured
+user and key must each be nonempty valid HTTP field values with no leading or
+trailing optional whitespace, and both are validated before request input is
+read. Every authentication attempt compares both supplied values with constant
+work. A missing, duplicate, empty, or incorrect value in either header returns
+the same `401 Unauthorized` response before a body is read or the database is
+accessed. Successful requests remain read-only: explicit insertion targets are
+rejected before their bodies are read, and INSERT statements on query routes
+are rejected by read-only statement validation. All responses include
+`Cache-Control: private, no-store`. This narrow named-principal boundary does
+not add roles, grants, credential storage, or key-only insertion authority; the
+existing bearer and `X-ClickHouse-Key` APIs retain their documented behavior.
+
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before
 sending keys, tokens, or queries over an untrusted network; otherwise they are

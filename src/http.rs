@@ -1189,6 +1189,92 @@ pub fn handle_http_query_read_only_with_clickhouse_key_and_limits(
     )
 }
 
+/// Handles one read-only HTTP exchange for a named ClickHouse principal.
+///
+/// Every request, including operational routes, must carry exactly one
+/// `X-ClickHouse-User` header and exactly one `X-ClickHouse-Key` header. Header
+/// names are matched case-insensitively; both values are matched
+/// case-sensitively against `expected_clickhouse_user` and
+/// `expected_clickhouse_key`. Missing, duplicate, empty, and incorrect values
+/// receive the same `401 Unauthorized` response before a request body is read
+/// or the database is accessed. Both supplied values are compared with
+/// constant work regardless of either comparison's result.
+///
+/// The configured user and key must each be a nonempty HTTP field value
+/// without leading or trailing optional whitespace. Both are validated before
+/// any request input is read. Like the key-only read-only handler, this API
+/// never exposes an insertion route or enables INSERT execution and includes
+/// `Cache-Control: private, no-store` on every response. The embedding
+/// application must provide TLS to protect the credentials and query contents
+/// in transit.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_read_only_with_clickhouse_principal(
+    database: &SharedDatabase,
+    expected_clickhouse_user: &str,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_read_only_with_clickhouse_principal_and_limits(
+        database,
+        expected_clickhouse_user,
+        expected_clickhouse_key,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one named-principal, read-only ClickHouse HTTP exchange with
+/// explicit resource limits.
+///
+/// See [`handle_http_query_read_only_with_clickhouse_principal`] for
+/// authentication and access-control behavior and
+/// [`handle_http_query_with_limits`] for resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_read_only_with_clickhouse_principal_and_limits(
+    database: &SharedDatabase,
+    expected_clickhouse_user: &str,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
+    if let Err(message) = validate_clickhouse_principal_configuration(
+        expected_clickhouse_user.as_bytes(),
+        expected_clickhouse_key.as_bytes(),
+    ) {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            CLICKHOUSE_KEY_RESPONSE_HEADERS,
+            message,
+            limits.max_response_bytes,
+        );
+    }
+
+    handle_http_query_exchange(
+        database,
+        input,
+        output,
+        limits,
+        Authentication::ClickHousePrincipal {
+            user: expected_clickhouse_user.as_bytes(),
+            key: expected_clickhouse_key.as_bytes(),
+        },
+        HttpAccess::ReadOnly,
+    )
+}
+
 fn handle_http_query_with_clickhouse_key_access_and_limits(
     database: &SharedDatabase,
     expected_clickhouse_key: &str,
@@ -1207,7 +1293,7 @@ fn handle_http_query_with_clickhouse_key_access_and_limits(
             limits.max_response_bytes,
         );
     }
-    if !is_valid_clickhouse_key(expected_clickhouse_key.as_bytes()) {
+    if !is_valid_clickhouse_credential(expected_clickhouse_key.as_bytes()) {
         return write_error_response(
             &mut output,
             Status::INTERNAL_SERVER_ERROR,
@@ -1245,6 +1331,7 @@ enum Authentication<'a> {
     None,
     Bearer(&'a [u8]),
     ClickHouseKey(&'a [u8]),
+    ClickHousePrincipal { user: &'a [u8], key: &'a [u8] },
 }
 
 impl Authentication<'_> {
@@ -1254,7 +1341,9 @@ impl Authentication<'_> {
 
     const fn response_headers(self) -> &'static [&'static [u8]] {
         match self {
-            Self::ClickHouseKey(_) => CLICKHOUSE_KEY_RESPONSE_HEADERS,
+            Self::ClickHouseKey(_) | Self::ClickHousePrincipal { .. } => {
+                CLICKHOUSE_KEY_RESPONSE_HEADERS
+            }
             Self::None | Self::Bearer(_) => &[],
         }
     }
@@ -2323,6 +2412,8 @@ fn parse_headers(
     let mut expect_seen = false;
     let mut authorization = None;
     let mut duplicate_authorization = false;
+    let mut clickhouse_user = None;
+    let mut duplicate_clickhouse_user = false;
     let mut clickhouse_key = None;
     let mut duplicate_clickhouse_key = false;
     let mut clickhouse_format = None;
@@ -2374,8 +2465,15 @@ fn parse_headers(
             && authorization.replace(value).is_some()
         {
             duplicate_authorization = true;
-        } else if matches!(authentication, Authentication::ClickHouseKey(_))
-            && name.eq_ignore_ascii_case(b"x-clickhouse-key")
+        } else if matches!(authentication, Authentication::ClickHousePrincipal { .. })
+            && name.eq_ignore_ascii_case(b"x-clickhouse-user")
+            && clickhouse_user.replace(value).is_some()
+        {
+            duplicate_clickhouse_user = true;
+        } else if matches!(
+            authentication,
+            Authentication::ClickHouseKey(_) | Authentication::ClickHousePrincipal { .. }
+        ) && name.eq_ignore_ascii_case(b"x-clickhouse-key")
             && clickhouse_key.replace(value).is_some()
         {
             duplicate_clickhouse_key = true;
@@ -2415,6 +2513,22 @@ fn parse_headers(
                     Status::UNAUTHORIZED,
                     "X-ClickHouse-Key authentication required",
                     &[b"WWW-Authenticate: X-ClickHouse-Key\r\n"],
+                )
+                .into());
+            }
+        }
+        Authentication::ClickHousePrincipal { user, key } => {
+            // Keep both comparisons unconditional so a rejected request does
+            // not reveal which of the two credentials was absent or wrong.
+            let user_matches = constant_work_eq(clickhouse_user.unwrap_or(&[]), user);
+            let key_matches = constant_work_eq(clickhouse_key.unwrap_or(&[]), key);
+            let authorized =
+                user_matches & key_matches & !duplicate_clickhouse_user & !duplicate_clickhouse_key;
+            if !authorized {
+                return Err(RequestFailure::with_headers(
+                    Status::UNAUTHORIZED,
+                    "X-ClickHouse-User and X-ClickHouse-Key authentication required",
+                    &[b"WWW-Authenticate: X-ClickHouse-User, X-ClickHouse-Key\r\n"],
                 )
                 .into());
             }
@@ -2554,10 +2668,29 @@ fn is_bearer_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
 }
 
-fn is_valid_clickhouse_key(key: &[u8]) -> bool {
-    !key.is_empty()
-        && trim_optional_whitespace(key) == key
-        && key.iter().copied().all(is_header_value_byte)
+fn validate_clickhouse_principal_configuration(
+    user: &[u8],
+    key: &[u8],
+) -> Result<(), &'static str> {
+    if user.is_empty() {
+        return Err("configured ClickHouse user must not be empty");
+    }
+    if !is_valid_clickhouse_credential(user) {
+        return Err("configured ClickHouse user is not a valid HTTP header value");
+    }
+    if key.is_empty() {
+        return Err("configured ClickHouse key must not be empty");
+    }
+    if !is_valid_clickhouse_credential(key) {
+        return Err("configured ClickHouse key is not a valid HTTP header value");
+    }
+    Ok(())
+}
+
+fn is_valid_clickhouse_credential(credential: &[u8]) -> bool {
+    !credential.is_empty()
+        && trim_optional_whitespace(credential) == credential
+        && credential.iter().copied().all(is_header_value_byte)
 }
 
 fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
