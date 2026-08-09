@@ -669,6 +669,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         | Statement::SystemTables
         | Statement::SystemColumns
         | Statement::SystemMetrics
+        | Statement::SystemSettings
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
