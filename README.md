@@ -1267,6 +1267,13 @@ bounded decoding, validation, and atomic registration to
 writer contention, lock poisoning, and the existing typed snapshot restore
 failures remain distinct. Every failure leaves catalog data and cached metrics
 unchanged.
+`SharedDatabase::try_restore_int64_tables_from_files` extends those guarantees
+to the transactional snapshot-set restore. It makes one nonblocking write-lock
+attempt before any source access and holds the guard while delegating the
+caller-supplied entry slice and inclusive entry-count bound to
+`Database::restore_int64_tables_from_files`. Busy and poisoned locks remain
+distinct from indexed count, name, file, schema, and table-limit failures; no
+failure changes catalog data or cached metrics.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries

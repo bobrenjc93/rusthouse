@@ -23,7 +23,8 @@ pub use aggregate::{
 pub use batch::{
     DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseMetrics, DatabaseSnapshotRestoreEntry,
     DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, SharedDatabase,
-    SharedDatabaseError, SharedDatabaseSnapshotRestoreError, TableLimits,
+    SharedDatabaseError, SharedDatabaseSnapshotRestoreError, SharedDatabaseSnapshotSetRestoreError,
+    TableLimits,
 };
 #[cfg(unix)]
 pub use batch::{DatabaseSnapshotSaveError, SharedDatabaseSnapshotSaveError};

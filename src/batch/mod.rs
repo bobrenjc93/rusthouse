@@ -22,6 +22,7 @@ pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 pub use shared_database::SharedDatabaseSnapshotSaveError;
 pub use shared_database::{
     DatabaseMetrics, SharedDatabase, SharedDatabaseError, SharedDatabaseSnapshotRestoreError,
+    SharedDatabaseSnapshotSetRestoreError,
 };
 pub use storage::TableLimits;
 
