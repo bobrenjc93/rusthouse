@@ -846,13 +846,14 @@ fn serve_http_connections(
 /// selected explicitly. The corresponding independent ingestion limits and
 /// nonblocking [`SharedDatabase`] importer are used. Success returns an empty
 /// `200 OK` response. The unauthenticated handlers do not expose either route.
-/// The insertion-capable `X-ClickHouse-Key`-authenticated handlers expose the
-/// same route set. Both authenticated insert forms accept the same optional
-/// `X-ClickHouse-Database: default` header as the query forms. The
-/// [`handle_http_query_read_only_with_bearer_token`] and
-/// [`handle_http_query_read_only_with_clickhouse_key`] families require the
-/// same credentials but do not expose either explicit insertion route or
-/// enable INSERT execution on standard query routes.
+/// The insertion-capable `X-ClickHouse-Key`-authenticated and named-principal
+/// handlers expose the same route set. All authenticated insert forms accept
+/// the same optional `X-ClickHouse-Database: default` header as the query
+/// forms. The [`handle_http_query_read_only_with_bearer_token`] and
+/// [`handle_http_query_read_only_with_clickhouse_key`] families, including the
+/// named-principal read-only variants, require the same credentials but do not
+/// expose either explicit insertion route or enable INSERT execution on
+/// standard query routes.
 ///
 /// `GET /metrics` accepts no request body and returns four unlabeled Prometheus
 /// gauges for database totals plus `rusthouse_table_rows` and
@@ -1190,6 +1191,77 @@ pub fn handle_http_query_read_only_with_clickhouse_key_and_limits(
     )
 }
 
+/// Handles one read-write HTTP exchange for a named ClickHouse principal.
+///
+/// Every request, including insert and operational routes, must carry exactly
+/// one `X-ClickHouse-User` header and exactly one `X-ClickHouse-Key` header.
+/// Header names are matched case-insensitively; both values are matched
+/// case-sensitively against `expected_clickhouse_user` and
+/// `expected_clickhouse_key`. Missing, duplicate, empty, and incorrect values
+/// receive the same `401 Unauthorized` response before a request body is read
+/// or the database is accessed. Both supplied values are compared with
+/// constant work regardless of either comparison's result.
+///
+/// Correctly authenticated requests expose the same bounded, atomic,
+/// nonblocking SQL, CSV, and TSV insertion paths as
+/// [`handle_http_query_with_clickhouse_key`]. The configured user and key must
+/// each be a nonempty HTTP field value without leading or trailing optional
+/// whitespace, and both are validated before any request input is read. Every
+/// response includes `Cache-Control: private, no-store`. The embedding
+/// application must provide TLS to protect credentials and query contents in
+/// transit.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_clickhouse_principal(
+    database: &SharedDatabase,
+    expected_clickhouse_user: &str,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_with_clickhouse_principal_and_limits(
+        database,
+        expected_clickhouse_user,
+        expected_clickhouse_key,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one named-principal, read-write ClickHouse HTTP exchange with
+/// explicit resource limits.
+///
+/// See [`handle_http_query_with_clickhouse_principal`] for authentication and
+/// access-control behavior and [`handle_http_query_with_limits`] for
+/// resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_clickhouse_principal_and_limits(
+    database: &SharedDatabase,
+    expected_clickhouse_user: &str,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_with_clickhouse_principal_access_and_limits(
+        database,
+        expected_clickhouse_user,
+        expected_clickhouse_key,
+        input,
+        &mut output,
+        limits,
+        HttpAccess::ReadWrite,
+    )
+}
+
 /// Handles one read-only HTTP exchange for a named ClickHouse principal.
 ///
 /// Every request, including operational routes, must carry exactly one
@@ -1249,6 +1321,26 @@ pub fn handle_http_query_read_only_with_clickhouse_principal_and_limits(
     mut output: impl Write,
     limits: HttpQueryLimits,
 ) -> Result<(), HttpQueryError> {
+    handle_http_query_with_clickhouse_principal_access_and_limits(
+        database,
+        expected_clickhouse_user,
+        expected_clickhouse_key,
+        input,
+        &mut output,
+        limits,
+        HttpAccess::ReadOnly,
+    )
+}
+
+fn handle_http_query_with_clickhouse_principal_access_and_limits(
+    database: &SharedDatabase,
+    expected_clickhouse_user: &str,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+    access: HttpAccess,
+) -> Result<(), HttpQueryError> {
     if let Err(message) = validate_clickhouse_principal_configuration(
         expected_clickhouse_user.as_bytes(),
         expected_clickhouse_key.as_bytes(),
@@ -1272,7 +1364,7 @@ pub fn handle_http_query_read_only_with_clickhouse_principal_and_limits(
             user: expected_clickhouse_user.as_bytes(),
             key: expected_clickhouse_key.as_bytes(),
         },
-        HttpAccess::ReadOnly,
+        access,
     )
 }
 

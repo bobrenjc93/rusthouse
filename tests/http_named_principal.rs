@@ -1,10 +1,18 @@
 use std::io::{self, Cursor, Read};
+use std::sync::{Arc, RwLock, mpsc};
+use std::thread;
+use std::time::Duration;
 
+use rusthouse::batch::csv::CsvIngestLimits;
+use rusthouse::batch::engine::Database;
+use rusthouse::batch::tsv::TsvIngestLimits;
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase,
     handle_http_query_read_only_with_clickhouse_key,
     handle_http_query_read_only_with_clickhouse_principal,
     handle_http_query_read_only_with_clickhouse_principal_and_limits,
+    handle_http_query_with_clickhouse_principal,
+    handle_http_query_with_clickhouse_principal_and_limits,
 };
 
 const USER: &str = "reporting";
@@ -38,6 +46,19 @@ fn exchange(database: &SharedDatabase, request: &[u8]) -> Vec<u8> {
     response
 }
 
+fn write_exchange(database: &SharedDatabase, request: &[u8]) -> Vec<u8> {
+    let mut response = Vec::new();
+    handle_http_query_with_clickhouse_principal(
+        database,
+        USER,
+        KEY,
+        Cursor::new(request),
+        &mut response,
+    )
+    .expect("named-principal read-write exchange succeeds");
+    response
+}
+
 fn assert_status(response: &[u8], expected: &str) {
     let response = std::str::from_utf8(response).expect("response is UTF-8");
     assert_eq!(response.lines().next(), Some(expected));
@@ -58,6 +79,51 @@ fn assert_private(response: &[u8]) {
             .windows(b"Cache-Control: private, no-store\r\n".len())
             .any(|window| window == b"Cache-Control: private, no-store\r\n")
     );
+}
+
+#[test]
+fn named_read_write_principal_wires_sql_csv_and_tsv_insertion_then_reads() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .unwrap();
+
+    let (sql, _) = request(
+        "/insert",
+        b"INSERT INTO events VALUES (1, 'sql');",
+        principal_headers(),
+    );
+    let sql_response = write_exchange(&database, &sql);
+    assert_status(&sql_response, "HTTP/1.1 200 OK");
+    assert_eq!(body(&sql_response), b"");
+    assert_private(&sql_response);
+
+    let (csv, _) = request("/insert/events", b"label,id\ncsv,2\n", principal_headers());
+    let csv_response = write_exchange(&database, &csv);
+    assert_status(&csv_response, "HTTP/1.1 200 OK");
+    assert_eq!(body(&csv_response), b"");
+    assert_private(&csv_response);
+
+    let (tsv, _) = request(
+        "/?query=INSERT+INTO+events+FORMAT+TabSeparated",
+        b"3\ttsv\n",
+        principal_headers(),
+    );
+    let tsv_response = write_exchange(&database, &tsv);
+    assert_status(&tsv_response, "HTTP/1.1 200 OK");
+    assert_eq!(body(&tsv_response), b"");
+    assert_private(&tsv_response);
+
+    let read = write_exchange(
+        &database,
+        b"GET /?query=SELECT+id%2C+label+FROM+events+ORDER+BY+id%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-User: reporting\r\nX-ClickHouse-Key: read key:42\r\n\r\n",
+    );
+    assert_status(&read, "HTTP/1.1 200 OK");
+    assert_eq!(
+        body(&read),
+        br#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"sql"],[2,"csv"],[3,"tsv"]]}"#
+    );
+    assert_private(&read);
 }
 
 #[test]
@@ -139,7 +205,7 @@ fn named_principal_credential_failures_are_identical_and_leave_bodies_unread() {
 
     for (name, headers) in rejected_headers {
         let (request, body_offset) = request("/insert/events", b"id\n99\n", headers);
-        let mut input = Cursor::new(request);
+        let mut input = Cursor::new(request.clone());
         let mut response = Vec::new();
         handle_http_query_read_only_with_clickhouse_principal(
             &database,
@@ -161,12 +227,158 @@ fn named_principal_credential_failures_are_identical_and_leave_bodies_unread() {
             br#"{"error":"X-ClickHouse-User and X-ClickHouse-Key authentication required"}"#
         );
         assert_private(&response);
+
+        let mut write_input = Cursor::new(request);
+        let mut write_response = Vec::new();
+        handle_http_query_with_clickhouse_principal(
+            &database,
+            USER,
+            KEY,
+            &mut write_input,
+            &mut write_response,
+        )
+        .unwrap_or_else(|error| panic!("{name} read-write rejection responds: {error}"));
+        assert_eq!(
+            write_input.position(),
+            body_offset,
+            "{name} read-write rejection leaves the body unread"
+        );
+        assert_eq!(
+            write_response, response,
+            "{name} rejection is identical for read-only and read-write principals"
+        );
+
         if let Some(expected) = &expected_response {
             assert_eq!(&response, expected, "{name} must be indistinguishable");
         } else {
             expected_response = Some(response);
         }
     }
+}
+
+#[test]
+fn named_read_write_principal_enforces_explicit_http_csv_and_tsv_limits() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+
+    let sql = b"INSERT INTO events VALUES (1);";
+    let (sql_request, body_offset) = request("/insert", sql, principal_headers());
+    let mut sql_input = Cursor::new(sql_request);
+    let mut sql_response = Vec::new();
+    handle_http_query_with_clickhouse_principal_and_limits(
+        &database,
+        USER,
+        KEY,
+        &mut sql_input,
+        &mut sql_response,
+        HttpQueryLimits {
+            max_sql_bytes: sql.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(sql_input.position(), body_offset);
+    assert_status(&sql_response, "HTTP/1.1 413 Payload Too Large");
+    assert_private(&sql_response);
+
+    let csv = b"id\n1\n";
+    let (csv_request, _) = request("/insert/events", csv, principal_headers());
+    let mut csv_response = Vec::new();
+    handle_http_query_with_clickhouse_principal_and_limits(
+        &database,
+        USER,
+        KEY,
+        Cursor::new(csv_request),
+        &mut csv_response,
+        HttpQueryLimits {
+            csv_ingest_limits: CsvIngestLimits::new(csv.len() - 1, 10, 10),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_status(&csv_response, "HTTP/1.1 400 Bad Request");
+    assert!(body(&csv_response).starts_with(br#"{"error":"database CSV ingestion failed:"#));
+    assert_private(&csv_response);
+
+    let tsv = b"2\n";
+    let (tsv_request, _) = request(
+        "/insert/events",
+        tsv,
+        concat!(
+            "X-ClickHouse-User: reporting\r\n",
+            "X-ClickHouse-Key: read key:42\r\n",
+            "X-ClickHouse-Format: TabSeparated\r\n",
+        ),
+    );
+    let mut tsv_response = Vec::new();
+    handle_http_query_with_clickhouse_principal_and_limits(
+        &database,
+        USER,
+        KEY,
+        Cursor::new(tsv_request),
+        &mut tsv_response,
+        HttpQueryLimits {
+            tsv_ingest_limits: TsvIngestLimits::new(tsv.len() - 1, 10, 10),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_status(&tsv_response, "HTTP/1.1 400 Bad Request");
+    assert!(body(&tsv_response).starts_with(br#"{"error":"database TSV ingestion failed:"#));
+    assert_private(&tsv_response);
+
+    assert!(
+        database
+            .query("SELECT id FROM events;")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+}
+
+#[test]
+fn named_read_write_principal_returns_503_without_waiting_on_a_reader() {
+    let mut initial = Database::new();
+    initial.execute("CREATE TABLE events (id Int64);").unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let mut reader = Some(inner.read().unwrap());
+    let (request, _) = request(
+        "/insert",
+        b"INSERT INTO events VALUES (1);",
+        principal_headers(),
+    );
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(write_exchange(&worker_database, &request))
+            .unwrap();
+    });
+
+    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(response) => response,
+        Err(error) => {
+            drop(reader.take());
+            worker.join().unwrap();
+            panic!("named-principal insertion blocked behind a reader: {error}");
+        }
+    };
+    assert_status(&response, "HTTP/1.1 503 Service Unavailable");
+    assert_eq!(body(&response), br#"{"error":"database is unavailable"}"#);
+    assert_private(&response);
+    assert_eq!(
+        reader
+            .as_ref()
+            .unwrap()
+            .catalog()
+            .table("events")
+            .unwrap()
+            .row_count(),
+        0
+    );
+    drop(reader.take());
+    worker.join().unwrap();
 }
 
 #[test]
