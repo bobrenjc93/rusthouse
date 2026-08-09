@@ -204,6 +204,38 @@ impl Catalog {
             .fold(0_usize, usize::saturating_add)
     }
 
+    /// Returns the greatest one-based column position in any table.
+    #[must_use]
+    pub(crate) fn max_column_position(&self) -> usize {
+        self.tables
+            .values()
+            .map(|table| table.schema().len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Returns the String payload bytes required by the exact
+    /// `system.columns` metadata result without allocating.
+    #[must_use]
+    pub(crate) fn system_column_string_bytes(&self, database_name: &str) -> usize {
+        self.tables
+            .values()
+            .map(|table| {
+                table
+                    .schema()
+                    .iter()
+                    .map(|column| {
+                        database_name
+                            .len()
+                            .saturating_add(table.name().len())
+                            .saturating_add(column.name.len())
+                            .saturating_add(column.data_type.as_str().len())
+                    })
+                    .fold(0_usize, usize::saturating_add)
+            })
+            .fold(0_usize, usize::saturating_add)
+    }
+
     /// Returns the number of rows retained across all registered tables.
     #[must_use]
     pub fn retained_row_count(&self) -> usize {
@@ -255,6 +287,15 @@ impl Catalog {
             .into_iter()
             .map(|(_, table)| (table.name(), table.row_count()))
             .collect()
+    }
+
+    /// Returns tables in deterministic, case-insensitive name order for
+    /// bounded schema metadata materialization.
+    #[must_use]
+    pub(crate) fn tables_in_name_order(&self) -> Vec<&Table> {
+        let mut tables = self.tables.iter().collect::<Vec<_>>();
+        tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        tables.into_iter().map(|(_, table)| table).collect()
     }
 
     /// Returns owned display names, row counts, and cached retained-value byte
