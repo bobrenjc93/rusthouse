@@ -6,8 +6,9 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusthouse::batch::engine::StatementResult;
 use rusthouse::batch::error::Error;
-use rusthouse::batch::value::DataType;
+use rusthouse::batch::value::{DataType, Value};
 use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
     Database, DatabaseSnapshotSaveError, Int64TablePayloadCodec, Int64TablePayloadError,
@@ -60,7 +61,7 @@ fn codecs(
 }
 
 #[test]
-fn atomically_replaces_and_round_trips_through_the_existing_decoder() {
+fn atomically_replaces_and_round_trips_through_decoder_and_batch_database() {
     let directory = TestDirectory::new();
     let path = directory.join("readings.snapshot");
     fs::write(&path, b"old destination bytes").unwrap();
@@ -78,13 +79,33 @@ fn atomically_replaces_and_round_trips_through_the_existing_decoder() {
         .unwrap();
 
     let restored =
-        restore_int64_table_payload_from_file(path, snapshot_codec, payload_codec).unwrap();
+        restore_int64_table_payload_from_file(&path, snapshot_codec, payload_codec).unwrap();
     assert_eq!(restored.schema(), &Schema::int64("Measurement", false));
     assert_eq!(restored.row_cap(), 5);
     assert_eq!(
         restored.values(),
         &[Some(i64::MIN), Some(7), Some(i64::MAX)]
     );
+
+    let mut reopened = Database::with_max_rows_per_table(5);
+    reopened
+        .restore_int64_table_from_file("Archive", path, snapshot_codec, payload_codec)
+        .unwrap();
+    let results = reopened
+        .execute("SELECT Measurement FROM archive;")
+        .unwrap();
+    let [StatementResult::Query(query)] = results.as_slice() else {
+        panic!("the restored table must produce one query result");
+    };
+    assert_eq!(
+        query.rows,
+        vec![
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Int64(7)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+    assert_eq!(reopened.catalog().table("ARCHIVE").unwrap().row_cap(), 5);
 }
 
 #[test]
