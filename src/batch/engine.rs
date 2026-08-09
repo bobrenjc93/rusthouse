@@ -21,9 +21,11 @@ use crate::batch::value::{DataType, Value, ValueRef};
 #[cfg(unix)]
 use crate::snapshot::Int64TablePayloadFileSaveError;
 use crate::snapshot::{
-    Int64TablePayloadCodec, Int64TablePayloadFileRestoreError, SnapshotCodec,
-    restore_int64_table_payload_from_file,
+    Int64TablePayloadCodec, Int64TablePayloadFileRecoveryError,
+    Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError, SnapshotCodec,
+    restore_int64_table_payload_from_file, restore_int64_table_payload_from_file_with_backup,
 };
+use crate::storage::Int64Table;
 
 pub use crate::batch::storage::{
     DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_ROWS_PER_TABLE,
@@ -479,6 +481,8 @@ pub enum StatementResult {
 pub enum DatabaseSnapshotRestoreError {
     /// Opening or decoding the bounded snapshot failed.
     Snapshot(Int64TablePayloadFileRestoreError),
+    /// Both the primary and explicit backup snapshots failed bounded restore.
+    Recovery(Int64TablePayloadFileRecoveryError),
     /// Batch tables do not currently support nullable physical columns.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
@@ -490,6 +494,7 @@ impl fmt::Display for DatabaseSnapshotRestoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Snapshot(error) => write!(formatter, "could not restore snapshot: {error}"),
+            Self::Recovery(error) => write!(formatter, "could not recover snapshot: {error}"),
             Self::NullableColumn { column } => write!(
                 formatter,
                 "snapshot column '{column}' is nullable; batch snapshot restore requires a non-nullable Int64 column"
@@ -566,6 +571,7 @@ impl std::error::Error for DatabaseSnapshotRestoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Snapshot(error) => Some(error),
+            Self::Recovery(error) => Some(error),
             Self::Table(error) => Some(error),
             Self::NullableColumn { .. } => None,
         }
@@ -586,6 +592,12 @@ impl std::error::Error for DatabaseSnapshotSaveError {
 impl From<Int64TablePayloadFileRestoreError> for DatabaseSnapshotRestoreError {
     fn from(error: Int64TablePayloadFileRestoreError) -> Self {
         Self::Snapshot(error)
+    }
+}
+
+impl From<Int64TablePayloadFileRecoveryError> for DatabaseSnapshotRestoreError {
+    fn from(error: Int64TablePayloadFileRecoveryError) -> Self {
+        Self::Recovery(error)
     }
 }
 
@@ -726,6 +738,53 @@ impl Database {
         }
 
         let restored = restore_int64_table_payload_from_file(path, snapshot_codec, payload_codec)?;
+        self.register_restored_int64_table(table_name, restored)
+    }
+
+    /// Reopens one self-describing, non-nullable `Int64` snapshot from a
+    /// primary or caller-supplied backup file as a named batch table.
+    ///
+    /// The primary file is decoded first and takes precedence whenever it is
+    /// valid. The backup is inspected only if bounded primary file, envelope,
+    /// or payload decoding fails. A successful restore reports which file
+    /// supplied the table. If neither file can be decoded, the
+    /// [`DatabaseSnapshotRestoreError::Recovery`] variant retains both typed
+    /// failures.
+    ///
+    /// Database validation is identical to [`Self::restore_int64_table_from_file`]:
+    /// the caller-provided table name must be unique, the snapshot column must
+    /// be non-nullable, and the persisted table must fit all configured
+    /// [`TableLimits`]. The catalog and its cached metrics change only after
+    /// decoding and every validation step succeed.
+    pub fn restore_int64_table_from_file_with_backup(
+        &mut self,
+        table_name: &str,
+        primary_path: impl AsRef<Path>,
+        backup_path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: Int64TablePayloadCodec,
+    ) -> std::result::Result<Int64TablePayloadFileRecoverySource, DatabaseSnapshotRestoreError>
+    {
+        if self.catalog.table_exists(table_name) {
+            return Err(Error::TableAlreadyExists(table_name.to_owned()).into());
+        }
+
+        let recovered = restore_int64_table_payload_from_file_with_backup(
+            primary_path,
+            backup_path,
+            snapshot_codec,
+            payload_codec,
+        )?;
+        let (restored, source) = recovered.into_parts();
+        self.register_restored_int64_table(table_name, restored)?;
+        Ok(source)
+    }
+
+    fn register_restored_int64_table(
+        &mut self,
+        table_name: &str,
+        restored: Int64Table,
+    ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
         let column = restored.schema().column();
         if column.is_nullable() {
             return Err(DatabaseSnapshotRestoreError::NullableColumn {
@@ -1134,22 +1193,24 @@ impl Database {
             max_result_bytes,
             self.query_result_limits.max_rows,
             0,
+            0,
         )
     }
 
     /// Executes one already-parsed read-only query with caller-supplied limits.
     ///
     /// Caller limits may only tighten the database's configured result-byte,
-    /// result-row, and scan-row limits. Zero leaves the corresponding configured
-    /// limit in place. Result-shape validation applies both effective result
-    /// limits before result rows are materialized; the effective scan limit is
-    /// charged against the complete source table independently of `LIMIT`.
+    /// result-row, scan-row, and group-count limits. Zero leaves the
+    /// corresponding configured limit in place. Result-shape validation applies
+    /// both effective result limits before result rows are materialized; the
+    /// effective scan and group limits are charged independently of `LIMIT`.
     pub(crate) fn execute_query_statement_with_parameterized_limits(
         &self,
         statement: Statement,
         max_result_bytes: usize,
         max_result_rows: usize,
         max_scan_rows: usize,
+        max_groups: usize,
     ) -> Result<QueryResult> {
         let tightened_result_limit = max_result_bytes < self.query_result_limits.max_bytes;
         let max_rows = if max_result_rows == 0 {
@@ -1162,9 +1223,15 @@ impl Database {
         } else {
             self.query_result_limits.max_scan_rows.min(max_scan_rows)
         };
+        let max_groups = if max_groups == 0 {
+            self.query_result_limits.max_groups
+        } else {
+            self.query_result_limits.max_groups.min(max_groups)
+        };
         let query_limits = QueryResultLimits {
             max_scan_rows,
             max_rows,
+            max_groups,
             max_bytes: self.query_result_limits.max_bytes.min(max_result_bytes),
             ..self.query_result_limits
         };
