@@ -63,17 +63,18 @@ unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` and
 non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
 global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
-Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, and a sole ungrouped
-`MIN(Int64)` with more than 262,144 matched rows use deterministic contiguous
+Global `countIf(Bool)` and a sole ungrouped `SUM(Int64)`, `MIN(Int64)`, or
+`MAX(Int64)` with more than 262,144 matched rows use deterministic contiguous
 chunks, targeting about 131,072 rows per computation lane. Release-mode
 crossover measurements kept smaller inputs sequential. Helper threads share one
 nonblocking process-wide admission budget; total lanes are capped at both 16 and
 the process's available parallelism. Checked count partials and checked i128 SUM
-partials are reduced in chunk order; optional Int64 minima are reduced directly
+partials are reduced in chunk order; optional Int64 extrema are reduced directly
 without allocating a partial-results collection. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
-or below the threshold, grouped aggregates, `SUM` or `MIN` in a multi-aggregate
-projection, non-Int64 `MIN`, and other aggregate functions remain sequential.
+or below the threshold, grouped aggregates, `SUM`, `MIN`, or `MAX` in a
+multi-aggregate projection, non-Int64 extrema, and other aggregate functions
+remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
