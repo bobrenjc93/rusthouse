@@ -875,20 +875,27 @@ subsequent request.
 single-exchange API. It consumes a caller-bound `TcpListener`, accepts up to
 1,024 connections by default, and dispatches them sequentially against one
 `SharedDatabase` through `handle_http_query_with_limits`. Every connection gets
-an absolute 30-second exchange deadline and is closed after its one response or
-connection-local failure. Before every socket read or write, the remaining
-deadline is installed as that operation's timeout, so a client cannot retain
-the sequential listener by drip-feeding bytes. Protocol errors that can be
-represented on the wire receive their normal bounded response. Transport and
-socket failures are recorded in the returned `HttpListenerReport`, and later
-connections are still accepted. Interrupted, connection-aborted, and
-connection-reset accept attempts are retried without consuming the connection
-budget. Other listener configuration and accept failures instead return the
-typed `HttpListenerError` immediately.
+an absolute 30-second socket-I/O window starting at acceptance and is closed
+after its one response or connection-local failure. Before every socket read or
+write, the remaining window is installed as that operation's timeout, so a
+client cannot retain the sequential listener by drip-feeding bytes. This is not
+a complete-exchange or query-execution deadline: synchronous SQL parsing,
+execution, and response construction are not canceled and may run past the I/O
+cutoff, at which point the eventual response write fails. Those operations
+remain governed by the existing database and `HttpQueryLimits` resource bounds.
+An embedder needing a hard wall-clock service deadline must add cancellable
+execution or bounded concurrency.
+
+Protocol errors that can be represented on the wire receive their normal
+bounded response. Transport and socket failures are recorded in the returned
+`HttpListenerReport`, and later connections are still accepted. Interrupted,
+connection-aborted, and connection-reset accept attempts are retried without
+consuming the connection budget. Other listener configuration and accept
+failures instead return the typed `HttpListenerError` immediately.
 
 `serve_http_read_only_with_limits` accepts `HttpListenerLimits` to set the
-finite accepted-connection budget, a nonzero per-connection deadline, and the
-nested `HttpQueryLimits`. Reaching the connection budget drops the owned
+finite accepted-connection budget, a nonzero `io_timeout` window, and the nested
+`HttpQueryLimits`. Reaching the connection budget drops the owned
 listener and returns; a zero budget returns without accepting, which also gives
 embedders a deterministic finite shutdown boundary. The listener is
 deliberately sequential and unauthenticated, read-only, and plain-text HTTP: it

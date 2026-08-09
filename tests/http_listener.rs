@@ -65,7 +65,7 @@ fn serves_multiple_connections_and_isolates_a_malformed_client() {
         .expect("setup shared database");
     let limits = HttpListenerLimits {
         max_connections: 4,
-        connection_timeout: CLIENT_TIMEOUT,
+        io_timeout: CLIENT_TIMEOUT,
         ..HttpListenerLimits::default()
     };
     let (address, server) = spawn_listener(&database, limits);
@@ -107,7 +107,7 @@ fn serves_multiple_connections_and_isolates_a_malformed_client() {
 fn closes_each_connection_after_exactly_one_response() {
     let limits = HttpListenerLimits {
         max_connections: 1,
-        connection_timeout: CLIENT_TIMEOUT,
+        io_timeout: CLIENT_TIMEOUT,
         ..HttpListenerLimits::default()
     };
     let (address, server) = spawn_listener(&SharedDatabase::default(), limits);
@@ -133,10 +133,10 @@ fn closes_each_connection_after_exactly_one_response() {
 }
 
 #[test]
-fn drip_fed_client_cannot_renew_the_deadline_or_stop_the_next_client() {
+fn drip_fed_client_cannot_renew_the_io_window_or_stop_the_next_client() {
     let limits = HttpListenerLimits {
         max_connections: 2,
-        connection_timeout: Duration::from_millis(250),
+        io_timeout: Duration::from_millis(250),
         ..HttpListenerLimits::default()
     };
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind drip-feed listener");
@@ -186,10 +186,10 @@ fn drip_fed_client_cannot_renew_the_deadline_or_stop_the_next_client() {
 }
 
 #[test]
-fn forwards_exchange_limits_and_rejects_an_unbounded_timeout() {
+fn forwards_exchange_limits_and_rejects_a_zero_io_timeout() {
     let limits = HttpListenerLimits {
         max_connections: 1,
-        connection_timeout: CLIENT_TIMEOUT,
+        io_timeout: CLIENT_TIMEOUT,
         query_limits: HttpQueryLimits {
             max_header_bytes: 32,
             ..HttpQueryLimits::default()
@@ -214,12 +214,12 @@ fn forwards_exchange_limits_and_rejects_an_unbounded_timeout() {
         listener,
         HttpListenerLimits {
             max_connections: 0,
-            connection_timeout: Duration::ZERO,
+            io_timeout: Duration::ZERO,
             ..HttpListenerLimits::default()
         },
     )
-    .expect_err("zero timeout is rejected before accepting");
-    assert!(matches!(error, HttpListenerError::InvalidConnectionTimeout));
+    .expect_err("zero I/O timeout is rejected before accepting");
+    assert!(matches!(error, HttpListenerError::InvalidIoTimeout));
 }
 
 #[test]

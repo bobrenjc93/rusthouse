@@ -35,8 +35,8 @@ pub const DEFAULT_MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// [`serve_http_read_only`].
 pub const DEFAULT_MAX_HTTP_CONNECTIONS: usize = 1024;
 
-/// Default absolute exchange deadline for each accepted TCP connection.
-pub const DEFAULT_HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default absolute socket-I/O window for each accepted TCP connection.
+pub const DEFAULT_HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resource limits for a single [`handle_http_query`] exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,26 +119,30 @@ pub struct HttpListenerLimits {
     /// Maximum number of sequential TCP connections to accept before the
     /// listener is dropped and the function returns.
     pub max_connections: usize,
-    /// Absolute elapsed-time budget for every accepted connection's complete
-    /// HTTP exchange.
+    /// Absolute elapsed-time window after acceptance in which socket reads and
+    /// writes may occur.
     ///
-    /// A zero duration is rejected before the listener accepts a connection.
-    pub connection_timeout: Duration,
+    /// The window runs during request processing, but it does not interrupt
+    /// synchronous SQL parsing, execution, or response construction. Those
+    /// operations remain governed by [`Self::query_limits`] and the database's
+    /// resource limits rather than a wall-clock deadline. A zero duration is
+    /// rejected before the listener accepts a connection.
+    pub io_timeout: Duration,
     /// Request, ingestion, and response limits passed to the existing
     /// read-only HTTP exchange handler.
     pub query_limits: HttpQueryLimits,
 }
 
 impl HttpListenerLimits {
-    /// Creates explicit connection-count, timeout, and exchange bounds.
+    /// Creates explicit connection-count, socket-I/O, and exchange bounds.
     pub const fn new(
         max_connections: usize,
-        connection_timeout: Duration,
+        io_timeout: Duration,
         query_limits: HttpQueryLimits,
     ) -> Self {
         Self {
             max_connections,
-            connection_timeout,
+            io_timeout,
             query_limits,
         }
     }
@@ -148,7 +152,7 @@ impl Default for HttpListenerLimits {
     fn default() -> Self {
         Self::new(
             DEFAULT_MAX_HTTP_CONNECTIONS,
-            DEFAULT_HTTP_CONNECTION_TIMEOUT,
+            DEFAULT_HTTP_IO_TIMEOUT,
             HttpQueryLimits::default(),
         )
     }
@@ -231,8 +235,8 @@ pub struct HttpListenerReport {
 /// served.
 #[derive(Debug)]
 pub enum HttpListenerError {
-    /// The configured per-connection timeout was zero.
-    InvalidConnectionTimeout,
+    /// The configured socket-I/O timeout was zero.
+    InvalidIoTimeout,
     /// Switching the owned listener to blocking mode failed.
     SetBlocking(io::Error),
     /// Accepting the next connection failed.
@@ -247,10 +251,10 @@ pub enum HttpListenerError {
 impl fmt::Display for HttpListenerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidConnectionTimeout => {
+            Self::InvalidIoTimeout => {
                 write!(
                     formatter,
-                    "HTTP connection timeout must be greater than zero"
+                    "HTTP socket-I/O timeout must be greater than zero"
                 )
             }
             Self::SetBlocking(error) => {
@@ -270,7 +274,7 @@ impl fmt::Display for HttpListenerError {
 impl StdError for HttpListenerError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::InvalidConnectionTimeout => None,
+            Self::InvalidIoTimeout => None,
             Self::SetBlocking(error) => Some(error),
             Self::Accept { source, .. } => Some(source),
         }
@@ -300,16 +304,23 @@ pub fn serve_http_read_only(
 /// limits.
 ///
 /// Connections are accepted and handled sequentially against the same
-/// [`SharedDatabase`]. Each accepted stream receives the configured read and
-/// write deadline for the complete exchange, is dispatched through
-/// [`handle_http_query_with_limits`], and is explicitly closed after at most
-/// one response. The remaining socket timeout is reduced before every read and
-/// write, so incremental client progress cannot renew the connection's budget.
+/// [`SharedDatabase`]. Each accepted stream receives the configured absolute
+/// socket-I/O window, is dispatched through [`handle_http_query_with_limits`],
+/// and is explicitly closed after at most one response. The remaining socket
+/// timeout is reduced before every read and write, so incremental client
+/// progress cannot renew the window.
 /// A protocol failure that can be represented as an HTTP response counts as a
 /// completed exchange. A transport or socket failure is recorded in the
 /// returned report, its stream is dropped, and the listener continues with the
 /// next connection. Interrupted, connection-aborted, and connection-reset
 /// accept attempts are retried without consuming the connection budget.
+///
+/// The socket-I/O window is not a complete-exchange or query-execution
+/// deadline. SQL parsing, execution, and response construction run
+/// synchronously and cannot be canceled by this API; they can continue past
+/// the I/O cutoff, after which the next response write fails with a timed-out
+/// [`HttpQueryError::Write`]. Embedders requiring a hard wall-clock service
+/// deadline must add cancellable execution or a bounded concurrency policy.
 ///
 /// The function returns after exactly [`HttpListenerLimits::max_connections`]
 /// accepts; a zero connection limit returns immediately. It does not create
@@ -319,18 +330,18 @@ pub fn serve_http_read_only(
 ///
 /// # Errors
 ///
-/// Returns [`HttpListenerError::InvalidConnectionTimeout`] before accepting a
-/// connection when the timeout is zero. Listener configuration and accept
-/// failures are also returned immediately. Failures after a connection has
-/// been accepted remain connection-local and are collected in the successful
-/// [`HttpListenerReport`].
+/// Returns [`HttpListenerError::InvalidIoTimeout`] before accepting a
+/// connection when the socket-I/O timeout is zero. Listener configuration and
+/// accept failures are also returned immediately. Failures after a connection
+/// has been accepted remain connection-local and are collected in the
+/// successful [`HttpListenerReport`].
 pub fn serve_http_read_only_with_limits(
     database: &SharedDatabase,
     listener: TcpListener,
     limits: HttpListenerLimits,
 ) -> Result<HttpListenerReport, HttpListenerError> {
-    if limits.connection_timeout.is_zero() {
-        return Err(HttpListenerError::InvalidConnectionTimeout);
+    if limits.io_timeout.is_zero() {
+        return Err(HttpListenerError::InvalidIoTimeout);
     }
     listener
         .set_nonblocking(false)
@@ -373,13 +384,13 @@ fn retry_transient_accept_errors<T>(mut accept: impl FnMut() -> io::Result<T>) -
     }
 }
 
-struct DeadlineTcpStream {
+struct IoDeadlineTcpStream {
     stream: TcpStream,
     started: Instant,
     timeout: Duration,
 }
 
-impl DeadlineTcpStream {
+impl IoDeadlineTcpStream {
     fn new(stream: TcpStream, timeout: Duration) -> Self {
         Self {
             stream,
@@ -393,19 +404,19 @@ impl DeadlineTcpStream {
             .checked_sub(self.started.elapsed())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "HTTP exchange deadline exceeded")
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP socket-I/O window expired")
             })
     }
 }
 
-impl Read for &DeadlineTcpStream {
+impl Read for &IoDeadlineTcpStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.stream.set_read_timeout(Some(self.remaining()?))?;
         (&self.stream).read(buffer)
     }
 }
 
-impl Write for &DeadlineTcpStream {
+impl Write for &IoDeadlineTcpStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         self.stream.set_write_timeout(Some(self.remaining()?))?;
         (&self.stream).write(buffer)
@@ -422,15 +433,15 @@ fn serve_http_read_only_connection(
     stream: TcpStream,
     limits: HttpListenerLimits,
 ) -> Result<(), HttpConnectionError> {
-    let stream = DeadlineTcpStream::new(stream, limits.connection_timeout);
+    let stream = IoDeadlineTcpStream::new(stream, limits.io_timeout);
     let exchange = (|| {
         stream
             .stream
-            .set_read_timeout(Some(limits.connection_timeout))
+            .set_read_timeout(Some(limits.io_timeout))
             .map_err(HttpConnectionError::SetReadTimeout)?;
         stream
             .stream
-            .set_write_timeout(Some(limits.connection_timeout))
+            .set_write_timeout(Some(limits.io_timeout))
             .map_err(HttpConnectionError::SetWriteTimeout)?;
         handle_http_query_with_limits(database, &stream, &stream, limits.query_limits)
             .map_err(HttpConnectionError::Exchange)
@@ -2985,5 +2996,24 @@ mod listener_tests {
         .expect_err("fatal listener error is returned");
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn non_io_processing_expires_the_next_socket_operation_without_preemption() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+        let client = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect loopback client");
+        let (server, _) = listener.accept().expect("accept loopback client");
+        let stream = IoDeadlineTcpStream::new(server, Duration::from_millis(5));
+
+        // The I/O wrapper cannot interrupt synchronous work between socket
+        // operations. Time spent there instead makes the next operation fail.
+        std::thread::sleep(Duration::from_millis(20));
+        let error = (&stream)
+            .write(b"response")
+            .expect_err("socket-I/O window expired during non-I/O work");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(client);
     }
 }
