@@ -2145,6 +2145,22 @@
         "eval_c88a7f3d": 80,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:669",
+      "recordedAt": "2026-08-09T05:43:35.673Z",
+      "label": "PR #669",
+      "kind": "composite",
+      "prNumber": 669,
+      "title": "YOLO generation 96: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 80,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
