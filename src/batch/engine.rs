@@ -5080,6 +5080,12 @@ fn execute_grouped<'a>(
                     &aggregate_specs[aggregate_state],
                     parallelism,
                 ),
+                AggregateFunction::Max => max_global_int64(
+                    table,
+                    matching_rows,
+                    &aggregate_specs[aggregate_state],
+                    parallelism,
+                ),
                 _ => unreachable!("paired Int64 aggregate shape is resolved"),
             };
             let count = count_matched_rows(matching_rows.len())?;
@@ -5193,7 +5199,10 @@ fn paired_global_count_int64_aggregate(
     let aggregate_state = aggregate_specs.iter().position(|spec| {
         matches!(
             spec.function,
-            AggregateFunction::Sum | AggregateFunction::Avg | AggregateFunction::Min
+            AggregateFunction::Sum
+                | AggregateFunction::Avg
+                | AggregateFunction::Min
+                | AggregateFunction::Max
         ) && spec.input_type == Some(DataType::Int64)
     })?;
     let function = aggregate_specs[aggregate_state].function;
@@ -9003,47 +9012,79 @@ mod tests {
     }
 
     #[test]
-    fn global_max_int64_forced_workers_match_empty_null_having_and_pagination() {
+    fn global_count_max_int64_forced_workers_preserve_empty_results_and_pagination() {
         let mut database = max_int64_database(0, |_| unreachable!("empty input"));
         let first_page = assert_global_aggregate_worker_differential(
             &mut database,
-            "SELECT MAX(value) AS maximum FROM empty_max_values \
-             HAVING maximum IS NULL ORDER BY maximum LIMIT 1 OFFSET 0",
+            "SELECT COUNT(*) AS rows, MAX(value) AS maximum FROM empty_max_values \
+             HAVING maximum IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 0",
         );
-        assert_eq!(first_page.rows, [vec![Value::Null(DataType::Int64)]]);
+        assert_eq!(
+            first_page.rows,
+            [vec![Value::Int64(0), Value::Null(DataType::Int64)]]
+        );
 
         let second_page = assert_global_aggregate_worker_differential(
             &mut database,
-            "SELECT MAX(value) AS maximum FROM empty_max_values \
-             HAVING maximum IS NULL ORDER BY maximum LIMIT 1 OFFSET 1",
+            "SELECT MAX(value) AS maximum, COUNT() AS rows FROM empty_max_values \
+             HAVING maximum IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 1",
         );
         assert!(second_page.rows.is_empty());
     }
 
     #[test]
-    fn global_max_int64_forced_workers_match_after_filtering_and_having() {
+    fn global_count_max_int64_forced_workers_match_filtered_projection_orders_and_aliases() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
             .saturating_add(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD / 2)
             .saturating_add(5);
         let value_for = |id: usize| i64::try_from(id % 1_003).unwrap() - 501;
         let mut database = max_int64_database(row_count, |id| (value_for(id), id % 3 != 0));
-        let expected = (1..=row_count)
+        let matched_rows = (1..=row_count).filter(|id| id % 3 != 0).count();
+        let expected_maximum = (1..=row_count)
             .filter(|id| id % 3 != 0)
             .map(value_for)
             .max()
             .unwrap();
-        let result = assert_global_aggregate_worker_differential(
+
+        let count_first = assert_global_aggregate_worker_differential(
             &mut database,
             &format!(
-                "SELECT MAX(value) AS maximum FROM values_to_max WHERE included = true \
-                 HAVING maximum = {expected} ORDER BY maximum DESC LIMIT 1 OFFSET 0"
+                "SELECT COUNT(*) AS matched, MAX(value) AS maximum FROM values_to_max \
+                 WHERE included = true HAVING maximum = {expected_maximum} \
+                 ORDER BY matched DESC LIMIT 1 OFFSET 0"
             ),
         );
-        assert_eq!(result.rows, [vec![Value::Int64(expected)]]);
+        assert_eq!(count_first.columns[0].name, "matched");
+        assert_eq!(count_first.columns[1].name, "maximum");
+        assert_eq!(
+            count_first.rows,
+            [vec![
+                Value::Int64(i64::try_from(matched_rows).unwrap()),
+                Value::Int64(expected_maximum),
+            ]]
+        );
+
+        let maximum_first = assert_global_aggregate_worker_differential(
+            &mut database,
+            &format!(
+                "SELECT MAX(value) AS maximum, COUNT() AS matched FROM values_to_max \
+                 WHERE included = true HAVING matched = {matched_rows} \
+                 ORDER BY maximum DESC LIMIT 1 OFFSET 0"
+            ),
+        );
+        assert_eq!(maximum_first.columns[0].name, "maximum");
+        assert_eq!(maximum_first.columns[1].name, "matched");
+        assert_eq!(
+            maximum_first.rows,
+            [vec![
+                Value::Int64(expected_maximum),
+                Value::Int64(i64::try_from(matched_rows).unwrap()),
+            ]]
+        );
     }
 
     #[test]
-    fn global_max_int64_forced_workers_match_at_parallel_boundary_and_use_shared_budget() {
+    fn global_count_max_int64_parallel_boundary_uses_shared_budget_with_sequential_fallback() {
         static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
             GlobalAggregateWorkerBudget::new(0);
         static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
@@ -9056,11 +9097,17 @@ mod tests {
         ] {
             let result = assert_global_aggregate_worker_differential(
                 &mut database,
-                &format!("SELECT MAX(value) FROM values_to_max WHERE id <= {matched_rows}"),
+                &format!(
+                    "SELECT COUNT(*) AS rows, MAX(value) AS maximum FROM values_to_max \
+                     WHERE id <= {matched_rows}"
+                ),
             );
             assert_eq!(
                 result.rows,
-                [vec![Value::Int64(i64::try_from(matched_rows).unwrap())]]
+                [vec![
+                    Value::Int64(i64::try_from(matched_rows).unwrap()),
+                    Value::Int64(i64::try_from(matched_rows).unwrap()),
+                ]]
             );
         }
 
@@ -9069,8 +9116,15 @@ mod tests {
             &UNAVAILABLE_BUDGET,
         );
         assert_eq!(
-            query(&mut database, "SELECT MAX(value) FROM values_to_max").rows,
-            [vec![Value::Int64(i64::try_from(row_count).unwrap())]],
+            query(
+                &mut database,
+                "SELECT MAX(value) AS maximum, COUNT() AS rows FROM values_to_max"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]],
             "an unavailable helper budget falls back to the query thread"
         );
 
@@ -9080,15 +9134,25 @@ mod tests {
             &OBSERVED_BUDGET,
         );
         assert_eq!(
-            query(&mut database, "SELECT MAX(value) FROM values_to_max").rows,
-            [vec![Value::Int64(i64::try_from(row_count).unwrap())]]
+            query(
+                &mut database,
+                &format!(
+                    "SELECT MAX(value), COUNT(*) FROM values_to_max WHERE id <= {}",
+                    GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+                )
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD).unwrap()),
+                Value::Int64(i64::try_from(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD).unwrap()),
+            ]]
         );
-        assert!(
+        assert_eq!(
             OBSERVED_BUDGET
                 .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
-            "sole MAX(Int64) uses the shared helper budget"
+                .load(AtomicOrdering::Acquire),
+            0,
+            "the paired shape stays sequential at the threshold"
         );
 
         OBSERVED_BUDGET.reset_peak();
@@ -9103,12 +9167,52 @@ mod tests {
                 Value::Int64(i64::try_from(row_count).unwrap()),
             ]]
         );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "the paired COUNT(*) and MAX(Int64) shape uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(), MAX(value) FROM values_to_max"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "the paired COUNT() and MAX(Int64) shape uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(id), MAX(value) FROM values_to_max"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
         assert_eq!(
             OBSERVED_BUDGET
                 .peak_helpers_in_use
                 .load(AtomicOrdering::Acquire),
             0,
-            "MAX(Int64) in a multi-aggregate projection stays sequential"
+            "COUNT(column) plus MAX(Int64) remains on the sequential fallback"
         );
     }
 
@@ -9133,13 +9237,20 @@ mod tests {
     }
 
     #[test]
-    fn global_max_int64_worker_failure_repeats_the_complete_maximum_locally() {
+    fn global_count_max_int64_worker_failure_repeats_the_complete_pair_locally() {
         let values = [-9, -7, -5, -3, -1, 1, 3, 5, i64::MAX, i64::MIN];
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut matching_rows = vec![0; row_count];
         let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
         matching_rows[second_partition] = 8;
-        let maximum = reduce_global_int64_extremum(
+        let sequential_maximum = reduce_global_int64_extremum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(1),
+            "max",
+            i64::max,
+        );
+        let failed_parallel_maximum = reduce_global_int64_extremum(
             &values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
@@ -9152,7 +9263,12 @@ mod tests {
             },
         );
 
-        assert_eq!(maximum, Some(i64::MAX));
+        assert_eq!(failed_parallel_maximum, sequential_maximum);
+        assert_eq!(failed_parallel_maximum, Some(i64::MAX));
+        assert_eq!(
+            count_matched_rows(matching_rows.len()),
+            Ok(i64::try_from(row_count).unwrap())
+        );
     }
 
     #[test]
