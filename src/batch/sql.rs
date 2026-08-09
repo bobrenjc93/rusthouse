@@ -441,6 +441,7 @@ impl AggregateFunction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArgument {
+    Empty,
     Wildcard,
     Column(String),
 }
@@ -2289,6 +2290,10 @@ impl<'a> Parser<'a> {
             })?;
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
+            } else if function == AggregateFunction::Count
+                && matches!(self.peek(), TokenKind::RightParen)
+            {
+                AggregateArgument::Empty
             } else {
                 AggregateArgument::Column(self.expect_identifier("aggregate column")?)
             };

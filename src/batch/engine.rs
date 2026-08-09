@@ -3412,6 +3412,15 @@ fn resolve_select_items(
                 alias,
             } => {
                 let (argument_index, input_type, argument_name) = match argument {
+                    AggregateArgument::Empty => {
+                        if *function != AggregateFunction::Count {
+                            return Err(Error::InvalidQuery(format!(
+                                "{}() is not supported; use a column argument",
+                                function.name()
+                            )));
+                        }
+                        (None, None, String::new())
+                    }
                     AggregateArgument::Wildcard => {
                         if *function != AggregateFunction::Count {
                             return Err(Error::InvalidQuery(format!(
