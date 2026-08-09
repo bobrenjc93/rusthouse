@@ -736,8 +736,9 @@ optional `database=default` parameter, one optional decimal `max_result_rows`
 parameter, one optional decimal `max_result_bytes` parameter, one optional
 decimal `max_rows_to_read` parameter, one optional decimal
 `max_rows_to_group_by` parameter, one optional decimal `max_threads` parameter,
-and one optional `default_format` parameter in any order with `query`, including
-percent-encoded parameter names and values.
+one optional decimal `readonly` parameter, and one optional `default_format`
+parameter in any order with `query`, including percent-encoded parameter names
+and values.
 All names and values use form-style decoding: each `%HH` escape becomes one
 byte and `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
@@ -771,13 +772,18 @@ that request and never changes `SHOW SETTINGS` or `system.settings`. The
 available-hardware and fixed 16-lane ceilings still apply, and simultaneous
 requests continue to share the process-wide nonblocking helper admission
 budget.
+`readonly` accepts ASCII decimal digits whose numeric value is `0` or `1`.
+`readonly=1` tightens only that request to the read-only query path, including
+when the authenticated handler is otherwise insertion-capable. `readonly=0`
+retains the handler's configured access; it never upgrades a read-only handler
+or changes persistent configuration.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
 same SQL byte limit as a POST body; the database, workload-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
 duplicate `query`, `database`, `max_result_rows`, `max_result_bytes`,
-`max_rows_to_read`, `max_rows_to_group_by`, `max_threads`, or `default_format`
-parameters,
-malformed or overflowing workload limits, unknown parameters, malformed
+`max_rows_to_read`, `max_rows_to_group_by`, `max_threads`, `readonly`, or
+`default_format` parameters, malformed or overflowing workload limits,
+malformed or out-of-range `readonly` values, unknown parameters, malformed
 escapes, non-default database values, unsupported formats, and invalid SQL
 UTF-8 are rejected.
 Parameter validation follows configured authentication and precedes database
