@@ -45,15 +45,17 @@ pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
 };
 pub use http::{
-    DEFAULT_MAX_HTTP_HEADER_BYTES, DEFAULT_MAX_HTTP_HEADER_COUNT, DEFAULT_MAX_HTTP_RESPONSE_BYTES,
-    DEFAULT_MAX_HTTP_SQL_BYTES, HttpQueryError, HttpQueryLimits, handle_http_query,
+    DEFAULT_HTTP_CONNECTION_TIMEOUT, DEFAULT_MAX_HTTP_CONNECTIONS, DEFAULT_MAX_HTTP_HEADER_BYTES,
+    DEFAULT_MAX_HTTP_HEADER_COUNT, DEFAULT_MAX_HTTP_RESPONSE_BYTES, DEFAULT_MAX_HTTP_SQL_BYTES,
+    HttpConnectionError, HttpConnectionFailure, HttpListenerError, HttpListenerLimits,
+    HttpListenerReport, HttpQueryError, HttpQueryLimits, handle_http_query,
     handle_http_query_read_only_with_bearer_token,
     handle_http_query_read_only_with_bearer_token_and_limits,
     handle_http_query_read_only_with_clickhouse_key,
     handle_http_query_read_only_with_clickhouse_key_and_limits,
     handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
     handle_http_query_with_clickhouse_key, handle_http_query_with_clickhouse_key_and_limits,
-    handle_http_query_with_limits,
+    handle_http_query_with_limits, serve_http_read_only, serve_http_read_only_with_limits,
 };
 pub use join::{
     JoinError, JoinLimits, JoinRowPair, LeftOuterJoinRowPair, inner_equi_join_nullable_i64,

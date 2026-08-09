@@ -869,8 +869,30 @@ authenticated handler's `*_and_limits` variant with `HttpQueryLimits` to set
 explicit insertion limits. Each call reads exactly one header block and, only
 for a POST query or authenticated insert, exactly its declared body; it emits at
 most one final `Connection: close` response and never reads or handles a
-subsequent request. This single-exchange API deliberately leaves listener,
-connection, timeout, and shutdown lifecycle to the embedding application.
+subsequent request.
+
+`serve_http_read_only` adds a built-in, bounded TCP lifecycle around that
+single-exchange API. It consumes a caller-bound `TcpListener`, accepts up to
+1,024 connections by default, and dispatches them sequentially against one
+`SharedDatabase` through `handle_http_query_with_limits`. Every connection gets
+a 30-second read and write timeout and is closed after its one response or
+connection-local failure. Protocol errors that can be represented on the wire
+receive their normal bounded response. Transport and socket failures are
+recorded in the returned `HttpListenerReport`, and later connections are still
+accepted. Listener configuration and accept failures instead return the typed
+`HttpListenerError` immediately.
+
+`serve_http_read_only_with_limits` accepts `HttpListenerLimits` to set the
+finite accepted-connection budget, a nonzero per-connection timeout, and the
+nested `HttpQueryLimits`. Reaching the connection budget drops the owned
+listener and returns; a zero budget returns without accepting, which also gives
+embedders a deterministic finite shutdown boundary. The listener is
+deliberately sequential and unauthenticated, read-only, and plain-text HTTP: it
+does not create worker threads, terminate TLS, or enable INSERT. Bind it to a
+loopback address or provide equivalent network access control unless public
+read access is intended. The transport-neutral `handle_http_query*` functions
+remain available when an embedder needs a different listener, authentication,
+concurrency, or shutdown policy.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or
