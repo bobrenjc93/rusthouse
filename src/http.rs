@@ -110,7 +110,10 @@ impl StdError for HttpQueryError {
 /// carry UTF-8 SQL in their body. `GET /?query=<percent-encoded SQL>` and
 /// `POST /?query=<percent-encoded SQL>` carry the same SQL in a required
 /// form-style query parameter and optionally accept one `database=default`
-/// parameter and one `default_format` parameter in any order. `default_format`
+/// parameter, one decimal `max_result_rows` parameter, and one `default_format`
+/// parameter in any order. A nonzero `max_result_rows` can tighten but never
+/// relax the database's configured result-row limit; zero disables the
+/// request-level limit while retaining the configured cap. `default_format`
 /// accepts `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. Parameter
 /// names and values are percent-decoded, and `+` becomes a space. An
@@ -120,8 +123,9 @@ impl StdError for HttpQueryError {
 /// TSV body when it ends in `FORMAT TabSeparated`; it routes the body through
 /// the same bounded, atomic, nonblocking importer as `POST /insert/<table>`.
 /// All other parameterized queries require an absent or zero `Content-Length`.
-/// Empty, duplicate, unknown, and unsupported parameters are rejected after
-/// authentication and before database access. A
+/// Empty, duplicate, unknown, and unsupported parameters, plus malformed or
+/// overflowing `max_result_rows` values, are rejected after authentication and
+/// before database lock admission. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
 /// may instead end in a case-insensitive SQL `FORMAT CSVWithNames`, `FORMAT
@@ -606,7 +610,7 @@ fn handle_http_query_exchange(
         }
     };
 
-    let (sql, response_format) = match request {
+    let (sql, response_format, max_result_rows) = match request {
         HttpRequest::Ping => {
             return write_response(
                 &mut output,
@@ -812,10 +816,15 @@ fn handle_http_query_exchange(
         HttpRequest::Query {
             sql,
             response_format,
-        } => (sql, response_format),
+            max_result_rows,
+        } => (sql, response_format, max_result_rows),
     };
 
-    match database.try_query(&sql) {
+    let query_result = max_result_rows.map_or_else(
+        || database.try_query(&sql),
+        |max_result_rows| database.try_query_with_result_row_limit(&sql, max_result_rows),
+    );
+    match query_result {
         Ok(result) => {
             let mut body = BoundedVec::new(limits.max_response_bytes);
             let (write_failed, content_type) = match response_format {
@@ -940,6 +949,7 @@ fn read_request(
             classify_standard_query_request(
                 sql,
                 request.response_format,
+                None,
                 access.allows_insert() && !output_format_selected,
             )
         }
@@ -1020,6 +1030,7 @@ fn read_request(
             classify_standard_query_request(
                 sql,
                 response_format,
+                decoded.max_result_rows,
                 access.allows_insert()
                     && matches!(method, ParameterizedQueryMethod::Post)
                     && !output_format_selected,
@@ -1060,6 +1071,7 @@ fn parse_parameterized_table_insert(sql: &str) -> Option<(String, TableInsertFor
 fn classify_standard_query_request(
     mut sql: String,
     response_format: Option<QueryResponseFormat>,
+    max_result_rows: Option<usize>,
     insert_enabled: bool,
 ) -> Result<HttpRequest, RequestReadError> {
     let sql_format = take_terminal_query_format(&mut sql);
@@ -1101,6 +1113,7 @@ fn classify_standard_query_request(
         Ok(HttpRequest::Query {
             sql,
             response_format,
+            max_result_rows,
         })
     }
 }
@@ -1433,6 +1446,7 @@ enum HttpRequest {
     Query {
         sql: String,
         response_format: QueryResponseFormat,
+        max_result_rows: Option<usize>,
     },
     Insert {
         sql: String,
@@ -1535,6 +1549,7 @@ impl ParameterizedQueryMethod {
 struct DecodedQuery {
     sql: Vec<u8>,
     response_format: Option<QueryResponseFormat>,
+    max_result_rows: Option<usize>,
 }
 
 fn parse_headers(
@@ -1870,6 +1885,7 @@ fn parse_request_line(
         (_, target)
             if target.starts_with(b"/?query=")
                 || target.starts_with(b"/?database=")
+                || target.starts_with(b"/?max_result_rows=")
                 || target.starts_with(b"/?default_format=") =>
         {
             Err(RequestFailure::with_headers(
@@ -1944,6 +1960,7 @@ fn decode_query_parameters(
     let mut query = None;
     let mut database_seen = false;
     let mut response_format = None;
+    let mut max_result_rows = None;
 
     for encoded_parameter in encoded_parameters.split(|byte| *byte == b'&') {
         let Some(equals) = encoded_parameter.iter().position(|byte| *byte == b'=') else {
@@ -2014,6 +2031,17 @@ fn decode_query_parameters(
                     }
                 });
             }
+            b"max_result_rows" => {
+                if max_result_rows.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate max_result_rows parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                max_result_rows = Some(parse_decimal_max_result_rows(&value)?);
+            }
             _ => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
@@ -2033,7 +2061,31 @@ fn decode_query_parameters(
     Ok(DecodedQuery {
         sql,
         response_format,
+        max_result_rows,
     })
+}
+
+fn parse_decimal_max_result_rows(value: &[u8]) -> Result<usize, RequestReadError> {
+    let mut parsed = 0_usize;
+    for byte in value {
+        if !byte.is_ascii_digit() {
+            return Err(RequestFailure::new(
+                Status::BAD_REQUEST,
+                "max_result_rows parameter must be a decimal integer",
+            )
+            .into());
+        }
+        parsed = parsed
+            .checked_mul(10)
+            .and_then(|parsed| parsed.checked_add(usize::from(byte - b'0')))
+            .ok_or_else(|| {
+                RequestReadError::from(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "max_result_rows parameter is out of range",
+                ))
+            })?;
+    }
+    Ok(parsed)
 }
 
 fn decode_form_component(

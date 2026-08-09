@@ -621,21 +621,28 @@ body. Headerless inputs use physical schema order. Each requires one decimal
 case-insensitive, permit one optional trailing semicolon, and otherwise must be
 exact: an explicit column list, another format, or any extra SQL is not
 accepted as query-plus-data. Both parameterized request forms also accept one
-optional `database=default` parameter and
-one optional `default_format` parameter in any order with `query`, including
-percent-encoded parameter names and values. All
+optional `database=default` parameter, one optional decimal `max_result_rows`
+parameter, and one optional `default_format` parameter in any order with
+`query`, including percent-encoded parameter names and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
 `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
 `JSONEachRow`, and `JSONCompactEachRow`, selecting the corresponding existing
 response writer.
+`max_result_rows` accepts ASCII decimal digits. A nonzero value tightens the
+database's configured query-result row limit for that request, while zero
+disables the request-level limit and retains the configured cap. A larger value
+never relaxes the configured limit. The effective row limit is checked with
+the other query-result shape limits before result rows are materialized.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
-same SQL byte limit as a POST body; the database and format parameters do not
-count toward that limit. Empty parameters or values, duplicate `query`,
-`database`, or `default_format` parameters, unknown parameters, malformed
+same SQL byte limit as a POST body; the database, row-limit, and format
+parameters do not count toward that limit. Empty parameters or values,
+duplicate `query`, `database`, `max_result_rows`, or `default_format`
+parameters, malformed or overflowing row limits, unknown parameters, malformed
 escapes, non-default database values, unsupported formats, and invalid SQL
-UTF-8 are rejected. Parameter validation follows configured authentication and
-precedes database access. GET requests and every request handled by any
+UTF-8 are rejected.
+Parameter validation follows configured authentication and precedes database
+lock admission. GET requests and every request handled by any
 read-only API use the read-only, exactly-one-statement
 `SharedDatabase::try_query` path. A POST through an insertion-capable
 authenticated handler without an explicit output-format selector additionally
