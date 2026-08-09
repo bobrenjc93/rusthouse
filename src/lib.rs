@@ -21,8 +21,8 @@ pub use aggregate::{
     aggregate_nullable_i64, count_nullable_i64, min_nullable_i64,
 };
 pub use batch::{
-    Database, DatabaseMetrics, DatabaseSnapshotRestoreError, SharedDatabase, SharedDatabaseError,
-    TableLimits,
+    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseMetrics, DatabaseSnapshotRestoreError,
+    SharedDatabase, SharedDatabaseError, SharedDatabaseSnapshotRestoreError, TableLimits,
 };
 #[cfg(unix)]
 pub use batch::{DatabaseSnapshotSaveError, SharedDatabaseSnapshotSaveError};
