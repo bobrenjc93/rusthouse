@@ -133,6 +133,11 @@ case-insensitive name is absent. If that name is already registered, it returns
 a successful no-op command and retains the existing display name, schema, rows,
 and row cap even when the requested schema differs. Plain `CREATE TABLE`
 continues to report an error for an existing case-insensitive name.
+Both forms optionally accept the case-insensitive ClickHouse suffix `ENGINE =
+Memory`. It selects the existing in-memory execution path and does not add a
+second storage engine. The equals sign is required; unsupported engines,
+duplicate engine clauses, and any other trailing syntax are rejected while the
+complete batch is parsed, before any statement mutates the catalog.
 
 `DROP TABLE IF EXISTS <name>` removes a matching table using the same
 case-insensitive name resolution as ordinary `DROP TABLE`. If the table is
@@ -604,9 +609,10 @@ session. It reads one statement from each nonempty input line and prints a row
 list such as `[7, NULL, -2]` for each projection. That session allows 65,536
 input bytes, 1,024 statements, 64 tables, and 1,024 rows per table. In either
 mode, malformed or failed SQL is reported on standard error and exits nonzero.
-The legacy session also accepts the exact `CREATE TABLE IF NOT EXISTS` form;
-its existence check is case-insensitive while ordinary legacy names retain
-their existing exact-match behavior.
+The legacy session also accepts the exact `CREATE TABLE IF NOT EXISTS` form and
+the optional `ENGINE = Memory` suffix on either CREATE form. Its existence check
+is case-insensitive while ordinary legacy names retain their existing
+exact-match behavior.
 
 ```bash
 printf '%s\n' \
