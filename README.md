@@ -693,11 +693,11 @@ exact: an explicit column list, another format, or any extra SQL is not
 accepted as query-plus-data. Both parameterized request forms also accept one
 optional `database=default` parameter, one optional decimal `max_result_rows`
 parameter, one optional decimal `max_result_bytes` parameter, one optional
-decimal `max_rows_to_read` parameter, and one optional `default_format`
-parameter in any order with `query`, including percent-encoded parameter names
-and values. All
-names and values use form-style decoding: each `%HH` escape becomes one byte and
-`+` becomes a space. `default_format` accepts the exact case-sensitive values
+decimal `max_rows_to_read` parameter, one optional decimal
+`max_rows_to_group_by` parameter, and one optional `default_format` parameter
+in any order with `query`, including percent-encoded parameter names and values.
+All names and values use form-style decoding: each `%HH` escape becomes one
+byte and `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
 `JSONEachRow`, and `JSONCompactEachRow`, selecting the corresponding existing
 response writer.
@@ -717,13 +717,19 @@ the database's configured source-scan row limit for that request, while zero
 retains the configured limit. A larger value never relaxes the configured
 limit. The complete source table is charged before row inspection, so `WHERE`
 and `LIMIT` cannot reduce the charged row count.
+`max_rows_to_group_by` also accepts ASCII decimal digits. A nonzero value
+tightens the database's configured group-count limit for that request, while
+zero retains the configured limit. A larger value never relaxes the configured
+limit. `GROUP BY` and `DISTINCT` charge every distinct working group before
+`HAVING` and `LIMIT`, so those result clauses cannot hide excess groups.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
 same SQL byte limit as a POST body; the database, workload-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
 duplicate `query`, `database`, `max_result_rows`, `max_result_bytes`,
-`max_rows_to_read`, or `default_format` parameters, malformed or overflowing
-workload limits, unknown parameters, malformed escapes, non-default database
-values, unsupported formats, and invalid SQL UTF-8 are rejected.
+`max_rows_to_read`, `max_rows_to_group_by`, or `default_format` parameters,
+malformed or overflowing workload limits, unknown parameters, malformed
+escapes, non-default database values, unsupported formats, and invalid SQL
+UTF-8 are rejected.
 Parameter validation follows configured authentication and precedes database
 lock admission. GET requests and every request handled by any read-only API use
 the read-only, exactly-one-statement nonblocking `SharedDatabase::try_query`

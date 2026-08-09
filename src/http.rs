@@ -779,8 +779,9 @@ fn serve_http_connections(
 /// form-style query parameter and optionally accept one `database=default`
 /// parameter, one decimal `max_result_rows` parameter, one decimal
 /// `max_result_bytes` parameter, one decimal `max_rows_to_read` parameter, and
-/// one `default_format` parameter in any order. Nonzero result and scan limits
-/// can tighten but never relax the database's configured query limits;
+/// one decimal `max_rows_to_group_by` parameter, and one `default_format`
+/// parameter in any order. Nonzero result, scan, and group limits can tighten
+/// but never relax the database's configured query limits;
 /// `max_result_bytes` also cannot relax the default retained-result byte limit.
 /// Zero disables the corresponding request-level limit while retaining the
 /// configured defaults. `default_format`
@@ -1282,8 +1283,14 @@ fn handle_http_query_exchange(
         }
     };
 
-    let (sql, response_format, max_result_bytes, max_result_rows, max_rows_to_read) = match request
-    {
+    let (
+        sql,
+        response_format,
+        max_result_bytes,
+        max_result_rows,
+        max_rows_to_read,
+        max_rows_to_group_by,
+    ) = match request {
         HttpRequest::Ping => {
             return write_response(
                 &mut output,
@@ -1492,23 +1499,31 @@ fn handle_http_query_exchange(
             max_result_bytes,
             max_result_rows,
             max_rows_to_read,
+            max_rows_to_group_by,
         } => (
             sql,
             response_format,
             max_result_bytes,
             max_result_rows,
             max_rows_to_read,
+            max_rows_to_group_by,
         ),
     };
 
-    let query_result = match (max_result_bytes, max_result_rows, max_rows_to_read) {
-        (None, None, None) => database.try_query(&sql),
-        (max_result_bytes, max_result_rows, max_rows_to_read) => database
+    let query_result = match (
+        max_result_bytes,
+        max_result_rows,
+        max_rows_to_read,
+        max_rows_to_group_by,
+    ) {
+        (None, None, None, None) => database.try_query(&sql),
+        (max_result_bytes, max_result_rows, max_rows_to_read, max_rows_to_group_by) => database
             .try_query_with_parameterized_workload_limits(
                 &sql,
                 max_result_bytes.unwrap_or(0),
                 max_result_rows.unwrap_or(0),
                 max_rows_to_read.unwrap_or(0),
+                max_rows_to_group_by.unwrap_or(0),
             ),
     };
     match query_result {
@@ -1639,6 +1654,7 @@ fn read_request(
                 None,
                 None,
                 None,
+                None,
                 access.allows_insert() && !output_format_selected,
             )
         }
@@ -1722,6 +1738,7 @@ fn read_request(
                 decoded.max_result_bytes,
                 decoded.max_result_rows,
                 decoded.max_rows_to_read,
+                decoded.max_rows_to_group_by,
                 access.allows_insert()
                     && matches!(method, ParameterizedQueryMethod::Post)
                     && !output_format_selected,
@@ -1767,6 +1784,7 @@ fn classify_standard_query_request(
     max_result_bytes: Option<usize>,
     max_result_rows: Option<usize>,
     max_rows_to_read: Option<usize>,
+    max_rows_to_group_by: Option<usize>,
     insert_enabled: bool,
 ) -> Result<HttpRequest, RequestReadError> {
     let sql_format = take_terminal_query_format(&mut sql);
@@ -1814,6 +1832,7 @@ fn classify_standard_query_request(
             max_result_bytes,
             max_result_rows,
             max_rows_to_read,
+            max_rows_to_group_by,
         })
     }
 }
@@ -2151,6 +2170,7 @@ enum HttpRequest {
         max_result_bytes: Option<usize>,
         max_result_rows: Option<usize>,
         max_rows_to_read: Option<usize>,
+        max_rows_to_group_by: Option<usize>,
     },
     Insert {
         sql: String,
@@ -2256,6 +2276,7 @@ struct DecodedQuery {
     max_result_bytes: Option<usize>,
     max_result_rows: Option<usize>,
     max_rows_to_read: Option<usize>,
+    max_rows_to_group_by: Option<usize>,
 }
 
 fn parse_headers(
@@ -2594,6 +2615,7 @@ fn parse_request_line(
                 || target.starts_with(b"/?max_result_bytes=")
                 || target.starts_with(b"/?max_result_rows=")
                 || target.starts_with(b"/?max_rows_to_read=")
+                || target.starts_with(b"/?max_rows_to_group_by=")
                 || target.starts_with(b"/?default_format=") =>
         {
             Err(RequestFailure::with_headers(
@@ -2671,6 +2693,7 @@ fn decode_query_parameters(
     let mut max_result_bytes = None;
     let mut max_result_rows = None;
     let mut max_rows_to_read = None;
+    let mut max_rows_to_group_by = None;
 
     for encoded_parameter in encoded_parameters.split(|byte| *byte == b'&') {
         let Some(equals) = encoded_parameter.iter().position(|byte| *byte == b'=') else {
@@ -2774,6 +2797,17 @@ fn decode_query_parameters(
                 let value = decode_form_component(encoded_value, None)?;
                 max_rows_to_read = Some(parse_decimal_max_rows_to_read(&value)?);
             }
+            b"max_rows_to_group_by" => {
+                if max_rows_to_group_by.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate max_rows_to_group_by parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                max_rows_to_group_by = Some(parse_decimal_max_rows_to_group_by(&value)?);
+            }
             _ => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
@@ -2796,6 +2830,7 @@ fn decode_query_parameters(
         max_result_bytes,
         max_result_rows,
         max_rows_to_read,
+        max_rows_to_group_by,
     })
 }
 
@@ -2820,6 +2855,14 @@ fn parse_decimal_max_rows_to_read(value: &[u8]) -> Result<usize, RequestReadErro
         value,
         "max_rows_to_read parameter must be a decimal integer",
         "max_rows_to_read parameter is out of range",
+    )
+}
+
+fn parse_decimal_max_rows_to_group_by(value: &[u8]) -> Result<usize, RequestReadError> {
+    parse_decimal_workload_limit(
+        value,
+        "max_rows_to_group_by parameter must be a decimal integer",
+        "max_rows_to_group_by parameter is out of range",
     )
 }
 
