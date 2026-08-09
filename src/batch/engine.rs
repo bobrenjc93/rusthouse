@@ -4980,15 +4980,25 @@ fn execute_grouped<'a>(
 
     if group_columns.is_empty() {
         if let Some((count_state, aggregate_state, function)) = paired_global_count_int_aggregate {
-            let partial = global_int64_sum_partial(
-                table,
-                matching_rows,
-                &aggregate_specs[aggregate_state],
-                parallelism,
-            )?;
-            aggregate_states[count_state][0] =
-                AggregateState::Count(count_matched_rows(matching_rows.len())?);
-            aggregate_states[aggregate_state][0] = partial.into_state(function);
+            let aggregate = match function {
+                AggregateFunction::Sum | AggregateFunction::Avg => global_int64_sum_partial(
+                    table,
+                    matching_rows,
+                    &aggregate_specs[aggregate_state],
+                    parallelism,
+                )?
+                .into_state(function),
+                AggregateFunction::Min => min_global_int64(
+                    table,
+                    matching_rows,
+                    &aggregate_specs[aggregate_state],
+                    parallelism,
+                ),
+                _ => unreachable!("paired Int64 aggregate shape is resolved"),
+            };
+            let count = count_matched_rows(matching_rows.len())?;
+            aggregate_states[count_state][0] = AggregateState::Count(count);
+            aggregate_states[aggregate_state][0] = aggregate;
         } else {
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
                 if spec.function == AggregateFunction::CountIf {
@@ -5097,7 +5107,7 @@ fn paired_global_count_int64_aggregate(
     let aggregate_state = aggregate_specs.iter().position(|spec| {
         matches!(
             spec.function,
-            AggregateFunction::Sum | AggregateFunction::Avg
+            AggregateFunction::Sum | AggregateFunction::Avg | AggregateFunction::Min
         ) && spec.input_type == Some(DataType::Int64)
     })?;
     let function = aggregate_specs[aggregate_state].function;
@@ -8225,29 +8235,79 @@ mod tests {
     }
 
     #[test]
-    fn global_min_int64_forced_workers_match_after_filtering_and_having() {
+    fn global_count_min_int64_forced_workers_preserve_empty_results_and_pagination() {
+        let mut database = min_int64_database(0, |_| unreachable!("empty input"));
+        let first_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT COUNT(*) AS rows, MIN(value) AS minimum FROM empty_min_values \
+             HAVING minimum IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(
+            first_page.rows,
+            [vec![Value::Int64(0), Value::Null(DataType::Int64)]]
+        );
+
+        let second_page = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT MIN(value) AS minimum, COUNT() AS rows FROM empty_min_values \
+             HAVING minimum IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 1",
+        );
+        assert!(second_page.rows.is_empty());
+    }
+
+    #[test]
+    fn global_count_min_int64_forced_workers_match_filtered_projection_orders_and_aliases() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
             .saturating_add(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD / 2)
             .saturating_add(5);
         let value_for = |id: usize| i64::try_from(id % 1_003).unwrap() - 501;
         let mut database = min_int64_database(row_count, |id| (value_for(id), id % 3 != 0));
-        let expected = (1..=row_count)
+        let matched_rows = (1..=row_count).filter(|id| id % 3 != 0).count();
+        let expected_minimum = (1..=row_count)
             .filter(|id| id % 3 != 0)
             .map(value_for)
             .min()
             .unwrap();
-        let result = assert_global_aggregate_worker_differential(
+
+        let count_first = assert_global_aggregate_worker_differential(
             &mut database,
             &format!(
-                "SELECT MIN(value) AS minimum FROM values_to_min WHERE included = true \
-                 HAVING minimum = {expected} ORDER BY minimum LIMIT 1 OFFSET 0"
+                "SELECT COUNT(*) AS matched, MIN(value) AS minimum FROM values_to_min \
+                 WHERE included = true HAVING minimum = {expected_minimum} \
+                 ORDER BY matched DESC LIMIT 1 OFFSET 0"
             ),
         );
-        assert_eq!(result.rows, [vec![Value::Int64(expected)]]);
+        assert_eq!(count_first.columns[0].name, "matched");
+        assert_eq!(count_first.columns[1].name, "minimum");
+        assert_eq!(
+            count_first.rows,
+            [vec![
+                Value::Int64(i64::try_from(matched_rows).unwrap()),
+                Value::Int64(expected_minimum),
+            ]]
+        );
+
+        let minimum_first = assert_global_aggregate_worker_differential(
+            &mut database,
+            &format!(
+                "SELECT MIN(value) AS minimum, COUNT() AS matched FROM values_to_min \
+                 WHERE included = true HAVING matched = {matched_rows} \
+                 ORDER BY minimum LIMIT 1 OFFSET 0"
+            ),
+        );
+        assert_eq!(minimum_first.columns[0].name, "minimum");
+        assert_eq!(minimum_first.columns[1].name, "matched");
+        assert_eq!(
+            minimum_first.rows,
+            [vec![
+                Value::Int64(expected_minimum),
+                Value::Int64(i64::try_from(matched_rows).unwrap()),
+            ]]
+        );
     }
 
     #[test]
-    fn global_min_int64_forced_workers_match_at_parallel_boundary_and_use_shared_budget() {
+    fn global_count_min_int64_parallel_boundary_uses_shared_budget_with_sequential_fallback() {
         static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
             GlobalAggregateWorkerBudget::new(0);
         static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
@@ -8262,13 +8322,17 @@ mod tests {
         ] {
             let result = assert_global_aggregate_worker_differential(
                 &mut database,
-                &format!("SELECT MIN(value) FROM values_to_min WHERE id <= {matched_rows}"),
+                &format!(
+                    "SELECT COUNT(*) AS rows, MIN(value) AS minimum FROM values_to_min \
+                     WHERE id <= {matched_rows}"
+                ),
             );
             assert_eq!(
                 result.rows,
-                [vec![Value::Int64(
-                    i64::try_from(row_count - matched_rows).unwrap()
-                )]]
+                [vec![
+                    Value::Int64(i64::try_from(matched_rows).unwrap()),
+                    Value::Int64(i64::try_from(row_count - matched_rows).unwrap()),
+                ]]
             );
         }
 
@@ -8277,8 +8341,15 @@ mod tests {
             &UNAVAILABLE_BUDGET,
         );
         assert_eq!(
-            query(&mut database, "SELECT MIN(value) FROM values_to_min").rows,
-            [vec![Value::Int64(0)]],
+            query(
+                &mut database,
+                "SELECT MIN(value), COUNT() FROM values_to_min"
+            )
+            .rows,
+            [vec![
+                Value::Int64(0),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]],
             "an unavailable helper budget falls back to the query thread"
         );
 
@@ -8303,6 +8374,29 @@ mod tests {
         assert_eq!(
             query(
                 &mut database,
+                &format!(
+                    "SELECT MIN(value), COUNT(*) FROM values_to_min WHERE id <= {}",
+                    GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+                )
+            )
+            .rows,
+            [vec![
+                Value::Int64(1),
+                Value::Int64(i64::try_from(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD).unwrap()),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "the paired shape stays sequential at the threshold"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
                 "SELECT MIN(value), COUNT(*) FROM values_to_min"
             )
             .rows,
@@ -8311,12 +8405,32 @@ mod tests {
                 Value::Int64(i64::try_from(row_count).unwrap()),
             ]]
         );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "the paired COUNT(*) and MIN(Int64) shape uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(id), MIN(value) FROM values_to_min"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(0),
+            ]]
+        );
         assert_eq!(
             OBSERVED_BUDGET
                 .peak_helpers_in_use
                 .load(AtomicOrdering::Acquire),
             0,
-            "MIN(Int64) in a multi-aggregate projection stays sequential"
+            "COUNT(column) plus MIN(Int64) remains on the sequential fallback"
         );
     }
 
@@ -8341,7 +8455,7 @@ mod tests {
     }
 
     #[test]
-    fn global_min_int64_worker_failure_repeats_the_complete_minimum_locally() {
+    fn global_count_min_int64_worker_failure_repeats_the_complete_pair_locally() {
         let values = [9, 7, 5, 3, 1, -1, -3, -5, i64::MIN, i64::MAX];
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut matching_rows = vec![0; row_count];
@@ -8361,6 +8475,10 @@ mod tests {
         );
 
         assert_eq!(minimum, Some(i64::MIN));
+        assert_eq!(
+            count_matched_rows(matching_rows.len()),
+            Ok(i64::try_from(row_count).unwrap())
+        );
     }
 
     #[test]
