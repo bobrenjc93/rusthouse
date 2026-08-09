@@ -90,6 +90,18 @@ cell limits before changing the catalog or metrics. The payload is strictly a
 single-table format: it contains one column and no database name, batch table
 name, additional tables, or catalog metadata.
 
+`Database::restore_int64_tables_from_files` transactionally composes those
+single-table payloads into a caller-bounded catalog subset. Each
+`DatabaseSnapshotRestoreEntry` supplies a table name, source path, and its own
+envelope and payload codec bounds; the separate inclusive `max_entries`
+argument is checked before name validation or file access. The complete name
+set is validated case-insensitively against itself and the current catalog
+before file access. Every decoded table then remains staged outside the catalog
+until all entries pass corruption, nullability, row-cap, column, and cell validation.
+Only the complete set is registered and charged to cached metrics. An excessive
+count or entry failure reports the zero-based entry index and caller name, and
+leaves the existing catalog and metrics unchanged.
+
 `SharedDatabase::try_restore_int64_table_from_file` is available on every
 supported platform. It makes one nonblocking write-lock attempt before opening
 or reading the source, then holds that guard while delegating to

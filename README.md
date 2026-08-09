@@ -1258,6 +1258,15 @@ database's configured `TableLimits`, preserves the persisted row cap, and
 registers the table plus its cached metrics only after all decoding and storage
 validation succeeds. Duplicate names resolve case-insensitively just like SQL
 table names and leave the existing catalog unchanged.
+`Database::restore_int64_tables_from_files` restores a caller-bounded slice of
+`DatabaseSnapshotRestoreEntry` values as one atomic catalog change. The
+inclusive entry-count limit and the complete case-insensitive destination-name
+set are checked before any source file is opened. Each entry has independent
+envelope and self-describing payload codec bounds; decoded tables remain staged
+until every file passes corruption, non-nullability, and configured table-limit
+checks. Success makes the complete subset queryable and updates cached metrics;
+failure reports the zero-based entry and caller table name while preserving all
+prior catalog data and gauges.
 `Database::restore_int64_table_from_file_with_backup` adds explicit recovery:
 it tries the primary self-describing snapshot first, falls back to the supplied
 backup only when bounded snapshot decoding fails, and reports which file

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::batch::error::{Error, Result};
 use crate::batch::storage::{
@@ -108,6 +108,29 @@ impl Catalog {
             return Err(Error::TableAlreadyExists(table.name().to_owned()));
         }
         self.tables.insert(key, table);
+        Ok(())
+    }
+
+    /// Registers a completely constructed set of tables after preflighting
+    /// every existing and intra-set case-insensitive name collision.
+    ///
+    /// The returned index identifies the first rejected table in input order.
+    /// No table is inserted unless the complete set passes preflight.
+    pub(crate) fn register_tables(
+        &mut self,
+        tables: Vec<Table>,
+    ) -> std::result::Result<(), (usize, Error)> {
+        let mut incoming_names = HashSet::with_capacity(tables.len());
+        for (index, table) in tables.iter().enumerate() {
+            let key = normalize(table.name());
+            if self.tables.contains_key(&key) || !incoming_names.insert(key) {
+                return Err((index, Error::TableAlreadyExists(table.name().to_owned())));
+            }
+        }
+
+        for table in tables {
+            self.tables.insert(normalize(table.name()), table);
+        }
         Ok(())
     }
 
