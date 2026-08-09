@@ -114,6 +114,42 @@ fn sequential_connections_share_one_read_only_database_and_stop_at_the_limit() {
 }
 
 #[test]
+fn sequential_connections_observe_updated_cached_system_metrics() {
+    let database = SharedDatabase::default();
+    let (address, worker) = start_listener(
+        database.clone(),
+        HttpListenerLimits::new(2, HttpQueryLimits::default()),
+    );
+    let request = post_query("SELECT metric, value FROM system.metrics;");
+
+    let empty = exchange(address, &request);
+    assert!(empty.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        body(&empty),
+        br#"{"columns":[{"name":"metric","type":"String"},{"name":"value","type":"Int64"}],"rows":[["rusthouse_tables",0],["rusthouse_columns",0],["rusthouse_retained_rows",0],["rusthouse_retained_value_bytes",0]]}"#
+    );
+
+    database
+        .execute(
+            "CREATE TABLE readings (value Int64, label String); \
+             INSERT INTO readings VALUES (7, 'x'), (11, 'é');",
+        )
+        .unwrap();
+
+    let populated = exchange(address, &request);
+    assert!(populated.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        body(&populated),
+        br#"{"columns":[{"name":"metric","type":"String"},{"name":"value","type":"Int64"}],"rows":[["rusthouse_tables",1],["rusthouse_columns",2],["rusthouse_retained_rows",2],["rusthouse_retained_value_bytes",19]]}"#
+    );
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
 fn one_connection_receives_only_one_response_even_when_requests_are_pipelined() {
     let database = SharedDatabase::default();
     let (address, worker) = start_listener(
