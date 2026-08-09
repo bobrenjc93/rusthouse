@@ -109,6 +109,14 @@ table-limit validation happens after recovery chooses a source and does not
 trigger another attempt. Dual recovery, validation, and limit failures leave
 the target's display name, rows, schema, and cached metrics unchanged.
 
+`SharedDatabase::try_replace_int64_table_from_file_with_backup` exposes that
+replacement to concurrent users without blocking. It makes exactly one
+write-lock attempt before opening either source, retains the guard through the
+delegated primary-or-backup replacement, and returns the successful recovery
+source. Reader or writer contention, a poisoned lock, and typed snapshot or
+database validation failures remain distinct. Every failure preserves the
+target table and cached metrics.
+
 `Database::restore_int64_tables_from_files` transactionally composes those
 single-table payloads into a caller-bounded catalog subset. Each
 `DatabaseSnapshotRestoreEntry` supplies a table name, source path, and its own

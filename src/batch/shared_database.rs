@@ -17,7 +17,7 @@ use super::engine::{
 use super::error::Error;
 use super::sql::{self, Statement};
 use super::tsv::{TsvIngestError, TsvIngestLimits};
-use crate::snapshot::{Int64TablePayloadCodec, SnapshotCodec};
+use crate::snapshot::{Int64TablePayloadCodec, Int64TablePayloadFileRecoverySource, SnapshotCodec};
 
 /// An instantaneous measurement of data retained by a [`SharedDatabase`].
 ///
@@ -270,6 +270,8 @@ impl From<DatabaseSnapshotSaveError> for SharedDatabaseSnapshotSaveError {
 /// [`SharedDatabaseError::DatabaseBusy`] instead of waiting for a writer.
 /// [`Self::try_restore_int64_table_from_file`] attempts one write lock before
 /// bounded snapshot reading and atomic database restore.
+/// [`Self::try_replace_int64_table_from_file_with_backup`] does the same before
+/// atomically replacing an existing table from a primary or backup snapshot.
 /// [`Self::try_restore_int64_tables_from_files`] does the same for a
 /// caller-bounded atomic set of snapshots.
 #[cfg_attr(
@@ -434,6 +436,50 @@ impl SharedDatabase {
         };
         database
             .restore_int64_table_from_file(table_name, path, snapshot_codec, payload_codec)
+            .map_err(Into::into)
+    }
+
+    /// Attempts to replace one existing table from a primary `Int64` snapshot
+    /// or an explicit backup without waiting for the database lock.
+    ///
+    /// Exactly one nonblocking write-lock attempt occurs before either source
+    /// path is accessed. An active reader or writer returns
+    /// [`SharedDatabaseSnapshotRestoreError::DatabaseBusy`], and a poisoned
+    /// lock returns [`SharedDatabaseSnapshotRestoreError::LockPoisoned`], both
+    /// without opening either file. Once acquired, the guard is retained while
+    /// [`Database::replace_int64_table_from_file_with_backup`] checks the target,
+    /// performs bounded primary-or-backup recovery, validates the replacement,
+    /// and atomically swaps the table. Success reports which source supplied
+    /// the replacement.
+    ///
+    /// The primary takes precedence whenever it decodes successfully. If both
+    /// sources fail, the typed recovery error retains both failures. Every
+    /// failure preserves the target table and cached database metrics.
+    pub fn try_replace_int64_table_from_file_with_backup(
+        &self,
+        table_name: &str,
+        primary_path: impl AsRef<Path>,
+        backup_path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: Int64TablePayloadCodec,
+    ) -> Result<Int64TablePayloadFileRecoverySource, SharedDatabaseSnapshotRestoreError> {
+        let mut database = match self.inner.try_write() {
+            Ok(database) => database,
+            Err(TryLockError::WouldBlock) => {
+                return Err(SharedDatabaseSnapshotRestoreError::DatabaseBusy);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(SharedDatabaseSnapshotRestoreError::LockPoisoned);
+            }
+        };
+        database
+            .replace_int64_table_from_file_with_backup(
+                table_name,
+                primary_path,
+                backup_path,
+                snapshot_codec,
+                payload_codec,
+            )
             .map_err(Into::into)
     }
 
