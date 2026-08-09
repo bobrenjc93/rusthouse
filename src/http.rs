@@ -8,7 +8,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, ScopedJoinHandle};
+use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
@@ -516,7 +516,9 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key(
 /// acceptance, including any time before its worker begins running. Capacity is
 /// released only after the exchange finishes and the response direction is
 /// shut down. A cap of one therefore has the same acceptance and exchange
-/// ordering as the sequential authenticated listener.
+/// ordering as the sequential authenticated listener. If the operating system
+/// cannot create a worker, that accepted exchange runs synchronously on the
+/// listener thread without cancelling existing in-flight exchanges.
 ///
 /// Every accepted connection consumes one slot from
 /// [`HttpListenerLimits::max_connections`], including authentication,
@@ -539,6 +541,24 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
     expected_clickhouse_key: &str,
     limits: HttpListenerLimits,
     max_in_flight_connections: NonZeroUsize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_read_only_concurrently_with_clickhouse_key_and_limits_using(
+        listener,
+        database,
+        expected_clickhouse_key,
+        limits,
+        max_in_flight_connections,
+        HttpListenerWorkerSpawner::System,
+    )
+}
+
+fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits_using(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+    mut worker_spawner: HttpListenerWorkerSpawner,
 ) -> Result<HttpListenerReport, HttpListenerError> {
     let mut report = HttpListenerReport::default();
     let mut accept_failure = None;
@@ -563,38 +583,52 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
             report.accepted_connections += 1;
             let connection = report.accepted_connections;
             let completion_sender = completion_sender.clone();
-            let worker = scope.spawn(move || {
-                let exchange = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let exchange = handle_http_listener_connection(
+            let spawn = stream.try_clone().and_then(|worker_stream| {
+                worker_spawner.spawn_scoped(
+                    scope,
+                    format!("rusthouse-http-connection-{connection}"),
+                    move || {
+                        let exchange = panic::catch_unwind(AssertUnwindSafe(|| {
+                            handle_http_listener_connection_and_shutdown(
+                                database,
+                                &worker_stream,
+                                accepted_at,
+                                limits,
+                                HttpListenerHandler::ClickHouseKey(expected_clickhouse_key),
+                            )
+                        }));
+
+                        match exchange {
+                            Ok(exchange) => {
+                                let _ = completion_sender.send((connection, Some(exchange)));
+                            }
+                            Err(payload) => {
+                                // Wake the listener before preserving ordinary scoped
+                                // thread panic propagation. This prevents a panicking
+                                // exchange from leaving the capacity wait blocked.
+                                let _ = completion_sender.send((connection, None));
+                                panic::resume_unwind(payload);
+                            }
+                        }
+                    },
+                )
+            });
+            match spawn {
+                Ok(worker) => workers.push((connection, worker)),
+                Err(_) => {
+                    // Retaining the accepted stream in this thread permits a
+                    // local fallback when duplicating it or creating a worker
+                    // fails. The report and already-running exchanges survive.
+                    let exchange = handle_http_listener_connection_and_shutdown(
                         database,
                         &stream,
                         accepted_at,
                         limits,
                         HttpListenerHandler::ClickHouseKey(expected_clickhouse_key),
                     );
-
-                    // Half-close the response direction first so the peer can
-                    // observe the complete response and its terminating FIN.
-                    // Dropping the stream then closes the read direction even
-                    // when malformed or pipelined request bytes remain unread.
-                    let _ = stream.shutdown(Shutdown::Write);
-                    exchange
-                }));
-
-                match exchange {
-                    Ok(exchange) => {
-                        let _ = completion_sender.send((connection, Some(exchange)));
-                    }
-                    Err(payload) => {
-                        // Wake the listener before preserving ordinary scoped
-                        // thread panic propagation. This prevents a panicking
-                        // exchange from leaving the capacity wait blocked.
-                        let _ = completion_sender.send((connection, None));
-                        panic::resume_unwind(payload);
-                    }
+                    record_http_listener_exchange(&mut report, connection, exchange);
                 }
-            });
-            workers.push((connection, worker));
+            }
         }
 
         while !workers.is_empty() {
@@ -609,6 +643,45 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
     match accept_failure {
         Some(source) => Err(HttpListenerError::Accept { report, source }),
         None => Ok(report),
+    }
+}
+
+enum HttpListenerWorkerSpawner {
+    System,
+    #[cfg(test)]
+    FailOnAttempt {
+        attempt: usize,
+        fail_on: usize,
+    },
+}
+
+impl HttpListenerWorkerSpawner {
+    fn spawn_scoped<'scope, 'env, Worker>(
+        &mut self,
+        scope: &'scope Scope<'scope, 'env>,
+        name: String,
+        worker: Worker,
+    ) -> io::Result<ScopedJoinHandle<'scope, ()>>
+    where
+        Worker: FnOnce() + Send + 'scope,
+    {
+        let should_fail = match self {
+            Self::System => false,
+            #[cfg(test)]
+            Self::FailOnAttempt { attempt, fail_on } => {
+                *attempt += 1;
+                *attempt == *fail_on
+            }
+        };
+        if should_fail {
+            return Err(io::Error::other(
+                "injected HTTP listener worker spawn failure",
+            ));
+        }
+
+        thread::Builder::new()
+            .name(name)
+            .spawn_scoped(scope, worker)
     }
 }
 
@@ -660,6 +733,23 @@ fn record_http_listener_exchange(
     }
 }
 
+fn handle_http_listener_connection_and_shutdown(
+    database: &SharedDatabase,
+    stream: &TcpStream,
+    accepted_at: Instant,
+    limits: HttpListenerLimits,
+    handler: HttpListenerHandler<'_>,
+) -> Result<(), HttpQueryError> {
+    let exchange = handle_http_listener_connection(database, stream, accepted_at, limits, handler);
+
+    // Half-close the response direction first so the peer can observe the
+    // complete response and its terminating FIN. Dropping the stream then
+    // closes the read direction even when malformed or pipelined request bytes
+    // remain unread.
+    let _ = stream.shutdown(Shutdown::Write);
+    exchange
+}
+
 fn serve_http_read_only_connections(
     listener: &TcpListener,
     database: &SharedDatabase,
@@ -677,14 +767,13 @@ fn serve_http_read_only_connections(
         report.accepted_connections += 1;
         let connection = report.accepted_connections;
         let accepted_at = Instant::now();
-        let exchange =
-            handle_http_listener_connection(database, &stream, accepted_at, limits, handler);
-
-        // Half-close the response direction first so a peer can observe the
-        // complete response and its terminating FIN. Dropping the stream then
-        // closes the read direction even when malformed or pipelined request
-        // bytes remain unread.
-        let _ = stream.shutdown(Shutdown::Write);
+        let exchange = handle_http_listener_connection_and_shutdown(
+            database,
+            &stream,
+            accepted_at,
+            limits,
+            handler,
+        );
 
         record_http_listener_exchange(&mut report, connection, exchange);
     }
@@ -3236,5 +3325,89 @@ impl Write for BoundedVec {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_IO_TIMEOUT: Duration = Duration::from_secs(2);
+    const AUTHENTICATED_PING: &[u8] =
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n";
+
+    fn complete_loopback_exchange(address: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(address).expect("connect to loopback listener");
+        stream
+            .set_read_timeout(Some(TEST_IO_TIMEOUT))
+            .expect("set client read timeout");
+        stream
+            .set_write_timeout(Some(TEST_IO_TIMEOUT))
+            .expect("set client write timeout");
+        stream.write_all(request).expect("write complete request");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("finish request stream");
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("listener closes the connection after its response");
+        response
+    }
+
+    #[test]
+    fn worker_spawn_failure_falls_back_without_cancelling_an_in_flight_exchange() {
+        let limits = HttpListenerLimits {
+            read_timeout: TEST_IO_TIMEOUT,
+            write_timeout: TEST_IO_TIMEOUT,
+            ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let address = listener.local_addr().expect("read loopback address");
+        let server = thread::spawn(move || {
+            serve_http_read_only_concurrently_with_clickhouse_key_and_limits_using(
+                &listener,
+                &SharedDatabase::default(),
+                "correct-key",
+                limits,
+                NonZeroUsize::new(2).unwrap(),
+                HttpListenerWorkerSpawner::FailOnAttempt {
+                    attempt: 0,
+                    fail_on: 2,
+                },
+            )
+        });
+
+        let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+        stalled
+            .set_read_timeout(Some(TEST_IO_TIMEOUT))
+            .expect("set stalled client read timeout");
+        stalled
+            .set_write_timeout(Some(TEST_IO_TIMEOUT))
+            .expect("set stalled client write timeout");
+        stalled
+            .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+            .expect("write incomplete authenticated request");
+
+        let fallback_response = complete_loopback_exchange(address, AUTHENTICATED_PING);
+        assert!(fallback_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+        stalled
+            .write_all(b"\r\n\r\n")
+            .expect("complete in-flight request");
+        stalled
+            .shutdown(Shutdown::Write)
+            .expect("finish in-flight request stream");
+        let mut stalled_response = Vec::new();
+        stalled
+            .read_to_end(&mut stalled_response)
+            .expect("read in-flight response after fallback");
+        assert!(stalled_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+        let report = server.join().expect("listener did not panic").unwrap();
+        assert_eq!(report.accepted_connections, 2);
+        assert_eq!(report.successful_exchanges, 2);
+        assert!(report.connection_failures.is_empty());
     }
 }

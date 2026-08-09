@@ -949,8 +949,10 @@ occupies capacity until its one exchange finishes and its response direction is
 shut down. Once the cap is occupied, the listener waits for any exchange to
 finish before accepting another connection. A cap of one therefore retains the
 sequential authenticated behavior, while a larger cap lets a complete request
-finish without waiting behind a stalled client. `SharedDatabase` read admission
-remains nonblocking and allows concurrent readers.
+finish without waiting behind a stalled client. If the operating system cannot
+create a worker, the newly accepted exchange runs synchronously on the listener
+thread without cancelling existing in-flight exchanges. `SharedDatabase` read
+admission remains nonblocking and allows concurrent readers.
 
 The total connection budget remains an inclusive finite run bound, independent
 of the concurrency cap, and zero still returns without accepting. Read and
