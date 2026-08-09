@@ -245,6 +245,18 @@ impl Catalog {
         tables.into_iter().map(|(_, table)| table.name()).collect()
     }
 
+    /// Returns display names and row counts in deterministic,
+    /// case-insensitive table-name order.
+    #[must_use]
+    pub(crate) fn table_row_counts(&self) -> Vec<(&str, usize)> {
+        let mut tables = self.tables.iter().collect::<Vec<_>>();
+        tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        tables
+            .into_iter()
+            .map(|(_, table)| (table.name(), table.row_count()))
+            .collect()
+    }
+
     /// Returns owned display names, row counts, and cached retained-value byte
     /// counts in deterministic, case-insensitive table-name order.
     #[must_use]
@@ -345,6 +357,10 @@ mod tests {
         assert_eq!(catalog.retained_row_count(), 0);
         assert_eq!(catalog.table_name_bytes(), 14);
         assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
+        assert_eq!(
+            catalog.table_row_counts(),
+            [("Alpha", 0), ("beta", 0), ("zebra", 0)]
+        );
         assert_eq!(catalog.table_metric_variable_bytes(), (14, 3, 3));
         assert_eq!(
             catalog.table_metrics(),
