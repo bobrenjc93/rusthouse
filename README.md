@@ -66,7 +66,7 @@ pagination. `countIf(*)` and non-`Bool` arguments are rejected.
 Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `MIN(Int64)`,
 `MIN(Float64)`, `MAX(Int64)`, `MAX(Float64)`, or `AVG(Int64)`, and an exact
 two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
-`SUM(Int64)`, `AVG(Int64)`, or `MIN(Int64)` use
+`SUM(Int64)`, `AVG(Int64)`, `MIN(Int64)`, or `MAX(Int64)` use
 deterministic contiguous chunks when more than 262,144 rows match. The paired
 shape preserves either projection order and derives its row count with a
 checked conversion of the filtered cardinality while the existing checked
@@ -92,9 +92,9 @@ allocating a partial-results collection. Ordered reduction preserves the first
 occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
 or below the threshold, grouped aggregates, multi-aggregate projections other
-than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`, or
-row-count/`MIN(Int64)` pairs (including `COUNT(column)` pairs), `SUM(Float64)`,
-Bool/String extrema,
+than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
+row-count/`MIN(Int64)`, or row-count/`MAX(Int64)` pairs (including
+`COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema,
 `AVG(Float64)`, and other aggregate functions remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
