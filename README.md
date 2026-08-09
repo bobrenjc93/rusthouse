@@ -68,7 +68,10 @@ Global `countIf(Bool)` and a sole ungrouped `SUM(Int64)`, `MIN(Int64)`,
 deterministic contiguous chunks, targeting about 131,072 rows per computation
 lane. Release-mode crossover measurements kept smaller inputs sequential.
 Helper threads share one nonblocking process-wide admission budget; total lanes
-are capped at both 16 and the process's available parallelism. Checked count
+are capped at the database's configured aggregate worker cap, 16, and the
+process's available parallelism. The per-database cap defaults to 16, so
+existing construction retains the same behavior; a cap of one disables helper
+threads. Concurrent queries still share the process-wide budget. Checked count
 partials and checked i128 SUM/AVG sum-and-count partials are reduced in chunk
 order; optional Int64 extrema are reduced directly without allocating a
 partial-results collection. A sequential fallback preserves the same result
@@ -239,12 +242,13 @@ trailing clauses are deliberately unsupported. The query is available through
 `Database`, `SharedDatabase`, the CLI, and authenticated or unauthenticated
 read-only HTTP handlers in every supported output format.
 The exact case-insensitive `SHOW SETTINGS` returns `name` and `value` `String`
-columns for every configured `QueryResultLimits` and `TableLimits` field. Rows
-use stable `query_result_limits.<field>` and `table_limits.<field>` names in
-their respective struct declaration order, and values are unsigned decimal
-strings. Arguments and trailing clauses are rejected. The metadata result is
-itself subject to the configured query row, value, and byte limits plus the
-normal retained-result and formatted-output limits.
+columns for every configured `QueryResultLimits` and `TableLimits` field plus
+`global_aggregate_worker_cap`. Rows use stable
+`query_result_limits.<field>` and `table_limits.<field>` names in their
+respective struct declaration order, and values are unsigned decimal strings.
+Arguments and trailing clauses are rejected. The metadata result is itself
+subject to the configured query row, value, and byte limits plus the normal
+retained-result and formatted-output limits.
 The exact case-insensitive query
 `SELECT name, value FROM system.settings` returns the identical typed rows in
 the same stable order as `SHOW SETTINGS`. Other projections, aliases,
@@ -605,6 +609,11 @@ It preflights every index and value (including non-null, exact-type, and finite
 all unselected cells and table metadata.
 `Database::with_query_result_limits` and the matching `SharedDatabase`
 constructor configure the scan and output limits.
+`Database::with_global_aggregate_worker_cap` and the matching `SharedDatabase`
+constructor accept a `NonZeroUsize` computation-lane cap for the supported
+parallel global aggregates. The configured cap is an upper bound: the
+process-wide admission budget, available parallelism, useful input chunks, and
+the fixed 16-lane ceiling may reduce the effective lane count.
 `Database::with_max_rows_per_table` and its shared counterpart configure the
 row cap while retaining the default column and cell caps. `TableLimits` with
 `Database::with_table_limits` or `SharedDatabase::with_table_limits` configures

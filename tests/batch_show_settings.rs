@@ -1,9 +1,11 @@
 use std::io::{Cursor, Write};
 use std::mem::size_of;
+use std::num::NonZeroUsize;
 use std::process::{Command, Output, Stdio};
 
 use rusthouse::batch::engine::{
-    Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult, TableLimits,
+    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, QueryResult, QueryResultLimits, ResultColumn,
+    StatementResult, TableLimits,
 };
 use rusthouse::batch::error::Error;
 use rusthouse::batch::format::{OutputFormat, render};
@@ -14,11 +16,23 @@ use rusthouse::{
     handle_http_query_read_only_with_bearer_token, handle_http_query_read_only_with_clickhouse_key,
 };
 
-const SETTING_ROWS: usize = 13;
+const SETTING_ROWS: usize = 14;
 const SETTING_VALUES: usize = SETTING_ROWS * 2;
 const SYSTEM_SETTINGS_QUERY: &str = "SELECT name, value FROM system.settings";
 
 fn expected_result(query_limits: QueryResultLimits, table_limits: TableLimits) -> QueryResult {
+    expected_result_with_worker_cap(
+        query_limits,
+        table_limits,
+        DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP,
+    )
+}
+
+fn expected_result_with_worker_cap(
+    query_limits: QueryResultLimits,
+    table_limits: TableLimits,
+    global_aggregate_worker_cap: usize,
+) -> QueryResult {
     let settings = [
         (
             "query_result_limits.max_scan_rows",
@@ -51,6 +65,7 @@ fn expected_result(query_limits: QueryResultLimits, table_limits: TableLimits) -
         ("table_limits.max_rows", table_limits.max_rows),
         ("table_limits.max_columns", table_limits.max_columns),
         ("table_limits.max_cells", table_limits.max_cells),
+        ("global_aggregate_worker_cap", global_aggregate_worker_cap),
     ];
 
     QueryResult {
@@ -262,6 +277,24 @@ fn returns_every_custom_query_and_table_limit_in_stable_order() {
         expected,
         "system.settings must mirror SHOW SETTINGS"
     );
+
+    let worker_cap = NonZeroUsize::new(7).unwrap();
+    let mut worker_limited = Database::with_global_aggregate_worker_cap(worker_cap);
+    let expected = expected_result_with_worker_cap(
+        QueryResultLimits::default(),
+        TableLimits::default(),
+        worker_cap.get(),
+    );
+    assert_eq!(query(&mut worker_limited, "SHOW SETTINGS"), expected);
+    assert_eq!(
+        query(&mut worker_limited, SYSTEM_SETTINGS_QUERY),
+        expected,
+        "system.settings must mirror the configured aggregate worker cap"
+    );
+
+    let shared = SharedDatabase::with_global_aggregate_worker_cap(worker_cap);
+    assert_eq!(shared.global_aggregate_worker_cap().unwrap(), worker_cap);
+    assert_eq!(shared.query("SHOW SETTINGS").unwrap(), expected);
 }
 
 #[test]
@@ -531,7 +564,7 @@ fn http_reports_system_settings_result_limits_on_the_wire() {
     assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
     assert_eq!(
         http_body(&response),
-        b"{\"error\":\"SELECT result rows requires at least 13, exceeding the limit of 12\"}"
+        b"{\"error\":\"SELECT result rows requires at least 14, exceeding the limit of 13\"}"
     );
 }
 
@@ -596,7 +629,7 @@ fn authenticated_read_only_http_paths_admit_system_settings_at_the_exact_row_lim
         assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
         assert_eq!(
             http_body(&response),
-            b"{\"error\":\"SELECT result rows requires at least 13, exceeding the limit of 12\"}"
+            b"{\"error\":\"SELECT result rows requires at least 14, exceeding the limit of 13\"}"
         );
     }
 }
