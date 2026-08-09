@@ -832,6 +832,27 @@ fn csv_batch_filters_grouped_rows_with_a_count_alias() {
 }
 
 #[test]
+fn csv_batch_accepts_empty_count_with_grouping_having_ordering_and_pagination() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (kind String, included Bool);
+          INSERT INTO events VALUES
+              ('a', true), ('a', true), ('a', false),
+              ('b', true), ('b', true), ('c', true);
+          SELECT kind, count() AS occurrences FROM events
+          WHERE included = true
+          GROUP BY kind
+          HAVING occurrences >= 2
+          ORDER BY occurrences DESC, kind DESC
+          LIMIT 1 OFFSET 1;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"kind,occurrences\na,2\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_executes_grouped_count_if_with_alias_having_and_pagination() {
     let output = run(
         &["--format", "csv"],

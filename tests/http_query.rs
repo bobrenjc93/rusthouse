@@ -289,6 +289,38 @@ fn query_executes_filtered_count_if_over_http() {
 }
 
 #[test]
+fn query_executes_empty_count_over_http_and_preserves_its_name() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (kind String, included Bool); \
+             INSERT INTO events VALUES ('a', true), ('a', true), ('b', true);",
+        )
+        .expect("setup");
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT cOuNt() FROM events WHERE included = true;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"COUNT()","type":"Int64"}],"rows":[[3]]}"#,
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(
+                b"SELECT COUNT() AS matches FROM events WHERE included = true \
+                  HAVING matches = 3 ORDER BY matches DESC LIMIT 1 OFFSET 0;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"matches","type":"Int64"}],"rows":[[3]]}"#,
+    );
+}
+
+#[test]
 fn query_executes_unicode_infix_not_like_over_http() {
     let database = SharedDatabase::default();
     database
