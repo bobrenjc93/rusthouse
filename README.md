@@ -1232,6 +1232,12 @@ database's configured `TableLimits`, preserves the persisted row cap, and
 registers the table plus its cached metrics only after all decoding and storage
 validation succeeds. Duplicate names resolve case-insensitively just like SQL
 table names and leave the existing catalog unchanged.
+`Database::restore_int64_table_from_file_with_backup` adds explicit recovery:
+it tries the primary self-describing snapshot first, falls back to the supplied
+backup only when bounded snapshot decoding fails, and reports which file
+succeeded. If neither file is valid, its typed recovery error retains both
+failures. Database table validation remains atomic and applies unchanged to the
+recovered snapshot.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary
