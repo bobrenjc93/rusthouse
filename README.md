@@ -1192,6 +1192,14 @@ encoding and atomic-replacement errors retain their existing typed causes and
 destination-preservation reporting. Codec bounds are checked against borrowed
 batch storage before payload allocation; the adapter does not clone the column
 into a second table representation.
+`SharedDatabase::try_save_int64_table_to_file` is the synchronized Unix-only
+counterpart. It makes one nonblocking read-lock attempt, keeps the guard through
+validation, encoding, and atomic replacement, and therefore saves one
+consistent table version without cloning its column at the synchronization
+boundary. Existing readers remain compatible; writer contention and lock
+poisoning are reported without accessing the destination. Its typed error wraps
+the existing database save failures and preserves their destination-replacement
+status.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries
