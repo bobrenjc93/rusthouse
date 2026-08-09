@@ -1,5 +1,5 @@
 use std::error::Error as StdError;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -31,6 +31,17 @@ fn start_listener(
     (address, worker)
 }
 
+fn finish_request_stream(stream: &TcpStream) {
+    match stream.shutdown(Shutdown::Write) {
+        Ok(()) => {}
+        // The listener may authenticate or reject a complete request and close
+        // the connection before the client half-closes it. On Linux that valid
+        // close race is reported as ENOTCONN.
+        Err(error) if error.kind() == ErrorKind::NotConnected => {}
+        Err(error) => panic!("finish request stream: {error}"),
+    }
+}
+
 fn exchange(address: SocketAddr, request: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(address).expect("connect to loopback listener");
     stream
@@ -40,9 +51,7 @@ fn exchange(address: SocketAddr, request: &[u8]) -> Vec<u8> {
         .set_write_timeout(Some(IO_TIMEOUT))
         .expect("set client write timeout");
     stream.write_all(request).expect("write complete request");
-    stream
-        .shutdown(Shutdown::Write)
-        .expect("finish request stream");
+    finish_request_stream(&stream);
 
     let mut response = Vec::new();
     stream
@@ -455,9 +464,7 @@ fn stalled_response_times_out_without_preventing_the_next_connection() {
     stalled
         .write_all(&post_query("SELECT value FROM payloads;"))
         .expect("write request for large response");
-    stalled
-        .shutdown(Shutdown::Write)
-        .expect("finish large-response request");
+    finish_request_stream(&stalled);
 
     let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
