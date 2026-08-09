@@ -12,6 +12,8 @@ use rusthouse::{
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const STALLED_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
 const STALLED_RESPONSE_BYTES: usize = 15 * 1024 * 1024;
+const TRICKLE_INTERVAL: Duration = Duration::from_millis(20);
+const TRICKLE_BYTES: usize = 20;
 
 fn start_listener(
     database: SharedDatabase,
@@ -219,6 +221,52 @@ fn stalled_request_times_out_without_preventing_the_next_connection() {
     assert_eq!(body(&healthy), b"Ok.\n");
 
     let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 1);
+    assert_eq!(report.connection_failures.len(), 1);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        &report.connection_failures[0].source,
+        HttpQueryError::Read(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
+}
+
+#[test]
+fn trickling_request_cannot_renew_the_absolute_read_deadline() {
+    let limits = HttpListenerLimits {
+        read_timeout: STALLED_CONNECTION_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let (address, worker) = start_listener(SharedDatabase::default(), limits);
+
+    let mut trickling = TcpStream::connect(address).expect("connect trickling client");
+    trickling
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set trickling client write timeout");
+    trickling
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-Slow: ")
+        .expect("write incomplete request prefix");
+    let trickler = thread::spawn(move || {
+        for _ in 0..TRICKLE_BYTES {
+            thread::sleep(TRICKLE_INTERVAL);
+            if trickling.write_all(b"a").is_err() {
+                return;
+            }
+        }
+        let _ = trickling.shutdown(Shutdown::Write);
+    });
+
+    let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&healthy), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    trickler.join().expect("trickling client did not panic");
     assert_eq!(report.accepted_connections, 2);
     assert_eq!(report.successful_exchanges, 1);
     assert_eq!(report.connection_failures.len(), 1);
