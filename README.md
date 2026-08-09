@@ -268,6 +268,20 @@ are visible on the next query. Other shapes and trailing clauses are rejected.
 The complete row, value, byte, and retained-result bounds are preflighted before
 result storage is allocated, and the query is available through the normal
 `Database`, `SharedDatabase`, CLI, and HTTP paths in every supported format.
+The exact case-insensitive query
+`SELECT metric, value FROM system.metrics` returns the four cached database
+totals also exposed as unlabeled Prometheus gauges: `rusthouse_tables`,
+`rusthouse_columns`, `rusthouse_retained_rows`, and
+`rusthouse_retained_value_bytes`. Rows remain in that order and contain a
+`String` metric name plus a checked `Int64` value. The totals track table,
+column, retained-row, and retained scalar payload-byte lifecycle changes; the
+byte definition matches `GET /metrics`. Other projections, aliases, filters,
+ordering, limits, and trailing clauses are rejected. The fixed result shape,
+metric-name payload, row/value/byte bounds, retained-result bound, and all
+integer conversions are checked before result storage is allocated. The query
+reads constant-time cached database measurements without scanning tables or
+values and is available through the normal `Database`, `SharedDatabase`, CLI,
+and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
 bounded `String`, preserving the stored table and column display names and
 schema order while normalizing type spellings.
@@ -599,8 +613,8 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes plus the exact `system.tables` and
-`system.columns` metadata queries),
+and `currentDatabase()` probes plus the exact `system.tables`, `system.columns`,
+and `system.metrics` metadata queries),
 `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,
