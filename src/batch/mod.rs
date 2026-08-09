@@ -11,6 +11,9 @@ pub mod storage;
 pub mod tsv;
 pub mod value;
 
+pub use engine::Database;
+#[cfg(unix)]
+pub use engine::DatabaseSnapshotSaveError;
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 pub use shared_database::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 pub use storage::TableLimits;
@@ -19,7 +22,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use engine::{DEFAULT_MAX_QUERY_RESULT_BYTES, Database, StatementResult};
+use engine::{DEFAULT_MAX_QUERY_RESULT_BYTES, StatementResult};
 use format::{
     JsonEachRowWriteError, TableWriteError, write_csv, write_json, write_json_compact_each_row,
     write_json_each_row, write_table_with_affixes, write_tsv,

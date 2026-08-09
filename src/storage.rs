@@ -130,6 +130,22 @@ impl Int64Table {
         }
     }
 
+    /// Builds the legacy snapshot representation from a validated, non-nullable
+    /// physical column without retaining an intermediate row vector.
+    #[cfg(unix)]
+    pub(crate) fn from_non_nullable_values(
+        name: impl Into<String>,
+        row_cap: usize,
+        values: &[i64],
+    ) -> Self {
+        debug_assert!(values.len() <= row_cap);
+        Self {
+            schema: Schema::int64(name, false),
+            values: values.iter().copied().map(Some).collect(),
+            row_cap,
+        }
+    }
+
     /// Returns the table schema.
     pub fn schema(&self) -> &Schema {
         &self.schema

@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+#[cfg(unix)]
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -17,6 +19,13 @@ use crate::batch::sql::{
 use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
+#[cfg(unix)]
+use crate::snapshot::{
+    Int64TablePayloadCodec, Int64TablePayloadFileSaveError, SnapshotCodec,
+    save_int64_table_payload_to_file,
+};
+#[cfg(unix)]
+use crate::storage::Int64Table;
 
 pub use crate::batch::storage::{
     DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_ROWS_PER_TABLE,
@@ -466,6 +475,94 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+/// A failure while atomically saving one batch table as a self-describing
+/// `Int64` snapshot.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum DatabaseSnapshotSaveError {
+    /// The requested table was not present in the database.
+    Table(Error),
+    /// The selected table does not have exactly one physical column.
+    UnsupportedColumnCount {
+        /// The stored display name of the selected table.
+        table: String,
+        /// The number of physical columns in the selected table.
+        column_count: usize,
+    },
+    /// The selected table's only physical column is not `Int64`.
+    UnsupportedColumnType {
+        /// The stored display name of the unsupported column.
+        column: String,
+        /// The physical type found in the batch table.
+        data_type: DataType,
+    },
+    /// Encoding or atomically replacing the snapshot failed.
+    Snapshot(Int64TablePayloadFileSaveError),
+}
+
+#[cfg(unix)]
+impl DatabaseSnapshotSaveError {
+    /// Returns whether the destination was replaced before this error occurred.
+    ///
+    /// Shape validation, payload encoding, and every replacement failure before
+    /// the rename return `false`. Only post-rename directory-sync uncertainty
+    /// returns `true`.
+    pub const fn destination_was_replaced(&self) -> bool {
+        match self {
+            Self::Snapshot(error) => error.destination_was_replaced(),
+            Self::Table(_)
+            | Self::UnsupportedColumnCount { .. }
+            | Self::UnsupportedColumnType { .. } => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for DatabaseSnapshotSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Table(error) => error.fmt(formatter),
+            Self::UnsupportedColumnCount {
+                table,
+                column_count,
+            } => write!(
+                formatter,
+                "table '{table}' has {column_count} columns; batch snapshot save requires exactly one non-nullable Int64 column"
+            ),
+            Self::UnsupportedColumnType { column, data_type } => write!(
+                formatter,
+                "column '{column}' has type {data_type}; batch snapshot save requires exactly one non-nullable Int64 column"
+            ),
+            Self::Snapshot(error) => write!(formatter, "could not save snapshot: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for DatabaseSnapshotSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Table(error) => Some(error),
+            Self::Snapshot(error) => Some(error),
+            Self::UnsupportedColumnCount { .. } | Self::UnsupportedColumnType { .. } => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<Error> for DatabaseSnapshotSaveError {
+    fn from(error: Error) -> Self {
+        Self::Table(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<Int64TablePayloadFileSaveError> for DatabaseSnapshotSaveError {
+    fn from(error: Int64TablePayloadFileSaveError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -554,6 +651,51 @@ impl Database {
     #[must_use]
     pub const fn table_limits(&self) -> TableLimits {
         self.table_limits
+    }
+
+    /// Atomically saves one non-nullable, one-column `Int64` batch table on Unix.
+    ///
+    /// `table_name` uses the catalog's normal case-insensitive lookup. The
+    /// self-describing payload preserves the stored column name, row order, and
+    /// table row cap; it intentionally does not contain the batch table name or
+    /// any other catalog table. Files produced here can be reopened by
+    /// [`crate::restore_int64_table_payload_from_file`].
+    ///
+    /// Table existence, exact column count, and physical type are checked before
+    /// any filesystem access. Payload encoding then completes through the
+    /// existing [`Int64TablePayloadCodec`] before the checksummed envelope is
+    /// atomically replaced. Consequently, every validation, encoding, or
+    /// pre-rename replacement failure preserves an existing destination.
+    #[cfg(unix)]
+    pub fn save_int64_table_to_file(
+        &self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: Int64TablePayloadCodec,
+    ) -> std::result::Result<(), DatabaseSnapshotSaveError> {
+        let table = self.catalog.table(table_name)?;
+        if table.schema().len() != 1 {
+            return Err(DatabaseSnapshotSaveError::UnsupportedColumnCount {
+                table: table.name().to_owned(),
+                column_count: table.schema().len(),
+            });
+        }
+
+        let column = &table.schema()[0];
+        if column.data_type != DataType::Int64 {
+            return Err(DatabaseSnapshotSaveError::UnsupportedColumnType {
+                column: column.name.clone(),
+                data_type: column.data_type,
+            });
+        }
+        let Column::Int64(values) = &table.columns()[0] else {
+            unreachable!("batch table storage must agree with its validated schema");
+        };
+        let snapshot_table =
+            Int64Table::from_non_nullable_values(&column.name, table.row_cap(), values);
+        save_int64_table_payload_to_file(path, &snapshot_table, snapshot_codec, payload_codec)?;
+        Ok(())
     }
 
     /// Atomically appends bounded, typed, headerless `CSV` input.
