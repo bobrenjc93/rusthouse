@@ -9428,6 +9428,150 @@ fn complete_response_is_capped_before_any_bytes_are_written() {
     assert!(too_small_output.is_empty());
 }
 
+#[test]
+fn parameterized_readonly_tightens_key_requests_without_granting_access() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (7);")
+        .unwrap();
+
+    for request in [
+        b"GET /?query=SELECT+id+FROM+events%3B&readonly=1 HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n".as_slice(),
+        b"POST /?readonly=%30%31&query=SELECT+id+FROM+events%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\nContent-Length: 0\r\n\r\n".as_slice(),
+    ] {
+        let response = clickhouse_key_exchange(&database, "correct-key", request);
+        assert_response(
+            &response,
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[7]]}"#,
+        );
+        assert_clickhouse_key_response_is_not_cacheable(&response);
+    }
+
+    let readonly_sql_insert = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"POST /?query=INSERT+INTO+events+VALUES+%288%29%3B&readonly=1 HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_response(
+        &readonly_sql_insert,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+
+    let formatted_body = b"9\n";
+    let (formatted_request, body_offset) = request_with_authorization_for_target(
+        "/?query=INSERT+INTO+events+FORMAT+TabSeparated&readonly=1",
+        formatted_body,
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    let mut formatted_input = Cursor::new(formatted_request);
+    let mut formatted_response = Vec::new();
+    handle_http_query_with_clickhouse_key(
+        &database,
+        "correct-key",
+        &mut formatted_input,
+        &mut formatted_response,
+    )
+    .unwrap();
+    assert_eq!(formatted_input.position(), body_offset);
+    assert_response(
+        &formatted_response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"POST /?query= does not accept a request body"}"#,
+    );
+
+    let retained_write_access = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"POST /?readonly=0&query=INSERT+INTO+events+VALUES+%2810%29%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_response_with_content_type(
+        &retained_write_access,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+
+    let read_only_handler_is_not_upgraded = read_only_clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"POST /?query=INSERT+INTO+events+VALUES+%2811%29%3B&readonly=0 HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_response(
+        &read_only_handler_is_not_upgraded,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found INSERT"}"#,
+    );
+
+    let rows = database
+        .query("SELECT id FROM events ORDER BY id;")
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Int64(7)], vec![Value::Int64(10)]]
+    );
+}
+
+#[test]
+fn readonly_validation_follows_key_authentication_and_precedes_admission_and_mutation() {
+    let mut initial = Database::new();
+    initial.execute("CREATE TABLE events (id Int64);").unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+
+    let unauthenticated = clickhouse_key_exchange(
+        &database,
+        "correct-key",
+        b"GET /?query=SELECT+1%3B&readonly=nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_response(
+        &unauthenticated,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+
+    let writer = inner.write().unwrap();
+    let cases = [
+        (
+            "readonly=0&read%6Fnly=1",
+            r#"{"error":"duplicate readonly parameter"}"#,
+        ),
+        (
+            "readonly=1.0",
+            r#"{"error":"readonly parameter must be a decimal integer"}"#,
+        ),
+        (
+            "readonly=2",
+            r#"{"error":"readonly parameter must be 0 or 1"}"#,
+        ),
+    ];
+    for method in ["GET", "POST"] {
+        for (setting, expected_body) in cases {
+            let content_length = if method == "POST" {
+                "Content-Length: 0\r\n"
+            } else {
+                ""
+            };
+            let request = format!(
+                "{method} /?query=INSERT+INTO+events+VALUES+%281%29%3B&{setting} HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n{content_length}\r\n"
+            );
+            let response = clickhouse_key_exchange(&database, "correct-key", request.as_bytes());
+            assert_response(&response, "HTTP/1.1 400 Bad Request", expected_body);
+            assert_clickhouse_key_response_is_not_cacheable(&response);
+        }
+    }
+    drop(writer);
+
+    assert!(
+        database
+            .query("SELECT id FROM events;")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+}
+
 struct FailingReader;
 
 impl Read for FailingReader {

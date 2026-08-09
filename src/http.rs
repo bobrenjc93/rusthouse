@@ -824,9 +824,12 @@ fn serve_http_connections(
 /// parameter, one decimal `max_result_rows` parameter, one decimal
 /// `max_result_bytes` parameter, one decimal `max_rows_to_read` parameter, and
 /// one decimal `max_rows_to_group_by` parameter, one decimal `max_threads`
-/// parameter, and one `default_format` parameter in any order. Nonzero result,
-/// scan, group, and worker limits can tighten but never relax the database's
-/// configured query limits;
+/// parameter, one decimal `readonly` parameter, and one `default_format`
+/// parameter in any order. `readonly=1` tightens the request to read-only,
+/// while `readonly=0` retains the handler's configured access and never grants
+/// insertion access to a read-only handler. Nonzero result, scan, group, and
+/// worker limits can tighten but never relax the database's configured query
+/// limits;
 /// `max_result_bytes` also cannot relax the default retained-result byte limit.
 /// Zero disables the corresponding request-level limit while retaining the
 /// configured defaults. `default_format`
@@ -841,8 +844,9 @@ fn serve_http_connections(
 /// bounded, atomic, nonblocking importer as `POST /insert/<table>`.
 /// All other parameterized queries require an absent or zero `Content-Length`.
 /// Empty, duplicate, unknown, and unsupported parameters, plus malformed or
-/// overflowing workload-limit values, are rejected after authentication and
-/// before database lock admission. A
+/// overflowing workload-limit values and malformed or out-of-range `readonly`
+/// values, are rejected after authentication and before database lock
+/// admission. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
 /// may instead end in a case-insensitive SQL `FORMAT JSON`, `FORMAT CSV`,
@@ -1517,6 +1521,14 @@ impl HttpAccess {
     const fn allows_insert(self) -> bool {
         matches!(self, Self::ReadWrite)
     }
+
+    const fn tighten_for_request(self, readonly: Option<bool>) -> Self {
+        if matches!(readonly, Some(true)) {
+            Self::ReadOnly
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1960,6 +1972,7 @@ fn read_request(
         }) => {
             let decoded =
                 decode_query_parameters(&encoded_parameters, method, limits.max_sql_bytes)?;
+            let access = access.tighten_for_request(decoded.readonly);
             let output_format_selected =
                 request.response_format.is_some() || decoded.response_format.is_some();
             let response_format = match (request.response_format, decoded.response_format) {
@@ -2567,6 +2580,7 @@ struct DecodedQuery {
     sql: Vec<u8>,
     response_format: Option<QueryResponseFormat>,
     workload_limits: ParameterizedWorkloadLimits,
+    readonly: Option<bool>,
 }
 
 fn parse_headers(
@@ -3018,6 +3032,7 @@ fn parse_request_line(
                 || target.starts_with(b"/?max_rows_to_read=")
                 || target.starts_with(b"/?max_rows_to_group_by=")
                 || target.starts_with(b"/?max_threads=")
+                || target.starts_with(b"/?readonly=")
                 || target.starts_with(b"/?default_format=") =>
         {
             Err(RequestFailure::with_headers(
@@ -3097,6 +3112,7 @@ fn decode_query_parameters(
     let mut max_rows_to_read = None;
     let mut max_rows_to_group_by = None;
     let mut max_threads = None;
+    let mut readonly = None;
 
     for encoded_parameter in encoded_parameters.split(|byte| *byte == b'&') {
         let Some(equals) = encoded_parameter.iter().position(|byte| *byte == b'=') else {
@@ -3222,6 +3238,17 @@ fn decode_query_parameters(
                 let value = decode_form_component(encoded_value, None)?;
                 max_threads = Some(parse_decimal_max_threads(&value)?);
             }
+            b"readonly" => {
+                if readonly.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate readonly parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                readonly = Some(parse_decimal_readonly(&value)?);
+            }
             _ => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
@@ -3248,11 +3275,26 @@ fn decode_query_parameters(
             max_rows_to_group_by,
             max_threads,
         },
+        readonly,
     })
 }
 
+fn parse_decimal_readonly(value: &[u8]) -> Result<bool, RequestReadError> {
+    match parse_decimal_parameter(
+        value,
+        "readonly parameter must be a decimal integer",
+        "readonly parameter must be 0 or 1",
+    )? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(
+            RequestFailure::new(Status::BAD_REQUEST, "readonly parameter must be 0 or 1").into(),
+        ),
+    }
+}
+
 fn parse_decimal_max_result_bytes(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_workload_limit(
+    parse_decimal_parameter(
         value,
         "max_result_bytes parameter must be a decimal integer",
         "max_result_bytes parameter is out of range",
@@ -3260,7 +3302,7 @@ fn parse_decimal_max_result_bytes(value: &[u8]) -> Result<usize, RequestReadErro
 }
 
 fn parse_decimal_max_result_rows(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_workload_limit(
+    parse_decimal_parameter(
         value,
         "max_result_rows parameter must be a decimal integer",
         "max_result_rows parameter is out of range",
@@ -3268,7 +3310,7 @@ fn parse_decimal_max_result_rows(value: &[u8]) -> Result<usize, RequestReadError
 }
 
 fn parse_decimal_max_rows_to_read(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_workload_limit(
+    parse_decimal_parameter(
         value,
         "max_rows_to_read parameter must be a decimal integer",
         "max_rows_to_read parameter is out of range",
@@ -3276,7 +3318,7 @@ fn parse_decimal_max_rows_to_read(value: &[u8]) -> Result<usize, RequestReadErro
 }
 
 fn parse_decimal_max_rows_to_group_by(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_workload_limit(
+    parse_decimal_parameter(
         value,
         "max_rows_to_group_by parameter must be a decimal integer",
         "max_rows_to_group_by parameter is out of range",
@@ -3284,14 +3326,14 @@ fn parse_decimal_max_rows_to_group_by(value: &[u8]) -> Result<usize, RequestRead
 }
 
 fn parse_decimal_max_threads(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_workload_limit(
+    parse_decimal_parameter(
         value,
         "max_threads parameter must be a decimal integer",
         "max_threads parameter is out of range",
     )
 }
 
-fn parse_decimal_workload_limit(
+fn parse_decimal_parameter(
     value: &[u8],
     malformed_message: &'static str,
     overflow_message: &'static str,

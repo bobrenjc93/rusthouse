@@ -6,6 +6,7 @@ use std::time::Duration;
 use rusthouse::batch::csv::CsvIngestLimits;
 use rusthouse::batch::engine::Database;
 use rusthouse::batch::tsv::TsvIngestLimits;
+use rusthouse::batch::value::Value;
 use rusthouse::{
     ClickHousePrincipal, ClickHousePrincipalRole, HttpQueryError, HttpQueryLimits,
     MAX_HTTP_NAMED_PRINCIPALS, SharedDatabase, handle_http_query_read_only_with_clickhouse_key,
@@ -677,6 +678,81 @@ fn key_only_read_only_api_remains_independent_of_named_principals() {
     )
     .unwrap();
     assert_status(&response, "HTTP/1.1 200 OK");
+}
+
+#[test]
+fn request_local_readonly_tightens_named_principal_access_without_granting_it() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (7);")
+        .unwrap();
+
+    let read = write_exchange(
+        &database,
+        b"GET /?readonly=1&query=SELECT+id+FROM+events%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-User: reporting\r\nX-ClickHouse-Key: read key:42\r\n\r\n",
+    );
+    assert_status(&read, "HTTP/1.1 200 OK");
+    assert_eq!(
+        body(&read),
+        br#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[7]]}"#
+    );
+    assert_private(&read);
+
+    let sql_insert = write_exchange(
+        &database,
+        b"POST /?query=INSERT+INTO+events+VALUES+%288%29%3B&readonly=1 HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-User: reporting\r\nX-ClickHouse-Key: read key:42\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_status(&sql_insert, "HTTP/1.1 400 Bad Request");
+    assert!(body(&sql_insert).starts_with(br#"{"error":"read-only query"#));
+    assert_private(&sql_insert);
+
+    let (formatted_request, body_offset) = request(
+        "/?readonly=1&query=INSERT+INTO+events+FORMAT+CSVWithNames",
+        b"id\n9\n",
+        principal_headers(),
+    );
+    let mut formatted_input = Cursor::new(formatted_request);
+    let mut formatted_response = Vec::new();
+    handle_http_query_with_clickhouse_principal(
+        &database,
+        USER,
+        KEY,
+        &mut formatted_input,
+        &mut formatted_response,
+    )
+    .unwrap();
+    assert_eq!(formatted_input.position(), body_offset);
+    assert_status(&formatted_response, "HTTP/1.1 400 Bad Request");
+    assert_eq!(
+        body(&formatted_response),
+        br#"{"error":"POST /?query= does not accept a request body"}"#
+    );
+    assert_private(&formatted_response);
+
+    let retained_write_access = write_exchange(
+        &database,
+        b"POST /?readonly=0&query=INSERT+INTO+events+VALUES+%2810%29%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-User: reporting\r\nX-ClickHouse-Key: read key:42\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_status(&retained_write_access, "HTTP/1.1 200 OK");
+    assert_eq!(body(&retained_write_access), b"");
+
+    let read_only_handler_is_not_upgraded = exchange(
+        &database,
+        b"POST /?query=INSERT+INTO+events+VALUES+%2811%29%3B&readonly=0 HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-User: reporting\r\nX-ClickHouse-Key: read key:42\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_status(
+        &read_only_handler_is_not_upgraded,
+        "HTTP/1.1 400 Bad Request",
+    );
+    assert!(body(&read_only_handler_is_not_upgraded).starts_with(br#"{"error":"read-only query"#));
+
+    let rows = database
+        .query("SELECT id FROM events ORDER BY id;")
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Int64(7)], vec![Value::Int64(10)]]
+    );
 }
 
 struct FailingReader;
