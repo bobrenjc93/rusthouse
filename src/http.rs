@@ -112,7 +112,8 @@ impl StdError for HttpQueryError {
     }
 }
 
-/// Listener and exchange bounds for [`serve_http_read_only_with_limits`].
+/// Listener and exchange bounds for [`serve_http_read_only_with_limits`] and
+/// [`serve_http_read_only_with_clickhouse_key_and_limits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpListenerLimits {
     /// Maximum number of accepted connections before the listener returns.
@@ -180,7 +181,7 @@ impl StdError for HttpConnectionFailure {
     }
 }
 
-/// Outcome of a finite [`serve_http_read_only_with_limits`] run.
+/// Outcome of a finite bounded-listener run.
 #[derive(Debug, Default)]
 pub struct HttpListenerReport {
     /// Number of connections accepted from the listener.
@@ -196,7 +197,7 @@ pub struct HttpListenerReport {
     pub connection_failures: Vec<HttpConnectionFailure>,
 }
 
-/// A listener-wide failure from [`serve_http_read_only_with_limits`].
+/// A listener-wide failure from a bounded-listener run.
 #[derive(Debug)]
 pub enum HttpListenerError {
     /// Accepting the next TCP connection failed.
@@ -316,12 +317,32 @@ fn handle_http_listener_connection(
     stream: &TcpStream,
     accepted_at: Instant,
     limits: HttpListenerLimits,
+    handler: HttpListenerHandler<'_>,
 ) -> Result<(), HttpQueryError> {
     let input = DeadlineTcpReader::new(stream, accepted_at, limits.read_timeout)
         .map_err(HttpQueryError::Read)?;
     let output = DeadlineTcpWriter::new(stream, accepted_at, limits.write_timeout)
         .map_err(HttpQueryError::Write)?;
-    handle_http_query_with_limits(database, input, output, limits.query_limits)
+    match handler {
+        HttpListenerHandler::Unauthenticated => {
+            handle_http_query_with_limits(database, input, output, limits.query_limits)
+        }
+        HttpListenerHandler::ClickHouseKey(expected_clickhouse_key) => {
+            handle_http_query_read_only_with_clickhouse_key_and_limits(
+                database,
+                expected_clickhouse_key,
+                input,
+                output,
+                limits.query_limits,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HttpListenerHandler<'a> {
+    Unauthenticated,
+    ClickHouseKey(&'a str),
 }
 
 /// Serves a finite number of sequential, read-only HTTP connections.
@@ -377,6 +398,87 @@ pub fn serve_http_read_only_with_limits(
     database: &SharedDatabase,
     limits: HttpListenerLimits,
 ) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_read_only_connections(
+        listener,
+        database,
+        limits,
+        HttpListenerHandler::Unauthenticated,
+    )
+}
+
+/// Serves a finite number of sequential, read-only HTTP connections that
+/// require an `X-ClickHouse-Key` credential.
+///
+/// This is the authenticated counterpart to [`serve_http_read_only`]. Every
+/// accepted connection is dispatched through
+/// [`handle_http_query_read_only_with_clickhouse_key`] with default exchange
+/// limits. Missing, duplicate, empty, and incorrect credentials are ordinary
+/// bounded `401 Unauthorized` exchanges: they consume a connection slot, count
+/// as successful exchanges in the report, and do not stop later clients.
+/// Correctly authenticated mutation requests are rejected by the read-only
+/// handler without changing the shared database.
+///
+/// The listener retains the same sequential isolation, absolute default read
+/// and write deadlines, connection budget, stream shutdown, and reporting
+/// behavior as [`serve_http_read_only`]. It provides authentication but does
+/// not terminate TLS; callers must provide TLS before sending a key or query
+/// over an untrusted network.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Interrupted accepts are retried.
+pub fn serve_http_read_only_with_clickhouse_key(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    max_connections: usize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_read_only_with_clickhouse_key_and_limits(
+        listener,
+        database,
+        expected_clickhouse_key,
+        HttpListenerLimits::new(max_connections, HttpQueryLimits::default()),
+    )
+}
+
+/// Serves bounded sequential, read-only, `X-ClickHouse-Key`-authenticated HTTP
+/// connections with explicit limits.
+///
+/// Every accepted connection is dispatched through
+/// [`handle_http_query_read_only_with_clickhouse_key_and_limits`]. Listener and
+/// exchange bounds, absolute-deadline behavior, failure isolation, reporting,
+/// and stream lifecycle are identical to [`serve_http_read_only_with_limits`].
+/// Authentication failures that can be represented on the wire are ordinary
+/// HTTP exchanges and therefore do not appear in
+/// [`HttpListenerReport::connection_failures`]. This function does not provide
+/// TLS.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Connection-local failures are returned in
+/// [`HttpListenerReport::connection_failures`] instead.
+pub fn serve_http_read_only_with_clickhouse_key_and_limits(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    limits: HttpListenerLimits,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_read_only_connections(
+        listener,
+        database,
+        limits,
+        HttpListenerHandler::ClickHouseKey(expected_clickhouse_key),
+    )
+}
+
+fn serve_http_read_only_connections(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    limits: HttpListenerLimits,
+    handler: HttpListenerHandler<'_>,
+) -> Result<HttpListenerReport, HttpListenerError> {
     let mut report = HttpListenerReport::default();
 
     while report.accepted_connections < limits.max_connections {
@@ -391,7 +493,8 @@ pub fn serve_http_read_only_with_limits(
         report.accepted_connections += 1;
         let connection = report.accepted_connections;
         let accepted_at = Instant::now();
-        let exchange = handle_http_listener_connection(database, &stream, accepted_at, limits);
+        let exchange =
+            handle_http_listener_connection(database, &stream, accepted_at, limits, handler);
 
         // Half-close the response direction first so a peer can observe the
         // complete response and its terminating FIN. Dropping the stream then

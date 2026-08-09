@@ -233,6 +233,14 @@ their respective struct declaration order, and values are unsigned decimal
 strings. Arguments and trailing clauses are rejected. The metadata result is
 itself subject to the configured query row, value, and byte limits plus the
 normal retained-result and formatted-output limits.
+The exact case-insensitive query
+`SELECT name, value FROM system.settings` returns the identical typed rows in
+the same stable order as `SHOW SETTINGS`. Other projections, aliases,
+functions, predicates, ordering, limits, and trailing clauses are deliberately
+unsupported. The query uses the normal bounded `SELECT` result construction
+and is available through `Database`, `SharedDatabase`, the CLI, and
+authenticated or unauthenticated read-only HTTP handlers in every supported
+output format.
 The exact case-insensitive `SHOW FUNCTIONS` returns every executable scalar,
 aggregate, compatibility-probe, and window function as one `String` column
 named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
@@ -615,7 +623,7 @@ poisoning is reported separately.
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
 and `currentDatabase()` probes plus the exact `system.tables`, `system.columns`,
-and `system.metrics` metadata queries),
+`system.metrics`, and `system.settings` metadata queries),
 `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,
@@ -917,11 +925,27 @@ default to 30 seconds. Every socket operation receives only the remaining time,
 so incremental progress cannot renew either deadline. Expiration is retained as
 a connection-local read or write failure so later clients are still accepted.
 The connection bound also limits the number of retained failures.
-This listener is deliberately single-threaded and adds neither authentication
-nor TLS; bind it only to an appropriate trusted interface and place it behind
-those controls when needed. The single-exchange functions remain available
-when an embedding needs a different connection, concurrency, authentication,
-timeout, or shutdown policy.
+The original listener APIs remain unauthenticated for compatibility.
+
+`serve_http_read_only_with_clickhouse_key` composes the same finite,
+single-threaded lifecycle with the existing least-privilege
+`X-ClickHouse-Key` handler. It takes an expected key and a connection maximum;
+`serve_http_read_only_with_clickhouse_key_and_limits` instead accepts the same
+explicit `HttpListenerLimits` used by the unauthenticated listener. Each
+connection independently requires exactly one matching key, and correctly
+authenticated requests remain read-only. Missing, duplicate, empty, and
+incorrect keys receive the ordinary indistinguishable bounded `401` exchange,
+consume one connection slot, and count as successful exchanges rather than
+transport failures. Later clients are still served. The shared connection
+budget, absolute deadlines, per-exchange limits, one-response stream shutdown,
+failure isolation, and typed final report are otherwise unchanged.
+
+Neither listener mode terminates TLS or adds concurrency, sessions, or daemon
+lifecycle management. In particular, the authenticated listener sends its key
+and query contents in plaintext unless the embedding places the bound listener
+behind TLS; do not expose it directly to an untrusted network. The
+single-exchange functions remain available when an embedding needs a different
+connection, concurrency, transport-security, timeout, or shutdown policy.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or

@@ -171,6 +171,8 @@ pub enum Statement {
     SystemColumns,
     /// Exact bounded database gauge query backed by cached catalog measurements.
     SystemMetrics,
+    /// Exact settings inventory query mirroring `SHOW SETTINGS`.
+    SystemSettings,
     Select(Select),
     /// A deliberately narrow, two-table Cartesian product.
     CrossJoin(CrossJoin),
@@ -931,6 +933,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_statement(&mut self) -> Result<Statement> {
+        if self.at_system_settings_select_start() {
+            return self.parse_system_settings_select();
+        }
         if self.at_system_metrics_select_start() {
             return self.parse_system_metrics_select();
         }
@@ -1054,6 +1059,55 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Statement::SystemMetrics)
+    }
+
+    fn parse_system_settings_select(&mut self) -> Result<Statement> {
+        const SHAPE: &str = "system.settings supports exactly SELECT name, value FROM system.settings with no trailing clauses";
+
+        for (index, column) in ["NAME", "VALUE"].into_iter().enumerate() {
+            self.reserve_ast_list_item()?;
+            self.expect_keyword(column)?;
+            if index == 0 {
+                self.expect(&TokenKind::Comma, "',' between system.settings columns")?;
+            }
+        }
+        self.expect_keyword("FROM")?;
+        self.expect_keyword("SYSTEM")?;
+        self.expect(&TokenKind::Dot, "'.' in system.settings")?;
+        self.expect_keyword("SETTINGS")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::SystemSettings)
+    }
+
+    fn at_system_settings_select_start(&self) -> bool {
+        fn is_keyword(token: &Token, expected: &str) -> bool {
+            matches!(&token.kind, TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+        }
+
+        fn next_is_keyword(lexer: &mut Lexer<'_>, expected: &str) -> bool {
+            lexer
+                .next_token()
+                .is_ok_and(|token| is_keyword(&token, expected))
+        }
+
+        fn next_is_token(lexer: &mut Lexer<'_>, expected: TokenKind) -> bool {
+            lexer.next_token().is_ok_and(|token| token.kind == expected)
+        }
+
+        if !is_keyword(&self.current, "NAME") {
+            return false;
+        }
+
+        let mut lexer = self.lexer;
+        next_is_token(&mut lexer, TokenKind::Comma)
+            && next_is_keyword(&mut lexer, "VALUE")
+            && next_is_keyword(&mut lexer, "FROM")
+            && next_is_keyword(&mut lexer, "SYSTEM")
+            && next_is_token(&mut lexer, TokenKind::Dot)
+            && next_is_keyword(&mut lexer, "SETTINGS")
     }
 
     fn at_system_metrics_select_start(&self) -> bool {
