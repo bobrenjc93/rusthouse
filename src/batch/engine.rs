@@ -20,12 +20,7 @@ use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
 #[cfg(unix)]
-use crate::snapshot::{
-    Int64TablePayloadCodec, Int64TablePayloadFileSaveError, SnapshotCodec,
-    save_int64_table_payload_to_file,
-};
-#[cfg(unix)]
-use crate::storage::Int64Table;
+use crate::snapshot::{Int64TablePayloadCodec, Int64TablePayloadFileSaveError, SnapshotCodec};
 
 pub use crate::batch::storage::{
     DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_ROWS_PER_TABLE,
@@ -692,9 +687,12 @@ impl Database {
         let Column::Int64(values) = &table.columns()[0] else {
             unreachable!("batch table storage must agree with its validated schema");
         };
-        let snapshot_table =
-            Int64Table::from_non_nullable_values(&column.name, table.row_cap(), values);
-        save_int64_table_payload_to_file(path, &snapshot_table, snapshot_codec, payload_codec)?;
+        let payload = payload_codec
+            .encode_non_nullable_values(&column.name, table.row_cap(), values)
+            .map_err(Int64TablePayloadFileSaveError::from)?;
+        snapshot_codec
+            .replace_file(path, &payload)
+            .map_err(Int64TablePayloadFileSaveError::from)?;
         Ok(())
     }
 

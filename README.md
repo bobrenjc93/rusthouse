@@ -1183,7 +1183,9 @@ table name and every other catalog table. Missing tables, multi-column tables,
 and other physical column types are rejected before filesystem access. Files it
 writes remain compatible with `restore_int64_table_payload_from_file`; payload
 encoding and atomic-replacement errors retain their existing typed causes and
-destination-preservation reporting.
+destination-preservation reporting. Codec bounds are checked against borrowed
+batch storage before payload allocation; the adapter does not clone the column
+into a second table representation.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries

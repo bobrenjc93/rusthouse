@@ -92,7 +92,10 @@ row cap, but the format still does not include the batch table name or other
 catalog tables. The existing `restore_int64_table_payload_from_file` decoder
 reopens its output. Its save error distinguishes table lookup and shape
 validation from the existing payload and replacement failures, and reports
-whether a post-rename directory-sync failure occurred.
+whether a post-rename directory-sync failure occurred. Name, row-cap, row-count,
+and encoded-byte limits are checked directly against borrowed batch storage
+before allocating the payload; no intermediate `Int64Table` column clone is
+created.
 
 `save_int64_table_to_file` is the Unix-only composed table save operation. It
 first encodes an existing `Int64Table` through `NullableI64PayloadCodec`, then

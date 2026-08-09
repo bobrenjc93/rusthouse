@@ -1695,7 +1695,61 @@ impl Int64TablePayloadCodec {
     /// Encodes one table, including its one-column schema and row cap.
     pub fn encode(self, table: &Int64Table) -> Result<Vec<u8>, Int64TablePayloadError> {
         let column = table.schema().column();
-        let name = column.name().as_bytes();
+        let metadata = self.validate_metadata(column.name(), table.row_cap(), table.row_count())?;
+        let encoded_rows_len = table.values().iter().try_fold(0_usize, |length, value| {
+            let row_len = if value.is_some() {
+                std::mem::size_of::<u8>() + std::mem::size_of::<i64>()
+            } else {
+                std::mem::size_of::<u8>()
+            };
+            length.checked_add(row_len)
+        });
+        let mut payload = self.encode_prefix(
+            column.name(),
+            column.is_nullable(),
+            metadata,
+            encoded_rows_len,
+        )?;
+        for value in table.values() {
+            match value {
+                None => payload.push(NULLABLE_I64_NULL_TAG),
+                Some(value) => {
+                    payload.push(NULLABLE_I64_VALUE_TAG);
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
+        Ok(payload)
+    }
+
+    /// Encodes one validated batch-engine `Int64` column without first cloning
+    /// it into an [`Int64Table`].
+    #[cfg(unix)]
+    pub(crate) fn encode_non_nullable_values(
+        self,
+        name: &str,
+        row_cap: usize,
+        values: &[i64],
+    ) -> Result<Vec<u8>, Int64TablePayloadError> {
+        let metadata = self.validate_metadata(name, row_cap, values.len())?;
+        let encoded_rows_len = values
+            .len()
+            .checked_mul(std::mem::size_of::<u8>() + std::mem::size_of::<i64>());
+        let mut payload = self.encode_prefix(name, false, metadata, encoded_rows_len)?;
+        for value in values {
+            payload.push(NULLABLE_I64_VALUE_TAG);
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(payload)
+    }
+
+    fn validate_metadata(
+        self,
+        name: &str,
+        row_cap: usize,
+        row_count: usize,
+    ) -> Result<(u64, u64, u64), Int64TablePayloadError> {
         let name_len = u64::try_from(name.len()).unwrap_or(u64::MAX);
         if name.len() > self.max_name_len {
             return Err(Int64TablePayloadError::NameTooLong {
@@ -1704,32 +1758,35 @@ impl Int64TablePayloadCodec {
             });
         }
 
-        let row_cap = u64::try_from(table.row_cap()).unwrap_or(u64::MAX);
-        if table.row_cap() > self.max_rows {
+        let encoded_row_cap = u64::try_from(row_cap).unwrap_or(u64::MAX);
+        if row_cap > self.max_rows {
             return Err(Int64TablePayloadError::RowCapLimitExceeded {
-                row_cap,
+                row_cap: encoded_row_cap,
                 max_rows: self.max_rows,
             });
         }
 
-        let row_count = u64::try_from(table.row_count()).unwrap_or(u64::MAX);
-        if table.row_count() > self.max_rows {
+        let encoded_row_count = u64::try_from(row_count).unwrap_or(u64::MAX);
+        if row_count > self.max_rows {
             return Err(Int64TablePayloadError::RowLimitExceeded {
-                row_count,
+                row_count: encoded_row_count,
                 max_rows: self.max_rows,
             });
         }
+        Ok((name_len, encoded_row_cap, encoded_row_count))
+    }
 
-        let fixed_len = INT64_TABLE_PAYLOAD_FIXED_LEN.checked_add(name.len());
-        let payload_len = fixed_len.and_then(|fixed_len| {
-            table.values().iter().try_fold(fixed_len, |length, value| {
-                let row_len = if value.is_some() {
-                    std::mem::size_of::<u8>() + std::mem::size_of::<i64>()
-                } else {
-                    std::mem::size_of::<u8>()
-                };
-                length.checked_add(row_len)
-            })
+    fn encode_prefix(
+        self,
+        name: &str,
+        nullable: bool,
+        (name_len, row_cap, row_count): (u64, u64, u64),
+        encoded_rows_len: Option<usize>,
+    ) -> Result<Vec<u8>, Int64TablePayloadError> {
+        let payload_len = encoded_rows_len.and_then(|encoded_rows_len| {
+            INT64_TABLE_PAYLOAD_FIXED_LEN
+                .checked_add(name.len())
+                .and_then(|fixed_len| fixed_len.checked_add(encoded_rows_len))
         });
         let Some(payload_len) = payload_len else {
             return Err(Int64TablePayloadError::PayloadTooLarge {
@@ -1748,25 +1805,15 @@ impl Int64TablePayloadCodec {
         payload.extend_from_slice(&INT64_TABLE_PAYLOAD_MAGIC);
         payload.extend_from_slice(&INT64_TABLE_PAYLOAD_VERSION.to_le_bytes());
         payload.push(INT64_TABLE_INT64_TAG);
-        payload.push(if column.is_nullable() {
+        payload.push(if nullable {
             INT64_TABLE_NULLABLE_TAG
         } else {
             INT64_TABLE_NOT_NULL_TAG
         });
         payload.extend_from_slice(&name_len.to_le_bytes());
-        payload.extend_from_slice(name);
+        payload.extend_from_slice(name.as_bytes());
         payload.extend_from_slice(&row_cap.to_le_bytes());
         payload.extend_from_slice(&row_count.to_le_bytes());
-        for value in table.values() {
-            match value {
-                None => payload.push(NULLABLE_I64_NULL_TAG),
-                Some(value) => {
-                    payload.push(NULLABLE_I64_VALUE_TAG);
-                    payload.extend_from_slice(&value.to_le_bytes());
-                }
-            }
-        }
-
         Ok(payload)
     }
 

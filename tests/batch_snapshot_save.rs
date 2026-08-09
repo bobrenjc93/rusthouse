@@ -170,6 +170,59 @@ fn payload_failure_preserves_an_existing_destination() {
 }
 
 #[test]
+fn codec_limits_are_checked_before_payload_allocation_or_path_access() {
+    let directory = TestDirectory::new();
+    let inaccessible_path = directory.join("absent-parent").join("snapshot");
+    let mut database = Database::with_max_rows_per_table(3);
+    database
+        .execute(
+            "CREATE TABLE readings (measurement Int64); \
+             INSERT INTO readings VALUES (1), (2), (3);",
+        )
+        .unwrap();
+    let snapshot_codec = SnapshotCodec::new(128);
+
+    let row_error = database
+        .save_int64_table_to_file(
+            "readings",
+            &inaccessible_path,
+            snapshot_codec,
+            Int64TablePayloadCodec::new("measurement".len(), 0, 128),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        row_error,
+        DatabaseSnapshotSaveError::Snapshot(Int64TablePayloadFileSaveError::Payload(
+            Int64TablePayloadError::RowCapLimitExceeded {
+                row_cap: 3,
+                max_rows: 0,
+            }
+        ))
+    ));
+    assert!(!row_error.destination_was_replaced());
+
+    let payload_error = database
+        .save_int64_table_to_file(
+            "readings",
+            &inaccessible_path,
+            snapshot_codec,
+            Int64TablePayloadCodec::new("measurement".len(), 3, 0),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        payload_error,
+        DatabaseSnapshotSaveError::Snapshot(Int64TablePayloadFileSaveError::Payload(
+            Int64TablePayloadError::PayloadTooLarge {
+                max_payload_len: 0,
+                ..
+            }
+        ))
+    ));
+    assert!(!payload_error.destination_was_replaced());
+    assert!(!directory.join("absent-parent").exists());
+}
+
+#[test]
 fn replacement_failure_preserves_the_destination_and_cleans_up() {
     let directory = TestDirectory::new();
     let path = directory.join("destination");
