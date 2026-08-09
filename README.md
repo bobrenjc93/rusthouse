@@ -1201,12 +1201,13 @@ poisoning are reported without accessing the destination. Its typed error wraps
 the existing database save failures and preserves their destination-replacement
 status.
 `SharedDatabase::try_restore_int64_table_from_file` is the synchronized
-Unix-only restore counterpart. It makes exactly one nonblocking write-lock
-attempt before accessing the source file, then delegates bounded decoding,
-validation, and atomic registration to `Database::restore_int64_table_from_file`
-while retaining that guard. Reader or writer contention, lock poisoning, and
-the existing typed snapshot restore failures remain distinct. Every failure
-leaves catalog data and cached metrics unchanged.
+restore counterpart on every supported platform. It makes exactly one
+nonblocking write-lock attempt before accessing the source file, then delegates
+bounded decoding, validation, and atomic registration to
+`Database::restore_int64_table_from_file` while retaining that guard. Reader or
+writer contention, lock poisoning, and the existing typed snapshot restore
+failures remain distinct. Every failure leaves catalog data and cached metrics
+unchanged.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries

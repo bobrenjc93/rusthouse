@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::fs;
 use std::io::ErrorKind;
 use std::mem::size_of;

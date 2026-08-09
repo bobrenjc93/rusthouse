@@ -2,21 +2,19 @@
 
 use std::error::Error as StdError;
 use std::fmt;
-#[cfg(unix)]
 use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use super::csv::{CsvIngestError, CsvIngestLimits};
-use super::engine::{
-    DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, QueryResult, QueryResultLimits, StatementResult,
-    TableLimits,
-};
 #[cfg(unix)]
-use super::engine::{DatabaseSnapshotRestoreError, DatabaseSnapshotSaveError};
+use super::engine::DatabaseSnapshotSaveError;
+use super::engine::{
+    DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, DatabaseSnapshotRestoreError, QueryResult,
+    QueryResultLimits, StatementResult, TableLimits,
+};
 use super::error::Error;
 use super::sql::{self, Statement};
 use super::tsv::{TsvIngestError, TsvIngestLimits};
-#[cfg(unix)]
 use crate::snapshot::{Int64TablePayloadCodec, SnapshotCodec};
 
 /// An instantaneous measurement of data retained by a [`SharedDatabase`].
@@ -119,7 +117,6 @@ impl From<TsvIngestError> for SharedDatabaseError {
 }
 
 /// A failure while nonblockingly restoring a snapshot into a [`SharedDatabase`].
-#[cfg(unix)]
 #[derive(Debug)]
 pub enum SharedDatabaseSnapshotRestoreError {
     /// A reader or writer prevented immediate acquisition of the database write lock.
@@ -130,7 +127,6 @@ pub enum SharedDatabaseSnapshotRestoreError {
     Snapshot(DatabaseSnapshotRestoreError),
 }
 
-#[cfg(unix)]
 impl fmt::Display for SharedDatabaseSnapshotRestoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -146,7 +142,6 @@ impl fmt::Display for SharedDatabaseSnapshotRestoreError {
     }
 }
 
-#[cfg(unix)]
 impl StdError for SharedDatabaseSnapshotRestoreError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
@@ -156,7 +151,6 @@ impl StdError for SharedDatabaseSnapshotRestoreError {
     }
 }
 
-#[cfg(unix)]
 impl From<DatabaseSnapshotRestoreError> for SharedDatabaseSnapshotRestoreError {
     fn from(error: DatabaseSnapshotRestoreError) -> Self {
         Self::Snapshot(error)
@@ -230,17 +224,11 @@ impl From<DatabaseSnapshotSaveError> for SharedDatabaseSnapshotSaveError {
 /// `EXISTS TABLE` under a shared read lock.
 /// [`Self::try_query`] accepts the same input but returns
 /// [`SharedDatabaseError::DatabaseBusy`] instead of waiting for a writer.
+/// [`Self::try_restore_int64_table_from_file`] attempts one write lock before
+/// bounded snapshot reading and atomic database restore.
 #[cfg_attr(
     unix,
-    doc = "On Unix, [`Self::try_restore_int64_table_from_file`] attempts one write lock"
-)]
-#[cfg_attr(
-    unix,
-    doc = "before bounded snapshot reading and atomic database restore, while"
-)]
-#[cfg_attr(
-    unix,
-    doc = "[`Self::try_save_int64_table_to_file`] attempts one read lock and atomically"
+    doc = "On Unix, [`Self::try_save_int64_table_to_file`] attempts one read lock and"
 )]
 #[cfg_attr(unix, doc = "saves a supported table without copying its column.")]
 /// [`Self::try_execute_insert_batch`] similarly attempts
@@ -331,7 +319,7 @@ impl SharedDatabase {
         Ok(self.read()?.table_limits())
     }
 
-    /// Attempts to restore one self-describing, non-nullable `Int64` snapshot on Unix.
+    /// Attempts to restore one self-describing, non-nullable `Int64` snapshot.
     ///
     /// Exactly one nonblocking write-lock attempt occurs before the source path
     /// is accessed. An active reader or writer returns
@@ -340,7 +328,6 @@ impl SharedDatabase {
     /// [`Database::restore_int64_table_from_file`] path performs bounded file
     /// reading, decoding, validation, and atomic catalog registration. Snapshot
     /// failures therefore leave all catalog data and cached metrics unchanged.
-    #[cfg(unix)]
     pub fn try_restore_int64_table_from_file(
         &self,
         table_name: &str,

@@ -22,12 +22,10 @@ pub use aggregate::{
 };
 pub use batch::{
     Database, DatabaseMetrics, DatabaseSnapshotRestoreError, SharedDatabase, SharedDatabaseError,
-    TableLimits,
+    SharedDatabaseSnapshotRestoreError, TableLimits,
 };
 #[cfg(unix)]
-pub use batch::{
-    DatabaseSnapshotSaveError, SharedDatabaseSnapshotRestoreError, SharedDatabaseSnapshotSaveError,
-};
+pub use batch::{DatabaseSnapshotSaveError, SharedDatabaseSnapshotSaveError};
 pub use catalog::{
     Catalog, CatalogCsvIngestError, CatalogCsvReaderIngestError, CatalogError, CatalogLimits,
     CatalogSnapshotRestoreError,
