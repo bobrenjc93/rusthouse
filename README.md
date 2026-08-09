@@ -904,13 +904,15 @@ one slot, reaching the configured count returns the report, and zero returns
 without accepting. Callers can run finite serving batches repeatedly on the
 same borrowed listener for a long-lived service. Use
 `serve_http_read_only_with_limits` and `HttpListenerLimits` to apply an explicit
-`HttpQueryLimits` value independently to every connection. The connection
-bound also limits the number of retained failures. This listener is deliberately
-single-threaded and adds neither authentication, TLS, nor socket timeouts; bind
-it only to an appropriate trusted interface and place it behind those controls
-when needed. The single-exchange functions remain available when an embedding
-needs a different connection, concurrency, authentication, timeout, or
-shutdown policy.
+`HttpQueryLimits` value and configurable read and write timeouts independently
+to every connection. Both socket timeouts default to 30 seconds; expiration is
+retained as a connection-local read or write failure so later clients are still
+accepted. The connection bound also limits the number of retained failures.
+This listener is deliberately single-threaded and adds neither authentication
+nor TLS; bind it only to an appropriate trusted interface and place it behind
+those controls when needed. The single-exchange functions remain available
+when an embedding needs a different connection, concurrency, authentication,
+timeout, or shutdown policy.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or

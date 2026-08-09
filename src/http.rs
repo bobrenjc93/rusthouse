@@ -5,6 +5,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener};
+use std::time::Duration;
 
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
 use crate::batch::format::{
@@ -29,6 +30,14 @@ pub const DEFAULT_MAX_HTTP_SQL_BYTES: usize = 1024 * 1024;
 
 /// Default maximum size of the complete HTTP response, including headers.
 pub const DEFAULT_MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default maximum blocking interval for a socket read on an accepted listener
+/// connection.
+pub const DEFAULT_HTTP_CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default maximum blocking interval for a socket write on an accepted
+/// listener connection.
+pub const DEFAULT_HTTP_CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resource limits for a single [`handle_http_query`] exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +122,18 @@ pub struct HttpListenerLimits {
     /// Each accepted connection consumes one slot even when its exchange fails.
     /// Zero makes the listener return without calling [`TcpListener::accept`].
     pub max_connections: usize,
+    /// Maximum blocking duration for each socket read operation.
+    ///
+    /// The duration must be nonzero and supported by the operating system.
+    /// Configuration failures and expired reads are recorded as connection-local
+    /// [`HttpQueryError::Read`] failures.
+    pub read_timeout: Duration,
+    /// Maximum blocking duration for each socket write operation.
+    ///
+    /// The duration must be nonzero and supported by the operating system.
+    /// Configuration failures and expired writes are recorded as connection-local
+    /// [`HttpQueryError::Write`] failures.
+    pub write_timeout: Duration,
     /// Resource limits applied independently to every accepted connection.
     pub query_limits: HttpQueryLimits,
 }
@@ -122,6 +143,8 @@ impl HttpListenerLimits {
     pub const fn new(max_connections: usize, query_limits: HttpQueryLimits) -> Self {
         Self {
             max_connections,
+            read_timeout: DEFAULT_HTTP_CONNECTION_READ_TIMEOUT,
+            write_timeout: DEFAULT_HTTP_CONNECTION_WRITE_TIMEOUT,
             query_limits,
         }
     }
@@ -215,7 +238,9 @@ impl StdError for HttpListenerError {
 /// The function blocks until `max_connections` connections have been accepted
 /// or the listener returns a non-interrupted accept error. Passing zero returns
 /// immediately. Connections are deliberately handled one at a time; the
-/// listener does not add authentication, TLS, or socket timeouts.
+/// listener does not add authentication or TLS. Default per-connection read and
+/// write deadlines prevent one stalled peer from blocking later connections
+/// indefinitely.
 ///
 /// # Errors
 ///
@@ -237,9 +262,11 @@ pub fn serve_http_read_only(
 ///
 /// The accepted-connection limit bounds both the run and the maximum number of
 /// retained [`HttpConnectionFailure`] values. [`HttpListenerLimits::query_limits`]
-/// is applied afresh to each connection. Regardless of exchange success, the
-/// stream is shut down and dropped before another connection is accepted, so
-/// HTTP pipelining cannot extend a connection past its first exchange.
+/// is applied afresh to each connection. The configured socket read and write
+/// timeouts are also applied immediately after each accept. Regardless of
+/// exchange success, the stream is shut down and dropped before another
+/// connection is accepted, so HTTP pipelining cannot extend a connection past
+/// its first exchange.
 ///
 /// # Errors
 ///
@@ -264,8 +291,17 @@ pub fn serve_http_read_only_with_limits(
 
         report.accepted_connections += 1;
         let connection = report.accepted_connections;
-        let exchange =
-            handle_http_query_with_limits(database, &stream, &stream, limits.query_limits);
+        let exchange = stream
+            .set_read_timeout(Some(limits.read_timeout))
+            .map_err(HttpQueryError::Read)
+            .and_then(|()| {
+                stream
+                    .set_write_timeout(Some(limits.write_timeout))
+                    .map_err(HttpQueryError::Write)
+            })
+            .and_then(|()| {
+                handle_http_query_with_limits(database, &stream, &stream, limits.query_limits)
+            });
 
         // Half-close the response direction first so a peer can observe the
         // complete response and its terminating FIN. Dropping the stream then

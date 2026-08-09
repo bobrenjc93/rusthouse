@@ -45,6 +45,7 @@ pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
 };
 pub use http::{
+    DEFAULT_HTTP_CONNECTION_READ_TIMEOUT, DEFAULT_HTTP_CONNECTION_WRITE_TIMEOUT,
     DEFAULT_MAX_HTTP_HEADER_BYTES, DEFAULT_MAX_HTTP_HEADER_COUNT, DEFAULT_MAX_HTTP_RESPONSE_BYTES,
     DEFAULT_MAX_HTTP_SQL_BYTES, HttpConnectionFailure, HttpListenerError, HttpListenerLimits,
     HttpListenerReport, HttpQueryError, HttpQueryLimits, handle_http_query,

@@ -10,6 +10,8 @@ use rusthouse::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const STALLED_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
+const STALLED_RESPONSE_BYTES: usize = 15 * 1024 * 1024;
 
 fn start_listener(
     database: SharedDatabase,
@@ -193,6 +195,88 @@ fn malformed_client_is_closed_without_preventing_the_next_request() {
     assert_eq!(report.accepted_connections, 2);
     assert_eq!(report.successful_exchanges, 2);
     assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn stalled_request_times_out_without_preventing_the_next_connection() {
+    let limits = HttpListenerLimits {
+        read_timeout: STALLED_CONNECTION_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let (address, worker) = start_listener(SharedDatabase::default(), limits);
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost")
+        .expect("write incomplete request without closing it");
+
+    let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&healthy), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 1);
+    assert_eq!(report.connection_failures.len(), 1);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        &report.connection_failures[0].source,
+        HttpQueryError::Read(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
+}
+
+#[test]
+fn stalled_response_times_out_without_preventing_the_next_connection() {
+    let database = SharedDatabase::default();
+    database
+        .execute(&format!(
+            "CREATE TABLE payloads (value String); INSERT INTO payloads VALUES ('{}');",
+            "x".repeat(STALLED_RESPONSE_BYTES)
+        ))
+        .expect("create a response larger than the loopback socket buffers");
+    let limits = HttpListenerLimits {
+        read_timeout: IO_TIMEOUT,
+        write_timeout: STALLED_CONNECTION_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let (address, worker) = start_listener(database, limits);
+
+    let mut stalled = TcpStream::connect(address).expect("connect non-reading client");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set non-reading client write timeout");
+    stalled
+        .write_all(&post_query("SELECT value FROM payloads;"))
+        .expect("write request for large response");
+    stalled
+        .shutdown(Shutdown::Write)
+        .expect("finish large-response request");
+
+    let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&healthy), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 1);
+    assert_eq!(report.connection_failures.len(), 1);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        &report.connection_failures[0].source,
+        HttpQueryError::Write(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
 }
 
 #[test]
