@@ -16,7 +16,7 @@ use rusthouse::{
     handle_http_query_read_only_with_clickhouse_key,
 };
 
-const FUNCTIONS: [&str; 18] = [
+const FUNCTIONS: [&str; 19] = [
     "ABS",
     "AVG",
     "CAST",
@@ -33,6 +33,7 @@ const FUNCTIONS: [&str; 18] = [
     "ROUND",
     "ROW_NUMBER",
     "SUM",
+    "toString",
     "UPPER",
     "version",
 ];

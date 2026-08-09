@@ -40,6 +40,7 @@ pub const SUPPORTED_FUNCTION_NAMES: &[&str] = &[
     "ROUND",
     "ROW_NUMBER",
     "SUM",
+    "toString",
     "UPPER",
     "version",
 ];
@@ -356,6 +357,10 @@ pub enum SelectItem {
     Cast {
         name: String,
         target_type: DataType,
+        alias: Option<String>,
+    },
+    ToString {
+        name: String,
         alias: Option<String>,
     },
     Length {
@@ -2228,6 +2233,13 @@ impl<'a> Parser<'a> {
                 });
             }
 
+            if name.eq_ignore_ascii_case("toString") {
+                let name = self.expect_identifier("column in toString")?;
+                self.expect(&TokenKind::RightParen, "')' after toString expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::ToString { name, alias });
+            }
+
             if name.eq_ignore_ascii_case("LENGTH") {
                 let name = self.expect_identifier("String column in LENGTH")?;
                 self.expect(&TokenKind::RightParen, "')' after LENGTH expression")?;
@@ -2379,6 +2391,13 @@ impl<'a> Parser<'a> {
             let target_type = self.parse_column_cast_target_type()?;
             self.expect(&TokenKind::RightParen, "')' after ORDER BY CAST expression")?;
             Ok(format!("CAST({argument} AS {target_type})"))
+        } else if name.eq_ignore_ascii_case("toString") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("column in ORDER BY toString")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY toString expression",
+            )?;
+            Ok(format!("toString({argument})"))
         } else {
             Ok(name)
         }

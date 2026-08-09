@@ -279,9 +279,9 @@ aggregate, compatibility-probe, and window function as one `String` column
 named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
 `ABS`, `AVG`, `CAST`, `CEIL`, `COUNT`, `countIf`, `currentDatabase`, `FLOOR`,
 `LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`, `ROUND`, `ROW_NUMBER`, `SUM`,
-`UPPER`, and `version`. Arguments and trailing clauses are rejected. The result
-uses the normal query row, value, byte, retained-result, and formatted-output
-limits.
+`toString`, `UPPER`, and `version`. Arguments and trailing clauses are rejected.
+The result uses the normal query row, value, byte, retained-result, and
+formatted-output limits.
 The exact case-insensitive query `SELECT name FROM system.functions` returns
 the identical typed rows in the same deterministic order as `SHOW FUNCTIONS`.
 Other projections, aliases, functions, predicates, ordering, limits, and
@@ -441,6 +441,18 @@ aggregate projections or `GROUP BY`. Generated `String` payload bytes—four or
 five for booleans, one through twenty for integers, and one through 327 for
 finite floats—are charged exactly against the result-byte limit before
 materialization. No other source/target type pairs are accepted.
+`toString(column)` is the case-insensitive ClickHouse-style String conversion
+for every physical type. `Int64`, `Float64`, and `Bool` inputs use exactly the
+same canonical formatting, lexicographic expression ordering, and generated
+payload-byte accounting as their `CAST(column AS String)` equivalents; a
+`String` input is an identity projection, including Unicode and empty values.
+It accepts an optional `AS alias`; otherwise, its result is named
+`toString(<column>)`. `WHERE` filtering and `ORDER BY` using either the
+normalized expression or its alias happen before `LIMIT`/`OFFSET` pagination
+and output materialization. Like `CAST`, `toString` is currently restricted to
+ungrouped scalar queries and cannot be combined with aggregate projections or
+`GROUP BY`. All normal result row, value, byte, retained-result, and formatted
+output limits apply.
 `LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
@@ -1343,6 +1355,14 @@ target is rejected before file access, and corruption, nullability, invalid
 column identifiers, or configured table-limit failures leave the old table and
 cached metrics unchanged. Success performs one catalog swap and adjusts the
 cached column, row, and retained-value-byte totals to the replacement exactly.
+`Database::replace_int64_table_from_file_with_backup` adds explicit recovery
+to that atomic replacement. It decodes the primary first and consults the
+backup only after a typed primary file, envelope, or table-payload failure;
+success reports which source supplied the replacement, while a dual failure
+retains both typed causes. Database validation runs only after a source has
+decoded and does not trigger fallback. A dual recovery, schema-validation, or
+configured-limit failure preserves the target's display name, data, and cached
+metrics.
 `Database::restore_int64_tables_from_files` restores a caller-bounded slice of
 `DatabaseSnapshotRestoreEntry` values as one atomic catalog change. The
 inclusive entry-count limit and the complete case-insensitive destination-name

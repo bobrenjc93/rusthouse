@@ -99,6 +99,16 @@ does it swap the catalog entry once and replace the cached measurements. A
 missing target, corrupt snapshot, nullable or invalid column, or limit failure
 leaves the prior table and metrics unchanged.
 
+`Database::replace_int64_table_from_file_with_backup` composes the same atomic
+replacement with the bounded primary-or-backup decoder. A decoded primary
+takes precedence without inspecting the backup. Any typed primary file,
+envelope, or table-payload decoding failure causes one attempt against the
+explicit backup with the same codecs; success identifies the source, and a
+dual failure preserves both typed causes. Non-nullability, identifier, and
+table-limit validation happens after recovery chooses a source and does not
+trigger another attempt. Dual recovery, validation, and limit failures leave
+the target's display name, rows, schema, and cached metrics unchanged.
+
 `Database::restore_int64_tables_from_files` transactionally composes those
 single-table payloads into a caller-bounded catalog subset. Each
 `DatabaseSnapshotRestoreEntry` supplies a table name, source path, and its own
