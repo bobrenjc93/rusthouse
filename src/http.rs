@@ -1141,7 +1141,7 @@ fn handle_http_query_exchange(
     let query_result = match (max_result_bytes, max_result_rows, max_rows_to_read) {
         (None, None, None) => database.try_query(&sql),
         (max_result_bytes, max_result_rows, max_rows_to_read) => database
-            .try_query_with_parameterized_result_limits(
+            .try_query_with_parameterized_workload_limits(
                 &sql,
                 max_result_bytes.unwrap_or(0),
                 max_result_rows.unwrap_or(0),
@@ -2430,7 +2430,7 @@ fn decode_query_parameters(
 }
 
 fn parse_decimal_max_result_bytes(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_result_limit(
+    parse_decimal_workload_limit(
         value,
         "max_result_bytes parameter must be a decimal integer",
         "max_result_bytes parameter is out of range",
@@ -2438,7 +2438,7 @@ fn parse_decimal_max_result_bytes(value: &[u8]) -> Result<usize, RequestReadErro
 }
 
 fn parse_decimal_max_result_rows(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_result_limit(
+    parse_decimal_workload_limit(
         value,
         "max_result_rows parameter must be a decimal integer",
         "max_result_rows parameter is out of range",
@@ -2446,14 +2446,14 @@ fn parse_decimal_max_result_rows(value: &[u8]) -> Result<usize, RequestReadError
 }
 
 fn parse_decimal_max_rows_to_read(value: &[u8]) -> Result<usize, RequestReadError> {
-    parse_decimal_result_limit(
+    parse_decimal_workload_limit(
         value,
         "max_rows_to_read parameter must be a decimal integer",
         "max_rows_to_read parameter is out of range",
     )
 }
 
-fn parse_decimal_result_limit(
+fn parse_decimal_workload_limit(
     value: &[u8],
     malformed_message: &'static str,
     overflow_message: &'static str,

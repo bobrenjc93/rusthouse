@@ -877,7 +877,7 @@ impl Database {
         statement: Statement,
         max_result_bytes: usize,
     ) -> Result<QueryResult> {
-        self.execute_query_statement_with_result_limits(
+        self.execute_query_statement_with_parameterized_limits(
             statement,
             max_result_bytes,
             self.query_result_limits.max_rows,
@@ -892,7 +892,7 @@ impl Database {
     /// limit in place. Result-shape validation applies both effective result
     /// limits before result rows are materialized; the effective scan limit is
     /// charged against the complete source table independently of `LIMIT`.
-    pub(crate) fn execute_query_statement_with_result_limits(
+    pub(crate) fn execute_query_statement_with_parameterized_limits(
         &self,
         statement: Statement,
         max_result_bytes: usize,

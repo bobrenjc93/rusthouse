@@ -590,7 +590,7 @@ impl SharedDatabase {
     /// relax, the database's configured result-byte, result-row, and scan-row
     /// limits or the default retained-result byte limit. Zero retains the
     /// corresponding defaults.
-    pub(crate) fn try_query_with_parameterized_result_limits(
+    pub(crate) fn try_query_with_parameterized_workload_limits(
         &self,
         input: &str,
         max_result_bytes: usize,
@@ -604,7 +604,7 @@ impl SharedDatabase {
             DEFAULT_MAX_RETAINED_RESULT_BYTES.min(max_result_bytes)
         };
         self.try_read()?
-            .execute_query_statement_with_result_limits(
+            .execute_query_statement_with_parameterized_limits(
                 statement,
                 max_result_bytes,
                 max_result_rows,
