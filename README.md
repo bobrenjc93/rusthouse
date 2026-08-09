@@ -871,8 +871,32 @@ authenticated handler's `*_and_limits` variant with `HttpQueryLimits` to set
 explicit insertion limits. Each call reads exactly one header block and, only
 for a POST query or authenticated insert, exactly its declared body; it emits at
 most one final `Connection: close` response and never reads or handles a
-subsequent request. This single-exchange API deliberately leaves listener,
-connection, timeout, and shutdown lifecycle to the embedding application.
+subsequent request.
+
+For a built-in read-only TCP lifecycle, `serve_http_read_only` accepts a
+caller-bound `TcpListener`, one `SharedDatabase`, and an explicit maximum number
+of connections. It accepts and handles connections sequentially, dispatches
+each through the same unauthenticated read-only `handle_http_query` path, and
+closes each stream after at most one response. Every connection observes the
+same synchronized database. A malformed protocol or SQL request receives its
+normal bounded HTTP error response and does not stop the listener. A local read,
+write, or unrepresentable-response-limit failure is retained as a typed
+`HttpConnectionFailure` in the final `HttpListenerReport`, and later clients
+are still accepted. An accept failure returns the typed `HttpListenerError`
+with the partial report and operating-system error.
+
+The connection count is an inclusive run bound: a failed connection consumes
+one slot, reaching the configured count returns the report, and zero returns
+without accepting. Callers can run finite serving batches repeatedly on the
+same borrowed listener for a long-lived service. Use
+`serve_http_read_only_with_limits` and `HttpListenerLimits` to apply an explicit
+`HttpQueryLimits` value independently to every connection. The connection
+bound also limits the number of retained failures. This listener is deliberately
+single-threaded and adds neither authentication, TLS, nor socket timeouts; bind
+it only to an appropriate trusted interface and place it behind those controls
+when needed. The single-exchange functions remain available when an embedding
+needs a different connection, concurrency, authentication, timeout, or
+shutdown policy.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or
