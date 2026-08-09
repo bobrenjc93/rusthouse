@@ -1037,13 +1037,46 @@ impl Database {
     ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
         let display_name = self.catalog.table(table_name)?.name().to_owned();
         let restored = restore_int64_table_payload_from_file(path, snapshot_codec, payload_codec)?;
-        let replacement = self.prepare_restored_int64_table(&display_name, restored)?;
-        let replacement_measurements = TableMeasurements::read(&replacement);
+        self.replace_restored_int64_table(table_name, &display_name, restored)
+    }
 
-        let previous = self.catalog.replace_table(table_name, replacement)?;
-        self.measurements
-            .replace(TableMeasurements::read(&previous), replacement_measurements);
-        Ok(())
+    /// Atomically replaces one existing table from a primary self-describing
+    /// `Int64` snapshot or an explicit backup.
+    ///
+    /// `table_name` uses the catalog's case-insensitive lookup, while a
+    /// successful replacement retains the target's stored display name. The
+    /// primary file is decoded first and takes precedence whenever decoding
+    /// succeeds. The backup is inspected only after a typed primary file,
+    /// envelope, or payload decoding failure. Success reports which file
+    /// supplied the replacement; if both fail, the
+    /// [`DatabaseSnapshotRestoreError::Recovery`] variant retains both typed
+    /// failures.
+    ///
+    /// Target existence is checked before either source is opened. After one
+    /// source is decoded, the same non-nullability, SQL identifier, row-cap,
+    /// column, and cell validation as [`Self::replace_int64_table_from_file`]
+    /// runs before one catalog swap. Database validation does not cause a
+    /// fallback. Dual recovery, validation, and resource-limit failures all
+    /// preserve the old table and its cached metrics.
+    pub fn replace_int64_table_from_file_with_backup(
+        &mut self,
+        table_name: &str,
+        primary_path: impl AsRef<Path>,
+        backup_path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: Int64TablePayloadCodec,
+    ) -> std::result::Result<Int64TablePayloadFileRecoverySource, DatabaseSnapshotRestoreError>
+    {
+        let display_name = self.catalog.table(table_name)?.name().to_owned();
+        let recovered = restore_int64_table_payload_from_file_with_backup(
+            primary_path,
+            backup_path,
+            snapshot_codec,
+            payload_codec,
+        )?;
+        let (restored, source) = recovered.into_parts();
+        self.replace_restored_int64_table(table_name, &display_name, restored)?;
+        Ok(source)
     }
 
     /// Atomically reopens a caller-bounded set of named, self-describing,
@@ -1182,6 +1215,21 @@ impl Database {
         let measurements = TableMeasurements::read(&table);
         self.catalog.register_table(table)?;
         self.measurements.add(measurements);
+        Ok(())
+    }
+
+    fn replace_restored_int64_table(
+        &mut self,
+        table_name: &str,
+        display_name: &str,
+        restored: Int64Table,
+    ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
+        let replacement = self.prepare_restored_int64_table(display_name, restored)?;
+        let replacement_measurements = TableMeasurements::read(&replacement);
+
+        let previous = self.catalog.replace_table(table_name, replacement)?;
+        self.measurements
+            .replace(TableMeasurements::read(&previous), replacement_measurements);
         Ok(())
     }
 

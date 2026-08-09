@@ -10,8 +10,8 @@ use rusthouse::batch::value::{DataType, Value};
 use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
     Database, DatabaseMetrics, DatabaseSnapshotRestoreError, Int64Table, Int64TablePayloadCodec,
-    Int64TablePayloadFileRestoreError, Schema, SharedDatabase, SnapshotCodec, SnapshotError,
-    TableLimits,
+    Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError, Schema, SharedDatabase,
+    SnapshotCodec, SnapshotError, TableLimits,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -165,6 +165,193 @@ fn successful_replacement_updates_cached_metrics_by_the_exact_table_delta() {
             retained_row_count: 4,
             retained_value_bytes: 32,
         })
+    );
+}
+
+#[test]
+fn recovery_replacement_prefers_the_primary_and_preserves_the_display_name() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&primary_path, "recovered", false, 3, &[Some(10), Some(20)]);
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (original Int64); INSERT INTO Readings VALUES (1);")
+        .unwrap();
+
+    let source = database
+        .replace_int64_table_from_file_with_backup(
+            "READINGS",
+            primary_path,
+            directory.join("missing-backup.snapshot"),
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+
+    assert_eq!(source, Int64TablePayloadFileRecoverySource::Primary);
+    assert_eq!(
+        database.catalog().table("readings").unwrap().name(),
+        "Readings"
+    );
+    assert_eq!(
+        query_rows(
+            &mut database,
+            "SELECT recovered FROM readings ORDER BY recovered;",
+        ),
+        vec![vec![Value::Int64(10)], vec![Value::Int64(20)]]
+    );
+}
+
+#[test]
+fn recovery_replacement_uses_the_backup_for_missing_and_corrupt_primaries() {
+    let directory = TestDirectory::new();
+    let backup_path = directory.join("backup.snapshot");
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&backup_path, "recovered", false, 2, &[Some(22)]);
+    let corrupt_primary_path = directory.join("corrupt-primary.snapshot");
+    let mut corrupt_primary = fs::read(&backup_path).unwrap();
+    *corrupt_primary.last_mut().unwrap() ^= 1;
+    fs::write(&corrupt_primary_path, corrupt_primary).unwrap();
+
+    for primary_path in [
+        directory.join("missing-primary.snapshot"),
+        corrupt_primary_path,
+    ] {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE Readings (original Int64); INSERT INTO Readings VALUES (1);")
+            .unwrap();
+
+        let source = database
+            .replace_int64_table_from_file_with_backup(
+                "readings",
+                primary_path,
+                &backup_path,
+                snapshot_codec,
+                payload_codec,
+            )
+            .unwrap();
+
+        assert_eq!(source, Int64TablePayloadFileRecoverySource::Backup);
+        assert_eq!(
+            database.catalog().table("readings").unwrap().name(),
+            "Readings"
+        );
+        assert_eq!(
+            query_rows(&mut database, "SELECT recovered FROM readings;"),
+            vec![vec![Value::Int64(22)]]
+        );
+    }
+}
+
+#[test]
+fn dual_recovery_failure_preserves_the_table_and_cached_metrics() {
+    let directory = TestDirectory::new();
+    let corrupt_backup_path = directory.join("corrupt-backup.snapshot");
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&corrupt_backup_path, "replacement", false, 2, &[Some(8)]);
+    let mut corrupt_backup = fs::read(&corrupt_backup_path).unwrap();
+    *corrupt_backup.last_mut().unwrap() ^= 1;
+    fs::write(&corrupt_backup_path, corrupt_backup).unwrap();
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Readings (original Int64); \
+             INSERT INTO Readings VALUES (1), (2);",
+        )
+        .unwrap();
+    let metrics_before = query_rows(&mut database, "SELECT metric, value FROM system.metrics;");
+
+    let error = database
+        .replace_int64_table_from_file_with_backup(
+            "readings",
+            directory.join("missing-primary.snapshot"),
+            corrupt_backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap_err();
+
+    let DatabaseSnapshotRestoreError::Recovery(recovery) = error else {
+        panic!("expected dual recovery error, got {error:?}");
+    };
+    assert!(matches!(
+        recovery.primary_error(),
+        Int64TablePayloadFileRestoreError::Open(source)
+            if source.kind() == ErrorKind::NotFound
+    ));
+    assert!(matches!(
+        recovery.backup_error(),
+        Int64TablePayloadFileRestoreError::Envelope(SnapshotError::ChecksumMismatch { .. })
+    ));
+    assert_original_table(&mut database);
+    assert_eq!(
+        query_rows(&mut database, "SELECT metric, value FROM system.metrics;"),
+        metrics_before
+    );
+}
+
+#[test]
+fn recovery_validation_and_limit_failures_preserve_the_table_and_cached_metrics() {
+    let directory = TestDirectory::new();
+    let nullable_primary_path = directory.join("nullable-primary.snapshot");
+    let (nullable_snapshot_codec, nullable_payload_codec) = write_snapshot(
+        &nullable_primary_path,
+        "nullable_value",
+        true,
+        3,
+        &[Some(9)],
+    );
+    let limited_backup_path = directory.join("limited-backup.snapshot");
+    let (limited_snapshot_codec, limited_payload_codec) =
+        write_snapshot(&limited_backup_path, "replacement", false, 4, &[Some(10)]);
+    let mut database = Database::with_table_limits(TableLimits::new(3, 1, 3));
+    database
+        .execute(
+            "CREATE TABLE Readings (original Int64); \
+             INSERT INTO Readings VALUES (1), (2);",
+        )
+        .unwrap();
+    let metrics_before = query_rows(&mut database, "SELECT metric, value FROM system.metrics;");
+
+    assert!(matches!(
+        database.replace_int64_table_from_file_with_backup(
+            "readings",
+            nullable_primary_path,
+            directory.join("missing-validation-backup.snapshot"),
+            nullable_snapshot_codec,
+            nullable_payload_codec,
+        ),
+        Err(DatabaseSnapshotRestoreError::NullableColumn { ref column })
+            if column == "nullable_value"
+    ));
+    assert_original_table(&mut database);
+    assert_eq!(
+        query_rows(&mut database, "SELECT metric, value FROM system.metrics;"),
+        metrics_before
+    );
+
+    assert!(matches!(
+        database.replace_int64_table_from_file_with_backup(
+            "READINGS",
+            directory.join("missing-limit-primary.snapshot"),
+            limited_backup_path,
+            limited_snapshot_codec,
+            limited_payload_codec,
+        ),
+        Err(DatabaseSnapshotRestoreError::Table(
+            Error::ResourceLimitExceeded {
+                resource: "table row cap",
+                actual: 4,
+                max: 3,
+            }
+        ))
+    ));
+    assert_original_table(&mut database);
+    assert_eq!(
+        query_rows(&mut database, "SELECT metric, value FROM system.metrics;"),
+        metrics_before
     );
 }
 
