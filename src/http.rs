@@ -57,7 +57,7 @@ pub struct HttpQueryLimits {
     pub csv_ingest_limits: CsvIngestLimits,
     /// Byte, row, and value limits for one `POST /insert/<table>`
     /// `TabSeparated` or `TabSeparatedWithNames` body, including parameterized
-    /// `TabSeparated` insertion.
+    /// insertion in either format.
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub tsv_ingest_limits: TsvIngestLimits,
@@ -790,8 +790,9 @@ fn serve_http_connections(
 /// insertion-capable authenticated `POST` additionally accepts a headerless CSV
 /// body when the decoded SQL is exactly `INSERT INTO <table> FORMAT CSV`, a
 /// `CSVWithNames` body when it ends in `FORMAT CSVWithNames`, or a headerless
-/// TSV body when it ends in `FORMAT TabSeparated`; it routes the body through
-/// the same bounded, atomic, nonblocking importer as `POST /insert/<table>`.
+/// TSV body when it ends in `FORMAT TabSeparated`, or a named TSV body when it
+/// ends in `FORMAT TabSeparatedWithNames`; it routes the body through the same
+/// bounded, atomic, nonblocking importer as `POST /insert/<table>`.
 /// All other parameterized queries require an absent or zero `Content-Length`.
 /// Empty, duplicate, unknown, and unsupported parameters, plus malformed or
 /// overflowing workload-limit values, are rejected after authentication and
@@ -1751,6 +1752,8 @@ fn parse_parameterized_table_insert(sql: &str) -> Option<(String, TableInsertFor
         TableInsertFormat::CsvWithNames
     } else if input_format.eq_ignore_ascii_case("TabSeparated") {
         TableInsertFormat::TabSeparated
+    } else if input_format.eq_ignore_ascii_case("TabSeparatedWithNames") {
+        TableInsertFormat::TabSeparatedWithNames
     } else {
         return None;
     };
@@ -2191,7 +2194,7 @@ impl TableInsertFormat {
             Self::CsvWithNames => "CSVWithNames INSERT does not accept an output format selector",
             Self::TabSeparated => "TabSeparated INSERT does not accept an output format selector",
             Self::TabSeparatedWithNames => {
-                "parameterized INSERT does not accept an output format selector"
+                "TabSeparatedWithNames INSERT does not accept an output format selector"
             }
         }
     }

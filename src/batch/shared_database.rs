@@ -117,11 +117,11 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// Each SQL batch is completely parsed before the database lock is acquired.
 /// [`Self::execute`] retains one write lock while every statement executes, so
 /// statements from concurrent mutating batches cannot interleave. [`Self::query`]
-/// executes one `SELECT` (including the exact `system.tables`,
-/// `system.columns`, `system.metrics`, `system.settings`, and `system.functions`
-/// metadata queries), `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW FUNCTIONS`,
-/// `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` under
-/// a shared read lock.
+/// executes one `SELECT` (including the exact `system.databases`,
+/// `system.tables`, `system.columns`, `system.metrics`, `system.settings`, and
+/// `system.functions` metadata queries), `SHOW DATABASES`, `SHOW SETTINGS`,
+/// `SHOW FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or
+/// `EXISTS TABLE` under a shared read lock.
 /// [`Self::try_query`] accepts the same input but returns
 /// [`SharedDatabaseError::DatabaseBusy`] instead of waiting for a writer.
 /// [`Self::try_execute_insert_batch`] similarly attempts
@@ -667,6 +667,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         statement @ (Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
         | Statement::CurrentDatabaseSelect(_)
+        | Statement::SystemDatabases
         | Statement::SystemTables
         | Statement::SystemColumns
         | Statement::SystemMetrics

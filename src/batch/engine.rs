@@ -1135,6 +1135,7 @@ impl Database {
             statement @ (Statement::LiteralSelect(_)
             | Statement::VersionSelect(_)
             | Statement::CurrentDatabaseSelect(_)
+            | Statement::SystemDatabases
             | Statement::SystemTables
             | Statement::SystemColumns
             | Statement::SystemMetrics
@@ -1171,6 +1172,7 @@ impl Database {
             Statement::CurrentDatabaseSelect(select) => {
                 self.execute_current_database_select(select, query_result_limits)
             }
+            Statement::SystemDatabases => self.execute_system_databases(query_result_limits),
             Statement::SystemTables => self.execute_system_tables(query_result_limits),
             Statement::SystemColumns => self.execute_system_columns(query_result_limits),
             Statement::SystemMetrics => self.execute_system_metrics(query_result_limits),
@@ -1463,6 +1465,21 @@ impl Database {
         &self,
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
+        self.execute_databases(query_result_limits, SHOW_DATABASES_RESULT_RESOURCES)
+    }
+
+    fn execute_system_databases(
+        &self,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        self.execute_databases(query_result_limits, SELECT_RESULT_RESOURCES)
+    }
+
+    fn execute_databases(
+        &self,
+        query_result_limits: QueryResultLimits,
+        result_resources: QueryResultResources,
+    ) -> Result<QueryResult> {
         const DATABASE_NAME: &str = "default";
         const RESULT_COLUMN_NAME: &str = "name";
 
@@ -1472,10 +1489,10 @@ impl Database {
             1,
             RESULT_COLUMN_NAME.len(),
             query_result_limits,
-            SHOW_DATABASES_RESULT_RESOURCES,
+            result_resources,
         )?;
         enforce_resource_limit(
-            SHOW_DATABASES_RESULT_RESOURCES.bytes,
+            result_resources.bytes,
             fixed_bytes.saturating_add(DATABASE_NAME.len()),
             query_result_limits.max_bytes,
         )?;
@@ -2323,6 +2340,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
         | Statement::CurrentDatabaseSelect(_)
+        | Statement::SystemDatabases
         | Statement::SystemTables
         | Statement::SystemColumns
         | Statement::SystemMetrics

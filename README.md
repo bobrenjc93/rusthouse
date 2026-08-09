@@ -232,6 +232,12 @@ The exact case-insensitive `SHOW DATABASES` returns one `String` column named
 `name` containing RustHouse's single logical database, `default`. Arguments and
 trailing clauses are rejected, and the result uses the normal query row, value,
 byte, retained-result, and formatted-output limits.
+The exact case-insensitive query `SELECT name FROM system.databases` returns
+the identical column and row by reusing `SHOW DATABASES` result construction.
+Other projections, aliases, functions, predicates, ordering, limits, and
+trailing clauses are deliberately unsupported. The query is available through
+`Database`, `SharedDatabase`, the CLI, and authenticated or unauthenticated
+read-only HTTP handlers in every supported output format.
 The exact case-insensitive `SHOW SETTINGS` returns `name` and `value` `String`
 columns for every configured `QueryResultLimits` and `TableLimits` field. Rows
 use stable `query_result_limits.<field>` and `table_limits.<field>` names in
@@ -636,9 +642,9 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes plus the exact `system.tables`, `system.columns`,
-`system.metrics`, `system.settings`, and `system.functions` metadata queries),
-`SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
+and `currentDatabase()` probes plus the exact `system.databases`,
+`system.tables`, `system.columns`, `system.metrics`, `system.settings`, and
+`system.functions` metadata queries), `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,
 so cloned handles can run analytical reads concurrently. `try_query` and
@@ -678,8 +684,9 @@ ClickHouse-style parameterized forms,
 write-capable authenticated `POST` also accepts the canonical ClickHouse
 query-plus-data forms `/?query=INSERT+INTO+<table>+FORMAT+CSV` with a headerless
 CSV body, `/?query=INSERT+INTO+<table>+FORMAT+CSVWithNames` with a named CSV
-body, or `/?query=INSERT+INTO+<table>+FORMAT+TabSeparated` with a headerless TSV
-body. Headerless inputs use physical schema order. Each requires one decimal
+body, `/?query=INSERT+INTO+<table>+FORMAT+TabSeparated` with a headerless TSV
+body, or `/?query=INSERT+INTO+<table>+FORMAT+TabSeparatedWithNames` with a named
+TSV body. Headerless inputs use physical schema order. Each requires one decimal
 `Content-Length`. The SQL shape and supported format names are
 case-insensitive, permit one optional trailing semicolon, and otherwise must be
 exact: an explicit column list, another format, or any extra SQL is not
@@ -793,11 +800,13 @@ return `400 Bad Request` and append no rows. Empty headerless CSV and TSV are
 successful zero-row inserts. Success returns the same empty `200 OK` response as
 the SQL insert route. The unauthenticated handlers do not recognize it.
 The parameterized `INSERT INTO <table> FORMAT CSV`, `INSERT INTO <table> FORMAT
-CSVWithNames`, and `INSERT INTO <table> FORMAT TabSeparated` forms call the same
-headerless CSV, named CSV, and headerless TSV importers, respectively, with the
-same success response, authentication, admission, format-specific resource
-limits, and all-or-nothing behavior. An empty named CSV body fails as a missing
-header; empty headerless CSV and TSV bodies are successful zero-row inserts.
+CSVWithNames`, `INSERT INTO <table> FORMAT TabSeparated`, and `INSERT INTO
+<table> FORMAT TabSeparatedWithNames` forms call the same headerless CSV, named
+CSV, headerless TSV, and named TSV importers, respectively, with the same
+success response, authentication, admission, format-specific resource limits,
+and all-or-nothing behavior. Empty named CSV and named TSV bodies fail as a
+missing header; empty headerless CSV and TSV bodies are successful zero-row
+inserts.
 
 HTTP read admission never waits for the database lock. After request parsing,
 authentication, optional database-header and query-parameter validation, SQL
@@ -812,12 +821,12 @@ HTTP response limit retain their documented ordering and behavior.
 HTTP insert admission likewise never waits. After authentication and optional
 database-header validation, the bounded body or URL query is read and decoded.
 Standard authenticated POST insertion is disabled when an output format was
-selected. A parameterized headerless CSV, named CSV, or headerless TSV insert
-validates the exact SQL shape and both the HTTP and corresponding format byte
-caps before reading its body. The standard and explicit SQL routes complete SQL
-parsing before their immediate write-lock attempt; the headerless and named CSV
-and TSV routes pass their bounded bytes to the selected ingestion API, which
-attempts the lock before table lookup or parsing. Any active reader or writer
+selected. A parameterized headerless or named CSV or TSV insert validates the
+exact SQL shape and both the HTTP and corresponding format byte caps before
+reading its body. The standard and explicit SQL routes complete SQL parsing
+before their immediate write-lock attempt; the headerless and named CSV and TSV
+routes pass their bounded bytes to the selected ingestion API, which attempts
+the lock before table lookup or parsing. Any active reader or writer
 returns the same deterministic `503 Service Unavailable`; a poisoned lock
 returns `500 Internal Server Error`. Validation and commit occur under the
 acquired write lock so concurrent work cannot expose or cause a partial batch.
