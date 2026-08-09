@@ -800,9 +800,9 @@ impl SharedDatabase {
     ///
     /// Parsing and read-only validation finish before the single nonblocking
     /// read-lock attempt. Nonzero supplied limits can tighten, but cannot
-    /// relax, the database's configured result-byte, result-row, scan-row, and
-    /// group-count limits or the default retained-result byte limit. Zero
-    /// retains the corresponding defaults.
+    /// relax, the database's configured result-byte, result-row, scan-row,
+    /// group-count, and supported global-aggregate worker limits or the default
+    /// retained-result byte limit. Zero retains the corresponding defaults.
     pub(crate) fn try_query_with_parameterized_workload_limits(
         &self,
         input: &str,
@@ -810,6 +810,7 @@ impl SharedDatabase {
         max_result_rows: usize,
         max_scan_rows: usize,
         max_groups: usize,
+        max_threads: usize,
     ) -> Result<QueryResult, SharedDatabaseError> {
         let statement = parse_query_statement(input)?;
         let max_result_bytes = if max_result_bytes == 0 {
@@ -824,6 +825,7 @@ impl SharedDatabase {
                 max_result_rows,
                 max_scan_rows,
                 max_groups,
+                max_threads,
             )
             .map_err(Into::into)
     }

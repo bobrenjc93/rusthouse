@@ -272,6 +272,18 @@ impl GlobalAggregateParallelism {
             .min(matched_rows)
     }
 
+    fn with_request_worker_cap(self, max_threads: usize) -> Self {
+        if max_threads == 0 {
+            return self;
+        }
+
+        Self {
+            worker_cap: NonZeroUsize::new(self.worker_cap.get().min(max_threads))
+                .expect("a nonzero request cap and database cap have a nonzero minimum"),
+            ..self
+        }
+    }
+
     fn try_admit(self, matched_rows: usize) -> Option<GlobalAggregateWorkerAdmission> {
         let helper_threads = self.worker_count(matched_rows).saturating_sub(1);
         if helper_threads == 0 {
@@ -1551,16 +1563,18 @@ impl Database {
             self.query_result_limits.max_rows,
             0,
             0,
+            0,
         )
     }
 
     /// Executes one already-parsed read-only query with caller-supplied limits.
     ///
     /// Caller limits may only tighten the database's configured result-byte,
-    /// result-row, scan-row, and group-count limits. Zero leaves the
-    /// corresponding configured limit in place. Result-shape validation applies
-    /// both effective result limits before result rows are materialized; the
-    /// effective scan and group limits are charged independently of `LIMIT`.
+    /// result-row, scan-row, group-count, and supported global-aggregate worker
+    /// limits. Zero leaves the corresponding configured limit in place.
+    /// Result-shape validation applies both effective result limits before
+    /// result rows are materialized; the effective scan and group limits are
+    /// charged independently of `LIMIT`.
     pub(crate) fn execute_query_statement_with_parameterized_limits(
         &self,
         statement: Statement,
@@ -1568,6 +1582,7 @@ impl Database {
         max_result_rows: usize,
         max_scan_rows: usize,
         max_groups: usize,
+        max_threads: usize,
     ) -> Result<QueryResult> {
         let tightened_result_limit = max_result_bytes < self.query_result_limits.max_bytes;
         let max_rows = if max_result_rows == 0 {
@@ -1592,8 +1607,15 @@ impl Database {
             max_bytes: self.query_result_limits.max_bytes.min(max_result_bytes),
             ..self.query_result_limits
         };
+        let global_aggregate_parallelism = self
+            .global_aggregate_parallelism
+            .with_request_worker_cap(max_threads);
         let result = self
-            .execute_query_statement_with_limits(statement, query_limits)
+            .execute_query_statement_with_limits(
+                statement,
+                query_limits,
+                global_aggregate_parallelism,
+            )
             .map_err(|error| match error {
                 Error::ResourceLimitExceeded {
                     resource:
@@ -1828,7 +1850,11 @@ impl Database {
             | Statement::ShowCreateTable { .. }
             | Statement::DescribeTable { .. }
             | Statement::ExistsTable { .. }) => self
-                .execute_query_statement_with_limits(statement, query_result_limits)
+                .execute_query_statement_with_limits(
+                    statement,
+                    query_result_limits,
+                    self.global_aggregate_parallelism,
+                )
                 .map(StatementResult::Query),
         }
     }
@@ -1837,6 +1863,7 @@ impl Database {
         &self,
         statement: Statement,
         query_result_limits: QueryResultLimits,
+        global_aggregate_parallelism: GlobalAggregateParallelism,
     ) -> Result<QueryResult> {
         match statement {
             Statement::LiteralSelect(select) => {
@@ -1854,15 +1881,29 @@ impl Database {
             Statement::SystemMetrics => self.execute_system_metrics(query_result_limits),
             Statement::SystemSettings => self.execute_system_settings(query_result_limits),
             Statement::SystemFunctions => self.execute_system_functions(query_result_limits),
-            Statement::Select(select) => self.execute_select(select, query_result_limits),
+            Statement::Select(select) => self.execute_select(
+                select,
+                query_result_limits,
+                global_aggregate_parallelism,
+            ),
             Statement::CrossJoin(cross_join) => {
                 self.execute_cross_join(cross_join, query_result_limits)
             }
             Statement::UnionAll { left, right } => {
-                self.execute_union_all(left, right, query_result_limits)
+                self.execute_union_all(
+                    left,
+                    right,
+                    query_result_limits,
+                    global_aggregate_parallelism,
+                )
             }
             Statement::UnionDistinct { left, right } => {
-                self.execute_union_distinct(left, right, query_result_limits)
+                self.execute_union_distinct(
+                    left,
+                    right,
+                    query_result_limits,
+                    global_aggregate_parallelism,
+                )
             }
             Statement::ShowDatabases => self.execute_show_databases(query_result_limits),
             Statement::ShowSettings => self.execute_show_settings(query_result_limits),
@@ -2717,14 +2758,21 @@ impl Database {
         &self,
         select: Select,
         query_result_limits: QueryResultLimits,
+        global_aggregate_parallelism: GlobalAggregateParallelism,
     ) -> Result<QueryResult> {
-        self.execute_select_with_prefix(select, query_result_limits, None)
+        self.execute_select_with_prefix(
+            select,
+            query_result_limits,
+            global_aggregate_parallelism,
+            None,
+        )
     }
 
     fn execute_select_with_prefix(
         &self,
         select: Select,
         query_result_limits: QueryResultLimits,
+        global_aggregate_parallelism: GlobalAggregateParallelism,
         result_prefix: Option<SelectResultPrefix<'_>>,
     ) -> Result<QueryResult> {
         validate_distinct_shape(&select)?;
@@ -2815,7 +2863,7 @@ impl Database {
                 &group_columns,
                 &aggregate_specs,
                 query_result_limits,
-                self.global_aggregate_parallelism,
+                global_aggregate_parallelism,
             )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             if let Some(having) = having {
@@ -2886,8 +2934,15 @@ impl Database {
         left: Select,
         right: Select,
         query_result_limits: QueryResultLimits,
+        global_aggregate_parallelism: GlobalAggregateParallelism,
     ) -> Result<QueryResult> {
-        self.execute_union_operands(left, right, query_result_limits, "UNION ALL")
+        self.execute_union_operands(
+            left,
+            right,
+            query_result_limits,
+            global_aggregate_parallelism,
+            "UNION ALL",
+        )
     }
 
     fn execute_union_distinct(
@@ -2895,9 +2950,15 @@ impl Database {
         left: Select,
         right: Select,
         query_result_limits: QueryResultLimits,
+        global_aggregate_parallelism: GlobalAggregateParallelism,
     ) -> Result<QueryResult> {
-        let mut result =
-            self.execute_union_operands(left, right, query_result_limits, "UNION DISTINCT")?;
+        let mut result = self.execute_union_operands(
+            left,
+            right,
+            query_result_limits,
+            global_aggregate_parallelism,
+            "UNION DISTINCT",
+        )?;
         deduplicate_union_rows(&mut result.rows, result.columns.len(), query_result_limits)?;
         Ok(result)
     }
@@ -2907,12 +2968,15 @@ impl Database {
         left: Select,
         right: Select,
         query_result_limits: QueryResultLimits,
+        global_aggregate_parallelism: GlobalAggregateParallelism,
         operation: &'static str,
     ) -> Result<QueryResult> {
-        let mut left_result = self.execute_select(left, query_result_limits)?;
+        let mut left_result =
+            self.execute_select(left, query_result_limits, global_aggregate_parallelism)?;
         let mut right_result = self.execute_select_with_prefix(
             right,
             query_result_limits,
+            global_aggregate_parallelism,
             Some(SelectResultPrefix::from_result(&left_result, operation)),
         )?;
 
@@ -6928,6 +6992,21 @@ mod tests {
         }
     }
 
+    fn query_with_max_threads(database: &Database, sql: &str, max_threads: usize) -> QueryResult {
+        let mut statements = sql::parse(sql).expect("query parses");
+        assert_eq!(statements.len(), 1, "one query statement");
+        database
+            .execute_query_statement_with_parameterized_limits(
+                statements.pop().expect("one query statement"),
+                DEFAULT_MAX_RETAINED_RESULT_BYTES,
+                0,
+                0,
+                0,
+                max_threads,
+            )
+            .expect("parameterized query succeeds")
+    }
+
     fn count_if_database(row_count: usize) -> Database {
         count_if_database_with_worker_cap(
             row_count,
@@ -7986,6 +8065,98 @@ mod tests {
     }
 
     #[test]
+    fn request_cap_one_and_two_match_for_every_supported_global_aggregate() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(8);
+        static LIMITED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(1);
+
+        let database_cap = NonZeroUsize::new(4).unwrap();
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = count_if_database_with_worker_cap(row_count, database_cap);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database_cap, &BUDGET);
+
+        for sql in [
+            "SELECT SUM(id) FROM events",
+            "SELECT AVG(id) FROM events",
+            "SELECT MIN(id) FROM events",
+            "SELECT MAX(id) FROM events",
+            "SELECT countIf(active) FROM events",
+        ] {
+            BUDGET.reset_peak();
+            let single_worker = query_with_max_threads(&database, sql, 1);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                0,
+                "max_threads=1 must keep {sql} sequential"
+            );
+
+            BUDGET.reset_peak();
+            let multi_worker = query_with_max_threads(&database, sql, 2);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                1,
+                "max_threads=2 must admit one helper for {sql}"
+            );
+            assert_eq!(
+                single_worker, multi_worker,
+                "request worker differential for {sql}"
+            );
+            assert_eq!(database.global_aggregate_worker_cap(), database_cap);
+        }
+
+        for max_threads in [0, usize::MAX] {
+            BUDGET.reset_peak();
+            let result = query_with_max_threads(
+                &database,
+                "SELECT countIf(active) FROM events",
+                max_threads,
+            );
+            assert_eq!(result.rows, [vec![Value::Int64((row_count / 2) as i64)]]);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                2,
+                "max_threads={max_threads} must retain the four-lane database cap"
+            );
+            assert_eq!(database.global_aggregate_worker_cap(), database_cap);
+        }
+
+        LIMITED_BUDGET.reset_peak();
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database_cap, &LIMITED_BUDGET);
+        let budget_limited =
+            query_with_max_threads(&database, "SELECT countIf(active) FROM events", 4);
+        assert_eq!(
+            budget_limited.rows,
+            [vec![Value::Int64((row_count / 2) as i64)]]
+        );
+        assert_eq!(
+            LIMITED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            1,
+            "the request cap remains subject to process-wide admission"
+        );
+
+        let cap_one = NonZeroUsize::new(1).unwrap();
+        assert_eq!(
+            database.set_global_aggregate_worker_cap(cap_one),
+            database_cap
+        );
+        LIMITED_BUDGET.reset_peak();
+        let database_limited =
+            query_with_max_threads(&database, "SELECT countIf(active) FROM events", 2);
+        assert_eq!(database_limited, budget_limited);
+        assert_eq!(
+            LIMITED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "a larger request value must not relax the database cap"
+        );
+        assert_eq!(database.global_aggregate_worker_cap(), cap_one);
+    }
+
+    #[test]
     fn oversized_configured_cap_preserves_the_hard_ceiling_and_results() {
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(31);
 
@@ -8050,19 +8221,20 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_cap_two_queries_match_sequential_and_obey_the_process_budget() {
+    fn concurrent_request_cap_two_queries_match_sequential_and_obey_the_process_budget() {
         use crate::batch::shared_database::SharedDatabase;
         use std::sync::{Arc, Barrier};
 
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
         let row_count =
             COUNT_IF_PARALLEL_ROW_THRESHOLD.saturating_add(COUNT_IF_PARALLEL_ROWS_PER_WORKER);
-        let cap = NonZeroUsize::new(2).unwrap();
-        let mut database = count_if_database_with_worker_cap(row_count, cap);
+        let database_cap = NonZeroUsize::new(4).unwrap();
+        let mut database = count_if_database_with_worker_cap(row_count, database_cap);
         database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
         let sequential = query(&mut database, "SELECT countIf(active) FROM events");
         BUDGET.reset_peak();
-        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database_cap, &BUDGET);
         let database = SharedDatabase::new(database);
         let query_count = 8;
         let started = Arc::new(Barrier::new(query_count));
@@ -8073,7 +8245,14 @@ mod tests {
                 std::thread::spawn(move || {
                     started.wait();
                     database
-                        .query("SELECT countIf(active) FROM events")
+                        .try_query_with_parameterized_workload_limits(
+                            "SELECT countIf(active) FROM events",
+                            DEFAULT_MAX_RETAINED_RESULT_BYTES,
+                            0,
+                            0,
+                            0,
+                            2,
+                        )
                         .expect("concurrent countIf query")
                 })
             })
@@ -8086,6 +8265,10 @@ mod tests {
         let peak_helpers = BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire);
         assert!((2..=BUDGET.helper_limit).contains(&peak_helpers));
         assert_eq!(BUDGET.helpers_in_use.load(AtomicOrdering::Acquire), 0);
+        assert_eq!(
+            database.global_aggregate_worker_cap().unwrap(),
+            database_cap
+        );
     }
 
     #[test]

@@ -77,7 +77,9 @@ and returns its previous nonzero value; the new value immediately appears in
 aggregates. `SharedDatabase::try_set_global_aggregate_worker_cap` provides the
 same update with one nonblocking write-lock attempt, returning `DatabaseBusy`
 for contention and `LockPoisoned` for a poisoned lock. Concurrent queries still
-share the process-wide budget. Checked count
+share the process-wide budget. Parameterized HTTP queries may additionally set
+`max_threads` for one request without changing either settings result; zero
+retains the database cap, while a nonzero value can only tighten it. Checked count
 partials and checked i128 SUM/AVG sum-and-count partials are reduced in chunk
 order; optional Int64 extrema are reduced directly without allocating a
 partial-results collection. A sequential fallback preserves the same result
@@ -712,8 +714,9 @@ accepted as query-plus-data. Both parameterized request forms also accept one
 optional `database=default` parameter, one optional decimal `max_result_rows`
 parameter, one optional decimal `max_result_bytes` parameter, one optional
 decimal `max_rows_to_read` parameter, one optional decimal
-`max_rows_to_group_by` parameter, and one optional `default_format` parameter
-in any order with `query`, including percent-encoded parameter names and values.
+`max_rows_to_group_by` parameter, one optional decimal `max_threads` parameter,
+and one optional `default_format` parameter in any order with `query`, including
+percent-encoded parameter names and values.
 All names and values use form-style decoding: each `%HH` escape becomes one
 byte and `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
@@ -740,11 +743,19 @@ tightens the database's configured group-count limit for that request, while
 zero retains the configured limit. A larger value never relaxes the configured
 limit. `GROUP BY` and `DISTINCT` charge every distinct working group before
 `HAVING` and `LIMIT`, so those result clauses cannot hide excess groups.
+`max_threads` has the same decimal syntax. Zero retains the database's
+`global_aggregate_worker_cap`; a nonzero value is combined with that cap using
+the smaller value. It applies only to supported parallel global aggregates in
+that request and never changes `SHOW SETTINGS` or `system.settings`. The
+available-hardware and fixed 16-lane ceilings still apply, and simultaneous
+requests continue to share the process-wide nonblocking helper admission
+budget.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
 same SQL byte limit as a POST body; the database, workload-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
 duplicate `query`, `database`, `max_result_rows`, `max_result_bytes`,
-`max_rows_to_read`, `max_rows_to_group_by`, or `default_format` parameters,
+`max_rows_to_read`, `max_rows_to_group_by`, `max_threads`, or `default_format`
+parameters,
 malformed or overflowing workload limits, unknown parameters, malformed
 escapes, non-default database values, unsupported formats, and invalid SQL
 UTF-8 are rejected.

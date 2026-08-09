@@ -1,4 +1,5 @@
 use std::io::{self, Cursor, Read, Write};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -1362,12 +1363,12 @@ fn parameterized_get_and_post_combine_workload_limits_database_and_format_parame
 
     let exact_requests: &[(&[u8], &str, &[u8])] = &[
         (
-            b"GET /?database=default&max_result_bytes=%31%30%32%34&max_result_rows=%32&max_rows_to_read=%33&max_rows_to_group_by=%33&default_format=CSVWithNames&query=SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET /?database=default&max_result_bytes=%31%30%32%34&max_result_rows=%32&max_rows_to_read=%33&max_rows_to_group_by=%33&max_threads=%31&default_format=CSVWithNames&query=SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "text/csv; charset=utf-8",
             b"value\n1\n2\n",
         ),
         (
-            b"POST /?query=SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&max_rows_to_read=3&max_rows_to_group_by=3&max_result_bytes=1024&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            b"POST /?query=SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&max_rows_to_read=3&max_rows_to_group_by=3&max_threads=2&max_result_bytes=1024&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
             "text/tab-separated-values; charset=utf-8",
             b"value\n1\n2\n",
         ),
@@ -1405,6 +1406,186 @@ fn parameterized_get_and_post_combine_workload_limits_database_and_format_parame
         "HTTP/1.1 400 Bad Request",
         r#"{"error":"SELECT result rows requires at least 3, exceeding the limit of 2"}"#,
     );
+}
+
+#[test]
+fn parameterized_max_threads_accepts_get_post_zero_and_numeric_boundary_without_mutating_settings()
+{
+    let database = SharedDatabase::with_global_aggregate_worker_cap(NonZeroUsize::new(4).unwrap());
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+    let expected = r#"{"columns":[{"name":"SUM(value)","type":"Int64"}],"rows":[[6]]}"#;
+
+    for request in [
+        b"GET /?query=SELECT+SUM%28value%29+FROM+samples%3B&max_threads=1 HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+        b"POST /?max_threads=2&query=SELECT+SUM%28value%29+FROM+samples%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n".as_slice(),
+        b"GET /?max_threads=0&query=SELECT+SUM%28value%29+FROM+samples%3B HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+    ] {
+        assert_response(
+            &exchange(&database, request),
+            "HTTP/1.1 200 OK",
+            expected,
+        );
+    }
+
+    let largest = format!(
+        "POST /?query=SELECT+SUM%28value%29+FROM+samples%3B&max_threads={} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        usize::MAX,
+    );
+    assert_response(
+        &exchange(&database, largest.as_bytes()),
+        "HTTP/1.1 200 OK",
+        expected,
+    );
+
+    let settings_before = exchange(&database, &request(b"SHOW SETTINGS"));
+    let settings_with_request_cap = exchange(
+        &database,
+        b"GET /?max_threads=1&query=SHOW+SETTINGS HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(settings_with_request_cap, settings_before);
+    assert_eq!(
+        database.global_aggregate_worker_cap().unwrap().get(),
+        4,
+        "the request cap must not mutate the configured setting"
+    );
+}
+
+#[test]
+fn parameterized_max_threads_rejects_empty_duplicate_malformed_and_overflowing_values() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_threads= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_threads=1&query=SELECT+1%3B&max%5Fthreads=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_threads parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_threads=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_threads parameter must be a decimal integer"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_threads={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_threads parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn max_threads_composes_with_authentication_and_precedes_lock_admission() {
+    let healthy_database = SharedDatabase::default();
+    let valid_with_credentials = b"GET /?database=default&max_threads=1&max_result_rows=1&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&healthy_database, "correct-token", valid_with_credentials),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"1","type":"Int64"}],"rows":[[1]]}"#,
+    );
+
+    let poisoned_inner = Arc::new(RwLock::new(Database::new()));
+    let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = poisoned_inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let invalid_without_credentials =
+        b"GET /?query=SELECT+1%3B&max_threads=nope HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(
+            &poisoned_database,
+            "correct-token",
+            invalid_without_credentials,
+        ),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let invalid_with_credentials = b"GET /?query=SELECT+1%3B&max_threads=nope&max_result_rows=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(
+            &poisoned_database,
+            "correct-token",
+            invalid_with_credentials,
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"max_threads parameter must be a decimal integer"}"#,
+    );
+}
+
+#[test]
+fn concurrent_parameterized_max_threads_requests_are_isolated_and_preserve_settings() {
+    use std::sync::Barrier;
+
+    let database = SharedDatabase::with_global_aggregate_worker_cap(NonZeroUsize::new(4).unwrap());
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+    let expected = exchange(
+        &database,
+        b"GET /?query=SELECT+SUM%28value%29+FROM+samples%3B&max_threads=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    let settings_before = exchange(&database, &request(b"SHOW SETTINGS"));
+    let request_count = 8;
+    let started = Arc::new(Barrier::new(request_count));
+    let handles = (0..request_count)
+        .map(|request_index| {
+            let database = database.clone();
+            let started = Arc::clone(&started);
+            thread::spawn(move || {
+                let max_threads = match request_index % 4 {
+                    0 => "1".to_owned(),
+                    1 => "2".to_owned(),
+                    2 => "0".to_owned(),
+                    _ => usize::MAX.to_string(),
+                };
+                let request = format!(
+                    "GET /?max_threads={max_threads}&max_result_rows=1&query=SELECT+SUM%28value%29+FROM+samples%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                );
+                started.wait();
+                exchange(&database, request.as_bytes())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        assert_eq!(handle.join().expect("request worker joins"), expected);
+    }
+    assert_eq!(
+        exchange(&database, &request(b"SHOW SETTINGS")),
+        settings_before
+    );
+    assert_eq!(database.global_aggregate_worker_cap().unwrap().get(), 4);
 }
 
 #[test]
