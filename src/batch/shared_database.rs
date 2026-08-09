@@ -118,7 +118,7 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// [`Self::execute`] retains one write lock while every statement executes, so
 /// statements from concurrent mutating batches cannot interleave. [`Self::query`]
 /// executes one `SELECT` (including the exact `system.tables`,
-/// `system.columns`, and `system.metrics` metadata queries),
+/// `system.columns`, `system.metrics`, and `system.settings` metadata queries),
 /// `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW FUNCTIONS`, `SHOW TABLES`, `SHOW
 /// CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` under a shared read lock.
 /// [`Self::try_query`] accepts the same input but returns

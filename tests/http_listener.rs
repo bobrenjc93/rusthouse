@@ -137,7 +137,7 @@ fn authenticated_listener_isolates_rejected_keys_and_preserves_read_only_state()
     let address = listener.local_addr().expect("read loopback address");
     let served_database = database.clone();
     let worker = thread::spawn(move || {
-        serve_http_read_only_with_clickhouse_key(&listener, &served_database, "correct-key", 4)
+        serve_http_read_only_with_clickhouse_key(&listener, &served_database, "correct-key", 5)
     });
 
     let missing = exchange(
@@ -178,6 +178,17 @@ fn authenticated_listener_isolates_rejected_keys_and_preserves_read_only_state()
             .any(|window| window == b"Cache-Control: private, no-store\r\n")
     );
 
+    let settings = exchange(
+        address,
+        &post_query_with_clickhouse_key("SELECT name, value FROM system.settings;", "correct-key"),
+    );
+    assert!(settings.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(
+        body(&settings)
+            .windows(b"query_result_limits.max_rows".len())
+            .any(|window| window == b"query_result_limits.max_rows")
+    );
+
     let mutation = exchange(
         address,
         &post_query_with_clickhouse_key("INSERT INTO readings VALUES (99);", "correct-key"),
@@ -189,8 +200,8 @@ fn authenticated_listener_isolates_rejected_keys_and_preserves_read_only_state()
         .join()
         .expect("listener thread did not panic")
         .expect("listener completed its connection budget");
-    assert_eq!(report.accepted_connections, 4);
-    assert_eq!(report.successful_exchanges, 4);
+    assert_eq!(report.accepted_connections, 5);
+    assert_eq!(report.successful_exchanges, 5);
     assert!(report.connection_failures.is_empty());
 
     let rows = database
