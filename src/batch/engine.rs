@@ -941,6 +941,37 @@ impl Database {
         self.global_aggregate_parallelism.worker_cap
     }
 
+    /// Replaces the computation-lane cap for supported global aggregates and
+    /// returns the previous cap.
+    ///
+    /// The new value is reported by subsequent `SHOW SETTINGS` and
+    /// `system.settings` queries and applies to subsequent supported global
+    /// aggregates. A cap of one keeps those aggregates sequential. Higher caps
+    /// remain subject to the process-wide worker budget, available hardware,
+    /// and the fixed [`MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS`] ceiling.
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use rusthouse::Database;
+    ///
+    /// let mut database = Database::with_global_aggregate_worker_cap(
+    ///     NonZeroUsize::new(1).unwrap(),
+    /// );
+    /// let previous = database.set_global_aggregate_worker_cap(
+    ///     NonZeroUsize::new(2).unwrap(),
+    /// );
+    /// assert_eq!(previous.get(), 1);
+    /// assert_eq!(database.global_aggregate_worker_cap().get(), 2);
+    /// ```
+    pub fn set_global_aggregate_worker_cap(
+        &mut self,
+        global_aggregate_worker_cap: NonZeroUsize,
+    ) -> NonZeroUsize {
+        let previous = self.global_aggregate_parallelism.worker_cap;
+        self.global_aggregate_parallelism.worker_cap = global_aggregate_worker_cap;
+        previous
+    }
+
     /// Reopens one self-describing, non-nullable `Int64` snapshot as a named
     /// batch table.
     ///
@@ -7902,6 +7933,56 @@ mod tests {
         let sequential =
             force_global_aggregate_workers(&mut database, 1, "SELECT countIf(active) FROM events");
         assert_eq!(capped, sequential);
+    }
+
+    #[test]
+    fn runtime_cap_one_and_two_match_for_every_supported_global_aggregate() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(8);
+
+        let initial = NonZeroUsize::new(7).unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let two = NonZeroUsize::new(2).unwrap();
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = count_if_database_with_worker_cap(row_count, initial);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(initial, &BUDGET);
+
+        for (query_index, sql) in [
+            "SELECT SUM(id) FROM events",
+            "SELECT AVG(id) FROM events",
+            "SELECT MIN(id) FROM events",
+            "SELECT MAX(id) FROM events",
+            "SELECT countIf(active) FROM events",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected_previous = if query_index == 0 { initial } else { two };
+            assert_eq!(
+                database.set_global_aggregate_worker_cap(one),
+                expected_previous
+            );
+            BUDGET.reset_peak();
+            let sequential = query(&mut database, sql);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                0,
+                "the runtime cap of one must keep {sql} sequential"
+            );
+
+            assert_eq!(database.set_global_aggregate_worker_cap(two), one);
+            BUDGET.reset_peak();
+            let parallel = query(&mut database, sql);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                1,
+                "the runtime cap of two must admit one helper for {sql}"
+            );
+            assert_eq!(
+                sequential, parallel,
+                "runtime worker differential for {sql}"
+            );
+        }
     }
 
     #[test]

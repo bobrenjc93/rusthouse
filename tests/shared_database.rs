@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier, RwLock, TryLockError};
 use std::thread;
@@ -332,6 +333,44 @@ fn try_query_preserves_lock_poisoning() {
     assert!(poisoner.join().is_err());
     assert_eq!(
         database.try_query("SHOW TABLES;"),
+        Err(SharedDatabaseError::LockPoisoned)
+    );
+}
+
+#[test]
+fn runtime_worker_cap_setter_is_nonblocking_and_preserves_lock_errors() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let two = NonZeroUsize::new(2).unwrap();
+    let inner = Arc::new(RwLock::new(Database::with_global_aggregate_worker_cap(one)));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let reader = inner.read().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(worker_database.try_set_global_aggregate_worker_cap(two))
+            .unwrap();
+    });
+
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(Err(SharedDatabaseError::DatabaseBusy)),
+        "the setter must finish without waiting for the held read lock"
+    );
+    assert_eq!(reader.global_aggregate_worker_cap(), one);
+    drop(reader);
+    worker.join().unwrap();
+    assert_eq!(database.try_set_global_aggregate_worker_cap(two), Ok(one));
+
+    let poisoned_inner = Arc::new(RwLock::new(Database::new()));
+    let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = poisoned_inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+    assert_eq!(
+        poisoned_database.try_set_global_aggregate_worker_cap(one),
         Err(SharedDatabaseError::LockPoisoned)
     );
 }
