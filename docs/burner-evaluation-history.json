@@ -2145,6 +2145,22 @@
         "eval_c88a7f3d": 80,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:668",
+      "recordedAt": "2026-08-09T06:26:01.749Z",
+      "label": "PR #668",
+      "kind": "leaf",
+      "prNumber": 668,
+      "title": "Add capped concurrency to the authenticated listener",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 80,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
