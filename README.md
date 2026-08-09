@@ -941,12 +941,31 @@ transport failures. Later clients are still served. The shared connection
 budget, absolute deadlines, per-exchange limits, one-response stream shutdown,
 failure isolation, and typed final report are otherwise unchanged.
 
-Neither listener mode terminates TLS or adds concurrency, sessions, or daemon
-lifecycle management. In particular, the authenticated listener sends its key
-and query contents in plaintext unless the embedding places the bound listener
-behind TLS; do not expose it directly to an untrusted network. The
-single-exchange functions remain available when an embedding needs a different
-connection, concurrency, transport-security, timeout, or shutdown policy.
+`serve_http_read_only_concurrently_with_clickhouse_key` is the opt-in concurrent
+listener. In addition to the expected key and finite total connection budget,
+it requires an explicit `NonZeroUsize` in-flight connection cap; the
+`_and_limits` variant also accepts `HttpListenerLimits`. An accepted connection
+occupies capacity until its one exchange finishes and its response direction is
+shut down. Once the cap is occupied, the listener waits for any exchange to
+finish before accepting another connection. A cap of one therefore retains the
+sequential authenticated behavior, while a larger cap lets a complete request
+finish without waiting behind a stalled client. `SharedDatabase` read admission
+remains nonblocking and allows concurrent readers.
+
+The total connection budget remains an inclusive finite run bound, independent
+of the concurrency cap, and zero still returns without accepting. Read and
+write deadlines start at each connection's acceptance, not when its worker is
+scheduled. Authentication, read-only routing, per-exchange limits, and
+one-response shutdown are unchanged. Connection-local transport and response
+limit failures do not stop other clients; the final report sorts them by
+acceptance position even when concurrent exchanges finish in another order.
+
+No listener mode terminates TLS or adds sessions or daemon lifecycle
+management. In particular, the authenticated listeners send their key and query
+contents in plaintext unless the embedding places the bound listener behind
+TLS; do not expose them directly to an untrusted network. The single-exchange
+functions remain available when an embedding needs a different connection,
+concurrency, transport-security, timeout, or shutdown policy.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or

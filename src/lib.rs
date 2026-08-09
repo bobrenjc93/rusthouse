@@ -55,8 +55,11 @@ pub use http::{
     handle_http_query_read_only_with_clickhouse_key_and_limits,
     handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
     handle_http_query_with_clickhouse_key, handle_http_query_with_clickhouse_key_and_limits,
-    handle_http_query_with_limits, serve_http_read_only, serve_http_read_only_with_clickhouse_key,
-    serve_http_read_only_with_clickhouse_key_and_limits, serve_http_read_only_with_limits,
+    handle_http_query_with_limits, serve_http_read_only,
+    serve_http_read_only_concurrently_with_clickhouse_key,
+    serve_http_read_only_concurrently_with_clickhouse_key_and_limits,
+    serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_clickhouse_key_and_limits,
+    serve_http_read_only_with_limits,
 };
 pub use join::{
     JoinError, JoinLimits, JoinRowPair, LeftOuterJoinRowPair, inner_equi_join_nullable_i64,

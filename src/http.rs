@@ -1,10 +1,14 @@
-//! Bounded HTTP exchanges and sequential read-only TCP serving.
+//! Bounded HTTP exchanges and finite read-only TCP serving.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::num::NonZeroUsize;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
@@ -112,8 +116,8 @@ impl StdError for HttpQueryError {
     }
 }
 
-/// Listener and exchange bounds for [`serve_http_read_only_with_limits`] and
-/// [`serve_http_read_only_with_clickhouse_key_and_limits`].
+/// Listener and exchange bounds for the sequential and concurrent read-only
+/// listener APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpListenerLimits {
     /// Maximum number of accepted connections before the listener returns.
@@ -473,6 +477,189 @@ pub fn serve_http_read_only_with_clickhouse_key_and_limits(
     )
 }
 
+/// Concurrently serves a finite number of read-only HTTP connections that
+/// require an `X-ClickHouse-Key` credential.
+///
+/// This is the opt-in concurrent counterpart to
+/// [`serve_http_read_only_with_clickhouse_key`]. `max_in_flight_connections` is
+/// an explicit, nonzero upper bound on accepted connections whose exchange has
+/// not finished. The total accepted-connection budget remains
+/// `max_connections`; passing zero for that budget still returns immediately.
+/// Every exchange uses the default resource limits and absolute deadlines.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Interrupted accepts are retried. Connection-local
+/// failures are returned in [`HttpListenerReport::connection_failures`].
+pub fn serve_http_read_only_concurrently_with_clickhouse_key(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    max_connections: usize,
+    max_in_flight_connections: NonZeroUsize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
+        listener,
+        database,
+        expected_clickhouse_key,
+        HttpListenerLimits::new(max_connections, HttpQueryLimits::default()),
+        max_in_flight_connections,
+    )
+}
+
+/// Concurrently serves finite, bounded, read-only,
+/// `X-ClickHouse-Key`-authenticated HTTP connections with explicit limits.
+///
+/// At most `max_in_flight_connections` accepted connections are handled at
+/// once. Each absolute read and write deadline starts at that connection's
+/// acceptance, including any time before its worker begins running. Capacity is
+/// released only after the exchange finishes and the response direction is
+/// shut down. A cap of one therefore has the same acceptance and exchange
+/// ordering as the sequential authenticated listener.
+///
+/// Every accepted connection consumes one slot from
+/// [`HttpListenerLimits::max_connections`], including authentication,
+/// protocol, query, and transport failures. Each connection receives at most
+/// one response. Transport failures are isolated from other connections and
+/// sorted by acceptance position in the final report even when exchanges
+/// finish in a different order. This function does not provide TLS, sessions,
+/// or daemon lifecycle management.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Interrupted accepts are retried. Connections accepted
+/// before an accept failure are allowed to finish and are included in that
+/// report. Connection-local failures are returned in
+/// [`HttpListenerReport::connection_failures`].
+pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    let mut report = HttpListenerReport::default();
+    let mut accept_failure = None;
+
+    thread::scope(|scope| {
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        let mut workers = Vec::new();
+
+        while report.accepted_connections < limits.max_connections {
+            if workers.len() == max_in_flight_connections.get() {
+                receive_http_listener_completion(&completion_receiver, &mut workers, &mut report);
+            }
+
+            let (stream, _) = match accept_http_connection(listener) {
+                Ok(connection) => connection,
+                Err(source) => {
+                    accept_failure = Some(source);
+                    break;
+                }
+            };
+            let accepted_at = Instant::now();
+            report.accepted_connections += 1;
+            let connection = report.accepted_connections;
+            let completion_sender = completion_sender.clone();
+            let worker = scope.spawn(move || {
+                let exchange = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let exchange = handle_http_listener_connection(
+                        database,
+                        &stream,
+                        accepted_at,
+                        limits,
+                        HttpListenerHandler::ClickHouseKey(expected_clickhouse_key),
+                    );
+
+                    // Half-close the response direction first so the peer can
+                    // observe the complete response and its terminating FIN.
+                    // Dropping the stream then closes the read direction even
+                    // when malformed or pipelined request bytes remain unread.
+                    let _ = stream.shutdown(Shutdown::Write);
+                    exchange
+                }));
+
+                match exchange {
+                    Ok(exchange) => {
+                        let _ = completion_sender.send((connection, Some(exchange)));
+                    }
+                    Err(payload) => {
+                        // Wake the listener before preserving ordinary scoped
+                        // thread panic propagation. This prevents a panicking
+                        // exchange from leaving the capacity wait blocked.
+                        let _ = completion_sender.send((connection, None));
+                        panic::resume_unwind(payload);
+                    }
+                }
+            });
+            workers.push((connection, worker));
+        }
+
+        while !workers.is_empty() {
+            receive_http_listener_completion(&completion_receiver, &mut workers, &mut report);
+        }
+    });
+
+    report
+        .connection_failures
+        .sort_unstable_by_key(|failure| failure.connection);
+
+    match accept_failure {
+        Some(source) => Err(HttpListenerError::Accept { report, source }),
+        None => Ok(report),
+    }
+}
+
+type HttpListenerCompletion = (usize, Option<Result<(), HttpQueryError>>);
+
+fn receive_http_listener_completion(
+    completion_receiver: &Receiver<HttpListenerCompletion>,
+    workers: &mut Vec<(usize, ScopedJoinHandle<'_, ()>)>,
+    report: &mut HttpListenerReport,
+) {
+    let (connection, exchange) = completion_receiver
+        .recv()
+        .expect("an in-flight HTTP listener worker must report completion");
+    let worker_position = workers
+        .iter()
+        .position(|(worker_connection, _)| *worker_connection == connection)
+        .expect("an HTTP listener completion must identify an in-flight connection");
+    let (_, worker) = workers.swap_remove(worker_position);
+
+    if let Err(payload) = worker.join() {
+        panic::resume_unwind(payload);
+    }
+    record_http_listener_exchange(
+        report,
+        connection,
+        exchange.expect("a successful HTTP listener worker must return an exchange result"),
+    );
+}
+
+fn accept_http_connection(listener: &TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> {
+    loop {
+        match listener.accept() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn record_http_listener_exchange(
+    report: &mut HttpListenerReport,
+    connection: usize,
+    exchange: Result<(), HttpQueryError>,
+) {
+    match exchange {
+        Ok(()) => report.successful_exchanges += 1,
+        Err(source) => report
+            .connection_failures
+            .push(HttpConnectionFailure { connection, source }),
+    }
+}
+
 fn serve_http_read_only_connections(
     listener: &TcpListener,
     database: &SharedDatabase,
@@ -482,12 +669,9 @@ fn serve_http_read_only_connections(
     let mut report = HttpListenerReport::default();
 
     while report.accepted_connections < limits.max_connections {
-        let (stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(source) => return Err(HttpListenerError::Accept { report, source }),
-            }
+        let (stream, _) = match accept_http_connection(listener) {
+            Ok(connection) => connection,
+            Err(source) => return Err(HttpListenerError::Accept { report, source }),
         };
 
         report.accepted_connections += 1;
@@ -502,12 +686,7 @@ fn serve_http_read_only_connections(
         // bytes remain unread.
         let _ = stream.shutdown(Shutdown::Write);
 
-        match exchange {
-            Ok(()) => report.successful_exchanges += 1,
-            Err(source) => report
-                .connection_failures
-                .push(HttpConnectionFailure { connection, source }),
-        }
+        record_http_listener_exchange(&mut report, connection, exchange);
     }
 
     Ok(report)
