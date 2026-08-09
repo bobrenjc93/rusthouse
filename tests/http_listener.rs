@@ -1,12 +1,15 @@
 use std::error::Error as StdError;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::num::NonZeroUsize;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rusthouse::{
     HttpListenerError, HttpListenerLimits, HttpListenerReport, HttpQueryError, HttpQueryLimits,
-    SharedDatabase, handle_http_query, serve_http_read_only,
+    SharedDatabase, handle_http_query, handle_http_query_read_only_with_clickhouse_key,
+    serve_http_read_only, serve_http_read_only_concurrently_with_clickhouse_key_and_limits,
     serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_clickhouse_key_and_limits,
     serve_http_read_only_with_limits,
 };
@@ -31,6 +34,17 @@ fn start_listener(
     (address, worker)
 }
 
+fn finish_request_stream(stream: &TcpStream) {
+    match stream.shutdown(Shutdown::Write) {
+        Ok(()) => {}
+        // The listener may authenticate or reject a complete request and close
+        // the connection before the client half-closes it. On Linux that valid
+        // close race is reported as ENOTCONN.
+        Err(error) if error.kind() == ErrorKind::NotConnected => {}
+        Err(error) => panic!("finish request stream: {error}"),
+    }
+}
+
 fn exchange(address: SocketAddr, request: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(address).expect("connect to loopback listener");
     stream
@@ -40,15 +54,44 @@ fn exchange(address: SocketAddr, request: &[u8]) -> Vec<u8> {
         .set_write_timeout(Some(IO_TIMEOUT))
         .expect("set client write timeout");
     stream.write_all(request).expect("write complete request");
-    stream
-        .shutdown(Shutdown::Write)
-        .expect("finish request stream");
+    finish_request_stream(&stream);
 
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
         .expect("listener closes the connection after its response");
     response
+}
+
+fn start_exchange(address: SocketAddr, request: Vec<u8>) -> (Receiver<Vec<u8>>, JoinHandle<()>) {
+    let (request_sent_sender, request_sent_receiver) = mpsc::sync_channel(0);
+    let (response_sender, response_receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).expect("connect to loopback listener");
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("set client read timeout");
+        stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .expect("set client write timeout");
+        stream.write_all(&request).expect("write complete request");
+        finish_request_stream(&stream);
+        request_sent_sender
+            .send(())
+            .expect("report completed client request");
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("listener closes the connection after its response");
+        response_sender
+            .send(response)
+            .expect("return loopback response");
+    });
+    request_sent_receiver
+        .recv()
+        .expect("client reports completed request");
+    (response_receiver, worker)
 }
 
 fn post_query(sql: &str) -> Vec<u8> {
@@ -269,6 +312,199 @@ fn authenticated_listener_explicit_limits_keep_deadline_failures_connection_loca
 }
 
 #[test]
+fn capped_authenticated_concurrency_serves_fast_client_while_first_client_is_stalled() {
+    let limits = HttpListenerLimits {
+        read_timeout: IO_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let worker = thread::spawn(move || {
+        serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
+            &listener,
+            &SharedDatabase::default(),
+            "correct-key",
+            limits,
+            NonZeroUsize::new(2).unwrap(),
+        )
+    });
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client read timeout");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+        .expect("write incomplete authenticated request");
+
+    let pipelined = b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\nGET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n";
+    let (fast_response, fast_client) = start_exchange(address, pipelined.to_vec());
+    let fast_response = fast_response
+        .recv_timeout(Duration::from_secs(1))
+        .expect("fast client must finish while the first client remains stalled");
+    assert!(fast_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(body(&fast_response), b"Ok.\n");
+    assert_eq!(
+        fast_response
+            .windows(b"HTTP/1.1".len())
+            .filter(|window| *window == b"HTTP/1.1")
+            .count(),
+        1
+    );
+    fast_client.join().expect("fast client did not panic");
+
+    stalled
+        .write_all(b"\r\n\r\n")
+        .expect("complete stalled request");
+    finish_request_stream(&stalled);
+    let mut stalled_response = Vec::new();
+    stalled
+        .read_to_end(&mut stalled_response)
+        .expect("read completed stalled response");
+    assert_eq!(body(&stalled_response), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn capped_authenticated_concurrency_with_cap_one_waits_before_accepting_the_next_client() {
+    let limits = HttpListenerLimits {
+        read_timeout: IO_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let worker = thread::spawn(move || {
+        serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
+            &listener,
+            &SharedDatabase::default(),
+            "correct-key",
+            limits,
+            NonZeroUsize::new(1).unwrap(),
+        )
+    });
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client read timeout");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+        .expect("write incomplete authenticated request");
+
+    let (fast_response, fast_client) = start_exchange(
+        address,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n".to_vec(),
+    );
+    assert!(matches!(
+        fast_response.recv_timeout(Duration::from_millis(200)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+
+    stalled
+        .write_all(b"\r\n\r\n")
+        .expect("complete stalled request");
+    finish_request_stream(&stalled);
+    let mut stalled_response = Vec::new();
+    stalled
+        .read_to_end(&mut stalled_response)
+        .expect("read completed stalled response");
+    assert_eq!(body(&stalled_response), b"Ok.\n");
+
+    let fast_response = fast_response
+        .recv_timeout(IO_TIMEOUT)
+        .expect("fast client proceeds after cap-one capacity is released");
+    assert_eq!(body(&fast_response), b"Ok.\n");
+    fast_client.join().expect("fast client did not panic");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn concurrent_transport_failures_are_isolated_and_reported_in_acceptance_order() {
+    let database = SharedDatabase::default();
+    let ping_request =
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n";
+    let mut expected_ping = Vec::new();
+    handle_http_query_read_only_with_clickhouse_key(
+        &database,
+        "correct-key",
+        Cursor::new(ping_request),
+        &mut expected_ping,
+    )
+    .unwrap();
+    let limits = HttpListenerLimits {
+        read_timeout: STALLED_CONNECTION_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        query_limits: HttpQueryLimits {
+            max_response_bytes: expected_ping.len(),
+            ..HttpQueryLimits::default()
+        },
+        ..HttpListenerLimits::new(3, HttpQueryLimits::default())
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let worker = thread::spawn(move || {
+        serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
+            &listener,
+            &database,
+            "correct-key",
+            limits,
+            NonZeroUsize::new(2).unwrap(),
+        )
+    });
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+        .expect("write incomplete authenticated request");
+
+    let oversized = post_query_with_clickhouse_key(
+        &format!("SELECT '{}' AS value;", "x".repeat(1_000)),
+        "correct-key",
+    );
+    assert!(exchange(address, &oversized).is_empty());
+    assert_eq!(exchange(address, ping_request), expected_ping);
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 3);
+    assert_eq!(report.successful_exchanges, 1);
+    assert_eq!(report.connection_failures.len(), 2);
+    assert_eq!(report.connection_failures[0].connection, 1);
+    assert!(matches!(
+        &report.connection_failures[0].source,
+        HttpQueryError::Read(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
+    assert_eq!(report.connection_failures[1].connection, 2);
+    assert!(matches!(
+        report.connection_failures[1].source,
+        HttpQueryError::ResponseLimitExceeded { max_bytes, .. }
+            if max_bytes == expected_ping.len()
+    ));
+}
+
+#[test]
 fn sequential_connections_observe_updated_cached_system_metrics() {
     let database = SharedDatabase::default();
     let (address, worker) = start_listener(
@@ -455,9 +691,7 @@ fn stalled_response_times_out_without_preventing_the_next_connection() {
     stalled
         .write_all(&post_query("SELECT value FROM payloads;"))
         .expect("write request for large response");
-    stalled
-        .shutdown(Shutdown::Write)
-        .expect("finish large-response request");
+    finish_request_stream(&stalled);
 
     let healthy = exchange(address, b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
