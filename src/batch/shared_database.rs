@@ -2,9 +2,13 @@
 
 use std::error::Error as StdError;
 use std::fmt;
+#[cfg(unix)]
+use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use super::csv::{CsvIngestError, CsvIngestLimits};
+#[cfg(unix)]
+use super::engine::DatabaseSnapshotSaveError;
 use super::engine::{
     DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, QueryResult, QueryResultLimits, StatementResult,
     TableLimits,
@@ -12,6 +16,8 @@ use super::engine::{
 use super::error::Error;
 use super::sql::{self, Statement};
 use super::tsv::{TsvIngestError, TsvIngestLimits};
+#[cfg(unix)]
+use crate::snapshot::{Int64TablePayloadCodec, SnapshotCodec};
 
 /// An instantaneous measurement of data retained by a [`SharedDatabase`].
 ///
@@ -112,6 +118,61 @@ impl From<TsvIngestError> for SharedDatabaseError {
     }
 }
 
+/// A failure while nonblockingly saving a [`SharedDatabase`] table snapshot.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum SharedDatabaseSnapshotSaveError {
+    /// A writer prevented immediate acquisition of the database read lock.
+    DatabaseBusy,
+    /// A thread panicked while it held the database write lock.
+    LockPoisoned,
+    /// Table validation, payload encoding, or atomic replacement failed.
+    Snapshot(DatabaseSnapshotSaveError),
+}
+
+#[cfg(unix)]
+impl SharedDatabaseSnapshotSaveError {
+    /// Returns whether the destination was replaced before this error occurred.
+    ///
+    /// Lock-acquisition failures never access the destination. Snapshot errors
+    /// preserve the more precise replacement status reported by
+    /// [`DatabaseSnapshotSaveError::destination_was_replaced`].
+    pub const fn destination_was_replaced(&self) -> bool {
+        match self {
+            Self::Snapshot(error) => error.destination_was_replaced(),
+            Self::DatabaseBusy | Self::LockPoisoned => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for SharedDatabaseSnapshotSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseBusy => write!(formatter, "shared database is busy"),
+            Self::LockPoisoned => write!(formatter, "shared database lock is poisoned"),
+            Self::Snapshot(error) => write!(formatter, "shared database snapshot failed: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl StdError for SharedDatabaseSnapshotSaveError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::DatabaseBusy | Self::LockPoisoned => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<DatabaseSnapshotSaveError> for SharedDatabaseSnapshotSaveError {
+    fn from(error: DatabaseSnapshotSaveError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 /// A clonable, synchronized handle to an in-memory typed [`Database`].
 ///
 /// Each SQL batch is completely parsed before the database lock is acquired.
@@ -124,6 +185,14 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// `EXISTS TABLE` under a shared read lock.
 /// [`Self::try_query`] accepts the same input but returns
 /// [`SharedDatabaseError::DatabaseBusy`] instead of waiting for a writer.
+#[cfg_attr(
+    unix,
+    doc = "On Unix, [`Self::try_save_int64_table_to_file`] likewise attempts one read"
+)]
+#[cfg_attr(
+    unix,
+    doc = "lock and atomically saves a supported table without copying its column."
+)]
 /// [`Self::try_execute_insert_batch`] similarly attempts
 /// one nonblocking write lock for an atomic `INSERT`-only batch, and
 /// [`Self::try_ingest_csv`], [`Self::try_ingest_csv_with_names`],
@@ -210,6 +279,38 @@ impl SharedDatabase {
     /// Returns the persistent resource limits applied to each created table.
     pub fn table_limits(&self) -> Result<TableLimits, SharedDatabaseError> {
         Ok(self.read()?.table_limits())
+    }
+
+    /// Attempts to atomically save one non-nullable, one-column `Int64` table on Unix.
+    ///
+    /// Exactly one nonblocking read-lock attempt occurs. A concurrent writer
+    /// returns [`SharedDatabaseSnapshotSaveError::DatabaseBusy`] without
+    /// accessing the destination, while an existing reader is compatible. The
+    /// acquired guard is retained through table validation, payload encoding,
+    /// and atomic file replacement, so the saved rows form one consistent
+    /// database snapshot. The existing [`Database::save_int64_table_to_file`]
+    /// implementation receives the borrowed database directly; column data is
+    /// not cloned at this synchronization boundary.
+    #[cfg(unix)]
+    pub fn try_save_int64_table_to_file(
+        &self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: Int64TablePayloadCodec,
+    ) -> Result<(), SharedDatabaseSnapshotSaveError> {
+        let database = match self.inner.try_read() {
+            Ok(database) => database,
+            Err(TryLockError::WouldBlock) => {
+                return Err(SharedDatabaseSnapshotSaveError::DatabaseBusy);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(SharedDatabaseSnapshotSaveError::LockPoisoned);
+            }
+        };
+        database
+            .save_int64_table_to_file(table_name, path, snapshot_codec, payload_codec)
+            .map_err(Into::into)
     }
 
     /// Takes a consistent, constant-time metrics snapshot without waiting for

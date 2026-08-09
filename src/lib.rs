@@ -20,12 +20,12 @@ pub use aggregate::{
     AggregateError, AggregateLimits, NullableI64Aggregates, NullableI64Counts, RowSelection,
     aggregate_nullable_i64, count_nullable_i64, min_nullable_i64,
 };
-#[cfg(unix)]
-pub use batch::DatabaseSnapshotSaveError;
 pub use batch::{
     Database, DatabaseMetrics, DatabaseSnapshotRestoreError, SharedDatabase, SharedDatabaseError,
     TableLimits,
 };
+#[cfg(unix)]
+pub use batch::{DatabaseSnapshotSaveError, SharedDatabaseSnapshotSaveError};
 pub use catalog::{
     Catalog, CatalogCsvIngestError, CatalogCsvReaderIngestError, CatalogError, CatalogLimits,
     CatalogSnapshotRestoreError,
