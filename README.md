@@ -806,15 +806,16 @@ For parameterized GET and POST queries, the header and `database=default` query
 parameter may coexist; each is validated independently against the same single
 database.
 
-The insertion-capable bearer- and `X-ClickHouse-Key`-authenticated handlers also
-expose exact `POST /insert` as an explicit write route. It requires one decimal
-`Content-Length`, applies the same UTF-8 SQL body and request limits as
-`POST /query`, and executes the same nonempty `INSERT`-only transaction as an
-authenticated standard POST. The database preflights the entire batch before
-commit, so syntax, target, shape, type, capacity, empty batch, or
-mixed-statement failures return `400 Bad Request` without applying any rows.
-Success returns `200 OK` with an empty plain-text body. The route is not
-recognized by `handle_http_query` or `handle_http_query_with_limits`.
+The insertion-capable bearer-, `X-ClickHouse-Key`-, and named-principal
+authenticated handlers also expose exact `POST /insert` as an explicit write
+route. It requires one decimal `Content-Length`, applies the same UTF-8 SQL body
+and request limits as `POST /query`, and executes the same nonempty
+`INSERT`-only transaction as an authenticated standard POST. The database
+preflights the entire batch before commit, so syntax, target, shape, type,
+capacity, empty batch, or mixed-statement failures return `400 Bad Request`
+without applying any rows. Success returns `200 OK` with an empty plain-text
+body. The route is not recognized by `handle_http_query` or
+`handle_http_query_with_limits`.
 
 Those insertion-capable handlers also expose exact `POST /insert/<table>` for
 `CSV`, `CSVWithNames`, `TabSeparated`, or `TabSeparatedWithNames` ingestion.
@@ -1098,6 +1099,17 @@ applying the same authenticated, pre-body insertion-route rejection as the
 read-only bearer APIs. Use these read-only variants for query or monitoring
 credentials that do not require ingestion authority.
 
+To bind an ingestion credential to an exact identity, use
+`handle_http_query_with_clickhouse_principal` or its `_and_limits` variant.
+They apply the same exact, constant-work user-and-key authentication described
+below while exposing the existing bounded SQL, CSV, CSVWithNames,
+TabSeparated, and TabSeparatedWithNames insertion paths. Writes use the same
+atomic, nonblocking database admission as the other insertion-capable handlers,
+so contention returns `503 Service Unavailable`, and the explicit-limits
+variant applies its independent HTTP, CSV, and TSV bounds. Successful reads,
+writes, and operational responses all include `Cache-Control: private,
+no-store`.
+
 To bind a read-only key to an exact identity, use
 `handle_http_query_read_only_with_clickhouse_principal` or its `_and_limits`
 variant. These handlers require exactly one `X-ClickHouse-User` and exactly one
@@ -1111,9 +1123,9 @@ the same `401 Unauthorized` response before a body is read or the database is
 accessed. Successful requests remain read-only: explicit insertion targets are
 rejected before their bodies are read, and INSERT statements on query routes
 are rejected by read-only statement validation. All responses include
-`Cache-Control: private, no-store`. This narrow named-principal boundary does
-not add roles, grants, credential storage, or key-only insertion authority; the
-existing bearer and `X-ClickHouse-Key` APIs retain their documented behavior.
+`Cache-Control: private, no-store`. Neither named-principal boundary adds roles,
+grants, or credential storage. The existing bearer, key-only, and named
+read-only APIs retain their documented behavior.
 
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before
@@ -1255,6 +1267,13 @@ bounded decoding, validation, and atomic registration to
 writer contention, lock poisoning, and the existing typed snapshot restore
 failures remain distinct. Every failure leaves catalog data and cached metrics
 unchanged.
+`SharedDatabase::try_restore_int64_tables_from_files` extends those guarantees
+to the transactional snapshot-set restore. It makes one nonblocking write-lock
+attempt before any source access and holds the guard while delegating the
+caller-supplied entry slice and inclusive entry-count bound to
+`Database::restore_int64_tables_from_files`. Busy and poisoned locks remain
+distinct from indexed count, name, file, schema, and table-limit failures; no
+failure changes catalog data or cached metrics.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries

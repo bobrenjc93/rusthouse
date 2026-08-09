@@ -110,6 +110,15 @@ database contention without source access; poisoned locks and the existing
 typed snapshot failures remain distinguishable. The delegated database restore
 keeps catalog entries and cached metrics unchanged on every failure.
 
+`SharedDatabase::try_restore_int64_tables_from_files` provides the same
+nonblocking synchronization for an atomic snapshot set. It makes exactly one
+write-lock attempt before any source file access and, while holding that guard,
+delegates the caller's entry slice and inclusive `max_entries` bound to
+`Database::restore_int64_tables_from_files`. Contention, lock poisoning, and
+indexed set-restore failures are distinct. Count and name validation still
+precede file access, and every failure preserves both catalog data and cached
+metrics.
+
 `Database::save_int64_table_to_file` adapts one named batch-engine table to the
 same self-describing payload and atomic replacement operation. The selected
 table must exist and have exactly one non-nullable physical `Int64` column.

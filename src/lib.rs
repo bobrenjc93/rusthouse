@@ -23,7 +23,8 @@ pub use aggregate::{
 pub use batch::{
     DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseMetrics, DatabaseSnapshotRestoreEntry,
     DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, SharedDatabase,
-    SharedDatabaseError, SharedDatabaseSnapshotRestoreError, TableLimits,
+    SharedDatabaseError, SharedDatabaseSnapshotRestoreError, SharedDatabaseSnapshotSetRestoreError,
+    TableLimits,
 };
 #[cfg(unix)]
 pub use batch::{DatabaseSnapshotSaveError, SharedDatabaseSnapshotSaveError};
@@ -63,8 +64,9 @@ pub use http::{
     handle_http_query_read_only_with_clickhouse_principal_and_limits,
     handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
     handle_http_query_with_clickhouse_key, handle_http_query_with_clickhouse_key_and_limits,
-    handle_http_query_with_limits, serve_http_read_only,
-    serve_http_read_only_concurrently_with_clickhouse_key,
+    handle_http_query_with_clickhouse_principal,
+    handle_http_query_with_clickhouse_principal_and_limits, handle_http_query_with_limits,
+    serve_http_read_only, serve_http_read_only_concurrently_with_clickhouse_key,
     serve_http_read_only_concurrently_with_clickhouse_key_and_limits,
     serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_clickhouse_key_and_limits,
     serve_http_read_only_with_limits, serve_http_with_clickhouse_key,
