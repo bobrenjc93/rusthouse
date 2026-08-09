@@ -244,6 +244,17 @@ case-insensitive order as one `String` column. RustHouse has no other logical
 database, so non-default database names and trailing clauses are rejected. All
 three forms use the normal query row, value, byte, retained-result, and
 formatted-output limits.
+The exact case-insensitive query
+`SELECT database, name, engine, total_rows FROM system.tables` exposes the same
+current catalog as four typed columns. Rows are ordered deterministically by
+case-insensitive table name and contain `default`, the stored display name,
+`Memory`, and the table's checked `Int64` row count. An empty catalog returns
+the four-column schema with no rows; create, insert, truncate, and drop
+changes are visible on the next query. Other projections, aliases, predicates,
+ordering, limits, and trailing clauses are deliberately unsupported. This is a
+bounded metadata query rather than a general virtual-table engine: it uses the
+normal read-only `Database` and `SharedDatabase` paths and the usual query row,
+value, byte, retained-result, CLI, and HTTP formatting limits.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
 bounded `String`, preserving the stored table and column display names and
 schema order while normalizing type spellings.
@@ -575,7 +586,8 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes), `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
+and `currentDatabase()` probes plus the exact `system.tables` metadata query),
+`SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,
 so cloned handles can run analytical reads concurrently. `try_query` and
@@ -621,21 +633,28 @@ body. Headerless inputs use physical schema order. Each requires one decimal
 case-insensitive, permit one optional trailing semicolon, and otherwise must be
 exact: an explicit column list, another format, or any extra SQL is not
 accepted as query-plus-data. Both parameterized request forms also accept one
-optional `database=default` parameter and
-one optional `default_format` parameter in any order with `query`, including
-percent-encoded parameter names and values. All
+optional `database=default` parameter, one optional decimal `max_result_rows`
+parameter, and one optional `default_format` parameter in any order with
+`query`, including percent-encoded parameter names and values. All
 names and values use form-style decoding: each `%HH` escape becomes one byte and
 `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
 `JSONEachRow`, and `JSONCompactEachRow`, selecting the corresponding existing
 response writer.
+`max_result_rows` accepts ASCII decimal digits. A nonzero value tightens the
+database's configured query-result row limit for that request, while zero
+disables the request-level limit and retains the configured cap. A larger value
+never relaxes the configured limit. The effective row limit is checked with
+the other query-result shape limits before result rows are materialized.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
-same SQL byte limit as a POST body; the database and format parameters do not
-count toward that limit. Empty parameters or values, duplicate `query`,
-`database`, or `default_format` parameters, unknown parameters, malformed
+same SQL byte limit as a POST body; the database, row-limit, and format
+parameters do not count toward that limit. Empty parameters or values,
+duplicate `query`, `database`, `max_result_rows`, or `default_format`
+parameters, malformed or overflowing row limits, unknown parameters, malformed
 escapes, non-default database values, unsupported formats, and invalid SQL
-UTF-8 are rejected. Parameter validation follows configured authentication and
-precedes database access. GET requests and every request handled by any
+UTF-8 are rejected.
+Parameter validation follows configured authentication and precedes database
+lock admission. GET requests and every request handled by any
 read-only API use the read-only, exactly-one-statement
 `SharedDatabase::try_query` path. A POST through an insertion-capable
 authenticated handler without an explicit output-format selector additionally

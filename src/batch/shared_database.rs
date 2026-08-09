@@ -117,9 +117,9 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// Each SQL batch is completely parsed before the database lock is acquired.
 /// [`Self::execute`] retains one write lock while every statement executes, so
 /// statements from concurrent mutating batches cannot interleave. [`Self::query`]
-/// executes one `SELECT`, `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW FUNCTIONS`,
-/// `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`
-/// under a shared read lock.
+/// executes one `SELECT` (including the exact `system.tables` metadata query),
+/// `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW FUNCTIONS`, `SHOW TABLES`, `SHOW
+/// CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` under a shared read lock.
 /// [`Self::try_query`] accepts the same input but returns
 /// [`SharedDatabaseError::DatabaseBusy`] instead of waiting for a writer.
 /// [`Self::try_execute_insert_batch`] similarly attempts
@@ -582,6 +582,27 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
+    /// Attempts one read-only query with an explicit result-row limit.
+    ///
+    /// Parsing and read-only validation finish before the single nonblocking
+    /// read-lock attempt. A nonzero supplied limit can tighten, but cannot
+    /// relax, the database's configured result-row limit. Zero retains the
+    /// configured limit.
+    pub(crate) fn try_query_with_result_row_limit(
+        &self,
+        input: &str,
+        max_result_rows: usize,
+    ) -> Result<QueryResult, SharedDatabaseError> {
+        let statement = parse_query_statement(input)?;
+        self.try_read()?
+            .execute_query_statement_with_result_limits(
+                statement,
+                DEFAULT_MAX_RETAINED_RESULT_BYTES,
+                max_result_rows,
+            )
+            .map_err(Into::into)
+    }
+
     /// Reports whether a database read lock is immediately available.
     ///
     /// This check never waits, parses SQL, or accesses database contents. A
@@ -635,6 +656,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         statement @ (Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
         | Statement::CurrentDatabaseSelect(_)
+        | Statement::SystemTables
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
