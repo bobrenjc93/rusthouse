@@ -1278,12 +1278,62 @@ fn cli_conditional_create_is_silent_and_preserves_the_existing_table_lifecycle()
 }
 
 #[test]
+fn cli_accepts_memory_engine_for_plain_and_conditional_create() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE Events (id Int64) ENGINE = Memory; \
+          CREATE TABLE IF NOT EXISTS events (ignored String) engine=memory; \
+          INSERT INTO events VALUES (7); \
+          SELECT database, name, engine, total_rows FROM system.tables;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"database,name,engine,total_rows\ndefault,Events,Memory,1\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn cli_rejects_invalid_engine_suffix_before_executing_the_batch() {
+    for suffix in [
+        "ENGINE Memory",
+        "ENGINE = MergeTree",
+        "ENGINE = Memory ENGINE = Memory",
+        "ENGINE = Memory trailing",
+    ] {
+        let input = format!(
+            "CREATE TABLE first (id Int64); \
+             SELECT database, name, engine, total_rows FROM system.tables; \
+             CREATE TABLE rejected (id Int64) {suffix};"
+        );
+        let output = run(&["--format", "csv"], input.as_bytes());
+
+        assert!(
+            !output.status.success(),
+            "invalid suffix succeeded: {suffix:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "batch executed before failure: {suffix:?}"
+        );
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .starts_with("error: SQL error at byte "),
+            "{suffix:?}"
+        );
+    }
+}
+
+#[test]
 fn legacy_cli_conditional_create_preserves_rows_across_case_variants() {
     let output = run(
         &[],
-        b"CREATE TABLE IF NOT EXISTS Events (value Int64)\n\
+        b"CREATE TABLE IF NOT EXISTS Events (value Int64) ENGINE = Memory\n\
           INSERT INTO Events VALUES (7)\n\
-          CREATE TABLE IF NOT EXISTS events (replacement Int64 NOT NULL)\n\
+          CREATE TABLE IF NOT EXISTS events (replacement Int64 NOT NULL) engine=memory\n\
           SELECT value FROM Events\n",
     );
 

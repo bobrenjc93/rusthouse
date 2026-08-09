@@ -1590,6 +1590,20 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
+        if self.eat_keyword("ENGINE") {
+            self.expect(&TokenKind::Equal, "'=' after ENGINE")?;
+            let position = self.position();
+            let engine = self.expect_identifier("table engine after ENGINE =")?;
+            if !engine.eq_ignore_ascii_case("Memory") {
+                return Err(Error::Sql {
+                    position,
+                    message: format!("unsupported table engine '{engine}'; expected Memory"),
+                });
+            }
+        }
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after CREATE TABLE");
+        }
         if if_not_exists {
             Ok(Statement::CreateTableIfNotExists { name, columns })
         } else {

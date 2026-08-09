@@ -46,6 +46,37 @@ fn parses_if_not_exists_with_keyword_casing_and_preserves_if_table_name() {
 }
 
 #[test]
+fn parses_optional_memory_engine_for_plain_and_conditional_create() {
+    for (input, if_not_exists) in [
+        ("CREATE TABLE events (value Int64) ENGINE = Memory", false),
+        (
+            "create table if not exists Events (value int64) engine=memory",
+            true,
+        ),
+        ("CrEaTe TABLE metrics (value INT64) EnGiNe = MeMoRy", false),
+    ] {
+        let statement = parse_create_table(input, ParseLimits::default()).unwrap();
+        assert_eq!(statement.if_not_exists(), if_not_exists, "{input:?}");
+        assert_eq!(statement.column().data_type(), DataType::Int64, "{input:?}");
+    }
+}
+
+#[test]
+fn rejects_invalid_or_trailing_create_table_engine_clauses() {
+    for input in [
+        "CREATE TABLE events (value Int64) ENGINE Memory",
+        "CREATE TABLE events (value Int64) ENGINE = MergeTree",
+        "CREATE TABLE events (value Int64) ENGINE = Memory ENGINE = Memory",
+        "CREATE TABLE events (value Int64) ENGINE = Memory trailing",
+    ] {
+        assert!(
+            parse_create_table(input, ParseLimits::default()).is_err(),
+            "invalid engine suffix was accepted: {input:?}"
+        );
+    }
+}
+
+#[test]
 fn rejects_malformed_if_not_exists_forms() {
     for input in [
         "CREATE TABLE IF EXISTS events (value Int64)",

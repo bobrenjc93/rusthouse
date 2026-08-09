@@ -548,7 +548,7 @@ impl Error for ParseError {}
 /// accepted grammar is:
 ///
 /// ```text
-/// CREATE TABLE [IF NOT EXISTS] identifier (identifier Int64 [NULL | NOT NULL])
+/// CREATE TABLE [IF NOT EXISTS] identifier (identifier Int64 [NULL | NOT NULL]) [ENGINE = Memory]
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted. Statement and
@@ -916,6 +916,15 @@ impl<'input> Parser<'input> {
         self.skip_whitespace();
         self.expect_byte(b')', "')'")?;
         self.skip_whitespace();
+
+        if self.keyword_at_position("ENGINE") {
+            self.expect_keyword("ENGINE")?;
+            self.skip_whitespace();
+            self.expect_byte(b'=', "'='")?;
+            self.skip_whitespace();
+            self.expect_keyword("Memory")?;
+            self.skip_whitespace();
+        }
 
         if self.position != self.bytes.len() {
             return Err(ParseError::TrailingInput {
