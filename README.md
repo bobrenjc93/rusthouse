@@ -71,7 +71,13 @@ Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
 existing construction retains the same behavior; a cap of one disables helper
-threads. Concurrent queries still share the process-wide budget. Checked count
+threads. `Database::set_global_aggregate_worker_cap` changes the cap at runtime
+and returns its previous nonzero value; the new value immediately appears in
+`SHOW SETTINGS` and `system.settings` and applies to subsequent supported
+aggregates. `SharedDatabase::try_set_global_aggregate_worker_cap` provides the
+same update with one nonblocking write-lock attempt, returning `DatabaseBusy`
+for contention and `LockPoisoned` for a poisoned lock. Concurrent queries still
+share the process-wide budget. Checked count
 partials and checked i128 SUM/AVG sum-and-count partials are reduced in chunk
 order; optional Int64 extrema are reduced directly without allocating a
 partial-results collection. A sequential fallback preserves the same result
@@ -613,7 +619,10 @@ constructor configure the scan and output limits.
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
 parallel global aggregates. The configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
-the fixed 16-lane ceiling may reduce the effective lane count.
+the fixed 16-lane ceiling may reduce the effective lane count. The matching
+runtime setters are `Database::set_global_aggregate_worker_cap` and the
+nonblocking `SharedDatabase::try_set_global_aggregate_worker_cap`; both return
+the previous nonzero cap.
 `Database::with_max_rows_per_table` and its shared counterpart configure the
 row cap while retaining the default column and cell caps. `TableLimits` with
 `Database::with_table_limits` or `SharedDatabase::with_table_limits` configures
@@ -1077,6 +1086,23 @@ variant. They preserve `X-ClickHouse-Key` authentication, response limits, and
 applying the same authenticated, pre-body insertion-route rejection as the
 read-only bearer APIs. Use these read-only variants for query or monitoring
 credentials that do not require ingestion authority.
+
+To bind a read-only key to an exact identity, use
+`handle_http_query_read_only_with_clickhouse_principal` or its `_and_limits`
+variant. These handlers require exactly one `X-ClickHouse-User` and exactly one
+`X-ClickHouse-Key` header on queries, `/ping`, `/ready`, and `/metrics`; header
+names are case-insensitive and both values are case-sensitive. The configured
+user and key must each be nonempty valid HTTP field values with no leading or
+trailing optional whitespace, and both are validated before request input is
+read. Every authentication attempt compares both supplied values with constant
+work. A missing, duplicate, empty, or incorrect value in either header returns
+the same `401 Unauthorized` response before a body is read or the database is
+accessed. Successful requests remain read-only: explicit insertion targets are
+rejected before their bodies are read, and INSERT statements on query routes
+are rejected by read-only statement validation. All responses include
+`Cache-Control: private, no-store`. This narrow named-principal boundary does
+not add roles, grants, credential storage, or key-only insertion authority; the
+existing bearer and `X-ClickHouse-Key` APIs retain their documented behavior.
 
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before

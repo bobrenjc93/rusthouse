@@ -334,6 +334,34 @@ impl SharedDatabase {
         Ok(self.read()?.global_aggregate_worker_cap())
     }
 
+    /// Attempts to replace the computation-lane cap for supported global
+    /// aggregates, returning the previous cap.
+    ///
+    /// Exactly one nonblocking write-lock attempt is made. An active reader or
+    /// writer returns [`SharedDatabaseError::DatabaseBusy`], and a poisoned
+    /// lock returns [`SharedDatabaseError::LockPoisoned`]. After a successful
+    /// update, subsequent aggregate and settings queries observe the new cap.
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use rusthouse::SharedDatabase;
+    ///
+    /// let one = NonZeroUsize::new(1).unwrap();
+    /// let two = NonZeroUsize::new(2).unwrap();
+    /// let database = SharedDatabase::with_global_aggregate_worker_cap(one);
+    /// assert_eq!(database.try_set_global_aggregate_worker_cap(two)?, one);
+    /// assert_eq!(database.global_aggregate_worker_cap()?, two);
+    /// # Ok::<(), rusthouse::SharedDatabaseError>(())
+    /// ```
+    pub fn try_set_global_aggregate_worker_cap(
+        &self,
+        global_aggregate_worker_cap: NonZeroUsize,
+    ) -> Result<NonZeroUsize, SharedDatabaseError> {
+        Ok(self
+            .try_write()?
+            .set_global_aggregate_worker_cap(global_aggregate_worker_cap))
+    }
+
     /// Attempts to restore one self-describing, non-nullable `Int64` snapshot.
     ///
     /// Exactly one nonblocking write-lock attempt occurs before the source path
