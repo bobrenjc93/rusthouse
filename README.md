@@ -232,6 +232,12 @@ The exact case-insensitive `SHOW DATABASES` returns one `String` column named
 `name` containing RustHouse's single logical database, `default`. Arguments and
 trailing clauses are rejected, and the result uses the normal query row, value,
 byte, retained-result, and formatted-output limits.
+The exact case-insensitive query `SELECT name FROM system.databases` returns
+the identical column and row by reusing `SHOW DATABASES` result construction.
+Other projections, aliases, functions, predicates, ordering, limits, and
+trailing clauses are deliberately unsupported. The query is available through
+`Database`, `SharedDatabase`, the CLI, and authenticated or unauthenticated
+read-only HTTP handlers in every supported output format.
 The exact case-insensitive `SHOW SETTINGS` returns `name` and `value` `String`
 columns for every configured `QueryResultLimits` and `TableLimits` field. Rows
 use stable `query_result_limits.<field>` and `table_limits.<field>` names in
@@ -636,9 +642,9 @@ poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
 engine. Its `query` method accepts exactly one `SELECT` (including `version()`
-and `currentDatabase()` probes plus the exact `system.tables`, `system.columns`,
-`system.metrics`, `system.settings`, and `system.functions` metadata queries),
-`SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
+and `currentDatabase()` probes plus the exact `system.databases`,
+`system.tables`, `system.columns`, `system.metrics`, `system.settings`, and
+`system.functions` metadata queries), `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW
 FUNCTIONS`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
 TABLE`, takes a shared read lock, and returns an owned, resource-bounded result,
 so cloned handles can run analytical reads concurrently. `try_query` and
