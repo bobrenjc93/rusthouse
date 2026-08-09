@@ -800,8 +800,9 @@ fn serve_http_connections(
 /// before database lock admission. A
 /// `default_format` parameter cannot be combined with an
 /// `X-ClickHouse-Format` header. Exactly one read-only query on any query form
-/// may instead end in a case-insensitive SQL `FORMAT JSON`, `FORMAT
-/// CSVWithNames`, `FORMAT TabSeparated`, `FORMAT JSONEachRow`, or `FORMAT
+/// may instead end in a case-insensitive SQL `FORMAT JSON`, `FORMAT CSV`,
+/// `FORMAT CSVWithNames`, `FORMAT TabSeparated`, `FORMAT
+/// TabSeparatedWithNames`, `FORMAT JSONEachRow`, or `FORMAT
 /// JSONCompactEachRow` clause, with an optional trailing semicolon. The clause
 /// selects the corresponding existing bounded writer and cannot be combined
 /// with either HTTP format selector. Quoted strings and line comments are not
@@ -1796,6 +1797,9 @@ fn classify_standard_query_request(
             QueryResponseFormat::CsvWithNames => {
                 "FORMAT CSVWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
             }
+            QueryResponseFormat::Csv => {
+                "FORMAT CSV clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
+            }
             QueryResponseFormat::JsonEachRow => {
                 "FORMAT JSONEachRow clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
             }
@@ -1805,7 +1809,9 @@ fn classify_standard_query_request(
             QueryResponseFormat::TabSeparated => {
                 "FORMAT TabSeparated clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
             }
-            _ => unreachable!("the SQL FORMAT scanner only returns supported terminal formats"),
+            QueryResponseFormat::TabSeparatedWithNames => {
+                "FORMAT TabSeparatedWithNames clause cannot be combined with X-ClickHouse-Format header or default_format parameter"
+            }
         };
         return Err(RequestFailure::new(Status::BAD_REQUEST, message).into());
     };
@@ -1966,10 +1972,17 @@ fn terminal_query_format(sql: &str) -> Option<(usize, QueryResponseFormat)> {
     }
     let response_format = if format_name.text.eq_ignore_ascii_case("JSON") {
         QueryResponseFormat::Json
+    } else if format_name.text.eq_ignore_ascii_case("CSV") {
+        QueryResponseFormat::Csv
     } else if format_name.text.eq_ignore_ascii_case("CSVWithNames") {
         QueryResponseFormat::CsvWithNames
     } else if format_name.text.eq_ignore_ascii_case("TabSeparated") {
         QueryResponseFormat::TabSeparated
+    } else if format_name
+        .text
+        .eq_ignore_ascii_case("TabSeparatedWithNames")
+    {
+        QueryResponseFormat::TabSeparatedWithNames
     } else if format_name.text.eq_ignore_ascii_case("JSONEachRow") {
         QueryResponseFormat::JsonEachRow
     } else if format_name.text.eq_ignore_ascii_case("JSONCompactEachRow") {
