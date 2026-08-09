@@ -90,6 +90,14 @@ cell limits before changing the catalog or metrics. The payload is strictly a
 single-table format: it contains one column and no database name, batch table
 name, additional tables, or catalog metadata.
 
+`SharedDatabase::try_restore_int64_table_from_file` is available on every
+supported platform. It makes one nonblocking write-lock attempt before opening
+or reading the source, then holds that guard while delegating to
+`Database::restore_int64_table_from_file`. Active readers and writers report
+database contention without source access; poisoned locks and the existing
+typed snapshot failures remain distinguishable. The delegated database restore
+keeps catalog entries and cached metrics unchanged on every failure.
+
 `Database::save_int64_table_to_file` adapts one named batch-engine table to the
 same self-describing payload and atomic replacement operation. The selected
 table must exist and have exactly one non-nullable physical `Int64` column.

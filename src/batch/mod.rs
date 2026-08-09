@@ -17,7 +17,9 @@ pub use engine::{DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseSnapshot
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 #[cfg(unix)]
 pub use shared_database::SharedDatabaseSnapshotSaveError;
-pub use shared_database::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
+pub use shared_database::{
+    DatabaseMetrics, SharedDatabase, SharedDatabaseError, SharedDatabaseSnapshotRestoreError,
+};
 pub use storage::TableLimits;
 
 use std::error::Error as StdError;
