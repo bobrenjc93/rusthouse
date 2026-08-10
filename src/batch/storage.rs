@@ -1059,6 +1059,28 @@ impl Table {
         filter: Int64Filter,
         source_rows: Range<usize>,
     ) -> Option<Int64MinMaxIndexScan> {
+        self.int64_min_max_index_scan_with(column, source_rows, |block| {
+            block_may_match(block, filter)
+        })
+    }
+
+    pub(crate) fn int64_min_max_nullness_index_scan(
+        &self,
+        column: usize,
+        is_null: bool,
+        source_rows: Range<usize>,
+    ) -> Option<Int64MinMaxIndexScan> {
+        self.int64_min_max_index_scan_with(column, source_rows, |block| {
+            block_may_match_nullness(block, is_null)
+        })
+    }
+
+    fn int64_min_max_index_scan_with(
+        &self,
+        column: usize,
+        source_rows: Range<usize>,
+        block_may_match: impl Fn(Int64MinMaxBlockMetadata) -> bool,
+    ) -> Option<Int64MinMaxIndexScan> {
         let index = self.int64_min_max_index.as_ref()?;
         if index.column != column
             || index.source_generation != self.mutation_generation
@@ -1083,7 +1105,7 @@ impl Table {
             if start >= end {
                 continue;
             }
-            if block_may_match(*block, filter) {
+            if block_may_match(*block) {
                 scanned_blocks = scanned_blocks.saturating_add(1);
                 ranges.push(start..end);
             } else {
@@ -1707,6 +1729,14 @@ fn block_may_match(block: Int64MinMaxBlockMetadata, filter: Int64Filter) -> bool
     }
 }
 
+fn block_may_match_nullness(block: Int64MinMaxBlockMetadata, is_null: bool) -> bool {
+    if is_null {
+        block.null_count != 0
+    } else {
+        block.null_count < block.row_count
+    }
+}
+
 pub(crate) fn validate_row_selection(
     row_indexes: impl IntoIterator<Item = usize>,
     input_rows: usize,
@@ -1890,6 +1920,22 @@ mod tests {
             summarize_nullable_int64_block(0, [None, None]),
             Int64Filter::Equal(0),
         ));
+        assert!(!block_may_match_nullness(
+            summarize_nullable_int64_block(0, [Some(1), Some(2)]),
+            true,
+        ));
+        assert!(!block_may_match_nullness(
+            summarize_nullable_int64_block(0, [None, None]),
+            false,
+        ));
+        assert!(block_may_match_nullness(
+            summarize_nullable_int64_block(0, [Some(1), None]),
+            true,
+        ));
+        assert!(block_may_match_nullness(
+            summarize_nullable_int64_block(0, [Some(1), None]),
+            false,
+        ));
     }
 
     #[test]
@@ -1915,11 +1961,21 @@ mod tests {
                 .int64_min_max_index_scan(0, Int64Filter::Equal(2), 0..table.row_count())
                 .is_some()
         );
+        assert!(
+            table
+                .int64_min_max_nullness_index_scan(0, true, 0..table.row_count())
+                .is_some()
+        );
 
         table.mutation_generation = table.mutation_generation.wrapping_add(1);
         assert!(
             table
                 .int64_min_max_index_scan(0, Int64Filter::Equal(2), 0..table.row_count())
+                .is_none()
+        );
+        assert!(
+            table
+                .int64_min_max_nullness_index_scan(0, true, 0..table.row_count())
                 .is_none()
         );
         table.mutation_generation = table.mutation_generation.wrapping_sub(1);
