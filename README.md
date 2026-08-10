@@ -26,7 +26,11 @@ The early implementation should favor Rust's standard library and a small depend
 The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and composable `WHERE`
-comparisons with unary `NOT`, `AND`, and `OR`. The exact inclusive range forms
+comparisons with unary `NOT`, `AND`, and `OR`. Case-insensitive
+`column IS NULL` and `column IS NOT NULL` are composable atoms for every
+physical column: nullable values follow SQL nullness semantics, while a
+non-nullable column never satisfies `IS NULL` and always satisfies
+`IS NOT NULL`. The exact inclusive range forms
 `column BETWEEN lower_literal AND upper_literal` and
 `column NOT BETWEEN lower_literal AND upper_literal` accept the same typed
 literals as comparisons and bind as one predicate atom. `BETWEEN` is equivalent
@@ -423,9 +427,10 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n [OFFSET m]]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison, inclusive `BETWEEN` and `NOT BETWEEN`, nonempty `IN` and
-`NOT IN`, and prefix, suffix, and contains `LIKE` and `NOT LIKE` predicates as
-regular `SELECT`, including independently applied unary `NOT`.
+composable comparison and nullness predicates, inclusive
+`BETWEEN` and `NOT BETWEEN`, nonempty `IN` and `NOT IN`, and prefix, suffix,
+and contains `LIKE` and `NOT LIKE` predicates as regular `SELECT`, including
+independently applied unary `NOT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -647,7 +652,8 @@ node also counts toward that limit, while all leaves share one retained copy of
 the column identifier. `NOT IN` adds and charges exactly one negation node
 around that balanced tree. A `LIKE` pattern is one predicate node, and infix
 `NOT LIKE` adds and charges exactly one negation node around the same
-allocation-free matcher.
+allocation-free matcher. Each `IS NULL` or `IS NOT NULL` atom is one predicate
+node.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW DATABASES`, `SHOW SETTINGS`, `SHOW FUNCTIONS`, `SHOW

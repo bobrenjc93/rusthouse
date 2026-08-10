@@ -697,6 +697,53 @@ fn json_cli_round_trips_sql_created_nullable_int64_values_and_ddl() {
 }
 
 #[test]
+fn json_cli_filters_sql_created_nullable_values_with_nullness_predicates() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE readings (measurement Nullable(Int64)); \
+          INSERT INTO readings VALUES (NULL), (7), (-2), (NULL), (3); \
+          SELECT measurement FROM readings \
+          WHERE measurement IS NULL ORDER BY measurement LIMIT 1; \
+          SELECT measurement FROM readings \
+          WHERE NOT measurement IS NULL AND measurement IS NOT NULL \
+          ORDER BY measurement DESC LIMIT 2 OFFSET 1; \
+          SELECT COUNT(*) AS missing FROM readings WHERE measurement iS nUlL;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        concat!(
+            r#"{"columns":[{"name":"measurement","type":"Int64"}],"rows":[[null]]}"#,
+            "\n",
+            r#"{"columns":[{"name":"measurement","type":"Int64"}],"rows":[[3],[-2]]}"#,
+            "\n",
+            r#"{"columns":[{"name":"missing","type":"Int64"}],"rows":[[2]]}"#,
+            "\n",
+        )
+        .as_bytes()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn batch_cli_rejects_malformed_nullness_predicate() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE readings (measurement Nullable(Int64)); \
+          SELECT measurement FROM readings WHERE measurement IS NOT;",
+    );
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("expected keyword NULL")
+    );
+}
+
+#[test]
 fn batch_cli_keeps_drop_table_command_output_silent() {
     for format in [
         "table",

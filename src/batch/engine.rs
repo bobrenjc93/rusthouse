@@ -8681,6 +8681,10 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    Nullness {
+        column: usize,
+        is_null: bool,
+    },
     LikePrefix {
         column: usize,
         prefix: String,
@@ -8760,6 +8764,9 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
+            Self::Nullness { column, is_null } => {
+                matches!(table.columns()[*column].value_ref(row), ValueRef::Null(_)) == *is_null
+            }
             Self::LikePrefix {
                 column,
                 prefix,
@@ -8835,6 +8842,14 @@ fn compile_predicate_with_polarity(
                     *operator
                 },
                 right,
+            })
+        }
+        Predicate::IsNull { column } | Predicate::IsNotNull { column } => {
+            let column_index = table.column_index(column)?;
+            let is_null = matches!(predicate, Predicate::IsNull { .. }) != negated;
+            Ok(CompiledPredicate::Nullness {
+                column: column_index,
+                is_null,
             })
         }
         Predicate::LikePrefix { column, prefix } => {

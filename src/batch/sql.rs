@@ -478,6 +478,14 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    /// Tests whether a physical column value is SQL `NULL`.
+    IsNull {
+        column: String,
+    },
+    /// Tests whether a physical column value is present.
+    IsNotNull {
+        column: String,
+    },
     /// A case-sensitive String prefix match parsed from `column LIKE 'prefix%'`.
     LikePrefix {
         column: String,
@@ -2642,8 +2650,9 @@ impl<'a> Parser<'a> {
         // `not` remains a valid column name, so a following predicate operator
         // makes this token the left operand rather than unary syntax. This
         // includes the two-token `NOT IN`, `NOT BETWEEN`, and `NOT LIKE`
-        // operators. `like` is also a valid column name; the pattern lookahead
-        // keeps unary `NOT like ...` distinct from a column named `not`.
+        // operators and `IS [NOT] NULL`. `like` is also a valid column name;
+        // the pattern lookahead keeps unary `NOT like ...` distinct from a
+        // column named `not`.
         if !self.at_keyword("NOT") || self.next_token_is_predicate_operator() {
             return self.parse_predicate_atom();
         }
@@ -2681,6 +2690,19 @@ impl<'a> Parser<'a> {
             TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("IN") => {
                 matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
             }
+            TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("IS") => {
+                let null_or_not = Self::next_or_invalid(&mut lexer);
+                match null_or_not.kind {
+                    TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("NULL") => true,
+                    TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("NOT") => {
+                        matches!(
+                            Self::next_or_invalid(&mut lexer).kind,
+                            TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("NULL")
+                        )
+                    }
+                    _ => false,
+                }
+            }
             TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("NOT") => {
                 match Self::next_or_invalid(&mut lexer).kind {
                     TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("IN") => {
@@ -2716,6 +2738,19 @@ impl<'a> Parser<'a> {
         }
 
         let left = self.parse_operand()?;
+        if self.eat_keyword("IS") {
+            let Operand::Column(column) = left else {
+                return self.error("IS NULL left operand must be a column");
+            };
+            let is_not_null = self.eat_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            self.record_predicate_node()?;
+            return Ok(if is_not_null {
+                Predicate::IsNotNull { column }
+            } else {
+                Predicate::IsNull { column }
+            });
+        }
         let infix_negated = self.eat_keyword("NOT");
         if self.eat_keyword("BETWEEN") {
             return self.parse_between_predicate(left, infix_negated);
