@@ -4012,13 +4012,22 @@ impl Database {
         // the scan limit. A sparse index can then narrow physical candidates,
         // but does not reduce that charge for an ordinary table.
         let int64_filter = predicate.as_ref().and_then(CompiledPredicate::int64_filter);
+        let int64_nullness = predicate
+            .as_ref()
+            .and_then(CompiledPredicate::int64_nullness);
         let source_rows = int64_filter
             .and_then(|(column, filter)| table.int64_range_partition_rows(column, filter))
             .unwrap_or(0..table.row_count());
         enforce_select_scan_rows(source_rows.len(), query_result_limits)?;
-        let indexed_scan = int64_filter.and_then(|(column, filter)| {
-            table.int64_min_max_index_scan(column, filter, source_rows.clone())
-        });
+        let indexed_scan = int64_filter
+            .and_then(|(column, filter)| {
+                table.int64_min_max_index_scan(column, filter, source_rows.clone())
+            })
+            .or_else(|| {
+                int64_nullness.and_then(|(column, is_null)| {
+                    table.int64_min_max_nullness_index_scan(column, is_null, source_rows.clone())
+                })
+            });
         let candidate_ranges = if let Some(scan) = indexed_scan {
             self.index_pruning_counters.record(&scan);
             scan.ranges
@@ -8762,6 +8771,13 @@ impl CompiledPredicate {
             ComparisonOperator::NotEqual => return None,
         };
         Some((column, filter))
+    }
+
+    fn int64_nullness(&self) -> Option<(usize, bool)> {
+        let Self::Nullness { column, is_null } = self else {
+            return None;
+        };
+        Some((*column, *is_null))
     }
 
     fn evaluate(&self, table: &Table, row: usize) -> bool {

@@ -2,7 +2,10 @@ use rusthouse::batch::engine::{Database, QueryResult, QueryResultLimits, Stateme
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{Predicate, Statement, parse};
 use rusthouse::batch::value::{DataType, Value};
-use rusthouse::{Int64MinMaxIndexAdmission, Int64MinMaxIndexLimits};
+use rusthouse::{
+    IndexPruningMetrics, Int64MinMaxBlockMetadata, Int64MinMaxIndexAdmission,
+    Int64MinMaxIndexLimits,
+};
 
 fn predicate(sql: &str) -> Predicate {
     let statements = parse(sql).expect("valid predicate query");
@@ -18,6 +21,32 @@ fn query(database: &mut Database, sql: &str) -> QueryResult {
         panic!("expected one query result");
     };
     result.clone()
+}
+
+fn assert_indexed_differential(
+    indexed: &mut Database,
+    unindexed: &mut Database,
+    sql: &str,
+    expected_delta: IndexPruningMetrics,
+) {
+    let before = indexed.index_pruning_metrics();
+    assert_eq!(query(indexed, sql), query(unindexed, sql), "{sql}");
+    let after = indexed.index_pruning_metrics();
+    assert_eq!(
+        after.scanned_blocks - before.scanned_blocks,
+        expected_delta.scanned_blocks,
+        "scanned blocks for {sql}",
+    );
+    assert_eq!(
+        after.pruned_blocks - before.pruned_blocks,
+        expected_delta.pruned_blocks,
+        "pruned blocks for {sql}",
+    );
+    assert_eq!(
+        unindexed.index_pruning_metrics(),
+        IndexPruningMetrics::default(),
+        "unindexed query must retain exact fallback for {sql}",
+    );
 }
 
 #[test]
@@ -183,40 +212,216 @@ fn non_nullable_columns_have_constant_sql_nullness_semantics() {
     );
 }
 
-#[test]
-fn nullness_uses_exact_fallback_without_sparse_index_pruning() {
+fn nullness_test_database() -> Database {
     let mut database = Database::new();
     database
         .execute(
             "CREATE TABLE readings (value Nullable(Int64)); \
-             INSERT INTO readings VALUES (NULL), (1), (2), (NULL), (3), (NULL);",
+             INSERT INTO readings VALUES \
+               (NULL), (NULL), (NULL), \
+               (1), (2), (3), \
+               (NULL), (4), (NULL), \
+               (5);",
         )
         .expect("setup");
+    database
+}
+
+#[test]
+fn indexed_nullness_matches_fallback_across_block_shapes_and_rebuilds() {
+    let mut indexed = nullness_test_database();
+    let mut unindexed = nullness_test_database();
     assert!(matches!(
-        database
+        indexed
             .create_int64_min_max_index(
                 "readings",
                 "value",
-                Int64MinMaxIndexLimits::new(2, 3, usize::MAX),
+                Int64MinMaxIndexLimits::new(3, 4, usize::MAX),
             )
             .expect("valid index request"),
         Int64MinMaxIndexAdmission::Created(_)
     ));
-
     assert_eq!(
-        query(
-            &mut database,
-            "SELECT value FROM readings WHERE value IS NULL",
-        )
-        .rows,
+        indexed
+            .catalog()
+            .table("readings")
+            .unwrap()
+            .int64_min_max_index_blocks()
+            .unwrap(),
         [
-            vec![Value::Null(DataType::Int64)],
-            vec![Value::Null(DataType::Int64)],
-            vec![Value::Null(DataType::Int64)],
+            Int64MinMaxBlockMetadata {
+                first_row: 0,
+                row_count: 3,
+                min: None,
+                max: None,
+                null_count: 3,
+            },
+            Int64MinMaxBlockMetadata {
+                first_row: 3,
+                row_count: 3,
+                min: Some(1),
+                max: Some(3),
+                null_count: 0,
+            },
+            Int64MinMaxBlockMetadata {
+                first_row: 6,
+                row_count: 3,
+                min: Some(4),
+                max: Some(4),
+                null_count: 2,
+            },
+            Int64MinMaxBlockMetadata {
+                first_row: 9,
+                row_count: 1,
+                min: Some(5),
+                max: Some(5),
+                null_count: 0,
+            },
         ]
     );
-    assert_eq!(database.index_pruning_metrics().scanned_blocks, 0);
-    assert_eq!(database.index_pruning_metrics().pruned_blocks, 0);
+
+    for (sql, expected_delta) in [
+        (
+            "SELECT value FROM readings WHERE value IS NULL ORDER BY value",
+            IndexPruningMetrics {
+                scanned_blocks: 2,
+                pruned_blocks: 2,
+            },
+        ),
+        (
+            "SELECT value FROM readings WHERE value IS NOT NULL ORDER BY value",
+            IndexPruningMetrics {
+                scanned_blocks: 3,
+                pruned_blocks: 1,
+            },
+        ),
+        (
+            "SELECT value FROM readings WHERE NOT value IS NULL ORDER BY value",
+            IndexPruningMetrics {
+                scanned_blocks: 3,
+                pruned_blocks: 1,
+            },
+        ),
+        (
+            "SELECT value FROM readings WHERE NOT (value IS NOT NULL) ORDER BY value",
+            IndexPruningMetrics {
+                scanned_blocks: 2,
+                pruned_blocks: 2,
+            },
+        ),
+    ] {
+        assert_indexed_differential(&mut indexed, &mut unindexed, sql, expected_delta);
+    }
+
+    let mutation = "ALTER TABLE readings UPDATE value = NULL WHERE value = 4; \
+                    INSERT INTO readings VALUES (NULL), (6);";
+    indexed.execute(mutation).expect("indexed mutation");
+    unindexed.execute(mutation).expect("unindexed mutation");
+    assert_eq!(
+        indexed
+            .catalog()
+            .table("readings")
+            .unwrap()
+            .int64_min_max_index_blocks()
+            .unwrap(),
+        [
+            Int64MinMaxBlockMetadata {
+                first_row: 0,
+                row_count: 3,
+                min: None,
+                max: None,
+                null_count: 3,
+            },
+            Int64MinMaxBlockMetadata {
+                first_row: 3,
+                row_count: 3,
+                min: Some(1),
+                max: Some(3),
+                null_count: 0,
+            },
+            Int64MinMaxBlockMetadata {
+                first_row: 6,
+                row_count: 3,
+                min: None,
+                max: None,
+                null_count: 3,
+            },
+            Int64MinMaxBlockMetadata {
+                first_row: 9,
+                row_count: 3,
+                min: Some(5),
+                max: Some(6),
+                null_count: 1,
+            },
+        ],
+        "successful mutations rebuild null counts before the next query",
+    );
+
+    assert_indexed_differential(
+        &mut indexed,
+        &mut unindexed,
+        "SELECT value FROM readings WHERE value IS NULL ORDER BY value",
+        IndexPruningMetrics {
+            scanned_blocks: 3,
+            pruned_blocks: 1,
+        },
+    );
+    assert_indexed_differential(
+        &mut indexed,
+        &mut unindexed,
+        "SELECT value FROM readings WHERE value IS NOT NULL ORDER BY value",
+        IndexPruningMetrics {
+            scanned_blocks: 2,
+            pruned_blocks: 2,
+        },
+    );
+    assert_indexed_differential(
+        &mut indexed,
+        &mut unindexed,
+        "SELECT value FROM readings WHERE NOT value IS NULL ORDER BY value",
+        IndexPruningMetrics {
+            scanned_blocks: 2,
+            pruned_blocks: 2,
+        },
+    );
+    assert_indexed_differential(
+        &mut indexed,
+        &mut unindexed,
+        "SELECT value FROM readings WHERE NOT (value IS NOT NULL) ORDER BY value",
+        IndexPruningMetrics {
+            scanned_blocks: 3,
+            pruned_blocks: 1,
+        },
+    );
+}
+
+#[test]
+fn compound_nullness_predicates_use_exact_unindexed_fallback() {
+    let mut indexed = nullness_test_database();
+    let mut unindexed = nullness_test_database();
+    indexed
+        .create_int64_min_max_index(
+            "readings",
+            "value",
+            Int64MinMaxIndexLimits::new(3, 4, usize::MAX),
+        )
+        .expect("valid index request");
+
+    for sql in [
+        "SELECT value FROM readings WHERE value IS NULL OR value = 2 ORDER BY value",
+        "SELECT value FROM readings WHERE value IS NOT NULL AND value >= 3 ORDER BY value",
+        "SELECT value FROM readings WHERE NOT (value IS NULL OR value = 2) ORDER BY value",
+    ] {
+        assert_eq!(
+            query(&mut indexed, sql),
+            query(&mut unindexed, sql),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        indexed.index_pruning_metrics(),
+        IndexPruningMetrics::default(),
+    );
 }
 
 #[test]
@@ -231,6 +436,13 @@ fn nullness_cannot_bypass_the_source_scan_limit_with_limit_zero() {
              INSERT INTO readings VALUES (NULL), (1), (NULL);",
         )
         .expect("setup");
+    database
+        .create_int64_min_max_index(
+            "readings",
+            "value",
+            Int64MinMaxIndexLimits::new(1, 3, usize::MAX),
+        )
+        .expect("valid index request");
 
     assert_eq!(
         database.execute("SELECT value FROM readings WHERE value IS NULL LIMIT 0"),
@@ -239,5 +451,10 @@ fn nullness_cannot_bypass_the_source_scan_limit_with_limit_zero() {
             actual: 3,
             max: 2,
         })
+    );
+    assert_eq!(
+        database.index_pruning_metrics(),
+        IndexPruningMetrics::default(),
+        "the full source charge fails before indexed work is recorded",
     );
 }
