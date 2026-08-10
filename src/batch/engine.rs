@@ -135,6 +135,17 @@ impl Default for QueryResultLimits {
     }
 }
 
+/// Nonpersistent workload limits supplied for one parameterized query.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParameterizedQueryLimits {
+    pub(crate) max_result_bytes: usize,
+    pub(crate) max_result_rows: usize,
+    pub(crate) max_result_values: usize,
+    pub(crate) max_scan_rows: usize,
+    pub(crate) max_groups: usize,
+    pub(crate) max_threads: usize,
+}
+
 /// A reusable in-memory SQL database.
 ///
 /// Checked `Int64` column-minus-literal expressions, `CAST`, `toString`,
@@ -2661,36 +2672,49 @@ impl Database {
     ) -> Result<QueryResult> {
         self.execute_query_statement_with_parameterized_limits(
             statement,
-            max_result_bytes,
-            self.query_result_limits.max_rows,
-            0,
-            0,
-            0,
+            ParameterizedQueryLimits {
+                max_result_bytes,
+                max_result_rows: self.query_result_limits.max_rows,
+                max_result_values: 0,
+                max_scan_rows: 0,
+                max_groups: 0,
+                max_threads: 0,
+            },
         )
     }
 
     /// Executes one already-parsed read-only query with caller-supplied limits.
     ///
     /// Caller limits may only tighten the database's configured result-byte,
-    /// result-row, scan-row, group-count, and supported global-aggregate worker
-    /// limits. Zero leaves the corresponding configured limit in place.
-    /// Result-shape validation applies both effective result limits before
-    /// result rows are materialized; the effective scan and group limits are
-    /// charged independently of `LIMIT`.
+    /// result-row, result-value, scan-row, group-count, and supported
+    /// global-aggregate worker limits. Zero leaves the corresponding configured
+    /// limit in place.
+    /// Result-shape validation applies the effective row, value, and byte
+    /// limits before result rows are materialized; the effective scan and group
+    /// limits are charged independently of `LIMIT`.
     pub(crate) fn execute_query_statement_with_parameterized_limits(
         &self,
         statement: Statement,
-        max_result_bytes: usize,
-        max_result_rows: usize,
-        max_scan_rows: usize,
-        max_groups: usize,
-        max_threads: usize,
+        requested_limits: ParameterizedQueryLimits,
     ) -> Result<QueryResult> {
+        let ParameterizedQueryLimits {
+            max_result_bytes,
+            max_result_rows,
+            max_result_values,
+            max_scan_rows,
+            max_groups,
+            max_threads,
+        } = requested_limits;
         let tightened_result_limit = max_result_bytes < self.query_result_limits.max_bytes;
         let max_rows = if max_result_rows == 0 {
             self.query_result_limits.max_rows
         } else {
             self.query_result_limits.max_rows.min(max_result_rows)
+        };
+        let max_values = if max_result_values == 0 {
+            self.query_result_limits.max_values
+        } else {
+            self.query_result_limits.max_values.min(max_result_values)
         };
         let max_scan_rows = if max_scan_rows == 0 {
             self.query_result_limits.max_scan_rows
@@ -2705,6 +2729,7 @@ impl Database {
         let query_limits = QueryResultLimits {
             max_scan_rows,
             max_rows,
+            max_values,
             max_groups,
             max_bytes: self.query_result_limits.max_bytes.min(max_result_bytes),
             ..self.query_result_limits
@@ -9082,11 +9107,14 @@ mod tests {
         database
             .execute_query_statement_with_parameterized_limits(
                 statements.pop().expect("one query statement"),
-                DEFAULT_MAX_RETAINED_RESULT_BYTES,
-                0,
-                0,
-                0,
-                max_threads,
+                ParameterizedQueryLimits {
+                    max_result_bytes: DEFAULT_MAX_RETAINED_RESULT_BYTES,
+                    max_result_rows: 0,
+                    max_result_values: 0,
+                    max_scan_rows: 0,
+                    max_groups: 0,
+                    max_threads,
+                },
             )
             .expect("parameterized query succeeds")
     }
@@ -12253,11 +12281,14 @@ mod tests {
                     database
                         .try_query_with_parameterized_workload_limits(
                             "SELECT countIf(active) FROM events",
-                            DEFAULT_MAX_RETAINED_RESULT_BYTES,
-                            0,
-                            0,
-                            0,
-                            2,
+                            ParameterizedQueryLimits {
+                                max_result_bytes: DEFAULT_MAX_RETAINED_RESULT_BYTES,
+                                max_result_rows: 0,
+                                max_result_values: 0,
+                                max_scan_rows: 0,
+                                max_groups: 0,
+                                max_threads: 2,
+                            },
                         )
                         .expect("concurrent countIf query")
                 })

@@ -12,6 +12,7 @@ use std::thread::{self, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
+use crate::batch::engine::ParameterizedQueryLimits;
 use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
     write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
@@ -822,10 +823,11 @@ fn serve_http_connections(
 /// `POST /?query=<percent-encoded SQL>` carry the same SQL in a required
 /// form-style query parameter and optionally accept one `database=default`
 /// parameter, one decimal `max_result_rows` parameter, one decimal
-/// `max_result_bytes` parameter, one decimal `max_rows_to_read` parameter, and
-/// one decimal `max_rows_to_group_by` parameter, one decimal `max_threads`
-/// parameter, one decimal `readonly` parameter, and one `default_format`
-/// parameter in any order. `readonly=1` tightens the request to read-only,
+/// `max_result_values` parameter, one decimal `max_result_bytes` parameter, one
+/// decimal `max_rows_to_read` parameter, one decimal `max_rows_to_group_by`
+/// parameter, one decimal `max_threads` parameter, one decimal `readonly`
+/// parameter, and one `default_format` parameter in any order. `readonly=1`
+/// tightens the request to read-only,
 /// while `readonly=0` retains the handler's configured access and never grants
 /// insertion access to a read-only handler. Nonzero result, scan, group, and
 /// worker limits can tighten but never relax the database's configured query
@@ -1797,6 +1799,7 @@ fn handle_http_query_exchange(
     let ParameterizedWorkloadLimits {
         max_result_bytes,
         max_result_rows,
+        max_result_values,
         max_rows_to_read,
         max_rows_to_group_by,
         max_threads,
@@ -1804,24 +1807,29 @@ fn handle_http_query_exchange(
     let query_result = match (
         max_result_bytes,
         max_result_rows,
+        max_result_values,
         max_rows_to_read,
         max_rows_to_group_by,
         max_threads,
     ) {
-        (None, None, None, None, None) => database.try_query(&sql),
+        (None, None, None, None, None, None) => database.try_query(&sql),
         (
             max_result_bytes,
             max_result_rows,
+            max_result_values,
             max_rows_to_read,
             max_rows_to_group_by,
             max_threads,
         ) => database.try_query_with_parameterized_workload_limits(
             &sql,
-            max_result_bytes.unwrap_or(0),
-            max_result_rows.unwrap_or(0),
-            max_rows_to_read.unwrap_or(0),
-            max_rows_to_group_by.unwrap_or(0),
-            max_threads.unwrap_or(0),
+            ParameterizedQueryLimits {
+                max_result_bytes: max_result_bytes.unwrap_or(0),
+                max_result_rows: max_result_rows.unwrap_or(0),
+                max_result_values: max_result_values.unwrap_or(0),
+                max_scan_rows: max_rows_to_read.unwrap_or(0),
+                max_groups: max_rows_to_group_by.unwrap_or(0),
+                max_threads: max_threads.unwrap_or(0),
+            },
         ),
     };
     match query_result {
@@ -2491,6 +2499,7 @@ enum HttpRequest {
 struct ParameterizedWorkloadLimits {
     max_result_bytes: Option<usize>,
     max_result_rows: Option<usize>,
+    max_result_values: Option<usize>,
     max_rows_to_read: Option<usize>,
     max_rows_to_group_by: Option<usize>,
     max_threads: Option<usize>,
@@ -3034,6 +3043,7 @@ fn parse_request_line(
                 || target.starts_with(b"/?database=")
                 || target.starts_with(b"/?max_result_bytes=")
                 || target.starts_with(b"/?max_result_rows=")
+                || target.starts_with(b"/?max_result_values=")
                 || target.starts_with(b"/?max_rows_to_read=")
                 || target.starts_with(b"/?max_rows_to_group_by=")
                 || target.starts_with(b"/?max_threads=")
@@ -3114,6 +3124,7 @@ fn decode_query_parameters(
     let mut response_format = None;
     let mut max_result_bytes = None;
     let mut max_result_rows = None;
+    let mut max_result_values = None;
     let mut max_rows_to_read = None;
     let mut max_rows_to_group_by = None;
     let mut max_threads = None;
@@ -3210,6 +3221,17 @@ fn decode_query_parameters(
                 let value = decode_form_component(encoded_value, None)?;
                 max_result_bytes = Some(parse_decimal_max_result_bytes(&value)?);
             }
+            b"max_result_values" => {
+                if max_result_values.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate max_result_values parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                max_result_values = Some(parse_decimal_max_result_values(&value)?);
+            }
             b"max_rows_to_read" => {
                 if max_rows_to_read.is_some() {
                     return Err(RequestFailure::new(
@@ -3276,6 +3298,7 @@ fn decode_query_parameters(
         workload_limits: ParameterizedWorkloadLimits {
             max_result_bytes,
             max_result_rows,
+            max_result_values,
             max_rows_to_read,
             max_rows_to_group_by,
             max_threads,
@@ -3311,6 +3334,14 @@ fn parse_decimal_max_result_rows(value: &[u8]) -> Result<usize, RequestReadError
         value,
         "max_result_rows parameter must be a decimal integer",
         "max_result_rows parameter is out of range",
+    )
+}
+
+fn parse_decimal_max_result_values(value: &[u8]) -> Result<usize, RequestReadError> {
+    parse_decimal_parameter(
+        value,
+        "max_result_values parameter must be a decimal integer",
+        "max_result_values parameter is out of range",
     )
 }
 

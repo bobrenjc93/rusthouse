@@ -1510,12 +1510,12 @@ fn parameterized_get_and_post_combine_workload_limits_database_and_format_parame
 
     let exact_requests: &[(&[u8], &str, &[u8])] = &[
         (
-            b"GET /?database=default&max_result_bytes=%31%30%32%34&max_result_rows=%32&max_rows_to_read=%33&max_rows_to_group_by=%33&max_threads=%31&default_format=CSVWithNames&query=SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET /?database=default&max_result_bytes=%31%30%32%34&max_result_rows=%32&max_result_values=%32&max_rows_to_read=%33&max_rows_to_group_by=%33&max_threads=%31&default_format=CSVWithNames&query=SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "text/csv; charset=utf-8",
             b"value\n1\n2\n",
         ),
         (
-            b"POST /?query=SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&max_rows_to_read=3&max_rows_to_group_by=3&max_threads=2&max_result_bytes=1024&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            b"POST /?query=SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value+LIMIT+2%3B&default_format=TabSeparatedWithNames&max_result_rows=2&max_result_values=2&max_rows_to_read=3&max_rows_to_group_by=3&max_threads=2&max_result_bytes=1024&database=default HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
             "text/tab-separated-values; charset=utf-8",
             b"value\n1\n2\n",
         ),
@@ -1814,6 +1814,170 @@ fn parameterized_max_result_rows_rejects_empty_duplicate_malformed_and_overflowi
             );
         }
     }
+}
+
+#[test]
+fn parameterized_max_result_values_enforces_exact_boundaries_before_materialization() {
+    let configured_limits = QueryResultLimits {
+        max_values: 4,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE samples (left_value Int64, right_value Int64); \
+             INSERT INTO samples VALUES (1, 10), (2, 20); \
+             CREATE TABLE invalid_values (value String); \
+             INSERT INTO invalid_values VALUES ('bad'), ('worse');",
+        )
+        .unwrap();
+    let expected = r#"{"columns":[{"name":"left_value","type":"Int64"},{"name":"right_value","type":"Int64"}],"rows":[[1,10],[2,20]]}"#;
+
+    for method in ["GET", "POST"] {
+        for requested_max in [4, 0] {
+            let request = format!(
+                "{method} /?query=SELECT+left_value%2C+right_value+FROM+samples%3B&max_result_values={requested_max} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 200 OK",
+                expected,
+            );
+        }
+
+        let below_boundary = format!(
+            "{method} /?max_result_values=3&query=SELECT+left_value%2C+right_value+FROM+samples%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, below_boundary.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"SELECT result values requires at least 4, exceeding the limit of 3"}"#,
+        );
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?max_result_values=1&query=SELECT+CAST%28value+AS+Int64%29+FROM+invalid_values%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"SELECT result values requires at least 2, exceeding the limit of 1"}"#,
+    );
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_result_values_zero_and_larger_values_never_relax_the_configured_limit() {
+    let configured_limits = QueryResultLimits {
+        max_values: 3,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE samples (left_value Int64, right_value Int64); \
+             INSERT INTO samples VALUES (1, 10), (2, 20);",
+        )
+        .unwrap();
+
+    for (method, requested_max) in [
+        ("GET", "0".to_owned()),
+        ("POST", "4".to_owned()),
+        ("GET", usize::MAX.to_string()),
+    ] {
+        let request = format!(
+            "{method} /?max_result_values={requested_max}&query=SELECT+left_value%2C+right_value+FROM+samples%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, request.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"SELECT result values requires at least 4, exceeding the limit of 3"}"#,
+        );
+    }
+
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_result_values_rejects_empty_duplicate_malformed_and_overflowing_values() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_result_values= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_result_values=1&query=SELECT+1%3B&max%5Fresult%5Fvalues=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_result_values parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_result_values=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_result_values parameter must be a decimal integer"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_result_values={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_result_values parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn max_result_values_validation_precedes_nonblocking_lock_admission() {
+    let contended_inner = Arc::new(RwLock::new(Database::new()));
+    let contended_database = SharedDatabase::from_arc(Arc::clone(&contended_inner));
+    let mut writer = Some(contended_inner.write().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let invalid = exchange(
+            &contended_database,
+            b"GET /?query=SELECT+1%3B&max_result_values=-1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let valid = exchange(
+            &contended_database,
+            b"POST /?max_result_values=1&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        sender.send((invalid, valid)).unwrap();
+    });
+    let (invalid, valid) = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(responses) => responses,
+        Err(error) => {
+            drop(writer.take());
+            worker.join().unwrap();
+            panic!("max_result_values admission blocked behind a writer: {error}");
+        }
+    };
+    assert_response(
+        &invalid,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"max_result_values parameter must be a decimal integer"}"#,
+    );
+    assert_response(
+        &valid,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    drop(writer.take());
+    worker.join().unwrap();
 }
 
 #[test]
