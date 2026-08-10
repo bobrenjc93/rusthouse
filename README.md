@@ -77,7 +77,9 @@ grouped ordering and pagination stages. The paired
 shape preserves either projection order and derives its row count with a
 checked conversion of the filtered cardinality while the existing checked
 sum-and-count lanes target about 131,072 rows each. Release-mode crossover
-measurements kept smaller inputs sequential.
+measurements kept smaller inputs sequential. Int64 scalar and paired shapes
+require a physically non-nullable argument; nullable Int64 aggregates use the
+bounded sequential state path.
 Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
@@ -121,6 +123,12 @@ case-insensitively; other nullable types and nullable multi-column declarations
 remain outside the bounded grammar. Library APIs and WAL recovery can also
 create this physical storage. The index metadata has explicit nullable-block
 semantics for both `Int64` storage forms.
+`COUNT`, `SUM`, `MIN`, and `MAX` accept physical `Nullable(Int64)` arguments.
+`SUM`, `MIN`, and `MAX` ignore absent values and return typed `Int64` `NULL`
+for empty or all-`NULL` inputs; `COUNT(column)` counts only present values.
+These nullable shapes compose with filters, grouping, HAVING, ordering,
+pagination, and other supported aggregate projections. Other operations retain
+their documented nullable restrictions.
 
 An admitted, current index can reject blocks only for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand

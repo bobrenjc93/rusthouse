@@ -90,7 +90,6 @@ fn create_two_table_registry(path: &Path) {
 
 fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
     for (expression, operation) in [
-        ("MAX(v)", "MAX"),
         ("AVG(v)", "AVG"),
         ("v - 1", "Int64 subtraction"),
         ("CAST(v AS String)", "CAST"),
@@ -117,7 +116,7 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
     let [StatementResult::Query(sum)] = results.as_slice() else {
         panic!("expected SUM query")
     };
-    assert_eq!(sum.rows, [vec![Value::Int64(1)]]);
+    assert_eq!(sum.rows, [vec![Value::Int64(-1)]]);
 
     let results = database
         .execute(&format!("SELECT COUNT(*), COUNT(v) FROM {table}"))
@@ -125,7 +124,7 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
     let [StatementResult::Query(count)] = results.as_slice() else {
         panic!("expected COUNT query")
     };
-    assert_eq!(count.rows, [vec![Value::Int64(2), Value::Int64(1)]]);
+    assert_eq!(count.rows, [vec![Value::Int64(3), Value::Int64(2)]]);
 
     let results = database
         .execute(&format!("SELECT MIN(v) FROM {table}"))
@@ -133,7 +132,15 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
     let [StatementResult::Query(minimum)] = results.as_slice() else {
         panic!("expected MIN query")
     };
-    assert_eq!(minimum.rows, [vec![Value::Int64(1)]]);
+    assert_eq!(minimum.rows, [vec![Value::Int64(i64::MIN)]]);
+
+    let results = database
+        .execute(&format!("SELECT MAX(v) FROM {table}"))
+        .unwrap();
+    let [StatementResult::Query(maximum)] = results.as_slice() else {
+        panic!("expected MAX query")
+    };
+    assert_eq!(maximum.rows, [vec![Value::Int64(i64::MAX)]]);
 
     let results = database
         .execute(&format!(
@@ -147,19 +154,20 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
         rendered.rows,
         [
             vec![Value::Null(rusthouse::batch::value::DataType::String)],
-            vec![Value::String("1".to_owned())],
+            vec![Value::String(i64::MIN.to_string())],
+            vec![Value::String(i64::MAX.to_string())],
         ]
     );
 }
 
 #[test]
-fn nullable_created_and_recovered_tables_support_sum_and_to_string() {
+fn nullable_created_and_recovered_tables_support_aggregates_and_to_string() {
     let directory = TestDirectory::new();
     let registry = directory.join("registry");
     let snapshot = directory.join("nullable.snapshot");
     let mut database = Database::new();
     database
-        .create_nullable_int64_table("Alpha", "v", vec![Some(1), None])
+        .create_nullable_int64_table("Alpha", "v", vec![Some(i64::MIN), None, Some(i64::MAX)])
         .unwrap();
 
     assert_nullable_aggregate_behavior(&mut database, "alpha");
