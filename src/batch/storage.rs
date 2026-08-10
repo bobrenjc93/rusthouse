@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
+use std::ops::Range;
 
 use crate::batch::error::{Error, Result};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -9,6 +11,110 @@ pub const DEFAULT_MAX_ROWS_PER_TABLE: usize = 1_000_000;
 pub const DEFAULT_MAX_COLUMNS_PER_TABLE: usize = 1_024;
 /// Default maximum number of physical scalar cells retained by one typed batch table.
 pub const DEFAULT_MAX_CELLS_PER_TABLE: usize = 4_000_000;
+/// Default number of consecutive source rows summarized by one sparse index block.
+pub const DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS: usize = 1_024;
+/// Default maximum number of metadata blocks retained by one sparse index.
+pub const DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS: usize = 4_096;
+/// Default maximum metadata bytes retained by one sparse index.
+pub const DEFAULT_INT64_MIN_MAX_INDEX_BYTES: usize = 1024 * 1024;
+
+/// Admission limits for one optional sparse `Int64` min/max index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Int64MinMaxIndexLimits {
+    /// Deterministic number of source rows represented by each block.
+    pub block_rows: usize,
+    /// Maximum number of block metadata entries.
+    pub max_blocks: usize,
+    /// Maximum bytes occupied by block metadata, excluding the `Vec` header.
+    pub max_bytes: usize,
+}
+
+impl Int64MinMaxIndexLimits {
+    #[must_use]
+    pub const fn new(block_rows: usize, max_blocks: usize, max_bytes: usize) -> Self {
+        Self {
+            block_rows,
+            max_blocks,
+            max_bytes,
+        }
+    }
+}
+
+impl Default for Int64MinMaxIndexLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS,
+            DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS,
+            DEFAULT_INT64_MIN_MAX_INDEX_BYTES,
+        )
+    }
+}
+
+/// Immutable summary for one deterministic sparse-index row block.
+///
+/// `min` and `max` summarize non-null values only. Both are `None` for an
+/// all-null block; `null_count` distinguishes that case from an empty block.
+/// Batch columns are currently non-nullable, but retaining this metadata makes
+/// block semantics explicit and safe for nullable physical columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Int64MinMaxBlockMetadata {
+    pub first_row: usize,
+    pub row_count: usize,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+    pub null_count: usize,
+}
+
+/// Public metadata about an admitted sparse index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int64MinMaxIndexInfo {
+    pub column: String,
+    pub block_rows: usize,
+    pub block_count: usize,
+    pub indexed_rows: usize,
+    pub retained_bytes: usize,
+}
+
+/// A non-error reason why a sparse-index request was not admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64MinMaxIndexRejection {
+    ZeroBlockRows,
+    SlotOccupied { table: String },
+    BlockLimitExceeded { required: usize, max: usize },
+    ByteLimitExceeded { required: usize, max: usize },
+}
+
+/// Result of attempting to admit an optional sparse index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64MinMaxIndexAdmission {
+    Created(Int64MinMaxIndexInfo),
+    Rejected(Int64MinMaxIndexRejection),
+}
+
+#[derive(Debug, Clone)]
+struct Int64MinMaxIndex {
+    column: usize,
+    limits: Int64MinMaxIndexLimits,
+    indexed_rows: usize,
+    source_generation: u64,
+    blocks: Vec<Int64MinMaxBlockMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Int64MinMaxFilter {
+    Equal(i64),
+    Less(i64),
+    LessOrEqual(i64),
+    Greater(i64),
+    GreaterOrEqual(i64),
+}
+
+#[derive(Debug)]
+pub(crate) struct Int64MinMaxIndexScan {
+    pub(crate) ranges: Vec<Range<usize>>,
+    pub(crate) scanned_blocks: usize,
+    pub(crate) pruned_blocks: usize,
+}
 
 /// Persistent resource limits applied to one typed batch table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +386,8 @@ pub struct Table {
     row_count: usize,
     retained_value_bytes: u128,
     limits: TableLimits,
+    mutation_generation: u64,
+    int64_min_max_index: Option<Int64MinMaxIndex>,
 }
 
 impl Table {
@@ -339,6 +447,8 @@ impl Table {
             row_count: 0,
             retained_value_bytes: 0,
             limits,
+            mutation_generation: 0,
+            int64_min_max_index: None,
         })
     }
 
@@ -441,6 +551,153 @@ impl Table {
                 table: self.name.clone(),
                 column: name.to_owned(),
             })
+    }
+
+    /// Returns metadata for this table's optional sparse `Int64` index.
+    #[must_use]
+    pub fn int64_min_max_index_info(&self) -> Option<Int64MinMaxIndexInfo> {
+        let index = self.int64_min_max_index.as_ref()?;
+        let column = self.schema.get(index.column)?;
+        Some(Int64MinMaxIndexInfo {
+            column: column.name.clone(),
+            block_rows: index.limits.block_rows,
+            block_count: index.blocks.len(),
+            indexed_rows: index.indexed_rows,
+            retained_bytes: index
+                .blocks
+                .len()
+                .saturating_mul(size_of::<Int64MinMaxBlockMetadata>()),
+        })
+    }
+
+    /// Returns immutable block summaries for this table's optional sparse index.
+    #[must_use]
+    pub fn int64_min_max_index_blocks(&self) -> Option<&[Int64MinMaxBlockMetadata]> {
+        self.int64_min_max_index
+            .as_ref()
+            .map(|index| index.blocks.as_slice())
+    }
+
+    pub(crate) fn try_create_int64_min_max_index(
+        &mut self,
+        column: &str,
+        limits: Int64MinMaxIndexLimits,
+    ) -> Result<Int64MinMaxIndexAdmission> {
+        let column = self.column_index(column)?;
+        if self.schema[column].data_type != DataType::Int64 {
+            return Err(Error::TypeMismatch {
+                context: format!(
+                    "sparse min-max index column '{}.{}'",
+                    self.name, self.schema[column].name
+                ),
+                expected: DataType::Int64.to_string(),
+                actual: self.schema[column].data_type.to_string(),
+            });
+        }
+        if limits.block_rows == 0 {
+            return Ok(Int64MinMaxIndexAdmission::Rejected(
+                Int64MinMaxIndexRejection::ZeroBlockRows,
+            ));
+        }
+
+        let index = match self.build_int64_min_max_index(column, limits) {
+            Ok(index) => index,
+            Err(rejection) => return Ok(Int64MinMaxIndexAdmission::Rejected(rejection)),
+        };
+        self.int64_min_max_index = Some(index);
+        Ok(Int64MinMaxIndexAdmission::Created(
+            self.int64_min_max_index_info()
+                .expect("the admitted index has a valid schema column"),
+        ))
+    }
+
+    pub(crate) fn drop_int64_min_max_index(&mut self) -> bool {
+        self.int64_min_max_index.take().is_some()
+    }
+
+    pub(crate) fn has_int64_min_max_index(&self) -> bool {
+        self.int64_min_max_index.is_some()
+    }
+
+    pub(crate) fn int64_min_max_index_scan(
+        &self,
+        column: usize,
+        filter: Int64MinMaxFilter,
+    ) -> Option<Int64MinMaxIndexScan> {
+        let index = self.int64_min_max_index.as_ref()?;
+        if index.column != column
+            || index.source_generation != self.mutation_generation
+            || index.indexed_rows != self.row_count
+            || index.limits.block_rows == 0
+            || !index_has_valid_layout(index)
+        {
+            return None;
+        }
+
+        let mut ranges = Vec::with_capacity(index.blocks.len());
+        let mut pruned_blocks = 0_usize;
+        for block in &index.blocks {
+            if block_may_match(*block, filter) {
+                ranges.push(block.first_row..block.first_row.saturating_add(block.row_count));
+            } else {
+                pruned_blocks = pruned_blocks.saturating_add(1);
+            }
+        }
+        Some(Int64MinMaxIndexScan {
+            scanned_blocks: index.blocks.len().saturating_sub(pruned_blocks),
+            pruned_blocks,
+            ranges,
+        })
+    }
+
+    fn build_int64_min_max_index(
+        &self,
+        column: usize,
+        limits: Int64MinMaxIndexLimits,
+    ) -> std::result::Result<Int64MinMaxIndex, Int64MinMaxIndexRejection> {
+        debug_assert!(limits.block_rows != 0);
+        let required_blocks = self.row_count.div_ceil(limits.block_rows);
+        if required_blocks > limits.max_blocks {
+            return Err(Int64MinMaxIndexRejection::BlockLimitExceeded {
+                required: required_blocks,
+                max: limits.max_blocks,
+            });
+        }
+        let required_bytes = required_blocks.saturating_mul(size_of::<Int64MinMaxBlockMetadata>());
+        if required_bytes > limits.max_bytes {
+            return Err(Int64MinMaxIndexRejection::ByteLimitExceeded {
+                required: required_bytes,
+                max: limits.max_bytes,
+            });
+        }
+
+        let Column::Int64(values) = &self.columns[column] else {
+            unreachable!("the index column type was validated");
+        };
+        let mut blocks = Vec::with_capacity(required_blocks);
+        for (block_number, values) in values.chunks(limits.block_rows).enumerate() {
+            blocks.push(summarize_nullable_int64_block(
+                block_number.saturating_mul(limits.block_rows),
+                values.iter().copied().map(Some),
+            ));
+        }
+        Ok(Int64MinMaxIndex {
+            column,
+            limits,
+            indexed_rows: self.row_count,
+            source_generation: self.mutation_generation,
+            blocks,
+        })
+    }
+
+    fn mark_values_mutated(&mut self) {
+        self.mutation_generation = self.mutation_generation.wrapping_add(1);
+        let Some(previous) = self.int64_min_max_index.take() else {
+            return;
+        };
+        self.int64_min_max_index = self
+            .build_int64_min_max_index(previous.column, previous.limits)
+            .ok();
     }
 
     /// Resolves and validates a nonempty explicit INSERT column list without
@@ -651,6 +908,7 @@ impl Table {
         self.schema.push(field);
         self.columns.push(column);
         self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
+        self.mark_values_mutated();
         Ok(())
     }
 
@@ -674,6 +932,10 @@ impl Table {
         self.retained_value_bytes = self
             .retained_value_bytes
             .saturating_sub(removed_column.retained_value_bytes_exact());
+        // A physical position may have shifted, so retaining any index would
+        // risk associating its metadata with the wrong column.
+        self.int64_min_max_index = None;
+        self.mutation_generation = self.mutation_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -723,6 +985,7 @@ impl Table {
         self.validate_row_capacity(1)?;
         self.validate_row(&row)?;
         self.append_validated_row(row);
+        self.mark_values_mutated();
         Ok(())
     }
 
@@ -757,8 +1020,12 @@ impl Table {
     }
 
     pub(crate) fn append_validated_rows(&mut self, rows: Vec<Vec<Value>>) {
+        let changed = !rows.is_empty();
         for row in rows {
             self.append_validated_row(row);
+        }
+        if changed {
+            self.mark_values_mutated();
         }
     }
 
@@ -773,6 +1040,7 @@ impl Table {
             return;
         };
 
+        let changed = !rows.is_empty();
         for source in rows {
             let mut row = self
                 .schema
@@ -788,6 +1056,9 @@ impl Table {
                 row[schema_index] = value;
             }
             self.append_validated_row(row);
+        }
+        if changed {
+            self.mark_values_mutated();
         }
     }
 
@@ -841,6 +1112,9 @@ impl Table {
             .retained_value_bytes
             .saturating_sub(removed_value_bytes)
             .saturating_add(added_value_bytes);
+        if replaced != 0 {
+            self.mark_values_mutated();
+        }
         Ok(replaced)
     }
 
@@ -873,6 +1147,7 @@ impl Table {
         self.retained_value_bytes = self
             .retained_value_bytes
             .saturating_sub(deleted_value_bytes);
+        self.mark_values_mutated();
         Ok(row_indexes.len())
     }
 
@@ -884,7 +1159,73 @@ impl Table {
         }
         self.row_count = 0;
         self.retained_value_bytes = 0;
+        if removed_rows != 0 {
+            self.mark_values_mutated();
+        }
         removed_rows
+    }
+}
+
+fn summarize_nullable_int64_block(
+    first_row: usize,
+    values: impl IntoIterator<Item = Option<i64>>,
+) -> Int64MinMaxBlockMetadata {
+    let mut row_count = 0_usize;
+    let mut null_count = 0_usize;
+    let mut min = None::<i64>;
+    let mut max = None::<i64>;
+    for value in values {
+        row_count = row_count.saturating_add(1);
+        if let Some(value) = value {
+            min = Some(min.map_or(value, |current| current.min(value)));
+            max = Some(max.map_or(value, |current| current.max(value)));
+        } else {
+            null_count = null_count.saturating_add(1);
+        }
+    }
+    Int64MinMaxBlockMetadata {
+        first_row,
+        row_count,
+        min,
+        max,
+        null_count,
+    }
+}
+
+fn index_has_valid_layout(index: &Int64MinMaxIndex) -> bool {
+    let expected_blocks = index.indexed_rows.div_ceil(index.limits.block_rows);
+    if index.blocks.len() != expected_blocks {
+        return false;
+    }
+    index.blocks.iter().enumerate().all(|(position, block)| {
+        let first_row = position.saturating_mul(index.limits.block_rows);
+        let expected_rows = index
+            .indexed_rows
+            .saturating_sub(first_row)
+            .min(index.limits.block_rows);
+        block.first_row == first_row
+            && block.row_count == expected_rows
+            && block.null_count <= block.row_count
+            && (block.min.is_some() == block.max.is_some())
+            && if block.min.is_some() {
+                block.null_count < block.row_count
+            } else {
+                block.null_count == block.row_count
+            }
+            && block.min.zip(block.max).is_none_or(|(min, max)| min <= max)
+    })
+}
+
+fn block_may_match(block: Int64MinMaxBlockMetadata, filter: Int64MinMaxFilter) -> bool {
+    let (Some(min), Some(max)) = (block.min, block.max) else {
+        return false;
+    };
+    match filter {
+        Int64MinMaxFilter::Equal(value) => min <= value && value <= max,
+        Int64MinMaxFilter::Less(value) => min < value,
+        Int64MinMaxFilter::LessOrEqual(value) => min <= value,
+        Int64MinMaxFilter::Greater(value) => max > value,
+        Int64MinMaxFilter::GreaterOrEqual(value) => max >= value,
     }
 }
 
@@ -1043,5 +1384,72 @@ mod tests {
         );
         assert_eq!(table.row_count(), 1);
         assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[1]));
+    }
+
+    #[test]
+    fn nullable_block_metadata_distinguishes_all_null_mixed_and_present_blocks() {
+        assert_eq!(
+            summarize_nullable_int64_block(0, [None, None, None]),
+            Int64MinMaxBlockMetadata {
+                first_row: 0,
+                row_count: 3,
+                min: None,
+                max: None,
+                null_count: 3,
+            }
+        );
+        assert_eq!(
+            summarize_nullable_int64_block(3, [Some(7), None, Some(-2), Some(7)]),
+            Int64MinMaxBlockMetadata {
+                first_row: 3,
+                row_count: 4,
+                min: Some(-2),
+                max: Some(7),
+                null_count: 1,
+            }
+        );
+        assert!(!block_may_match(
+            summarize_nullable_int64_block(0, [None, None]),
+            Int64MinMaxFilter::Equal(0),
+        ));
+    }
+
+    #[test]
+    fn stale_generation_and_malformed_layout_fall_back_without_pruning() {
+        let mut table = test_table();
+        table
+            .insert_rows(vec![
+                vec![Value::Int64(1), Value::String("a".to_owned())],
+                vec![Value::Int64(2), Value::String("b".to_owned())],
+            ])
+            .unwrap();
+        assert!(matches!(
+            table
+                .try_create_int64_min_max_index(
+                    "id",
+                    Int64MinMaxIndexLimits::new(1, 2, usize::MAX),
+                )
+                .unwrap(),
+            Int64MinMaxIndexAdmission::Created(_)
+        ));
+        assert!(
+            table
+                .int64_min_max_index_scan(0, Int64MinMaxFilter::Equal(2))
+                .is_some()
+        );
+
+        table.mutation_generation = table.mutation_generation.wrapping_add(1);
+        assert!(
+            table
+                .int64_min_max_index_scan(0, Int64MinMaxFilter::Equal(2))
+                .is_none()
+        );
+        table.mutation_generation = table.mutation_generation.wrapping_sub(1);
+        table.int64_min_max_index.as_mut().unwrap().blocks[1].first_row = 0;
+        assert!(
+            table
+                .int64_min_max_index_scan(0, Int64MinMaxFilter::Equal(2))
+                .is_none()
+        );
     }
 }

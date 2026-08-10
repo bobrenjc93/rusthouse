@@ -16,7 +16,9 @@ use crate::batch::sql::{
     HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, SUPPORTED_FUNCTION_NAMES, Select,
     SelectItem, Statement, VersionSelect,
 };
-use crate::batch::storage::{Column, Table, validate_table_name};
+use crate::batch::storage::{
+    Column, Int64MinMaxFilter, Int64MinMaxIndexScan, Table, validate_table_name,
+};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
 #[cfg(unix)]
@@ -31,8 +33,10 @@ use crate::snapshot::{
 use crate::storage::{Int64Table, Schema};
 
 pub use crate::batch::storage::{
-    DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_ROWS_PER_TABLE,
-    TableLimits,
+    DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS, DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS,
+    DEFAULT_INT64_MIN_MAX_INDEX_BYTES, DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE,
+    DEFAULT_MAX_ROWS_PER_TABLE, Int64MinMaxBlockMetadata, Int64MinMaxIndexAdmission,
+    Int64MinMaxIndexInfo, Int64MinMaxIndexLimits, Int64MinMaxIndexRejection, TableLimits,
 };
 
 /// Maximum estimated heap retained by the collecting [`Database::execute`] API.
@@ -208,6 +212,54 @@ pub struct Database {
     query_result_limits: QueryResultLimits,
     table_limits: TableLimits,
     global_aggregate_parallelism: GlobalAggregateParallelism,
+    index_pruning_counters: IndexPruningCounters,
+}
+
+/// Cumulative sparse-index work performed by successful indexed scans.
+///
+/// A scanned block is a block whose rows still pass through the exact
+/// predicate evaluator. A pruned block is rejected using metadata alone.
+/// Queries without an applicable, current index do not change either counter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexPruningMetrics {
+    pub scanned_blocks: usize,
+    pub pruned_blocks: usize,
+}
+
+#[derive(Debug, Default)]
+struct IndexPruningCounters {
+    scanned_blocks: AtomicUsize,
+    pruned_blocks: AtomicUsize,
+}
+
+impl IndexPruningCounters {
+    fn snapshot(&self) -> IndexPruningMetrics {
+        IndexPruningMetrics {
+            scanned_blocks: self.scanned_blocks.load(AtomicOrdering::Relaxed),
+            pruned_blocks: self.pruned_blocks.load(AtomicOrdering::Relaxed),
+        }
+    }
+
+    fn record(&self, scan: &Int64MinMaxIndexScan) {
+        saturating_atomic_add(&self.scanned_blocks, scan.scanned_blocks);
+        saturating_atomic_add(&self.pruned_blocks, scan.pruned_blocks);
+    }
+}
+
+fn saturating_atomic_add(counter: &AtomicUsize, amount: usize) {
+    let mut current = counter.load(AtomicOrdering::Relaxed);
+    loop {
+        let next = current.saturating_add(amount);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -520,6 +572,7 @@ impl Default for Database {
                 NonZeroUsize::new(DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP)
                     .expect("the default aggregate worker cap is nonzero"),
             ),
+            index_pruning_counters: IndexPruningCounters::default(),
         }
     }
 }
@@ -931,6 +984,7 @@ impl Database {
                 NonZeroUsize::new(DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP)
                     .expect("the default aggregate worker cap is nonzero"),
             ),
+            index_pruning_counters: IndexPruningCounters::default(),
         }
     }
 
@@ -981,6 +1035,57 @@ impl Database {
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Attempts to install the database's one optional sparse `Int64` min/max index.
+    ///
+    /// Names resolve case-insensitively. Unknown tables/columns and non-Int64
+    /// columns are errors. Capacity and slot pressure are normal admission
+    /// rejections: they leave the target and any existing index unchanged, and
+    /// subsequent queries continue on the exact unindexed path.
+    pub fn create_int64_min_max_index(
+        &mut self,
+        table: &str,
+        column: &str,
+        limits: Int64MinMaxIndexLimits,
+    ) -> Result<Int64MinMaxIndexAdmission> {
+        {
+            let target = self.catalog.table(table)?;
+            let column_index = target.column_index(column)?;
+            if target.schema()[column_index].data_type != DataType::Int64 {
+                return Err(Error::TypeMismatch {
+                    context: format!(
+                        "sparse min-max index column '{}.{}'",
+                        target.name(),
+                        target.schema()[column_index].name
+                    ),
+                    expected: DataType::Int64.to_string(),
+                    actual: target.schema()[column_index].data_type.to_string(),
+                });
+            }
+        }
+        if let Some(owner) = self.catalog.int64_min_max_index_owner() {
+            if !owner.eq_ignore_ascii_case(table) {
+                return Ok(Int64MinMaxIndexAdmission::Rejected(
+                    Int64MinMaxIndexRejection::SlotOccupied {
+                        table: owner.to_owned(),
+                    },
+                ));
+            }
+        }
+        self.table_mut(table)?
+            .try_create_int64_min_max_index(column, limits)
+    }
+
+    /// Removes a table's sparse index, returning whether one was present.
+    pub fn drop_int64_min_max_index(&mut self, table: &str) -> Result<bool> {
+        Ok(self.table_mut(table)?.drop_int64_min_max_index())
+    }
+
+    /// Returns cumulative scanned/pruned block counters without resetting them.
+    #[must_use]
+    pub fn index_pruning_metrics(&self) -> IndexPruningMetrics {
+        self.index_pruning_counters.snapshot()
     }
 
     pub(crate) fn retained_metrics(&self) -> (usize, usize, usize, usize) {
@@ -2782,11 +2887,13 @@ impl Database {
         &self,
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
-        const METRIC_NAMES: [&str; 4] = [
+        const METRIC_NAMES: [&str; 6] = [
             "rusthouse_tables",
             "rusthouse_columns",
             "rusthouse_retained_rows",
             "rusthouse_retained_value_bytes",
+            "rusthouse_index_scanned_blocks",
+            "rusthouse_index_pruned_blocks",
         ];
         const RESULT_COLUMN_COUNT: usize = 2;
         const RESULT_COLUMN_NAME_BYTES: usize = "metric".len() + "value".len();
@@ -2808,11 +2915,14 @@ impl Database {
             fixed_bytes.saturating_add(metric_name_bytes),
             query_result_limits.max_bytes,
         )?;
+        let index_metrics = self.index_pruning_metrics();
         let raw_values = [
             self.catalog.table_count() as u128,
             self.measurements.column_count,
             self.measurements.retained_row_count,
             self.measurements.retained_value_bytes,
+            index_metrics.scanned_blocks as u128,
+            index_metrics.pruned_blocks as u128,
         ];
         let mut values = [0_i64; METRIC_NAMES.len()];
         for ((value, raw_value), metric) in values.iter_mut().zip(raw_values).zip(METRIC_NAMES) {
@@ -3033,6 +3143,17 @@ impl Database {
         // both are evaluated only after the executor has admitted the full
         // source scan. Check before allocating the matching-row index vector.
         enforce_select_scan_limit(table, query_result_limits)?;
+        let indexed_scan = predicate
+            .as_ref()
+            .and_then(CompiledPredicate::int64_min_max_filter)
+            .and_then(|(column, filter)| table.int64_min_max_index_scan(column, filter));
+        let candidate_ranges = if let Some(scan) = indexed_scan {
+            self.index_pruning_counters.record(&scan);
+            scan.ranges
+        } else {
+            std::iter::once(0..table.row_count()).collect()
+        };
+        let candidate_rows = || candidate_ranges.iter().flat_map(|range| range.clone());
         let row_matches = |row| {
             predicate
                 .as_ref()
@@ -3045,9 +3166,7 @@ impl Database {
             // Ordered ROW_NUMBER needs every filtered source index to produce
             // deterministic ties. Count without retaining indices so the
             // complete state can be rejected before its first allocation.
-            let matching_row_count = (0..table.row_count())
-                .filter(|row| row_matches(*row))
-                .count();
+            let matching_row_count = candidate_rows().filter(|row| row_matches(*row)).count();
             validate_row_number_count(matching_row_count)?;
             let ordering_state_bytes =
                 matching_row_count.saturating_mul(ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES);
@@ -3058,11 +3177,11 @@ impl Database {
             )?;
 
             let mut rows = Vec::with_capacity(matching_row_count);
-            rows.extend((0..table.row_count()).filter(|row| row_matches(*row)));
+            rows.extend(candidate_rows().filter(|row| row_matches(*row)));
             debug_assert_eq!(rows.len(), matching_row_count);
             rows
         } else {
-            (0..table.row_count())
+            candidate_rows()
                 .filter(|row| row_matches(*row))
                 .collect::<Vec<_>>()
         };
@@ -7605,6 +7724,43 @@ impl CompiledPredicate {
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
     }
+
+    fn int64_min_max_filter(&self) -> Option<(usize, Int64MinMaxFilter)> {
+        let Self::Comparison {
+            left,
+            operator,
+            right,
+        } = self
+        else {
+            return None;
+        };
+        let (column, operator, value) = match (left, right) {
+            (
+                CompiledOperand::Column {
+                    index,
+                    data_type: DataType::Int64,
+                },
+                CompiledOperand::Literal(Value::Int64(value)),
+            ) => (*index, *operator, *value),
+            (
+                CompiledOperand::Literal(Value::Int64(value)),
+                CompiledOperand::Column {
+                    index,
+                    data_type: DataType::Int64,
+                },
+            ) => (*index, reverse_comparison(*operator), *value),
+            _ => return None,
+        };
+        let filter = match operator {
+            ComparisonOperator::Equal => Int64MinMaxFilter::Equal(value),
+            ComparisonOperator::Less => Int64MinMaxFilter::Less(value),
+            ComparisonOperator::LessOrEqual => Int64MinMaxFilter::LessOrEqual(value),
+            ComparisonOperator::Greater => Int64MinMaxFilter::Greater(value),
+            ComparisonOperator::GreaterOrEqual => Int64MinMaxFilter::GreaterOrEqual(value),
+            ComparisonOperator::NotEqual => return None,
+        };
+        Some((column, filter))
+    }
 }
 
 #[derive(Debug)]
@@ -7739,6 +7895,17 @@ const fn invert_comparison(operator: ComparisonOperator) -> ComparisonOperator {
         ComparisonOperator::LessOrEqual => ComparisonOperator::Greater,
         ComparisonOperator::Greater => ComparisonOperator::LessOrEqual,
         ComparisonOperator::GreaterOrEqual => ComparisonOperator::Less,
+    }
+}
+
+const fn reverse_comparison(operator: ComparisonOperator) -> ComparisonOperator {
+    match operator {
+        ComparisonOperator::Equal => ComparisonOperator::Equal,
+        ComparisonOperator::NotEqual => ComparisonOperator::NotEqual,
+        ComparisonOperator::Less => ComparisonOperator::Greater,
+        ComparisonOperator::LessOrEqual => ComparisonOperator::GreaterOrEqual,
+        ComparisonOperator::Greater => ComparisonOperator::Less,
+        ComparisonOperator::GreaterOrEqual => ComparisonOperator::LessOrEqual,
     }
 }
 
