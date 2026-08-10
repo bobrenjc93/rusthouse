@@ -2409,8 +2409,10 @@ impl Database {
     /// Every physical line is data and must contain exactly one field for each
     /// physical schema column, in schema order. Fields use the TSV writer's
     /// ClickHouse-style escapes: `\\`, `\t`, `\r`, `\n`, `\0`, `\b`, `\f`, and
-    /// `\'`. Decoded values parse as `Int64`, finite `Float64`, `Bool`, or
-    /// `String`; records may use LF or CRLF. Empty input appends zero rows.
+    /// `\'`. The exact raw `\N` field is NULL only for a physical
+    /// `Nullable(Int64)` column; escaped `\\N` remains String data. Decoded
+    /// values parse as `Int64`, finite `Float64`, `Bool`, or `String`; records
+    /// may use LF or CRLF. Empty input appends zero rows.
     ///
     /// The complete input, every row and value, configured limits, and
     /// remaining table capacity are validated before any physical column is
@@ -2455,8 +2457,9 @@ impl Database {
     /// target schema columns in any order, with matching case. Omitted columns
     /// receive their typed defaults. Fields use the TSV writer's ClickHouse-style
     /// escapes: `\\`, `\t`, `\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Values are
-    /// parsed as `Int64`, finite `Float64`, `Bool`, or `String`; records may use
-    /// LF or CRLF.
+    /// parsed as `Int64`, finite `Float64`, `Bool`, or `String`; the exact raw
+    /// `\N` field is NULL only for a selected physical `Nullable(Int64)` column,
+    /// while escaped `\\N` remains String data. Records may use LF or CRLF.
     ///
     /// Each supplied field is parsed as the type selected by its header.
     ///
