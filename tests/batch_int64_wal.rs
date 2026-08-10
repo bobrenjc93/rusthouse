@@ -208,7 +208,7 @@ fn replays_append_atomic_replacement_and_truncate_and_is_repeatable() {
 }
 
 #[test]
-fn ignores_only_a_torn_final_record() {
+fn ignores_torn_final_headers_bodies_and_commit_footers() {
     let directory = TestDirectory::new();
     let path = directory.join("torn.wal");
     let limits = Int64WriteAheadLogLimits::default();
@@ -223,12 +223,26 @@ fn ignores_only_a_torn_final_record() {
     database.execute("INSERT INTO events VALUES (3);").unwrap();
     database.disable_int64_write_ahead_log();
 
-    let mut bytes = fs::read(&path).unwrap();
-    bytes.truncate(bytes.len() - 7);
-    fs::write(&path, bytes).unwrap();
+    let complete = fs::read(&path).unwrap();
+    let last_record = *frame_starts(&complete).last().unwrap();
+    let payload_len = usize::try_from(u64::from_le_bytes(
+        complete[last_record + 20..last_record + 28]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    let body_end = last_record + INT64_WAL_FRAME_HEADER_LEN + payload_len;
 
-    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
-    assert_eq!(int64_values(&recovered, "events"), [1, 2]);
+    for (phase, length) in [
+        ("header", last_record + 5),
+        ("body", last_record + INT64_WAL_FRAME_HEADER_LEN + 12),
+        ("footer", body_end + 7),
+    ] {
+        let torn_path = directory.join(&format!("torn-{phase}.wal"));
+        fs::write(&torn_path, &complete[..length]).unwrap();
+        let recovered = Database::recover_int64_write_ahead_log(&torn_path, limits).unwrap();
+        assert_eq!(int64_values(&recovered, "events"), [1, 2], "{phase}");
+    }
 }
 
 #[test]

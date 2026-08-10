@@ -1280,9 +1280,10 @@ impl Database {
     ///
     /// Opt-in writes a bootstrap containing the table display name, column
     /// name, rows, table/database caps, query byte and row caps, and aggregate
-    /// worker cap. The destination is created exclusively. The bootstrap is
-    /// synchronized before the new directory entry, and the parent directory
-    /// is then synchronized before this method succeeds.
+    /// worker cap. The destination basename is created exclusively relative to
+    /// one opened parent descriptor. The bootstrap body and commit footer are
+    /// synchronized in that order, then the same parent descriptor is
+    /// synchronized before this method succeeds.
     #[cfg(unix)]
     pub fn enable_int64_write_ahead_log(
         &mut self,

@@ -1430,9 +1430,12 @@ synchronized bootstrap captures its display names, current rows, NULL
 restriction, table/database limits, query row and byte caps, and worker cap.
 Successful SQL/CSV/TSV appends, `TRUNCATE TABLE`, and atomic `ALTER TABLE ...
 UPDATE` replacements are framed, checksummed, committed, and synchronized
-before their in-memory mutations become visible. File bytes, record payload
-bytes, and committed record count all have explicit inclusive limits; a WAL
-failure leaves that mutation unpublished.
+before their in-memory mutations become visible. Each record body is synced
+before its commit footer is written and synced. Creation and parent sync both
+use one opened directory descriptor, so parent-path rebinding cannot split
+them across directories. File bytes, record payload bytes, and committed
+record count all have explicit inclusive limits; a WAL failure leaves that
+mutation unpublished.
 
 `Database::recover_int64_write_ahead_log` replays the complete committed prefix
 into a new database. It ignores only an incomplete final crash tail and returns

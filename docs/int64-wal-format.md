@@ -38,12 +38,19 @@ value)` pairs.
 
 ## Commit and recovery
 
-Creation exclusively creates the destination, writes the bootstrap, syncs the
-file, and then syncs its parent directory before enabling the WAL. Every later
-mutation writes its complete frame and syncs the file before the in-memory
-table is changed. A write or sync failure poisons that writer; the failed
-mutation is not published and callers must recover before continuing because
-an I/O error can leave the durability outcome indeterminate.
+Creation opens the parent directory, exclusively creates the final basename
+relative to that descriptor, and later syncs that same descriptor. Renaming or
+rebinding the parent pathname cannot redirect creation to one directory while
+another is synchronized.
+
+For the bootstrap and every later mutation, the header and payload (the record
+body) are written and synchronized first. Only then is the commit footer
+written and synchronized. The new parent directory entry is synchronized after
+the bootstrap footer. This ordering ensures that any footer which can survive
+a crash refers to an already-durable body. The in-memory mutation is published
+only after the footer sync succeeds. A write or sync failure poisons that
+writer; the failed mutation is not published and callers must recover before
+continuing because an I/O error can leave the commit outcome indeterminate.
 
 Recovery reads no more than the configured file-byte bound and checks the
 payload-byte and committed-record bounds before allocation. It replays only a

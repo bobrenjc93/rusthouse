@@ -3,9 +3,12 @@
 //! The stable framing and lifecycle are documented in `docs/int64-wal-format.md`.
 
 use std::error::Error as StdError;
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 /// Magic at the start of every write-ahead-log frame.
@@ -227,6 +230,7 @@ impl StdError for Int64WriteAheadLogCorruption {}
 pub enum Int64WriteAheadLogError {
     Limit(Int64WriteAheadLogLimitError),
     Corruption(Int64WriteAheadLogCorruption),
+    InvalidDestination,
     OpenParent(io::Error),
     Create(io::Error),
     Open(io::Error),
@@ -244,6 +248,9 @@ impl fmt::Display for Int64WriteAheadLogError {
         match self {
             Self::Limit(error) => error.fmt(formatter),
             Self::Corruption(error) => write!(formatter, "corrupt Int64 WAL: {error}"),
+            Self::InvalidDestination => formatter.write_str(
+                "Int64 WAL destination must have one normal non-NUL final path component",
+            ),
             Self::OpenParent(error) => write!(
                 formatter,
                 "could not open Int64 WAL parent directory: {error}"
@@ -281,7 +288,7 @@ impl StdError for Int64WriteAheadLogError {
             | Self::Write(error)
             | Self::SyncFile(error)
             | Self::SyncParent(error) => Some(error),
-            Self::NotRegularFile | Self::Poisoned => None,
+            Self::InvalidDestination | Self::NotRegularFile | Self::Poisoned => None,
         }
     }
 }
@@ -430,30 +437,18 @@ impl Int64WriteAheadLog {
                 bootstrap.values.len()
             )
         );
-        let frame = encode_frame(BOOTSTRAP_KIND, 0, &payload);
+        let (body, footer) = encode_record_parts(BOOTSTRAP_KIND, 0, &payload);
 
-        let parent = path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let parent_directory = File::open(parent).map_err(Int64WriteAheadLogError::OpenParent)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(Int64WriteAheadLogError::Create)?;
-        file.write_all(&frame)
-            .map_err(Int64WriteAheadLogError::Write)?;
-        file.sync_all().map_err(Int64WriteAheadLogError::SyncFile)?;
-        parent_directory
-            .sync_all()
-            .map_err(Int64WriteAheadLogError::SyncParent)?;
+        let destination = wal_destination_name(path)?;
+        let parent_directory = WalDirectory::open(normalized_parent(path))
+            .map_err(Int64WriteAheadLogError::OpenParent)?;
+        let file = create_committed_wal_file(&parent_directory, &destination, &body, &footer)?;
 
         Ok(Self {
             file,
             normalized_table_name: bootstrap.table_name.to_ascii_lowercase(),
             limits,
-            file_bytes: frame.len(),
+            file_bytes: body.len() + footer.len(),
             records: 1,
             poisoned: false,
         })
@@ -523,18 +518,121 @@ impl Int64WriteAheadLog {
             self.records,
             self.limits,
         )?;
-        let frame = encode_frame(kind, sequence, payload);
-        if let Err(error) = self.file.write_all(&frame) {
+        let (body, footer) = encode_record_parts(kind, sequence, payload);
+        if let Err(error) = write_committed_record(&mut self.file, &body, &footer) {
             self.poisoned = true;
-            return Err(Int64WriteAheadLogError::Write(error));
+            return Err(error);
         }
-        if let Err(error) = self.file.sync_all() {
-            self.poisoned = true;
-            return Err(Int64WriteAheadLogError::SyncFile(error));
-        }
-        self.file_bytes += frame.len();
+        self.file_bytes += body.len() + footer.len();
         self.records += 1;
         Ok(())
+    }
+}
+
+trait DurableWalFile {
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
+    fn sync_bytes(&mut self) -> io::Result<()>;
+}
+
+impl DurableWalFile for File {
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all(bytes)
+    }
+
+    fn sync_bytes(&mut self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+/// Persists the record body before making its commit footer durable.
+///
+/// Recovery can therefore treat every short header, body, or footer as an
+/// uncommitted tail. If any footer bytes reach storage, the header and payload
+/// were already synchronized successfully.
+fn write_committed_record(
+    file: &mut impl DurableWalFile,
+    body: &[u8],
+    footer: &[u8; INT64_WAL_COMMIT_LEN],
+) -> Result<(), Int64WriteAheadLogError> {
+    file.write_bytes(body)
+        .map_err(Int64WriteAheadLogError::Write)?;
+    file.sync_bytes()
+        .map_err(Int64WriteAheadLogError::SyncFile)?;
+    file.write_bytes(footer)
+        .map_err(Int64WriteAheadLogError::Write)?;
+    file.sync_bytes().map_err(Int64WriteAheadLogError::SyncFile)
+}
+
+fn create_committed_wal_file(
+    directory: &WalDirectory,
+    destination: &CStr,
+    body: &[u8],
+    footer: &[u8; INT64_WAL_COMMIT_LEN],
+) -> Result<File, Int64WriteAheadLogError> {
+    let mut file = directory
+        .create(destination)
+        .map_err(Int64WriteAheadLogError::Create)?;
+    write_committed_record(&mut file, body, footer)?;
+    directory
+        .sync()
+        .map_err(Int64WriteAheadLogError::SyncParent)?;
+    Ok(file)
+}
+
+fn wal_destination_name(path: &Path) -> Result<CString, Int64WriteAheadLogError> {
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.ends_with(b"/") || path_bytes.ends_with(b"/.") {
+        return Err(Int64WriteAheadLogError::InvalidDestination);
+    }
+    let name = match path.components().next_back() {
+        Some(std::path::Component::Normal(name)) => name,
+        _ => return Err(Int64WriteAheadLogError::InvalidDestination),
+    };
+    CString::new(name.as_bytes()).map_err(|_| Int64WriteAheadLogError::InvalidDestination)
+}
+
+fn normalized_parent(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+struct WalDirectory {
+    file: File,
+}
+
+impl WalDirectory {
+    fn open(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(Self { file })
+    }
+
+    fn create(&self, name: &CStr) -> io::Result<File> {
+        // SAFETY: the directory descriptor is open, `name` is NUL-terminated,
+        // and ownership is assumed only after `openat` returns a new descriptor.
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                libc::c_uint::from(0o666_u16),
+            )
+        };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful `openat` returned a new owned descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
     }
 }
 
@@ -751,20 +849,25 @@ fn validate_record_limits(
     Ok(())
 }
 
-fn encode_frame(kind: u8, sequence: u64, payload: &[u8]) -> Vec<u8> {
+fn encode_record_parts(
+    kind: u8,
+    sequence: u64,
+    payload: &[u8],
+) -> (Vec<u8>, [u8; INT64_WAL_COMMIT_LEN]) {
     let checksum = record_checksum(INT64_WAL_VERSION, kind, 0, sequence, payload);
-    let mut frame = Vec::with_capacity(INT64_WAL_FRAME_OVERHEAD + payload.len());
-    frame.extend_from_slice(&INT64_WAL_MAGIC);
-    frame.extend_from_slice(&INT64_WAL_VERSION.to_le_bytes());
-    frame.push(kind);
-    frame.push(0);
-    frame.extend_from_slice(&sequence.to_le_bytes());
-    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    frame.extend_from_slice(&checksum.to_le_bytes());
-    frame.extend_from_slice(payload);
-    frame.extend_from_slice(&INT64_WAL_COMMIT_MAGIC);
-    frame.extend_from_slice(&sequence.to_le_bytes());
-    frame
+    let mut body = Vec::with_capacity(INT64_WAL_FRAME_HEADER_LEN + payload.len());
+    body.extend_from_slice(&INT64_WAL_MAGIC);
+    body.extend_from_slice(&INT64_WAL_VERSION.to_le_bytes());
+    body.push(kind);
+    body.push(0);
+    body.extend_from_slice(&sequence.to_le_bytes());
+    body.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    body.extend_from_slice(&checksum.to_le_bytes());
+    body.extend_from_slice(payload);
+    let mut footer = [0; INT64_WAL_COMMIT_LEN];
+    footer[..INT64_WAL_COMMIT_MAGIC.len()].copy_from_slice(&INT64_WAL_COMMIT_MAGIC);
+    footer[INT64_WAL_COMMIT_MAGIC.len()..].copy_from_slice(&sequence.to_le_bytes());
+    (body, footer)
 }
 
 fn record_checksum(version: u16, kind: u8, reserved: u8, sequence: u64, payload: &[u8]) -> u32 {
@@ -1091,5 +1194,139 @@ impl<'a> PayloadReader<'a> {
         } else {
             Err(self.malformed("trailing payload bytes").into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum IoStep {
+        Write(Vec<u8>),
+        Sync,
+    }
+
+    struct FaultFile {
+        steps: Vec<IoStep>,
+        fail_at: Option<usize>,
+    }
+
+    impl FaultFile {
+        fn new(fail_at: Option<usize>) -> Self {
+            Self {
+                steps: Vec::new(),
+                fail_at,
+            }
+        }
+
+        fn complete_step(&self) -> io::Result<()> {
+            if self.fail_at == Some(self.steps.len() - 1) {
+                Err(io::Error::other("injected WAL I/O failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl DurableWalFile for FaultFile {
+        fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.steps.push(IoStep::Write(bytes.to_vec()));
+            self.complete_step()
+        }
+
+        fn sync_bytes(&mut self) -> io::Result<()> {
+            self.steps.push(IoStep::Sync);
+            self.complete_step()
+        }
+    }
+
+    #[test]
+    fn record_body_is_synced_before_the_commit_footer_is_written_and_synced() {
+        let body = b"header and payload";
+        let footer = *b"commit footer!!!";
+        assert_eq!(footer.len(), INT64_WAL_COMMIT_LEN);
+        let mut file = FaultFile::new(None);
+
+        write_committed_record(&mut file, body, &footer).unwrap();
+
+        assert_eq!(
+            file.steps,
+            [
+                IoStep::Write(body.to_vec()),
+                IoStep::Sync,
+                IoStep::Write(footer.to_vec()),
+                IoStep::Sync,
+            ]
+        );
+    }
+
+    #[test]
+    fn every_body_or_footer_failure_stops_before_the_next_durability_phase() {
+        let body = b"body";
+        let footer = [7; INT64_WAL_COMMIT_LEN];
+        for failed_step in 0..4 {
+            let mut file = FaultFile::new(Some(failed_step));
+
+            let error = write_committed_record(&mut file, body, &footer).unwrap_err();
+
+            assert_eq!(file.steps.len(), failed_step + 1);
+            assert!(matches!(
+                (failed_step, error),
+                (0 | 2, Int64WriteAheadLogError::Write(_))
+                    | (1 | 3, Int64WriteAheadLogError::SyncFile(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn creation_stays_with_the_open_parent_when_its_path_is_rebound() {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/wal-rebind-tests");
+        fs::create_dir_all(&base).unwrap();
+        let root = loop {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let parent = root.join("parent");
+        let moved_parent = root.join("moved-parent");
+        fs::create_dir(&parent).unwrap();
+        let directory = WalDirectory::open(&parent).unwrap();
+        fs::rename(&parent, &moved_parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+
+        let bootstrap = Int64WalBootstrap {
+            table_name: "Events".to_owned(),
+            column_name: "Id".to_owned(),
+            table_limits: [1, 1, 1],
+            database_table_limits: [1, 1, 1],
+            query_limits: [1; QUERY_LIMIT_FIELD_COUNT],
+            worker_cap: 1,
+            values: vec![],
+        };
+        let payload = encode_bootstrap(&bootstrap);
+        let (body, footer) = encode_record_parts(BOOTSTRAP_KIND, 0, &payload);
+        let destination = CString::new("events.wal").unwrap();
+        let file = create_committed_wal_file(&directory, &destination, &body, &footer).unwrap();
+        drop(file);
+
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        let wal_path = moved_parent.join("events.wal");
+        assert!(wal_path.is_file());
+        let recovered = recover(&wal_path, Int64WriteAheadLogLimits::default()).unwrap();
+        assert_eq!(recovered.bootstrap.table_name, "Events");
+        assert_eq!(recovered.bootstrap.column_name, "Id");
+
+        drop(directory);
+        fs::remove_dir_all(root).unwrap();
     }
 }
