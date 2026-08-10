@@ -149,25 +149,30 @@ fn nullable_count_preserves_query_resource_bounds() {
 }
 
 #[test]
-fn nullable_count_sum_and_minimum_coexist_while_other_aggregates_remain_rejected() {
+fn nullable_count_sum_and_extrema_coexist_while_avg_remains_rejected() {
     let mut database = Database::new();
     create_mixed(&mut database);
 
     assert_eq!(
-        query(&mut database, "SELECT COUNT(v), SUM(v), MIN(v) FROM mixed").rows,
-        [vec![Value::Int64(5), Value::Int64(13), Value::Int64(-1)]]
+        query(
+            &mut database,
+            "SELECT COUNT(v), SUM(v), MIN(v), MAX(v) FROM mixed"
+        )
+        .rows,
+        [vec![
+            Value::Int64(5),
+            Value::Int64(13),
+            Value::Int64(-1),
+            Value::Int64(5),
+        ]]
     );
 
-    for function in ["MAX", "AVG"] {
-        assert_eq!(
-            database
-                .execute(&format!("SELECT {function}(v) FROM mixed"))
-                .unwrap_err(),
-            Error::UnsupportedNullableOperation {
-                table: "mixed".to_owned(),
-                column: "v".to_owned(),
-                operation: function,
-            }
-        );
-    }
+    assert_eq!(
+        database.execute("SELECT AVG(v) FROM mixed").unwrap_err(),
+        Error::UnsupportedNullableOperation {
+            table: "mixed".to_owned(),
+            column: "v".to_owned(),
+            operation: "AVG",
+        }
+    );
 }
