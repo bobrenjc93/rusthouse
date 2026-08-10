@@ -9,8 +9,8 @@ use rusthouse::batch::engine::{Database, QueryResultLimits, ResultColumn};
 use rusthouse::batch::tsv::TsvIngestLimits;
 use rusthouse::batch::value::Value;
 use rusthouse::{
-    HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
-    handle_http_query_read_only_with_bearer_token,
+    HttpQueryError, HttpQueryLimits, Int64MinMaxIndexAdmission, Int64MinMaxIndexLimits,
+    SharedDatabase, handle_http_query, handle_http_query_read_only_with_bearer_token,
     handle_http_query_read_only_with_bearer_token_and_limits,
     handle_http_query_read_only_with_clickhouse_key,
     handle_http_query_read_only_with_clickhouse_key_and_limits,
@@ -167,6 +167,8 @@ fn metrics_body(
     columns: usize,
     retained_rows: usize,
     retained_value_bytes: usize,
+    index_scanned_blocks: usize,
+    index_pruned_blocks: usize,
     table_metrics: &[(&str, usize, usize)],
 ) -> String {
     let mut body = format!(
@@ -182,6 +184,12 @@ fn metrics_body(
          # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
          # TYPE rusthouse_retained_value_bytes gauge\n\
          rusthouse_retained_value_bytes {retained_value_bytes}\n\
+         # HELP rusthouse_index_scanned_blocks Sparse-index blocks scanned by successful indexed queries.\n\
+         # TYPE rusthouse_index_scanned_blocks counter\n\
+         rusthouse_index_scanned_blocks {index_scanned_blocks}\n\
+         # HELP rusthouse_index_pruned_blocks Sparse-index blocks pruned by successful indexed queries.\n\
+         # TYPE rusthouse_index_pruned_blocks counter\n\
+         rusthouse_index_pruned_blocks {index_pruned_blocks}\n\
          # HELP rusthouse_table_rows Number of rows retained by a table.\n\
          # TYPE rusthouse_table_rows gauge\n"
     );
@@ -210,6 +218,27 @@ fn assert_ok_metrics_response(
     retained_value_bytes: usize,
     table_metrics: &[(&str, usize, usize)],
 ) {
+    assert_ok_metrics_response_with_index_counters(
+        response,
+        tables,
+        columns,
+        retained_rows,
+        retained_value_bytes,
+        (0, 0),
+        table_metrics,
+    );
+}
+
+fn assert_ok_metrics_response_with_index_counters(
+    response: &[u8],
+    tables: usize,
+    columns: usize,
+    retained_rows: usize,
+    retained_value_bytes: usize,
+    index_pruning: (usize, usize),
+    table_metrics: &[(&str, usize, usize)],
+) {
+    let (index_scanned_blocks, index_pruned_blocks) = index_pruning;
     assert_response_with_content_type(
         response,
         "HTTP/1.1 200 OK",
@@ -219,6 +248,8 @@ fn assert_ok_metrics_response(
             columns,
             retained_rows,
             retained_value_bytes,
+            index_scanned_blocks,
+            index_pruned_blocks,
             table_metrics,
         )
         .as_bytes(),
@@ -1109,6 +1140,54 @@ fn metrics_reports_state_changes_as_prometheus_gauges() {
         0,
         0,
         &[("zebra", 0, 0)],
+    );
+}
+
+#[test]
+fn metrics_reports_zero_and_incremented_index_pruning_counters() {
+    let database = SharedDatabase::default();
+    const REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, key Int64); \
+             INSERT INTO events VALUES \
+                 (0, 0), (1, 1), (2, 2), (3, 3), \
+                 (4, 100), (5, 101), (6, 102), (7, 103), \
+                 (8, 200), (9, 201), (10, 202), (11, 203);",
+        )
+        .unwrap();
+    assert!(matches!(
+        database
+            .create_int64_min_max_index(
+                "events",
+                "key",
+                Int64MinMaxIndexLimits::new(4, 3, usize::MAX),
+            )
+            .unwrap(),
+        Int64MinMaxIndexAdmission::Created(_)
+    ));
+
+    assert_ok_metrics_response_with_index_counters(
+        &exchange(&database, REQUEST),
+        1,
+        2,
+        12,
+        192,
+        (0, 0),
+        &[("events", 12, 192)],
+    );
+    database
+        .query("SELECT id FROM events WHERE key = 202")
+        .expect("indexed query succeeds");
+    assert_ok_metrics_response_with_index_counters(
+        &exchange(&database, REQUEST),
+        1,
+        2,
+        12,
+        192,
+        (1, 2),
+        &[("events", 12, 192)],
     );
 }
 
@@ -6194,8 +6273,30 @@ fn metrics_preflights_the_complete_response_limit_before_materializing_samples()
                  (7), (8), (9), (10), (11), (12);",
         )
         .unwrap();
+    assert!(matches!(
+        database
+            .create_int64_min_max_index(
+                "Observed",
+                "id",
+                Int64MinMaxIndexLimits::new(4, 3, usize::MAX),
+            )
+            .unwrap(),
+        Int64MinMaxIndexAdmission::Created(_)
+    ));
+    database
+        .query("SELECT id FROM Observed WHERE id = 12")
+        .expect("indexed query succeeds");
     let request = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let expected_response = exchange(&database, request);
+    assert_ok_metrics_response_with_index_counters(
+        &expected_response,
+        1,
+        1,
+        12,
+        96,
+        (1, 2),
+        &[("Observed", 12, 96)],
+    );
 
     let mut exact_response = Vec::new();
     handle_http_query_with_limits(

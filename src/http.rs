@@ -904,10 +904,10 @@ fn serve_http_connections(
 /// standard query routes.
 ///
 /// `GET /metrics` accepts no request body and returns four unlabeled Prometheus
-/// gauges for database totals plus `rusthouse_table_rows` and
-/// `rusthouse_table_retained_value_bytes` gauges per current table. It takes a
-/// nonblocking, consistent database metrics snapshot; lock contention and
-/// poisoning return `503`.
+/// gauges for database totals, two sparse-index pruning counters, plus
+/// `rusthouse_table_rows` and `rusthouse_table_retained_value_bytes` gauges per
+/// current table. It takes a nonblocking, consistent database metrics snapshot;
+/// lock contention and poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
 /// database. `GET /ready` also accepts no body and returns the same successful
@@ -1614,9 +1614,14 @@ fn handle_http_query_exchange(
         }
         HttpRequest::Metrics => {
             let metrics = match database.metrics_snapshot_with_tables(
-                |totals, table_name_bytes, row_count_bytes, retained_value_byte_count_bytes| {
+                |totals,
+                 index_pruning,
+                 table_name_bytes,
+                 row_count_bytes,
+                 retained_value_byte_count_bytes| {
                     let body_bytes = prometheus_metrics_body_len(
                         totals,
+                        index_pruning,
                         table_name_bytes,
                         row_count_bytes,
                         retained_value_byte_count_bytes,
@@ -3580,6 +3585,16 @@ const RETAINED_VALUE_BYTES_METRIC_PREFIX: &str = concat!(
     "# TYPE rusthouse_retained_value_bytes gauge\n",
     "rusthouse_retained_value_bytes ",
 );
+const INDEX_SCANNED_BLOCKS_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_index_scanned_blocks Sparse-index blocks scanned by successful indexed queries.\n",
+    "# TYPE rusthouse_index_scanned_blocks counter\n",
+    "rusthouse_index_scanned_blocks ",
+);
+const INDEX_PRUNED_BLOCKS_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_index_pruned_blocks Sparse-index blocks pruned by successful indexed queries.\n",
+    "# TYPE rusthouse_index_pruned_blocks counter\n",
+    "rusthouse_index_pruned_blocks ",
+);
 const TABLE_ROWS_METRIC_HEADER: &str = concat!(
     "# HELP rusthouse_table_rows Number of rows retained by a table.\n",
     "# TYPE rusthouse_table_rows gauge\n",
@@ -3595,6 +3610,7 @@ const TABLE_RETAINED_VALUE_BYTES_METRIC_PREFIX: &str =
 
 fn prometheus_metrics_body_len(
     totals: crate::DatabaseMetrics,
+    index_pruning: crate::IndexPruningMetrics,
     table_name_bytes: usize,
     row_count_bytes: usize,
     retained_value_byte_count_bytes: usize,
@@ -3604,13 +3620,17 @@ fn prometheus_metrics_body_len(
         .saturating_add(COLUMNS_METRIC_PREFIX.len())
         .saturating_add(RETAINED_ROWS_METRIC_PREFIX.len())
         .saturating_add(RETAINED_VALUE_BYTES_METRIC_PREFIX.len())
+        .saturating_add(INDEX_SCANNED_BLOCKS_METRIC_PREFIX.len())
+        .saturating_add(INDEX_PRUNED_BLOCKS_METRIC_PREFIX.len())
         .saturating_add(TABLE_ROWS_METRIC_HEADER.len())
         .saturating_add(TABLE_RETAINED_VALUE_BYTES_METRIC_HEADER.len())
-        .saturating_add(4)
+        .saturating_add(6)
         .saturating_add(usize_decimal_len(totals.table_count))
         .saturating_add(usize_decimal_len(totals.column_count))
         .saturating_add(usize_decimal_len(totals.retained_row_count))
-        .saturating_add(usize_decimal_len(totals.retained_value_bytes));
+        .saturating_add(usize_decimal_len(totals.retained_value_bytes))
+        .saturating_add(usize_decimal_len(index_pruning.scanned_blocks))
+        .saturating_add(usize_decimal_len(index_pruning.pruned_blocks));
     let per_table_fixed_bytes = TABLE_ROW_METRIC_PREFIX
         .len()
         .saturating_add(TABLE_ROW_METRIC_SEPARATOR.len())
@@ -3629,7 +3649,11 @@ fn write_prometheus_metrics(
     output: &mut impl Write,
     metrics: DatabaseMetricsWithTables,
 ) -> io::Result<()> {
-    let DatabaseMetricsWithTables { totals, tables } = metrics;
+    let DatabaseMetricsWithTables {
+        totals,
+        index_pruning,
+        tables,
+    } = metrics;
     output.write_all(TABLES_METRIC_PREFIX.as_bytes())?;
     writeln!(output, "{}", totals.table_count)?;
     output.write_all(COLUMNS_METRIC_PREFIX.as_bytes())?;
@@ -3638,6 +3662,10 @@ fn write_prometheus_metrics(
     writeln!(output, "{}", totals.retained_row_count)?;
     output.write_all(RETAINED_VALUE_BYTES_METRIC_PREFIX.as_bytes())?;
     writeln!(output, "{}", totals.retained_value_bytes)?;
+    output.write_all(INDEX_SCANNED_BLOCKS_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", index_pruning.scanned_blocks)?;
+    output.write_all(INDEX_PRUNED_BLOCKS_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", index_pruning.pruned_blocks)?;
     output.write_all(TABLE_ROWS_METRIC_HEADER.as_bytes())?;
     for (table, row_count, _) in &tables {
         output.write_all(TABLE_ROW_METRIC_PREFIX.as_bytes())?;
