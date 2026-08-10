@@ -3140,6 +3140,23 @@ impl Database {
             let target = self.catalog.table(&table)?;
             let target_index = target.column_index(&target_column)?;
             let predicate_index = target.column_index(&predicate_column)?;
+            if matches!(&predicate_value, AlterUpdateValue::Null) {
+                return Err(Error::InvalidQuery(
+                    "ALTER TABLE UPDATE WHERE comparison does not accept NULL".to_owned(),
+                ));
+            }
+            if matches!(&value, AlterUpdateValue::Null)
+                && !target.column_is_nullable_int64(target_index)
+            {
+                return Err(Error::TypeMismatch {
+                    context: format!(
+                        "ALTER TABLE UPDATE target column '{}.{target_column}'",
+                        target.name()
+                    ),
+                    expected: target.schema()[target_index].data_type.to_string(),
+                    actual: "NULL".to_owned(),
+                });
+            }
             for (column, index, literal, role) in [
                 (&target_column, target_index, &value, "target"),
                 (
@@ -5493,7 +5510,10 @@ fn resolve_select_items(
                 if let Some(argument) = argument_index {
                     let supported_nullable_aggregate = matches!(
                         function,
-                        AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Min
+                        AggregateFunction::Count
+                            | AggregateFunction::Sum
+                            | AggregateFunction::Min
+                            | AggregateFunction::Max
                     ) && table
                         .column_is_nullable_int64(argument);
                     if !supported_nullable_aggregate {
@@ -6291,7 +6311,10 @@ fn execute_grouped<'a>(
                 input_type: Some(DataType::Int64),
                 ..
             }]
-        );
+        )
+        && aggregate_specs
+            .first()
+            .is_some_and(|spec| aggregate_argument_is_non_nullable_int64(table, spec));
     let sole_global_max_float = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -7600,9 +7623,10 @@ impl AggregateState {
             Self::Max(current) => {
                 let column = &table.columns()[spec.argument.expect("MAX argument")];
                 let candidate = column.value_ref(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| candidate > existing.as_ref())
+                if !matches!(candidate, ValueRef::Null(_))
+                    && current
+                        .as_ref()
+                        .is_none_or(|existing| candidate > existing.as_ref())
                 {
                     replace_extreme(
                         current,
@@ -11313,7 +11337,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_int64_minimum_stays_sequential_above_the_parallel_threshold() {
+    fn nullable_int64_extrema_stay_sequential_above_the_parallel_threshold() {
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
 
         let cap = NonZeroUsize::new(2).unwrap();
@@ -11336,13 +11360,21 @@ mod tests {
                     Value::Int64(i64::MIN),
                 ],
             ),
+            ("SELECT MAX(v) FROM readings", vec![Value::Int64(i64::MAX)]),
+            (
+                "SELECT COUNT(*), MAX(v) FROM readings",
+                vec![
+                    Value::Int64(i64::try_from(row_count).unwrap()),
+                    Value::Int64(i64::MAX),
+                ],
+            ),
         ] {
             BUDGET.reset_peak();
             assert_eq!(query(&mut database, sql).rows, [expected]);
             assert_eq!(
                 BUDGET.peak_helpers_in_use(),
                 0,
-                "nullable MIN must not request parallel aggregate helpers"
+                "nullable extrema must not request parallel aggregate helpers"
             );
         }
     }
@@ -12672,7 +12704,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_int64_minimum_obeys_the_exact_aggregate_state_byte_boundary() {
+    fn nullable_int64_extrema_obey_the_exact_aggregate_state_byte_boundary() {
         let fixed_bytes =
             std::mem::size_of::<AggregateState>() + std::mem::size_of::<Vec<AggregateState>>();
         let exact_limits = QueryResultLimits {
@@ -12692,6 +12724,10 @@ mod tests {
             query(&mut exact, "SELECT MIN(v) FROM readings").rows,
             [vec![Value::Int64(i64::MIN)]]
         );
+        assert_eq!(
+            query(&mut exact, "SELECT MAX(v) FROM readings").rows,
+            [vec![Value::Int64(i64::MAX)]]
+        );
 
         let mut limited = Database::with_query_result_limits(QueryResultLimits {
             max_aggregate_state_bytes: fixed_bytes - 1,
@@ -12701,7 +12737,7 @@ mod tests {
             .create_nullable_int64_table("readings", "v", vec![None, Some(1)])
             .unwrap();
         assert_eq!(
-            limited.execute("SELECT MIN(v) FROM readings"),
+            limited.execute("SELECT MAX(v) FROM readings"),
             Err(Error::ResourceLimitExceeded {
                 resource: "SELECT aggregate state bytes",
                 actual: fixed_bytes,

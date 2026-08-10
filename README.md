@@ -77,7 +77,9 @@ grouped ordering and pagination stages. The paired
 shape preserves either projection order and derives its row count with a
 checked conversion of the filtered cardinality while the existing checked
 sum-and-count lanes target about 131,072 rows each. Release-mode crossover
-measurements kept smaller inputs sequential.
+measurements kept smaller inputs sequential. Int64 scalar and paired shapes
+require a physically non-nullable argument; nullable Int64 aggregates use the
+bounded sequential state path.
 Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
@@ -121,6 +123,12 @@ case-insensitively; other nullable types and nullable multi-column declarations
 remain outside the bounded grammar. Library APIs and WAL recovery can also
 create this physical storage. The index metadata has explicit nullable-block
 semantics for both `Int64` storage forms.
+`COUNT`, `SUM`, `MIN`, and `MAX` accept physical `Nullable(Int64)` arguments.
+`SUM`, `MIN`, and `MAX` ignore absent values and return typed `Int64` `NULL`
+for empty or all-`NULL` inputs; `COUNT(column)` counts only present values.
+These nullable shapes compose with filters, grouping, HAVING, ordering,
+pagination, and other supported aggregate projections. Other operations retain
+their documented nullable restrictions.
 
 An admitted, current index can reject blocks only for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
@@ -235,28 +243,32 @@ semicolon is optional.
 `ALTER TABLE <table> UPDATE <target> = <literal> WHERE <column> = <literal>`
 provides one deliberately narrow ClickHouse-style mutation. The target and
 predicate may independently be existing `Int64`, `Float64`, `Bool`, or `String`
-columns, and each literal must have its corresponding column's type. `Int64`
-literals support the complete optionally signed range. `Float64` literals use
-finite, optionally signed decimal or scientific notation; a decimal point or
-exponent distinguishes them from `Int64` literals. Boolean literals are
-case-insensitive `TRUE` or `FALSE`. String literals are single-quoted, may be
-empty or contain Unicode, and escape an apostrophe by doubling it. For example,
-`ALTER TABLE events UPDATE label = 'it''s ready' WHERE category = 'queued'`
-updates every matching label. Table and column lookup is case-insensitive. The
-table and both columns are resolved, type-checked, and checked for finite
-Float64 literals before the full source row count is checked against the
-configured scan limit. After that bounded scan, all matches from the original
-predicate column are passed to one atomic column replacement, including an
-empty replacement for zero matches. Before allocating replacements for a
-String assignment, RustHouse counts matches without cloning and checks the
-matched count times the assignment's UTF-8 byte length against the configured
-query byte limit (16 MiB by default). Only matching rows clone the assignment.
-Invalid syntax, missing names, wrong types, non-finite values, scan-limit
-failures, and replacement-byte-limit failures leave the table unchanged.
-Expressions, additional assignments or predicates, other operators, and
-clauses such as `LIMIT` are not supported. A successful command reports its
-matched-row count through the library API and is silent in formatted CLI
-output.
+columns, and each literal must have its corresponding column's type. In the
+assignment position only, bare case-insensitive `NULL` is also accepted when
+the target is a physical `Nullable(Int64)` column; non-nullable targets and
+`WHERE column = NULL` remain rejected. For example,
+`ALTER TABLE readings UPDATE measurement = NULL WHERE measurement = 0` clears
+every matching nullable measurement. `Int64` literals support the complete
+optionally signed range. `Float64` literals use finite, optionally signed
+decimal or scientific notation; a decimal point or exponent distinguishes them
+from `Int64` literals. Boolean literals are case-insensitive `TRUE` or `FALSE`.
+String literals are single-quoted, may be empty or contain Unicode, and escape
+an apostrophe by doubling it. For example, `ALTER TABLE events UPDATE label =
+'it''s ready' WHERE category = 'queued'` updates every matching label. Table and
+column lookup is case-insensitive. The table and both columns are resolved,
+type-checked, and checked for finite Float64 literals before the full source row
+count is checked against the configured scan limit. After that bounded scan,
+all matches from the original predicate column are passed to one atomic column
+replacement, including an empty replacement for zero matches. Before
+allocating replacements for a String assignment, RustHouse counts matches
+without cloning and checks the matched count times the assignment's UTF-8 byte
+length against the configured query byte limit (16 MiB by default). Only
+matching rows clone the assignment. Invalid syntax, missing names, wrong types,
+non-finite values, scan-limit failures, and replacement-byte-limit failures
+leave the table unchanged. Expressions, additional assignments or predicates,
+other operators, and clauses such as `LIMIT` are not supported. A successful
+command reports its matched-row count through the library API and is silent in
+formatted CLI output.
 
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,

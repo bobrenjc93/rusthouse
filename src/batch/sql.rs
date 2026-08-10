@@ -131,7 +131,8 @@ pub enum Statement {
         predicate_column: String,
         predicate_value: AlterUpdateLiteral,
     },
-    /// The same exact mutation shape when either operand is an owned String.
+    /// The same exact mutation shape when either operand is an owned String or
+    /// the assignment is `NULL`.
     AlterUpdateOwned {
         table: String,
         target_column: String,
@@ -269,11 +270,13 @@ impl AlterUpdateLiteral {
     }
 }
 
-/// An owned operand used when an `ALTER TABLE UPDATE` includes a String.
+/// An extended operand used when an `ALTER TABLE UPDATE` includes a String or
+/// assigns `NULL` to a physical `Nullable(Int64)` column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlterUpdateValue {
     Literal(AlterUpdateLiteral),
     String(String),
+    Null,
 }
 
 impl From<AlterUpdateLiteral> for AlterUpdateValue {
@@ -288,6 +291,7 @@ impl AlterUpdateValue {
         match self {
             Self::Literal(value) => value.data_type(),
             Self::String(_) => DataType::String,
+            Self::Null => DataType::Int64,
         }
     }
 
@@ -296,6 +300,7 @@ impl AlterUpdateValue {
         match self {
             Self::Literal(value) => value.value(),
             Self::String(value) => Value::String(value),
+            Self::Null => Value::Null(DataType::Int64),
         }
     }
 }
@@ -1791,7 +1796,11 @@ impl<'a> Parser<'a> {
                 &TokenKind::Equal,
                 "'=' after ALTER TABLE UPDATE target column",
             )?;
-            let value = self.parse_alter_update_literal("ALTER TABLE UPDATE assignment")?;
+            let value = if self.eat_keyword("NULL") {
+                AlterUpdateValue::Null
+            } else {
+                self.parse_alter_update_literal("ALTER TABLE UPDATE assignment")?
+            };
             self.expect_keyword("WHERE")?;
             let predicate_column = self.expect_identifier("WHERE column name")?;
             self.expect(
