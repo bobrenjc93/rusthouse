@@ -211,11 +211,12 @@ pub struct Database {
     int64_write_ahead_log: Option<ActiveInt64WriteAheadLogs>,
 }
 
-/// Cumulative sparse-index work performed by successful indexed scans.
+/// Cumulative sparse-index work performed by indexed scan attempts.
 ///
 /// A scanned block is a block whose rows still pass through the exact
 /// predicate evaluator. A pruned block is rejected using metadata alone.
-/// Queries without an applicable, current index do not change either counter.
+/// Work remains counted if later query processing fails. Queries without an
+/// applicable, current index do not change either counter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IndexPruningMetrics {
     pub scanned_blocks: usize,

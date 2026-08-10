@@ -149,8 +149,9 @@ scan-row limit. Inserts, deletes, updates, truncation, and added columns rebuild
 the index within the table mutation; if its original cap is exceeded it is
 invalidated. Dropping a column or replacing/restoring the table invalidates it.
 `Database::index_pruning_metrics` exposes cumulative surviving
-`scanned_blocks` and metadata-rejected `pruned_blocks`; unindexed fallbacks do
-not increment them.
+`scanned_blocks` and metadata-rejected `pruned_blocks` whenever sparse-index
+pruning runs. This work remains counted if later query processing fails;
+unindexed fallbacks and errors before pruning do not increment either counter.
 
 `DELETE FROM <table> WHERE <comparison> [AND <comparison>]` and its ClickHouse
 mutation spelling, `ALTER TABLE <table> DELETE WHERE <comparison> [AND
@@ -378,11 +379,12 @@ The complete row, value, byte, and retained-result bounds are preflighted before
 result storage is allocated, and the query is available through the normal
 `Database`, `SharedDatabase`, CLI, and HTTP paths in every supported format.
 The exact case-insensitive query
-`SELECT metric, value FROM system.metrics` returns four cached database totals
-also exposed as unlabeled Prometheus gauges—`rusthouse_tables`,
-`rusthouse_columns`, `rusthouse_retained_rows`, and
+`SELECT metric, value FROM system.metrics` returns four cached database totals—
+`rusthouse_tables`, `rusthouse_columns`, `rusthouse_retained_rows`, and
 `rusthouse_retained_value_bytes`—followed by the cumulative
 `rusthouse_index_scanned_blocks` and `rusthouse_index_pruned_blocks` counters.
+All six are also exposed by `GET /metrics`; the database totals are Prometheus
+gauges and the sparse-index measurements are Prometheus counters.
 Rows remain in that order and contain a `String` metric name plus a checked
 `Int64` value. The totals track table,
 column, retained-row, and retained scalar payload-byte lifecycle changes; the
@@ -1077,7 +1079,13 @@ accepts no body and returns four unlabeled gauges: `rusthouse_tables`,
 `rusthouse_columns`, `rusthouse_retained_rows`, and
 `rusthouse_retained_value_bytes`. They report the registered table count, the
 schema-column count across all tables, the row count retained across all tables,
-and retained scalar payload bytes. It also returns
+and retained scalar payload bytes. The same response includes the unlabeled
+`rusthouse_index_scanned_blocks` and `rusthouse_index_pruned_blocks` counters
+reported by `system.metrics`. They count blocks passed to the exact predicate
+evaluator and blocks rejected from metadata, respectively, across indexed query
+attempts. Work remains counted when later query processing fails, including
+retained-result validation; queries without an applicable current index do not
+change either counter. It also returns
 `rusthouse_table_rows{table="<display-name>"}` and
 `rusthouse_table_retained_value_bytes{table="<display-name>"}` gauges for every
 current table, ordered case-insensitively by table name within each family. Each
@@ -1087,18 +1095,19 @@ catalog. A scrape that cannot fit all current-table samples within the
 configured complete-response cap fails with the existing bounded response-limit
 error instead of returning a partial metric family. An allocation-free catalog
 pass accounts for the table count, both copies of every display name, decimal
-row and byte-count values, and the complete HTTP envelope before any name is
+total and counter values, and the complete HTTP envelope before any name is
 cloned or sorted. The byte gauges count each `Int64` and `Float64` value as 8
 bytes, each `Bool` as 1 byte, and each `String` by its UTF-8 payload length; they
 exclude container capacity, schema text, and allocation metadata and saturate
 at the platform's maximum `usize`. The response uses Prometheus text format
 version 0.0.4. Table and database totals are maintained during mutations, so a
-scrape reads cached counters instead of scanning retained values. When the
+scrape reads cached measurements instead of scanning retained values. When the
 preflight succeeds, capturing the per-table samples copies and sorts the current
 catalog names, row counts, and cached byte counts under the same database
-read-lock attempt, then releases the lock before formatting or writing the
-response. It never waits for a writer; lock contention and poisoning return the
-same deterministic `503 Service Unavailable` response as `/ready`.
+read-lock attempt that snapshots the totals and index counters, then releases
+the lock before formatting or writing the response. It never waits for a
+writer; lock contention and poisoning return the same deterministic `503
+Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a
 POST body or decoded GET SQL, and 16 MiB for the complete response including
