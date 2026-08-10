@@ -1339,8 +1339,16 @@ oversized files before decoding, and keeps filesystem, envelope, RLE payload,
 nullability, and capacity failures typed without returning partial tables. The
 legacy high-level restore helper intentionally continues to accept only the
 uncompressed row format.
+`Database::restore_int64_table_rle_from_file` imports that same bounded RLE
+format as one caller-named typed batch table. Case-insensitive duplicate names
+are rejected before the source is opened; decoding, non-nullability, SQL
+identifier, and configured table-limit checks all finish before the catalog or
+cached metrics change. A successful import is immediately queryable by
+`SELECT` and retains the caller-supplied row cap for later inserts.
 The legacy save and restore helpers use row-only payloads, so
-their schema and table row-cap metadata remain caller-supplied. The
+their column schema and table row-cap metadata remain caller-supplied and are
+not authenticated by the snapshot. The destination batch table name is also
+caller-supplied: an RLE file contains rows only, not catalog metadata. The
 self-describing save helper is the metadata-preserving counterpart and reopens
 with `restore_int64_table_payload_from_file`. The codec also composes directly
 with the envelope's lower-level `encode`, `create_new_file`, and Unix
@@ -1369,6 +1377,12 @@ retains both typed causes. Database validation runs only after a source has
 decoded and does not trigger fallback. A dual recovery, schema-validation, or
 configured-limit failure preserves the target's display name, data, and cached
 metrics.
+`SharedDatabase::try_replace_int64_table_from_file_with_backup` provides the
+same recovery replacement through one nonblocking write-lock attempt made
+before either file is opened. It retains the guard while delegating the full
+primary-or-backup replacement and returns the successful recovery source.
+Reader or writer contention, lock poisoning, and typed snapshot failures are
+distinct, and every failure preserves the target and cached metrics.
 `Database::restore_int64_tables_from_files` restores a caller-bounded slice of
 `DatabaseSnapshotRestoreEntry` values as one atomic catalog change. The
 inclusive entry-count limit and the complete case-insensitive destination-name

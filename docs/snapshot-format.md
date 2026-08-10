@@ -109,6 +109,14 @@ table-limit validation happens after recovery chooses a source and does not
 trigger another attempt. Dual recovery, validation, and limit failures leave
 the target's display name, rows, schema, and cached metrics unchanged.
 
+`SharedDatabase::try_replace_int64_table_from_file_with_backup` exposes that
+replacement to concurrent users without blocking. It makes exactly one
+write-lock attempt before opening either source, retains the guard through the
+delegated primary-or-backup replacement, and returns the successful recovery
+source. Reader or writer contention, a poisoned lock, and typed snapshot or
+database validation failures remain distinct. Every failure preserves the
+target table and cached metrics.
+
 `Database::restore_int64_tables_from_files` transactionally composes those
 single-table payloads into a caller-bounded catalog subset. Each
 `DatabaseSnapshotRestoreEntry` supplies a table name, source path, and its own
@@ -171,6 +179,15 @@ helper and therefore requires a caller-supplied schema and row cap as well as
 the envelope and RLE codecs. The existing `restore_int64_table_from_file`
 helper is not format-detecting and continues to expect
 `NullableI64PayloadCodec` bytes.
+
+`Database::restore_int64_table_rle_from_file` registers one such restored table
+under a caller-supplied batch table name. It rejects a case-insensitive catalog
+duplicate before opening the file, then stages the bounded RLE restore and all
+batch schema and `TableLimits` validation before updating the catalog and
+cached metrics. The format remains row-only: the file does not store or
+authenticate the caller's column name, nullability, row cap, destination table
+name, or any other catalog metadata. Batch storage therefore requires callers
+to provide a non-nullable one-column `Int64` schema and an appropriate row cap.
 
 ## Nullable Int64 row payload
 
@@ -340,6 +357,12 @@ validates the exact envelope and complete RLE run stream before atomically
 appending all decoded rows to a new table. Open, read, oversized-file,
 envelope, RLE-payload, schema-nullability, and table-capacity failures remain
 typed; no error returns a partially populated table.
+
+The `Database` method of the same name adds a caller-named batch catalog
+registration around this exact decoder. It preserves catalog contents and
+cached metrics on typed file corruption, nullability, caller row-cap, or
+configured table-limit failures; success registers only the fully validated
+table.
 
 `Catalog::restore_int64_table_from_file` applies the catalog's per-table row
 cap and registers the restored table under a caller-supplied exact name only

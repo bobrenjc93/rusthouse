@@ -23,10 +23,12 @@ use crate::batch::value::{DataType, Value, ValueRef};
 use crate::snapshot::Int64TablePayloadFileSaveError;
 use crate::snapshot::{
     Int64TablePayloadCodec, Int64TablePayloadFileRecoveryError,
-    Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError, SnapshotCodec,
+    Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError,
+    Int64TableRleFileRestoreError, NullableI64RlePayloadCodec, SnapshotCodec,
     restore_int64_table_payload_from_file, restore_int64_table_payload_from_file_with_backup,
+    restore_int64_table_rle_from_file,
 };
-use crate::storage::Int64Table;
+use crate::storage::{Int64Table, Schema};
 
 pub use crate::batch::storage::{
     DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_ROWS_PER_TABLE,
@@ -558,6 +560,32 @@ pub enum DatabaseSnapshotRestoreError {
     Table(Error),
 }
 
+/// A failure while importing one row-only RLE `Int64` snapshot into a
+/// [`Database`].
+#[derive(Debug)]
+pub enum DatabaseRleSnapshotRestoreError {
+    /// Opening or decoding the bounded RLE snapshot failed, or its rows did
+    /// not satisfy the caller-supplied schema and row cap.
+    Snapshot(Int64TableRleFileRestoreError),
+    /// Batch tables do not currently support nullable physical columns.
+    NullableColumn { column: String },
+    /// The caller name, schema, duplicate name, or configured table limits
+    /// were rejected by batch storage.
+    Table(Error),
+}
+
+#[derive(Debug)]
+enum RestoredInt64TableValidationError {
+    NullableColumn { column: String },
+    Table(Error),
+}
+
+impl From<Error> for RestoredInt64TableValidationError {
+    fn from(error: Error) -> Self {
+        Self::Table(error)
+    }
+}
+
 /// One caller-named self-describing `Int64` snapshot in an atomic database
 /// restore set.
 #[derive(Debug, Clone, Copy)]
@@ -679,6 +707,19 @@ impl fmt::Display for DatabaseSnapshotRestoreError {
     }
 }
 
+impl fmt::Display for DatabaseRleSnapshotRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Snapshot(error) => write!(formatter, "could not restore RLE snapshot: {error}"),
+            Self::NullableColumn { column } => write!(
+                formatter,
+                "snapshot column '{column}' is nullable; batch snapshot restore requires a non-nullable Int64 column"
+            ),
+            Self::Table(error) => error.fmt(formatter),
+        }
+    }
+}
+
 impl fmt::Display for DatabaseSnapshotSetRestoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -777,6 +818,16 @@ impl std::error::Error for DatabaseSnapshotRestoreError {
     }
 }
 
+impl std::error::Error for DatabaseRleSnapshotRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::Table(error) => Some(error),
+            Self::NullableColumn { .. } => None,
+        }
+    }
+}
+
 impl std::error::Error for DatabaseSnapshotSetRestoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -803,6 +854,12 @@ impl From<Int64TablePayloadFileRestoreError> for DatabaseSnapshotRestoreError {
     }
 }
 
+impl From<Int64TableRleFileRestoreError> for DatabaseRleSnapshotRestoreError {
+    fn from(error: Int64TableRleFileRestoreError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 impl From<Int64TablePayloadFileRecoveryError> for DatabaseSnapshotRestoreError {
     fn from(error: Int64TablePayloadFileRecoveryError) -> Self {
         Self::Recovery(error)
@@ -812,6 +869,34 @@ impl From<Int64TablePayloadFileRecoveryError> for DatabaseSnapshotRestoreError {
 impl From<Error> for DatabaseSnapshotRestoreError {
     fn from(error: Error) -> Self {
         Self::Table(error)
+    }
+}
+
+impl From<Error> for DatabaseRleSnapshotRestoreError {
+    fn from(error: Error) -> Self {
+        Self::Table(error)
+    }
+}
+
+impl From<RestoredInt64TableValidationError> for DatabaseSnapshotRestoreError {
+    fn from(error: RestoredInt64TableValidationError) -> Self {
+        match error {
+            RestoredInt64TableValidationError::NullableColumn { column } => {
+                Self::NullableColumn { column }
+            }
+            RestoredInt64TableValidationError::Table(error) => Self::Table(error),
+        }
+    }
+}
+
+impl From<RestoredInt64TableValidationError> for DatabaseRleSnapshotRestoreError {
+    fn from(error: RestoredInt64TableValidationError) -> Self {
+        match error {
+            RestoredInt64TableValidationError::NullableColumn { column } => {
+                Self::NullableColumn { column }
+            }
+            RestoredInt64TableValidationError::Table(error) => Self::Table(error),
+        }
     }
 }
 
@@ -1012,6 +1097,50 @@ impl Database {
 
         let restored = restore_int64_table_payload_from_file(path, snapshot_codec, payload_codec)?;
         self.register_restored_int64_table(table_name, restored)
+    }
+
+    /// Imports one bounded row-only RLE `Int64` snapshot as a named batch
+    /// table.
+    ///
+    /// Unlike the self-describing snapshot accepted by
+    /// [`Self::restore_int64_table_from_file`], this format stores rows only.
+    /// The caller must supply the column schema and the table row cap; neither
+    /// value is authenticated by the file. `table_name` is also caller-owned
+    /// catalog metadata. The envelope and RLE codecs bound file bytes, decoded
+    /// rows, runs, and payload bytes.
+    ///
+    /// Existing names are resolved case-insensitively and rejected before the
+    /// source path is opened. The complete file is restored through
+    /// [`crate::restore_int64_table_rle_from_file`] and converted into a fully
+    /// validated non-nullable batch table before registration. Corruption,
+    /// nullability, invalid identifiers, caller row-cap failures, and the
+    /// database's configured [`TableLimits`] leave catalog data and cached
+    /// metrics unchanged.
+    pub fn restore_int64_table_rle_from_file(
+        &mut self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        schema: Schema,
+        row_cap: usize,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: NullableI64RlePayloadCodec,
+    ) -> std::result::Result<(), DatabaseRleSnapshotRestoreError> {
+        if self.catalog.table_exists(table_name) {
+            return Err(Error::TableAlreadyExists(table_name.to_owned()).into());
+        }
+
+        let restored = restore_int64_table_rle_from_file(
+            path,
+            schema,
+            row_cap,
+            snapshot_codec,
+            payload_codec,
+        )?;
+        let table = self.prepare_restored_int64_table_inner(table_name, restored)?;
+        let measurements = TableMeasurements::read(&table);
+        self.catalog.register_table(table)?;
+        self.measurements.add(measurements);
+        Ok(())
     }
 
     /// Atomically replaces one existing table from a self-describing,
@@ -1238,9 +1367,18 @@ impl Database {
         table_name: &str,
         restored: Int64Table,
     ) -> std::result::Result<Table, DatabaseSnapshotRestoreError> {
+        self.prepare_restored_int64_table_inner(table_name, restored)
+            .map_err(Into::into)
+    }
+
+    fn prepare_restored_int64_table_inner(
+        &self,
+        table_name: &str,
+        restored: Int64Table,
+    ) -> std::result::Result<Table, RestoredInt64TableValidationError> {
         let column = restored.schema().column();
         if column.is_nullable() {
-            return Err(DatabaseSnapshotRestoreError::NullableColumn {
+            return Err(RestoredInt64TableValidationError::NullableColumn {
                 column: column.name().to_owned(),
             });
         }
@@ -1265,7 +1403,7 @@ impl Database {
             .map(|value| value.expect("the decoded snapshot column is non-nullable"))
             .collect();
         Table::with_int64_values(table_name.to_owned(), column_name, values, restored_limits)
-            .map_err(Into::into)
+            .map_err(RestoredInt64TableValidationError::Table)
     }
 
     /// Atomically saves one non-nullable, one-column `Int64` batch table on Unix.
