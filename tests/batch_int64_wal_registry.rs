@@ -88,9 +88,8 @@ fn create_two_table_registry(path: &Path) {
     database.disable_int64_write_ahead_log();
 }
 
-fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
+fn assert_nullable_query_behavior(database: &mut Database, table: &str) {
     for (expression, operation) in [
-        ("v - 1", "Int64 subtraction"),
         ("CAST(v AS String)", "CAST"),
         ("ABS(v)", "ABS"),
         ("ROW_NUMBER() OVER (ORDER BY v ASC)", "ROW_NUMBER ORDER BY"),
@@ -108,6 +107,23 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
             "expression {expression}"
         );
     }
+
+    let results = database
+        .execute(&format!(
+            "SELECT v - 0 AS adjusted FROM {table} ORDER BY adjusted"
+        ))
+        .unwrap();
+    let [StatementResult::Query(adjusted)] = results.as_slice() else {
+        panic!("expected subtraction query")
+    };
+    assert_eq!(
+        adjusted.rows,
+        [
+            vec![Value::Null(rusthouse::batch::value::DataType::Int64)],
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
 
     let results = database
         .execute(&format!("SELECT SUM(v) FROM {table}"))
@@ -168,7 +184,7 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
 }
 
 #[test]
-fn nullable_created_and_recovered_tables_support_aggregates_and_to_string() {
+fn nullable_created_and_recovered_tables_support_subtraction_aggregates_and_to_string() {
     let directory = TestDirectory::new();
     let registry = directory.join("registry");
     let snapshot = directory.join("nullable.snapshot");
@@ -177,7 +193,7 @@ fn nullable_created_and_recovered_tables_support_aggregates_and_to_string() {
         .create_nullable_int64_table("Alpha", "v", vec![Some(i64::MIN), None, Some(i64::MAX)])
         .unwrap();
 
-    assert_nullable_aggregate_behavior(&mut database, "alpha");
+    assert_nullable_query_behavior(&mut database, "alpha");
     let snapshot_error = database
         .save_int64_table_to_file(
             "Alpha",
@@ -199,7 +215,7 @@ fn nullable_created_and_recovered_tables_support_aggregates_and_to_string() {
     database.disable_int64_write_ahead_log();
     let mut recovered =
         Database::recover_int64_write_ahead_log_registry(&registry, limits()).unwrap();
-    assert_nullable_aggregate_behavior(&mut recovered, "ALPHA");
+    assert_nullable_query_behavior(&mut recovered, "ALPHA");
 
     let results = recovered.execute("DESCRIBE TABLE Alpha").unwrap();
     let [StatementResult::Query(describe)] = results.as_slice() else {

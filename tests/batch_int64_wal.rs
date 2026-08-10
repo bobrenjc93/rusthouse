@@ -423,6 +423,21 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
         Value::Float64(-0.5)
     );
     let results = recovered
+        .execute("SELECT Measurement - 0 AS adjusted FROM READINGS ORDER BY adjusted")
+        .unwrap();
+    let [StatementResult::Query(adjusted)] = results.as_slice() else {
+        panic!("expected subtraction query")
+    };
+    assert_eq!(
+        adjusted.rows,
+        [
+            vec![Value::Null(rusthouse::batch::value::DataType::Int64)],
+            vec![Value::Null(rusthouse::batch::value::DataType::Int64)],
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+    let results = recovered
         .execute("SELECT toString(Measurement) AS rendered FROM READINGS ORDER BY rendered")
         .unwrap();
     let [StatementResult::Query(rendered)] = results.as_slice() else {
@@ -457,6 +472,16 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
     assert_eq!(
         nullable_int64_average(&mut all_null_recovered, "readings"),
         Value::Null(rusthouse::batch::value::DataType::Float64)
+    );
+    let results = all_null_recovered
+        .execute("SELECT Measurement - -9223372036854775808 FROM readings")
+        .unwrap();
+    let [StatementResult::Query(adjusted)] = results.as_slice() else {
+        panic!("expected all-NULL subtraction query")
+    };
+    assert_eq!(
+        adjusted.rows,
+        vec![vec![Value::Null(rusthouse::batch::value::DataType::Int64)]; 4]
     );
     let results = all_null_recovered
         .execute("SELECT toString(Measurement) FROM readings")
