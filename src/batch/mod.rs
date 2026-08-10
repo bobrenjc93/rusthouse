@@ -10,9 +10,9 @@ pub mod sql;
 pub mod storage;
 pub mod tsv;
 pub mod value;
-
 #[cfg(unix)]
-pub use engine::DatabaseSnapshotSaveError;
+pub mod wal;
+
 pub use engine::{
     DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS,
     DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS, DEFAULT_INT64_MIN_MAX_INDEX_BYTES,
@@ -23,6 +23,10 @@ pub use engine::{
     Int64MinMaxIndexLimits, Int64MinMaxIndexRejection, Int64RangePartition,
     Int64RangePartitionError, Int64RangePartitionLimits,
 };
+#[cfg(unix)]
+pub use engine::{
+    DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError, DatabaseSnapshotSaveError,
+};
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 #[cfg(unix)]
 pub use shared_database::SharedDatabaseSnapshotSaveError;
@@ -31,6 +35,13 @@ pub use shared_database::{
     SharedDatabaseSnapshotSetRestoreError,
 };
 pub use storage::TableLimits;
+#[cfg(unix)]
+pub use wal::{
+    DEFAULT_MAX_INT64_WAL_BYTES, DEFAULT_MAX_INT64_WAL_RECORD_BYTES, DEFAULT_MAX_INT64_WAL_RECORDS,
+    INT64_WAL_COMMIT_LEN, INT64_WAL_FRAME_HEADER_LEN, INT64_WAL_FRAME_OVERHEAD,
+    Int64WriteAheadLogCommitError, Int64WriteAheadLogCorruption, Int64WriteAheadLogError,
+    Int64WriteAheadLogLimitError, Int64WriteAheadLogLimits,
+};
 
 use std::error::Error as StdError;
 use std::fmt;
