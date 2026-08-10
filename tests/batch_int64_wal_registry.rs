@@ -92,7 +92,6 @@ fn assert_nullable_expressions_are_rejected(database: &mut Database, table: &str
     for (expression, operation) in [
         ("SUM(v)", "SUM"),
         ("COUNT(v)", "COUNT"),
-        ("MIN(v)", "MIN"),
         ("MAX(v)", "MAX"),
         ("AVG(v)", "AVG"),
         ("v - 1", "Int64 subtraction"),
@@ -134,6 +133,14 @@ fn assert_nullable_expressions_are_rejected(database: &mut Database, table: &str
         panic!("expected COUNT(*) query")
     };
     assert_eq!(count.rows, [vec![Value::Int64(2)]]);
+
+    let results = database
+        .execute(&format!("SELECT MIN(v) FROM {table}"))
+        .unwrap();
+    let [StatementResult::Query(minimum)] = results.as_slice() else {
+        panic!("expected MIN query")
+    };
+    assert_eq!(minimum.rows, [vec![Value::Int64(1)]]);
 }
 
 #[test]

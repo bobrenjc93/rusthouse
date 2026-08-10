@@ -69,6 +69,16 @@ fn nullable_int64_values(database: &Database, table_name: &str) -> Vec<Option<i6
     values.clone()
 }
 
+fn nullable_int64_minimum(database: &mut Database, table_name: &str) -> Value {
+    let results = database
+        .execute(&format!("SELECT MIN(Measurement) FROM {table_name}"))
+        .unwrap();
+    let [StatementResult::Query(result)] = results.as_slice() else {
+        panic!("expected one MIN query result")
+    };
+    result.rows[0][0].clone()
+}
+
 fn metrics(database: &mut Database) -> Vec<Vec<Value>> {
     let results = database
         .execute("SELECT metric, value FROM system.metrics")
@@ -177,7 +187,7 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
     let limits = Int64WriteAheadLogLimits::default();
     let mut database = Database::new();
     database
-        .create_nullable_int64_table("Readings", "Measurement", vec![Some(4)])
+        .create_nullable_int64_table("Readings", "Measurement", vec![Some(i64::MAX)])
         .unwrap();
     database
         .enable_int64_write_ahead_log("readings", &path, limits)
@@ -186,18 +196,39 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
     database
         .execute(
             "INSERT INTO READINGS (MEASUREMENT) VALUES \
-             (NULL), (7), (nUlL);",
+             (NULL), (-9223372036854775808), (nUlL);",
         )
         .unwrap();
     assert_eq!(
         nullable_int64_values(&database, "readings"),
-        [Some(4), None, Some(7), None]
+        [Some(i64::MAX), None, Some(i64::MIN), None]
+    );
+    assert_eq!(
+        nullable_int64_minimum(&mut database, "readings"),
+        Value::Int64(i64::MIN)
     );
 
-    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    let mut recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
     assert_eq!(
         nullable_int64_values(&recovered, "READINGS"),
-        [Some(4), None, Some(7), None]
+        [Some(i64::MAX), None, Some(i64::MIN), None]
+    );
+    assert_eq!(
+        nullable_int64_minimum(&mut recovered, "READINGS"),
+        Value::Int64(i64::MIN)
+    );
+
+    database
+        .replace_nullable_int64_values("readings", &[(0, None), (2, None)])
+        .unwrap();
+    let mut all_null_recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert_eq!(
+        nullable_int64_values(&all_null_recovered, "readings"),
+        [None, None, None, None]
+    );
+    assert_eq!(
+        nullable_int64_minimum(&mut all_null_recovered, "readings"),
+        Value::Null(rusthouse::batch::value::DataType::Int64)
     );
 }
 
@@ -225,8 +256,12 @@ fn failed_sql_null_wal_append_is_not_published_to_nullable_storage() {
     ));
     assert!(nullable_int64_values(&database, "readings").is_empty());
 
-    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    let mut recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
     assert!(nullable_int64_values(&recovered, "READINGS").is_empty());
+    assert_eq!(
+        nullable_int64_minimum(&mut recovered, "READINGS"),
+        Value::Null(rusthouse::batch::value::DataType::Int64)
+    );
 }
 
 #[test]
