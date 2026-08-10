@@ -8,6 +8,7 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -16,6 +17,7 @@ const REGISTRY_MANIFEST_NAME: &str = "manifest.rhi64";
 const REGISTRY_MANIFEST_MAGIC: [u8; 8] = *b"RHI64REG";
 const REGISTRY_MANIFEST_VERSION: u16 = 1;
 const REGISTRY_MANIFEST_HEADER_LEN: usize = 28;
+const REGISTRY_DESCRIPTOR_MIN_PAYLOAD_LEN: usize = 8;
 
 /// Default maximum number of table WALs in one registry directory.
 pub const DEFAULT_MAX_INT64_WAL_REGISTRY_TABLES: usize = 1_024;
@@ -1095,7 +1097,7 @@ impl WalDirectory {
         })
     }
 
-    fn entry_names(&self) -> io::Result<Vec<Vec<u8>>> {
+    fn first_unexpected_entry(&self, expected: &HashSet<Vec<u8>>) -> io::Result<Option<Vec<u8>>> {
         let descriptor = unsafe { libc::dup(self.file.as_raw_fd()) };
         if descriptor == -1 {
             return Err(io::Error::last_os_error());
@@ -1108,25 +1110,114 @@ impl WalDirectory {
             }
             return Err(error);
         }
-        let mut names = Vec::new();
-        loop {
-            let entry = unsafe { libc::readdir(stream) };
-            if entry.is_null() {
-                break;
-            }
+        let mut entry_buffer = MaybeUninit::<libc::dirent>::uninit();
+        let result = loop {
+            let entry = match next_directory_entry(stream, &mut entry_buffer) {
+                Ok(entry) if entry.is_null() => break Ok(None),
+                Ok(entry) => entry,
+                Err(error) => break Err(error),
+            };
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
-                names.push(name.to_vec());
+            if name != b"." && name != b".." && !expected.contains(name) {
+                break Ok(Some(name.to_vec()));
             }
+        };
+        let close_result = unsafe { libc::closedir(stream) };
+        match result {
+            Err(error) => Err(error),
+            Ok(_) if close_result == -1 => Err(io::Error::last_os_error()),
+            Ok(unexpected) => Ok(unexpected),
         }
-        if unsafe { libc::closedir(stream) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(names)
     }
 
     fn sync(&self) -> io::Result<()> {
         self.file.sync_all()
+    }
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "redox",
+    target_os = "android",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+fn next_directory_entry(
+    stream: *mut libc::DIR,
+    _entry_buffer: &mut MaybeUninit<libc::dirent>,
+) -> io::Result<*mut libc::dirent> {
+    // `readdir` distinguishes EOF from failure only through thread-local
+    // errno, so clear it before every call and inspect it on a null result.
+    let errno = directory_errno_location();
+    unsafe {
+        *errno = 0;
+    }
+    let entry = unsafe { libc::readdir(stream) };
+    let error = unsafe { *errno };
+    if entry.is_null() && error != 0 {
+        Err(io::Error::from_raw_os_error(error))
+    } else {
+        Ok(entry)
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "redox"
+))]
+fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::___errno() }
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "redox",
+    target_os = "android",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
+fn next_directory_entry(
+    stream: *mut libc::DIR,
+    entry_buffer: &mut MaybeUninit<libc::dirent>,
+) -> io::Result<*mut libc::dirent> {
+    let mut entry = std::ptr::null_mut();
+    let error = unsafe { libc::readdir_r(stream, entry_buffer.as_mut_ptr(), &mut entry) };
+    if error == 0 {
+        Ok(entry)
+    } else {
+        Err(io::Error::from_raw_os_error(error))
     }
 }
 
@@ -1587,11 +1678,17 @@ fn decode_registry_manifest(
         }
         .into());
     }
+    if count > payload.len() / REGISTRY_DESCRIPTOR_MIN_PAYLOAD_LEN {
+        return Err(Int64WriteAheadLogRegistryCorruption::ManifestPayload {
+            field: "descriptor count",
+        }
+        .into());
+    }
 
     let mut reader = RegistryManifestReader::new(payload);
-    let mut descriptors = Vec::with_capacity(count);
-    let mut tables = HashSet::with_capacity(count);
-    let mut members = HashSet::with_capacity(count);
+    let mut descriptors = Vec::new();
+    let mut tables = HashSet::new();
+    let mut members = HashSet::new();
     let mut previous: Option<String> = None;
     for _ in 0..count {
         let table = reader.string("table name")?;
@@ -1732,18 +1829,16 @@ pub(crate) fn recover_registry(
         .map(|descriptor| descriptor.member.as_bytes().to_vec())
         .chain(std::iter::once(REGISTRY_MANIFEST_NAME.as_bytes().to_vec()))
         .collect::<HashSet<_>>();
-    for entry in directory
-        .entry_names()
+    if let Some(entry) = directory
+        .first_unexpected_entry(&expected_entries)
         .map_err(Int64WriteAheadLogRegistryError::ReadDirectory)?
     {
-        if !expected_entries.contains(&entry) {
-            return Err(
-                Int64WriteAheadLogRegistryCorruption::UnexpectedDirectoryEntry {
-                    entry: String::from_utf8_lossy(&entry).into_owned(),
-                }
-                .into(),
-            );
-        }
+        return Err(
+            Int64WriteAheadLogRegistryCorruption::UnexpectedDirectoryEntry {
+                entry: String::from_utf8_lossy(&entry).into_owned(),
+            }
+            .into(),
+        );
     }
 
     let mut tables = Vec::with_capacity(descriptors.len());
@@ -2337,7 +2432,7 @@ fn decode_bootstrap(
         return Err(reader.malformed("worker cap").into());
     }
     let row_count = reader.usize("row count")?;
-    validate_bootstrap_caps(&reader, table_limits, database_table_limits, row_count)?;
+    validate_bootstrap_caps(&reader, table_limits, row_count)?;
     let required_value_bytes = row_count
         .checked_mul(if nullable { 9 } else { 8 })
         .ok_or_else(|| reader.malformed("row count"))?;
@@ -2368,16 +2463,13 @@ fn decode_bootstrap(
 fn validate_bootstrap_caps(
     reader: &PayloadReader<'_>,
     table_limits: [usize; 3],
-    database_table_limits: [usize; 3],
     row_count: usize,
 ) -> Result<(), Int64WriteAheadLogError> {
-    if table_limits[1] < 1
-        || table_limits[2] < row_count
-        || table_limits[0] < row_count
-        || database_table_limits[0] < table_limits[0]
-        || database_table_limits[1] < 1
-        || database_table_limits[2] < row_count
-    {
+    // Database table limits are defaults for future SQL-created tables. An
+    // explicitly created table can validly carry larger local limits (or live
+    // in a database whose defaults admit no ordinary table), so replay only
+    // requires the persisted table-local limits to cover its current shape.
+    if table_limits[1] < 1 || table_limits[2] < row_count || table_limits[0] < row_count {
         return Err(reader.malformed("table resource limits").into());
     }
     Ok(())

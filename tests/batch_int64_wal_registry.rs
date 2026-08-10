@@ -193,6 +193,49 @@ fn oversized_nullable_append_is_rejected_before_row_materialization() {
 }
 
 #[test]
+fn custom_nullable_table_limits_round_trip_through_single_and_registry_wals() {
+    let directory = TestDirectory::new();
+    let single = directory.join("custom.wal");
+    let registry = directory.join("custom-registry");
+    let database_limits = TableLimits::new(0, 0, 0);
+    let custom_limits = TableLimits::new(5, 1, 5);
+    let mut database = Database::with_table_limits(database_limits);
+    database
+        .create_nullable_int64_table_with_limits("Custom", "v", vec![Some(7), None], custom_limits)
+        .unwrap();
+
+    database
+        .enable_int64_write_ahead_log("Custom", &single, limits().per_table)
+        .unwrap();
+    database.disable_int64_write_ahead_log();
+    let recovered_single =
+        Database::recover_int64_write_ahead_log(&single, limits().per_table).unwrap();
+    assert_eq!(recovered_single.table_limits(), database_limits);
+    assert_eq!(
+        recovered_single.catalog().table("Custom").unwrap().limits(),
+        custom_limits
+    );
+    assert_eq!(nullable(&recovered_single, "Custom"), [Some(7), None]);
+
+    database
+        .enable_int64_write_ahead_log_registry(&["Custom"], &registry, limits())
+        .unwrap();
+    database.disable_int64_write_ahead_log();
+    let recovered_registry =
+        Database::recover_int64_write_ahead_log_registry(&registry, limits()).unwrap();
+    assert_eq!(recovered_registry.table_limits(), database_limits);
+    assert_eq!(
+        recovered_registry
+            .catalog()
+            .table("Custom")
+            .unwrap()
+            .limits(),
+        custom_limits
+    );
+    assert_eq!(nullable(&recovered_registry, "Custom"), [Some(7), None]);
+}
+
+#[test]
 fn mixed_tables_mutate_restart_deterministically_and_invalidate_pruning_metadata() {
     let directory = TestDirectory::new();
     let registry = directory.join("registry");
@@ -392,6 +435,25 @@ fn corrupt_missing_special_and_unlisted_members_fail_without_a_database() {
 }
 
 #[test]
+fn directory_validation_stops_on_unlisted_entries_without_buffering_the_directory() {
+    let directory = TestDirectory::new();
+    let registry = directory.join("unlisted-many");
+    create_two_table_registry(&registry);
+    for index in 0..512 {
+        fs::write(registry.join(format!("junk-{index:04}.wal")), b"junk").unwrap();
+    }
+
+    assert!(matches!(
+        Database::recover_int64_write_ahead_log_registry(&registry, limits()),
+        Err(DatabaseInt64WalRegistryRecoveryError::Registry(
+            Int64WriteAheadLogRegistryError::Corruption(
+                Int64WriteAheadLogRegistryCorruption::UnexpectedDirectoryEntry { .. }
+            )
+        ))
+    ));
+}
+
+#[test]
 fn duplicate_inputs_and_aggregate_limits_are_typed_and_prepublication() {
     let directory = TestDirectory::new();
     let over_table_cap = Int64WriteAheadLogRegistryLimits {
@@ -562,6 +624,23 @@ fn checksum_update(mut checksum: u32, bytes: &[u8]) -> u32 {
     checksum
 }
 
+fn manifest_with_count(count: u32, payload: &[u8]) -> Vec<u8> {
+    let mut checksum = u32::MAX;
+    checksum = checksum_update(checksum, &1_u16.to_le_bytes());
+    checksum = checksum_update(checksum, &0_u16.to_le_bytes());
+    checksum = checksum_update(checksum, &count.to_le_bytes());
+    checksum = checksum_update(checksum, &(payload.len() as u64).to_le_bytes());
+    checksum = checksum_update(checksum, payload);
+    let mut output = b"RHI64REG".to_vec();
+    output.extend_from_slice(&1_u16.to_le_bytes());
+    output.extend_from_slice(&0_u16.to_le_bytes());
+    output.extend_from_slice(&count.to_le_bytes());
+    output.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    output.extend_from_slice(&(!checksum).to_le_bytes());
+    output.extend_from_slice(payload);
+    output
+}
+
 fn manifest(descriptors: &[(&str, &str)]) -> Vec<u8> {
     let mut payload = Vec::new();
     for (table, member) in descriptors {
@@ -570,20 +649,35 @@ fn manifest(descriptors: &[(&str, &str)]) -> Vec<u8> {
         payload.extend_from_slice(&(member.len() as u32).to_le_bytes());
         payload.extend_from_slice(member.as_bytes());
     }
-    let mut checksum = u32::MAX;
-    checksum = checksum_update(checksum, &1_u16.to_le_bytes());
-    checksum = checksum_update(checksum, &0_u16.to_le_bytes());
-    checksum = checksum_update(checksum, &(descriptors.len() as u32).to_le_bytes());
-    checksum = checksum_update(checksum, &(payload.len() as u64).to_le_bytes());
-    checksum = checksum_update(checksum, &payload);
-    let mut output = b"RHI64REG".to_vec();
-    output.extend_from_slice(&1_u16.to_le_bytes());
-    output.extend_from_slice(&0_u16.to_le_bytes());
-    output.extend_from_slice(&(descriptors.len() as u32).to_le_bytes());
-    output.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    output.extend_from_slice(&(!checksum).to_le_bytes());
-    output.extend_from_slice(&payload);
-    output
+    manifest_with_count(descriptors.len() as u32, &payload)
+}
+
+#[test]
+fn manifest_rejects_an_unrepresentable_count_before_count_sized_allocation() {
+    let directory = TestDirectory::new();
+    let registry = directory.join("registry");
+    create_two_table_registry(&registry);
+    let payload = [0_u8; 8];
+    fs::write(
+        registry.join("manifest.rhi64"),
+        manifest_with_count(u32::MAX, &payload),
+    )
+    .unwrap();
+    let permissive = Int64WriteAheadLogRegistryLimits {
+        max_tables: usize::MAX,
+        ..limits()
+    };
+
+    assert!(matches!(
+        Database::recover_int64_write_ahead_log_registry(&registry, permissive),
+        Err(DatabaseInt64WalRegistryRecoveryError::Registry(
+            Int64WriteAheadLogRegistryError::Corruption(
+                Int64WriteAheadLogRegistryCorruption::ManifestPayload {
+                    field: "descriptor count"
+                }
+            )
+        ))
+    ));
 }
 
 #[test]
