@@ -208,9 +208,10 @@ preserved. Invalid, reserved, or already-used names and missing tables fail
 before mutation, leaving schema, data, row count, and row cap unchanged. A
 positional insert or complete explicit list must include the new field, while
 an explicit subset may omit it and receive its typed default. Default
-expressions, adding nullable columns, placement clauses, and `IF NOT EXISTS`
-are not supported. Each addition is preflighted against the table's persistent
-column and physical-cell caps before its default vector is allocated. A trailing
+expressions, `Nullable(...)` column additions, placement clauses, and
+`IF NOT EXISTS` are not supported by this statement. Each addition is
+preflighted against the table's persistent column and physical-cell caps before
+its default vector is allocated. A trailing
 semicolon is optional.
 
 `ALTER TABLE <table> RENAME COLUMN <source> TO <destination>` changes only the

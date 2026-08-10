@@ -438,7 +438,7 @@ pub enum DatabaseSnapshotRestoreError {
     Snapshot(Int64TablePayloadFileRestoreError),
     /// Both the primary and explicit backup snapshots failed bounded restore.
     Recovery(Int64TablePayloadFileRecoveryError),
-    /// Batch tables do not currently support nullable physical columns.
+    /// The legacy snapshot adapter accepts only non-nullable `Int64` payloads.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
     /// limits were rejected by batch storage.
@@ -452,7 +452,7 @@ pub enum DatabaseRleSnapshotRestoreError {
     /// Opening or decoding the bounded RLE snapshot failed, or its rows did
     /// not satisfy the caller-supplied schema and row cap.
     Snapshot(Int64TableRleFileRestoreError),
-    /// Batch tables do not currently support nullable physical columns.
+    /// The legacy row-only RLE adapter accepts only non-nullable `Int64` rows.
     NullableColumn { column: String },
     /// The caller name, schema, duplicate name, or configured table limits
     /// were rejected by batch storage.
@@ -690,10 +690,30 @@ pub enum DatabaseInt64WalRecoveryError {
 #[cfg(unix)]
 #[derive(Debug)]
 pub enum DatabaseInt64WalRegistryEnableError {
+    /// This database already has a single-table WAL or registry attached.
     AlreadyEnabled,
-    Table { table: String, error: Error },
-    UnsupportedColumnCount { table: String, column_count: usize },
-    UnsupportedColumnType { column: String, data_type: DataType },
+    /// Resolving one requested table failed.
+    Table {
+        /// Caller-supplied table name that failed resolution.
+        table: String,
+        /// Typed catalog or table failure.
+        error: Error,
+    },
+    /// A requested table does not have exactly one physical column.
+    UnsupportedColumnCount {
+        /// Stored display name of the unsupported table.
+        table: String,
+        /// Number of physical columns found in the table.
+        column_count: usize,
+    },
+    /// A requested table's only physical column is not `Int64`.
+    UnsupportedColumnType {
+        /// Stored display name of the unsupported column.
+        column: String,
+        /// Physical type found in the batch table.
+        data_type: DataType,
+    },
+    /// Bounding, creating, writing, or synchronizing the registry failed.
     Registry(Int64WriteAheadLogRegistryError),
 }
 
@@ -701,8 +721,16 @@ pub enum DatabaseInt64WalRegistryEnableError {
 #[cfg(unix)]
 #[derive(Debug)]
 pub enum DatabaseInt64WalRegistryRecoveryError {
+    /// Opening, bounding, validating, or replaying the registry failed.
     Registry(Int64WriteAheadLogRegistryError),
-    Table { table: String, error: Error },
+    /// A replayed member could not be staged as a valid batch table.
+    Table {
+        /// Member table display name, or its registry index if publication
+        /// failed after staging.
+        table: String,
+        /// Typed catalog or table validation failure.
+        error: Error,
+    },
 }
 
 #[cfg(unix)]
@@ -1385,8 +1413,9 @@ impl Database {
     }
 
     /// Creates and synchronizes a bounded WAL for one existing one-column
-    /// `Int64` table, then logs its successful appends, truncates, and atomic
-    /// value replacements before publishing them in memory.
+    /// `Int64` or nullable `Int64` table, then logs its successful appends,
+    /// truncates, and atomic value replacements before publishing them in
+    /// memory.
     ///
     /// Opt-in writes a bootstrap containing the table display name, column
     /// name, rows, table/database caps, query byte and row caps, and aggregate
@@ -1467,6 +1496,43 @@ impl Database {
     /// Creates an exclusive, checksummed WAL directory for multiple existing
     /// one-column `Int64` or nullable `Int64` tables. Member files and the new
     /// directory are synchronized before the manifest is durably published.
+    /// Table count, manifest bytes, aggregate member bytes and records, and
+    /// per-member limits are checked before the registry becomes active.
+    ///
+    /// Each member remains an independent log: a mutation spanning multiple
+    /// logged tables is rejected rather than committed as one transaction.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use rusthouse::{Database, Int64WriteAheadLogRegistryLimits};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let path = Path::new("analytics-registry"); // must not already exist
+    /// let mut database = Database::new();
+    /// database.execute("CREATE TABLE events (value Int64)")?;
+    /// database.create_nullable_int64_table(
+    ///     "optional_events",
+    ///     "value",
+    ///     vec![Some(1), None],
+    /// )?;
+    ///
+    /// let limits = Int64WriteAheadLogRegistryLimits::default();
+    /// database.enable_int64_write_ahead_log_registry(
+    ///     &["events", "optional_events"],
+    ///     path,
+    ///     limits,
+    /// )?;
+    /// database.execute("INSERT INTO events VALUES (2)")?;
+    /// database.append_nullable_int64_values("optional_events", &[Some(3), None])?;
+    /// assert!(database.disable_int64_write_ahead_log());
+    ///
+    /// let mut recovered = Database::recover_int64_write_ahead_log_registry(path, limits)?;
+    /// recovered.execute("SELECT COUNT(*) FROM events")?;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[cfg(unix)]
     pub fn enable_int64_write_ahead_log_registry<S: AsRef<str>>(
         &mut self,
@@ -1578,7 +1644,8 @@ impl Database {
     /// Recovery is read-only and does not attach a writer to the returned
     /// database. It is therefore idempotent and safe to repeat. To resume
     /// durable writes or compact the history, enable a new WAL at a new path
-    /// after successful recovery.
+    /// after successful recovery. The recovered table retains its stored
+    /// nullability.
     #[cfg(unix)]
     pub fn recover_int64_write_ahead_log(
         path: impl AsRef<Path>,
@@ -1636,6 +1703,14 @@ impl Database {
 
     /// Replays every checksummed registry member in canonical table-name order
     /// and publishes them only by returning one completely constructed database.
+    /// Manifest, per-member, aggregate-byte, and aggregate-record limits bound
+    /// recovery. Any corrupt, missing, inconsistent, or oversized member
+    /// returns an error without exposing a partial catalog.
+    ///
+    /// Recovery is read-only and does not attach writers to the returned
+    /// database. Enable a new registry at a new path to resume durable writes
+    /// or compact the recovered state; registries are not rotated or compacted
+    /// in place.
     #[cfg(unix)]
     pub fn recover_int64_write_ahead_log_registry(
         path: impl AsRef<Path>,
@@ -1845,11 +1920,12 @@ impl Database {
     /// table must fit its column and cell limits. Its persisted row cap is
     /// retained for subsequent inserts.
     ///
-    /// The current snapshot format contains exactly one table with one `Int64`
-    /// column. Nullable snapshots are rejected because batch storage does not
-    /// currently represent nullable physical columns. Corruption, invalid
-    /// identifiers, duplicate table names, nullability, and every resource
-    /// limit are checked before the catalog or cached metrics are changed.
+    /// The current snapshot adapter imports exactly one table with one
+    /// non-nullable `Int64` column. Nullable snapshots are rejected by this
+    /// legacy format even though batch tables can represent nullable physical
+    /// `Int64` columns. Corruption, invalid identifiers, duplicate table names,
+    /// nullability, and every resource limit are checked before the catalog or
+    /// cached metrics are changed.
     pub fn restore_int64_table_from_file(
         &mut self,
         table_name: &str,
