@@ -14,8 +14,9 @@ use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
     Database, DatabaseMetrics, DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError,
     DatabaseSnapshotSetRestoreError, Int64Table, Int64TablePayloadCodec,
-    Int64TablePayloadFileRestoreError, Schema, SharedDatabase, SharedDatabaseSnapshotRestoreError,
-    SharedDatabaseSnapshotSetRestoreError, SnapshotCodec, SnapshotError, TableLimits,
+    Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError, Schema, SharedDatabase,
+    SharedDatabaseSnapshotRestoreError, SharedDatabaseSnapshotSetRestoreError, SnapshotCodec,
+    SnapshotError, TableLimits,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -120,6 +121,252 @@ fn restores_one_int64_snapshot_as_a_queryable_table() {
             retained_value_bytes: 24,
         })
     );
+}
+
+#[test]
+fn recovery_replacement_prefers_the_primary_snapshot() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let backup_path = directory.join("backup.snapshot");
+    let (snapshot_codec, payload_codec) = write_snapshot(&primary_path, "reading", 2, &[Some(11)]);
+    write_snapshot(&backup_path, "reading", 2, &[Some(22)]);
+    let database = SharedDatabase::new(populated_database());
+
+    let source = database
+        .try_replace_int64_table_from_file_with_backup(
+            "EXISTING",
+            primary_path,
+            backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+
+    assert_eq!(source, Int64TablePayloadFileRecoverySource::Primary);
+    assert_eq!(
+        database
+            .query("SELECT reading FROM existing;")
+            .unwrap()
+            .rows,
+        [[Value::Int64(11)]]
+    );
+    assert_eq!(
+        database.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 1,
+            column_count: 1,
+            retained_row_count: 1,
+            retained_value_bytes: 8,
+        })
+    );
+}
+
+#[test]
+fn recovery_replacement_uses_the_backup_after_primary_corruption() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let backup_path = directory.join("backup.snapshot");
+    let (snapshot_codec, payload_codec) = write_snapshot(&primary_path, "reading", 2, &[Some(11)]);
+    write_snapshot(&backup_path, "reading", 2, &[Some(22)]);
+    let mut corrupt = fs::read(&primary_path).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&primary_path, corrupt).unwrap();
+    let database = SharedDatabase::new(populated_database());
+
+    let source = database
+        .try_replace_int64_table_from_file_with_backup(
+            "existing",
+            primary_path,
+            backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+
+    assert_eq!(source, Int64TablePayloadFileRecoverySource::Backup);
+    assert_eq!(
+        database
+            .query("SELECT reading FROM existing;")
+            .unwrap()
+            .rows,
+        [[Value::Int64(22)]]
+    );
+}
+
+#[test]
+fn dual_recovery_failure_preserves_the_target_and_cached_metrics() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("missing-primary.snapshot");
+    let backup_path = directory.join("corrupt-backup.snapshot");
+    let (snapshot_codec, payload_codec) = write_snapshot(&backup_path, "reading", 2, &[Some(22)]);
+    let mut corrupt = fs::read(&backup_path).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&backup_path, corrupt).unwrap();
+    let database = SharedDatabase::new(populated_database());
+    let tables_before = database.query("SHOW TABLES;").unwrap();
+    let rows_before = database.query("SELECT id FROM existing;").unwrap();
+    let metrics_before = database.metrics_snapshot();
+
+    let error = database
+        .try_replace_int64_table_from_file_with_backup(
+            "existing",
+            primary_path,
+            backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap_err();
+
+    let SharedDatabaseSnapshotRestoreError::Snapshot(DatabaseSnapshotRestoreError::Recovery(
+        recovery,
+    )) = error
+    else {
+        panic!("expected typed dual recovery failure, got {error:?}");
+    };
+    assert!(matches!(
+        recovery.primary_error(),
+        Int64TablePayloadFileRestoreError::Open(source)
+            if source.kind() == ErrorKind::NotFound
+    ));
+    assert!(matches!(
+        recovery.backup_error(),
+        Int64TablePayloadFileRestoreError::Envelope(SnapshotError::ChecksumMismatch { .. })
+    ));
+    assert_eq!(database.query("SHOW TABLES;").unwrap(), tables_before);
+    assert_eq!(
+        database.query("SELECT id FROM existing;").unwrap(),
+        rows_before
+    );
+    assert_eq!(database.metrics_snapshot(), metrics_before);
+}
+
+#[test]
+fn recovery_replacement_contention_is_nonblocking_and_precedes_file_access() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("missing-primary.snapshot");
+    let backup_path = directory.join("missing-backup.snapshot");
+    let (snapshot_codec, payload_codec) = codecs("reading", 1, &[Some(1)]);
+    let inner = Arc::new(RwLock::new(populated_database()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let metrics_before = database.metrics_snapshot();
+
+    let reader = inner.read().unwrap();
+    let reader_database = database.clone();
+    let reader_primary_path = primary_path.clone();
+    let reader_backup_path = backup_path.clone();
+    let (reader_sender, reader_receiver) = mpsc::channel();
+    let reader_worker = thread::spawn(move || {
+        reader_sender
+            .send(
+                reader_database.try_replace_int64_table_from_file_with_backup(
+                    "existing",
+                    reader_primary_path,
+                    reader_backup_path,
+                    snapshot_codec,
+                    payload_codec,
+                ),
+            )
+            .unwrap();
+    });
+    let reader_error = reader_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("replacement lock acquisition must not wait for an existing reader")
+        .unwrap_err();
+    assert!(matches!(
+        reader_error,
+        SharedDatabaseSnapshotRestoreError::DatabaseBusy
+    ));
+    assert_eq!(reader.catalog().table("existing").unwrap().row_count(), 1);
+    drop(reader);
+    reader_worker.join().unwrap();
+    assert_eq!(database.metrics_snapshot(), metrics_before);
+
+    let writer = inner.write().unwrap();
+    let writer_database = database.clone();
+    let writer_primary_path = primary_path.clone();
+    let writer_backup_path = backup_path.clone();
+    let (writer_sender, writer_receiver) = mpsc::channel();
+    let writer_worker = thread::spawn(move || {
+        writer_sender
+            .send(
+                writer_database.try_replace_int64_table_from_file_with_backup(
+                    "existing",
+                    writer_primary_path,
+                    writer_backup_path,
+                    snapshot_codec,
+                    payload_codec,
+                ),
+            )
+            .unwrap();
+    });
+    let writer_error = writer_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("replacement lock acquisition must not wait for an existing writer")
+        .unwrap_err();
+    assert!(matches!(
+        writer_error,
+        SharedDatabaseSnapshotRestoreError::DatabaseBusy
+    ));
+    assert_eq!(writer.catalog().table("existing").unwrap().row_count(), 1);
+    drop(writer);
+    writer_worker.join().unwrap();
+
+    assert!(!primary_path.exists());
+    assert!(!backup_path.exists());
+    assert_eq!(database.metrics_snapshot(), metrics_before);
+}
+
+#[test]
+fn recovery_replacement_poisoning_is_distinct_and_precedes_file_access() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("missing-primary.snapshot");
+    let backup_path = directory.join("missing-backup.snapshot");
+    let (snapshot_codec, payload_codec) = codecs("reading", 1, &[Some(1)]);
+    let inner = Arc::new(RwLock::new(populated_database()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let rows_before = database.query("SELECT id FROM existing;").unwrap();
+    let metrics_before = database.metrics_snapshot();
+    let poisoner = thread::spawn({
+        let inner = Arc::clone(&inner);
+        move || {
+            let _guard = inner.write().unwrap();
+            panic!("poison the database lock");
+        }
+    });
+    assert!(poisoner.join().is_err());
+
+    let error = database
+        .try_replace_int64_table_from_file_with_backup(
+            "existing",
+            &primary_path,
+            &backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SharedDatabaseSnapshotRestoreError::LockPoisoned
+    ));
+    assert!(!primary_path.exists());
+    assert!(!backup_path.exists());
+    let poisoned_guard = inner.read().unwrap_err().into_inner();
+    assert_eq!(
+        poisoned_guard
+            .catalog()
+            .table("existing")
+            .unwrap()
+            .row_count(),
+        1
+    );
+    drop(poisoned_guard);
+    inner.clear_poison();
+    assert_eq!(
+        database.query("SELECT id FROM existing;").unwrap(),
+        rows_before
+    );
+    assert_eq!(database.metrics_snapshot(), metrics_before);
 }
 
 #[test]

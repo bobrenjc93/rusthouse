@@ -1369,6 +1369,12 @@ retains both typed causes. Database validation runs only after a source has
 decoded and does not trigger fallback. A dual recovery, schema-validation, or
 configured-limit failure preserves the target's display name, data, and cached
 metrics.
+`SharedDatabase::try_replace_int64_table_from_file_with_backup` provides the
+same recovery replacement through one nonblocking write-lock attempt made
+before either file is opened. It retains the guard while delegating the full
+primary-or-backup replacement and returns the successful recovery source.
+Reader or writer contention, lock poisoning, and typed snapshot failures are
+distinct, and every failure preserves the target and cached metrics.
 `Database::restore_int64_tables_from_files` restores a caller-bounded slice of
 `DatabaseSnapshotRestoreEntry` values as one atomic catalog change. The
 inclusive entry-count limit and the complete case-insensitive destination-name
