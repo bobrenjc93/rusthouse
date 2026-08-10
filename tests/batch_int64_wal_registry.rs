@@ -21,6 +21,13 @@ use rusthouse::{
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+fn query(result: &StatementResult) -> &rusthouse::batch::engine::QueryResult {
+    let StatementResult::Query(query) = result else {
+        panic!("expected query result")
+    };
+    query
+}
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
@@ -89,11 +96,7 @@ fn create_two_table_registry(path: &Path) {
 }
 
 fn assert_nullable_query_behavior(database: &mut Database, table: &str) {
-    for (expression, operation) in [
-        ("CAST(v AS String)", "CAST"),
-        ("ABS(v)", "ABS"),
-        ("ROW_NUMBER() OVER (ORDER BY v ASC)", "ROW_NUMBER ORDER BY"),
-    ] {
+    for (expression, operation) in [("CAST(v AS String)", "CAST"), ("ABS(v)", "ABS")] {
         let error = database
             .execute(&format!("SELECT {expression} FROM {table}"))
             .unwrap_err();
@@ -107,6 +110,37 @@ fn assert_nullable_query_behavior(database: &mut Database, table: &str) {
             "expression {expression}"
         );
     }
+
+    let results = database
+        .execute(&format!(
+            "SELECT v, ROW_NUMBER() OVER (ORDER BY v ASC) AS n FROM {table} LIMIT 2; \
+             SELECT v, ROW_NUMBER() OVER (ORDER BY v DESC) AS n FROM {table} LIMIT 2"
+        ))
+        .unwrap();
+    let [
+        StatementResult::Query(ascending),
+        StatementResult::Query(descending),
+    ] = results.as_slice()
+    else {
+        panic!("expected ordered ROW_NUMBER queries")
+    };
+    assert_eq!(
+        ascending.rows,
+        [
+            vec![
+                Value::Null(rusthouse::batch::value::DataType::Int64),
+                Value::Int64(1),
+            ],
+            vec![Value::Int64(i64::MIN), Value::Int64(2)],
+        ]
+    );
+    assert_eq!(
+        descending.rows,
+        [
+            vec![Value::Int64(i64::MAX), Value::Int64(1)],
+            vec![Value::Int64(i64::MIN), Value::Int64(2)],
+        ]
+    );
 
     let results = database
         .execute(&format!(
@@ -181,6 +215,71 @@ fn assert_nullable_query_behavior(database: &mut Database, table: &str) {
             vec![Value::String(i64::MAX.to_string())],
         ]
     );
+}
+
+#[test]
+fn registry_recovered_mixed_and_all_null_keys_support_ordered_row_number() {
+    let directory = TestDirectory::new();
+    let registry = directory.join("nullable-window-registry");
+    let mut database = Database::new();
+    database
+        .create_nullable_int64_table(
+            "Mixed",
+            "v",
+            vec![Some(2), None, Some(1), Some(2), None, Some(1)],
+        )
+        .unwrap();
+    database
+        .create_nullable_int64_table("AllNull", "v", vec![None, None, None])
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log_registry(&["Mixed", "AllNull"], &registry, limits())
+        .unwrap();
+    database.disable_int64_write_ahead_log();
+
+    let mut recovered =
+        Database::recover_int64_write_ahead_log_registry(&registry, limits()).unwrap();
+    let results = recovered
+        .execute(
+            "SELECT v, ROW_NUMBER() OVER (ORDER BY v ASC) AS n FROM Mixed LIMIT 5; \
+             SELECT v, ROW_NUMBER() OVER (ORDER BY v DESC) AS n FROM Mixed LIMIT 5; \
+             SELECT ROW_NUMBER() OVER (ORDER BY v ASC) AS n FROM AllNull LIMIT 2; \
+             SELECT ROW_NUMBER() OVER (ORDER BY v DESC) AS n FROM AllNull LIMIT 2;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        query(&results[0]).rows,
+        [
+            vec![
+                Value::Null(rusthouse::batch::value::DataType::Int64),
+                Value::Int64(1)
+            ],
+            vec![
+                Value::Null(rusthouse::batch::value::DataType::Int64),
+                Value::Int64(2)
+            ],
+            vec![Value::Int64(1), Value::Int64(3)],
+            vec![Value::Int64(1), Value::Int64(4)],
+            vec![Value::Int64(2), Value::Int64(5)],
+        ]
+    );
+    assert_eq!(
+        query(&results[1]).rows,
+        [
+            vec![Value::Int64(2), Value::Int64(1)],
+            vec![Value::Int64(2), Value::Int64(2)],
+            vec![Value::Int64(1), Value::Int64(3)],
+            vec![Value::Int64(1), Value::Int64(4)],
+            vec![
+                Value::Null(rusthouse::batch::value::DataType::Int64),
+                Value::Int64(5)
+            ],
+        ]
+    );
+    let all_null_rows = [vec![Value::Int64(1)], vec![Value::Int64(2)]];
+    assert_eq!(query(&results[2]).rows, all_null_rows);
+    assert_eq!(query(&results[3]).rows, all_null_rows);
 }
 
 #[test]
