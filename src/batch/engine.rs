@@ -3915,6 +3915,9 @@ enum ResolvedItem {
     StringLengthUtf8 {
         source: usize,
     },
+    StringEmpty {
+        source: usize,
+    },
     StringLower {
         source: usize,
     },
@@ -4232,6 +4235,30 @@ fn resolve_select_items(
                     name: alias
                         .clone()
                         .unwrap_or_else(|| format!("lengthUTF8({})", table.schema()[source].name)),
+                    data_type: DataType::Int64,
+                });
+            }
+            SelectItem::Empty { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::String {
+                    return Err(Error::TypeMismatch {
+                        context: format!("empty argument '{name}'"),
+                        expected: DataType::String.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "empty projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::StringEmpty { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("empty({})", table.schema()[source].name)),
                     data_type: DataType::Int64,
                 });
             }
@@ -4625,6 +4652,9 @@ fn execute_projection(
                         ResolvedItem::StringLengthUtf8 { source } => Value::Int64(
                             string_length_utf8_to_i64(string_at(table, *source, *row))?,
                         ),
+                        ResolvedItem::StringEmpty { source } => {
+                            Value::Int64(i64::from(string_at(table, *source, *row).is_empty()))
+                        }
                         ResolvedItem::StringLower { source } => {
                             Value::String(string_at(table, *source, *row).to_ascii_lowercase())
                         }
@@ -4786,6 +4816,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::ToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::StringLengthUtf8 { .. }
+                | ResolvedItem::StringEmpty { .. }
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::Float64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
@@ -4879,6 +4910,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::StringLengthUtf8 { .. } => {
                     unreachable!("lengthUTF8 projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringEmpty { .. } => {
+                    unreachable!("empty projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLower { .. } => {
                     unreachable!("LOWER projections are restricted to ungrouped queries")
@@ -5196,35 +5230,43 @@ fn execute_grouped<'a>(
                 ..
             }]
         );
-    let paired_global_count_int_aggregate = if group_columns.is_empty() {
-        paired_global_count_int64_aggregate(aggregate_specs)
+    let paired_global_count = if group_columns.is_empty() {
+        paired_global_count_aggregate(aggregate_specs)
     } else {
         None
     };
 
     if group_columns.is_empty() {
-        if let Some((count_state, aggregate_state, function)) = paired_global_count_int_aggregate {
-            let aggregate = match function {
-                AggregateFunction::Sum | AggregateFunction::Avg => global_int64_sum_partial(
-                    table,
-                    matching_rows,
-                    &aggregate_specs[aggregate_state],
-                    parallelism,
-                )?
-                .into_state(function),
-                AggregateFunction::Min => min_global_int64(
+        if let Some((count_state, aggregate_state, function, input_type)) = paired_global_count {
+            let aggregate = match (function, input_type) {
+                (AggregateFunction::Sum | AggregateFunction::Avg, DataType::Int64) => {
+                    global_int64_sum_partial(
+                        table,
+                        matching_rows,
+                        &aggregate_specs[aggregate_state],
+                        parallelism,
+                    )?
+                    .into_state(function)
+                }
+                (AggregateFunction::Min, DataType::Int64) => min_global_int64(
                     table,
                     matching_rows,
                     &aggregate_specs[aggregate_state],
                     parallelism,
                 ),
-                AggregateFunction::Max => max_global_int64(
+                (AggregateFunction::Min, DataType::Float64) => min_global_float64(
                     table,
                     matching_rows,
                     &aggregate_specs[aggregate_state],
                     parallelism,
                 ),
-                _ => unreachable!("paired Int64 aggregate shape is resolved"),
+                (AggregateFunction::Max, DataType::Int64) => max_global_int64(
+                    table,
+                    matching_rows,
+                    &aggregate_specs[aggregate_state],
+                    parallelism,
+                ),
+                _ => unreachable!("paired aggregate shape is resolved"),
             };
             let count = count_matched_rows(matching_rows.len())?;
             aggregate_states[count_state][0] = AggregateState::Count(count);
@@ -5294,7 +5336,7 @@ fn execute_grouped<'a>(
                     || sole_global_min_float
                     || sole_global_max_int
                     || sole_global_max_float
-                    || paired_global_count_int_aggregate.is_some())
+                    || paired_global_count.is_some())
             {
                 continue;
             }
@@ -5322,9 +5364,9 @@ fn execute_grouped<'a>(
     Ok(GroupedData { keys, aggregates })
 }
 
-fn paired_global_count_int64_aggregate(
+fn paired_global_count_aggregate(
     aggregate_specs: &[AggregateSpec],
-) -> Option<(usize, usize, AggregateFunction)> {
+) -> Option<(usize, usize, AggregateFunction, DataType)> {
     if aggregate_specs.len() != 2 {
         return None;
     }
@@ -5335,16 +5377,21 @@ fn paired_global_count_int64_aggregate(
             && spec.input_type.is_none()
     })?;
     let aggregate_state = aggregate_specs.iter().position(|spec| {
-        matches!(
+        (matches!(
             spec.function,
             AggregateFunction::Sum
                 | AggregateFunction::Avg
                 | AggregateFunction::Min
                 | AggregateFunction::Max
-        ) && spec.input_type == Some(DataType::Int64)
+        ) && spec.input_type == Some(DataType::Int64))
+            || (spec.function == AggregateFunction::Min
+                && spec.input_type == Some(DataType::Float64))
     })?;
     let function = aggregate_specs[aggregate_state].function;
-    (count_state != aggregate_state).then_some((count_state, aggregate_state, function))
+    let input_type = aggregate_specs[aggregate_state]
+        .input_type
+        .expect("paired aggregate input type is resolved");
+    (count_state != aggregate_state).then_some((count_state, aggregate_state, function, input_type))
 }
 
 fn count_matched_rows(matched_rows: usize) -> Result<i64> {
@@ -6089,6 +6136,9 @@ impl GroupedData<'_> {
                                 "lengthUTF8 projections are restricted to ungrouped queries"
                             )
                         }
+                        ResolvedItem::StringEmpty { .. } => {
+                            unreachable!("empty projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::StringLower { .. } => {
                             unreachable!("LOWER projections are restricted to ungrouped queries")
                         }
@@ -6477,6 +6527,9 @@ fn resolved_expression_name(
         ResolvedItem::StringLengthUtf8 { source } => {
             format!("lengthUTF8({})", table.schema()[*source].name)
         }
+        ResolvedItem::StringEmpty { source } => {
+            format!("empty({})", table.schema()[*source].name)
+        }
         ResolvedItem::StringLower { source } => {
             format!("LOWER({})", table.schema()[*source].name)
         }
@@ -6651,6 +6704,9 @@ fn order_source_rows(
                     .chars()
                     .count()
                     .cmp(&string_at(table, source, right).chars().count()),
+                ResolvedItem::StringEmpty { source } => string_at(table, source, left)
+                    .is_empty()
+                    .cmp(&string_at(table, source, right).is_empty()),
                 ResolvedItem::StringLower { source } => ascii_lower_cmp(
                     string_at(table, source, left),
                     string_at(table, source, right),
@@ -6863,6 +6919,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::StringLengthUtf8 { .. } => {
                     unreachable!("lengthUTF8 projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringEmpty { .. } => {
+                    unreachable!("empty projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLower { .. } => {
                     unreachable!("LOWER projections are restricted to ungrouped queries")
@@ -8765,25 +8824,28 @@ mod tests {
     }
 
     #[test]
-    fn global_min_float64_forced_workers_match_empty_null_having_and_pagination() {
+    fn global_count_min_float64_forced_workers_match_empty_null_having_and_pagination() {
         let mut database = min_float64_database(0, |_| unreachable!("empty input"));
         let first_page = assert_global_aggregate_worker_differential(
             &mut database,
-            "SELECT MIN(value) AS minimum FROM empty_float_min_values \
-             HAVING minimum IS NULL ORDER BY minimum LIMIT 1 OFFSET 0",
+            "SELECT COUNT(*) AS rows, MIN(value) AS minimum FROM empty_float_min_values \
+             HAVING minimum IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 0",
         );
-        assert_eq!(first_page.rows, [vec![Value::Null(DataType::Float64)]]);
+        assert_eq!(
+            first_page.rows,
+            [vec![Value::Int64(0), Value::Null(DataType::Float64)]]
+        );
 
         let second_page = assert_global_aggregate_worker_differential(
             &mut database,
-            "SELECT MIN(value) AS minimum FROM empty_float_min_values \
-             HAVING minimum IS NULL ORDER BY minimum LIMIT 1 OFFSET 1",
+            "SELECT MIN(value) AS minimum, COUNT() AS rows FROM empty_float_min_values \
+             HAVING minimum IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 1",
         );
         assert!(second_page.rows.is_empty());
     }
 
     #[test]
-    fn global_min_float64_forced_workers_preserve_filtering_extrema_and_first_signed_zero() {
+    fn global_count_min_float64_forced_workers_preserve_projection_order_aliases_and_signed_zero() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
         let mut database = min_float64_database(row_count, |id| match id {
             1 => (f64::MAX, true),
@@ -8792,9 +8854,10 @@ mod tests {
             id if id == row_count => (0.0, true),
             _ => ((id % 1_003 + 1) as f64, true),
         });
-        let sql = "SELECT MIN(value) AS minimum FROM float_values_to_min \
+        let matched_rows = row_count - 1;
+        let sql = "SELECT COUNT(*) AS matched, MIN(value) AS minimum FROM float_values_to_min \
                    WHERE included = true HAVING minimum = 0.0 \
-                   ORDER BY minimum LIMIT 1 OFFSET 0";
+                   ORDER BY matched DESC LIMIT 1 OFFSET 0";
 
         let single_worker = force_global_aggregate_workers(&mut database, 1, sql);
         let multi_worker = force_global_aggregate_workers(&mut database, 4, sql);
@@ -8802,26 +8865,44 @@ mod tests {
             single_worker, multi_worker,
             "signed-zero worker differential"
         );
-        let Value::Float64(single_minimum) = &single_worker.rows[0][0] else {
+        assert_eq!(single_worker.columns[0].name, "matched");
+        assert_eq!(single_worker.columns[1].name, "minimum");
+        assert_eq!(
+            single_worker.rows[0][0],
+            Value::Int64(i64::try_from(matched_rows).unwrap())
+        );
+        let Value::Float64(single_minimum) = &single_worker.rows[0][1] else {
             panic!("single-worker minimum must be Float64")
         };
-        let Value::Float64(multi_minimum) = &multi_worker.rows[0][0] else {
+        let Value::Float64(multi_minimum) = &multi_worker.rows[0][1] else {
             panic!("multi-worker minimum must be Float64")
         };
         assert_eq!(single_minimum.to_bits(), (-0.0_f64).to_bits());
         assert_eq!(multi_minimum.to_bits(), single_minimum.to_bits());
 
-        let finite_extreme = assert_global_aggregate_worker_differential(
+        let minimum_first = assert_global_aggregate_worker_differential(
             &mut database,
-            "SELECT MIN(value) FROM float_values_to_min",
+            &format!(
+                "SELECT MIN(value) AS minimum, COUNT() AS matched FROM float_values_to_min \
+                 HAVING minimum = {} ORDER BY minimum LIMIT 1",
+                Value::Float64(f64::MIN).as_display_string()
+            ),
         );
-        assert_eq!(finite_extreme.rows, [vec![Value::Float64(f64::MIN)]]);
+        assert_eq!(minimum_first.columns[0].name, "minimum");
+        assert_eq!(minimum_first.columns[1].name, "matched");
+        assert_eq!(
+            minimum_first.rows,
+            [vec![
+                Value::Float64(f64::MIN),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
     }
 
     #[test]
-    fn global_min_float64_parallel_boundary_uses_shared_budget_only_for_the_sole_global_shape() {
-        static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
-            GlobalAggregateWorkerBudget::new(0);
+    fn global_count_min_float64_parallel_boundary_and_admission_exhaustion_fall_back_sequentially()
+    {
+        static SATURATED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
         static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
@@ -8832,20 +8913,41 @@ mod tests {
         ] {
             let result = assert_global_aggregate_worker_differential(
                 &mut database,
-                &format!("SELECT MIN(value) FROM float_values_to_min WHERE id <= {matched_rows}"),
+                &format!(
+                    "SELECT COUNT(*) AS rows, MIN(value) AS minimum \
+                     FROM float_values_to_min WHERE id <= {matched_rows}"
+                ),
             );
-            assert_eq!(result.rows, [vec![Value::Float64(7.25)]]);
+            assert_eq!(
+                result.rows,
+                [vec![
+                    Value::Int64(i64::try_from(matched_rows).unwrap()),
+                    Value::Float64(7.25),
+                ]]
+            );
         }
 
+        SATURATED_BUDGET.reset_peak();
+        let occupied_helpers = SATURATED_BUDGET
+            .try_acquire(3)
+            .expect("test reserves every helper");
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
             database.global_aggregate_worker_cap(),
-            &UNAVAILABLE_BUDGET,
+            &SATURATED_BUDGET,
         );
         assert_eq!(
-            query(&mut database, "SELECT MIN(value) FROM float_values_to_min").rows,
-            [vec![Value::Float64(7.25)]],
-            "failed admission falls back to the query thread"
+            query(
+                &mut database,
+                "SELECT MIN(value), COUNT() FROM float_values_to_min"
+            )
+            .rows,
+            [vec![
+                Value::Float64(7.25),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]],
+            "exhausted admission falls back to the complete pair on the query thread"
         );
+        drop(occupied_helpers);
 
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
             database.global_aggregate_worker_cap(),
@@ -8856,33 +8958,23 @@ mod tests {
             query(
                 &mut database,
                 &format!(
-                    "SELECT MIN(value) FROM float_values_to_min \
+                    "SELECT MIN(value), COUNT(*) FROM float_values_to_min \
                      WHERE id <= {}",
                     GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
                 ),
             )
             .rows,
-            [vec![Value::Float64(7.25)]]
+            [vec![
+                Value::Float64(7.25),
+                Value::Int64(i64::try_from(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD).unwrap()),
+            ]]
         );
         assert_eq!(
             OBSERVED_BUDGET
                 .peak_helpers_in_use
                 .load(AtomicOrdering::Acquire),
             0,
-            "the threshold itself stays sequential"
-        );
-
-        OBSERVED_BUDGET.reset_peak();
-        assert_eq!(
-            query(&mut database, "SELECT MIN(value) FROM float_values_to_min").rows,
-            [vec![Value::Float64(7.25)]]
-        );
-        assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
-            "sole MIN(Float64) above the threshold uses the shared helper budget"
+            "the paired shape stays sequential at the threshold"
         );
 
         OBSERVED_BUDGET.reset_peak();
@@ -8897,12 +8989,53 @@ mod tests {
                 Value::Int64(i64::try_from(row_count).unwrap()),
             ]]
         );
+        assert!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire)
+                > 0,
+            "paired COUNT(*) and MIN(Float64) above the threshold uses the shared helper budget"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT MIN(value), COUNT(id) FROM float_values_to_min"
+            )
+            .rows,
+            [vec![
+                Value::Float64(7.25),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
         assert_eq!(
             OBSERVED_BUDGET
                 .peak_helpers_in_use
                 .load(AtomicOrdering::Acquire),
             0,
-            "MIN(Float64) in a multi-aggregate projection stays sequential"
+            "COUNT(column) plus MIN(Float64) stays sequential"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT MIN(value), COUNT(*), MAX(value) FROM float_values_to_min"
+            )
+            .rows,
+            [vec![
+                Value::Float64(7.25),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Float64(7.25),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET
+                .peak_helpers_in_use
+                .load(AtomicOrdering::Acquire),
+            0,
+            "other multi-aggregate Float64 projections stay sequential"
         );
 
         OBSERVED_BUDGET.reset_peak();
@@ -8941,7 +9074,7 @@ mod tests {
     }
 
     #[test]
-    fn global_min_float64_worker_failure_repeats_the_complete_minimum_locally() {
+    fn global_count_min_float64_worker_failure_repeats_the_complete_pair_locally() {
         let values = [9.0, 7.0, 5.0, 3.0, 1.0, 0.0, -0.0, -5.0, f64::MIN];
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut matching_rows = vec![0; row_count];
@@ -8961,6 +9094,10 @@ mod tests {
         );
 
         assert_eq!(minimum, Some(f64::MIN));
+        assert_eq!(
+            count_matched_rows(matching_rows.len()),
+            Ok(i64::try_from(row_count).unwrap())
+        );
     }
 
     #[test]

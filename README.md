@@ -66,7 +66,7 @@ pagination. `countIf(*)` and non-`Bool` arguments are rejected.
 Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `MIN(Int64)`,
 `MIN(Float64)`, `MAX(Int64)`, `MAX(Float64)`, or `AVG(Int64)`, and an exact
 two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
-`SUM(Int64)`, `AVG(Int64)`, `MIN(Int64)`, or `MAX(Int64)` use
+`SUM(Int64)`, `AVG(Int64)`, `MIN(Int64)`, `MIN(Float64)`, or `MAX(Int64)` use
 deterministic contiguous chunks when more than 262,144 rows match. The paired
 shape preserves either projection order and derives its row count with a
 checked conversion of the filtered cardinality while the existing checked
@@ -93,7 +93,7 @@ occurrence of equal Float64 extrema, including signed zero. A sequential fallbac
 preserves the same result when budget or OS workers are unavailable. Inputs at
 or below the threshold, grouped aggregates, multi-aggregate projections other
 than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
-row-count/`MIN(Int64)`, or row-count/`MAX(Int64)` pairs (including
+row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, or row-count/`MAX(Int64)` pairs (including
 `COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema,
 `AVG(Float64)`, and other aggregate functions remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
@@ -277,9 +277,10 @@ output format.
 The exact case-insensitive `SHOW FUNCTIONS` returns every executable scalar,
 aggregate, compatibility-probe, and window function as one `String` column
 named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
-`ABS`, `AVG`, `CAST`, `CEIL`, `COUNT`, `countIf`, `currentDatabase`, `FLOOR`,
-`LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`, `ROUND`, `ROW_NUMBER`, `SUM`,
-`toString`, `UPPER`, and `version`. Arguments and trailing clauses are rejected.
+`ABS`, `AVG`, `CAST`, `CEIL`, `COUNT`, `countIf`, `currentDatabase`, `empty`,
+`FLOOR`, `LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`, `ROUND`, `ROW_NUMBER`,
+`SUM`, `toString`, `UPPER`, and `version`. Arguments and trailing clauses are
+rejected.
 The result uses the normal query row, value, byte, retained-result, and
 formatted-output limits.
 The exact case-insensitive query `SELECT name FROM system.functions` returns
@@ -476,6 +477,14 @@ ordering-state limit by default. Each entry is charged as two `usize` values
 allocation when it exceeds that limit; `LIMIT` and `OFFSET` do not reduce the
 charge. Result bounds charge only the fixed-size `Int64` output. Non-`String`
 arguments and grouped query shapes are rejected with typed errors.
+`empty(string_column)` is a case-insensitive, ungrouped scalar projection that
+returns `Int64` `1` for an empty String and `0` for every nonempty String,
+including Unicode text. It accepts an optional `AS alias`, `WHERE`, ordering by
+the normalized `empty(<column>)` expression or alias, and `LIMIT`/`OFFSET`.
+Evaluation and ordering do not allocate a transformed String or per-row key
+cache, and result accounting does not charge source String bytes. The existing
+scan, result row, value, byte, retained-result, and formatted-output limits
+still apply. Malformed, non-`String`, and grouped uses are rejected.
 `LOWER(string_column)` is an ungrouped scalar projection that lowercases ASCII
 letters while leaving every non-ASCII UTF-8 byte unchanged. Because this
 transformation preserves byte length, its owned `String` results are charged

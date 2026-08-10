@@ -31,6 +31,7 @@ pub const SUPPORTED_FUNCTION_NAMES: &[&str] = &[
     "COUNT",
     "countIf",
     "currentDatabase",
+    "empty",
     "FLOOR",
     "LENGTH",
     "lengthUTF8",
@@ -368,6 +369,10 @@ pub enum SelectItem {
         alias: Option<String>,
     },
     LengthUtf8 {
+        name: String,
+        alias: Option<String>,
+    },
+    Empty {
         name: String,
         alias: Option<String>,
     },
@@ -2254,6 +2259,13 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::LengthUtf8 { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("empty") {
+                let name = self.expect_identifier("String column in empty")?;
+                self.expect(&TokenKind::RightParen, "')' after empty expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Empty { name, alias });
+            }
+
             if name.eq_ignore_ascii_case("LOWER") {
                 let name = self.expect_identifier("String column in LOWER")?;
                 self.expect(&TokenKind::RightParen, "')' after LOWER expression")?;
@@ -2349,6 +2361,13 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY lengthUTF8 expression",
             )?;
             Ok(format!("lengthUTF8({argument})"))
+        } else if name.eq_ignore_ascii_case("empty") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("String column in ORDER BY empty")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY empty expression",
+            )?;
+            Ok(format!("empty({argument})"))
         } else if name.eq_ignore_ascii_case("LOWER") && self.eat(&TokenKind::LeftParen) {
             let argument = self.expect_identifier("String column in ORDER BY LOWER")?;
             self.expect(
