@@ -5313,7 +5313,9 @@ fn resolve_select_items(
                     }
                 };
                 validate_aggregate(*function, input_type)?;
-                if let Some(argument) = argument_index {
+                if let Some(argument) =
+                    argument_index.filter(|_| *function != AggregateFunction::Count)
+                {
                     reject_nullable_operation(table, argument, function.name())?;
                 }
                 let state = aggregate_specs.len();
@@ -7333,7 +7335,9 @@ impl AggregateState {
         match self {
             Self::Count(count) => {
                 let should_count = match spec.function {
-                    AggregateFunction::Count => true,
+                    AggregateFunction::Count => spec.argument.is_none_or(|argument| {
+                        !matches!(table.columns()[argument].value_ref(row), ValueRef::Null(_))
+                    }),
                     AggregateFunction::CountIf => {
                         let Column::Bool(values) =
                             &table.columns()[spec.argument.expect("countIf argument")]

@@ -88,10 +88,9 @@ fn create_two_table_registry(path: &Path) {
     database.disable_int64_write_ahead_log();
 }
 
-fn assert_nullable_expressions_are_rejected(database: &mut Database, table: &str) {
+fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
     for (expression, operation) in [
         ("SUM(v)", "SUM"),
-        ("COUNT(v)", "COUNT"),
         ("MIN(v)", "MIN"),
         ("MAX(v)", "MAX"),
         ("AVG(v)", "AVG"),
@@ -128,12 +127,12 @@ fn assert_nullable_expressions_are_rejected(database: &mut Database, table: &str
     );
 
     let results = database
-        .execute(&format!("SELECT COUNT(*) FROM {table}"))
+        .execute(&format!("SELECT COUNT(*), COUNT(v) FROM {table}"))
         .unwrap();
     let [StatementResult::Query(count)] = results.as_slice() else {
-        panic!("expected COUNT(*) query")
+        panic!("expected COUNT query")
     };
-    assert_eq!(count.rows, [vec![Value::Int64(2)]]);
+    assert_eq!(count.rows, [vec![Value::Int64(2), Value::Int64(1)]]);
 }
 
 #[test]
@@ -146,7 +145,7 @@ fn nullable_created_and_recovered_tables_reject_unsupported_physical_operations(
         .create_nullable_int64_table("Alpha", "v", vec![Some(1), None])
         .unwrap();
 
-    assert_nullable_expressions_are_rejected(&mut database, "alpha");
+    assert_nullable_aggregate_behavior(&mut database, "alpha");
     let snapshot_error = database
         .save_int64_table_to_file(
             "Alpha",
@@ -168,7 +167,7 @@ fn nullable_created_and_recovered_tables_reject_unsupported_physical_operations(
     database.disable_int64_write_ahead_log();
     let mut recovered =
         Database::recover_int64_write_ahead_log_registry(&registry, limits()).unwrap();
-    assert_nullable_expressions_are_rejected(&mut recovered, "ALPHA");
+    assert_nullable_aggregate_behavior(&mut recovered, "ALPHA");
 }
 
 #[test]
