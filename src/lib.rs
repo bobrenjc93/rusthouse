@@ -27,7 +27,11 @@ pub use batch::{
     SharedDatabaseSnapshotRestoreError, SharedDatabaseSnapshotSetRestoreError, TableLimits,
 };
 #[cfg(unix)]
-pub use batch::{DatabaseSnapshotSaveError, SharedDatabaseSnapshotSaveError};
+pub use batch::{
+    DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError, DatabaseSnapshotSaveError,
+    Int64WriteAheadLogCommitError, Int64WriteAheadLogCorruption, Int64WriteAheadLogError,
+    Int64WriteAheadLogLimitError, Int64WriteAheadLogLimits, SharedDatabaseSnapshotSaveError,
+};
 pub use catalog::{
     Catalog, CatalogCsvIngestError, CatalogCsvReaderIngestError, CatalogError, CatalogLimits,
     CatalogSnapshotRestoreError,

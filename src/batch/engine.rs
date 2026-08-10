@@ -16,9 +16,13 @@ use crate::batch::sql::{
     HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, SUPPORTED_FUNCTION_NAMES, Select,
     SelectItem, Statement, VersionSelect,
 };
-use crate::batch::storage::{Column, Table, validate_table_name};
+use crate::batch::storage::{Column, PreparedInsertRows, Table, validate_table_name};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
+#[cfg(unix)]
+use crate::batch::wal::{
+    self, Int64WalBootstrap, Int64WriteAheadLog, Int64WriteAheadLogError, Int64WriteAheadLogLimits,
+};
 #[cfg(unix)]
 use crate::snapshot::Int64TablePayloadFileSaveError;
 use crate::snapshot::{
@@ -208,6 +212,8 @@ pub struct Database {
     query_result_limits: QueryResultLimits,
     table_limits: TableLimits,
     global_aggregate_parallelism: GlobalAggregateParallelism,
+    #[cfg(unix)]
+    int64_write_ahead_log: Option<Int64WriteAheadLog>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -509,6 +515,38 @@ fn saturating_usize(value: u128) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
+#[cfg(unix)]
+const fn query_limits_to_array(limits: QueryResultLimits) -> [usize; 10] {
+    [
+        limits.max_scan_rows,
+        limits.max_rows,
+        limits.max_values,
+        limits.max_bytes,
+        limits.max_ordering_state_bytes,
+        limits.max_groups,
+        limits.max_group_key_cells,
+        limits.max_group_key_bytes,
+        limits.max_aggregate_state_cells,
+        limits.max_aggregate_state_bytes,
+    ]
+}
+
+#[cfg(unix)]
+const fn query_limits_from_array(limits: [usize; 10]) -> QueryResultLimits {
+    QueryResultLimits {
+        max_scan_rows: limits[0],
+        max_rows: limits[1],
+        max_values: limits[2],
+        max_bytes: limits[3],
+        max_ordering_state_bytes: limits[4],
+        max_groups: limits[5],
+        max_group_key_cells: limits[6],
+        max_group_key_bytes: limits[7],
+        max_aggregate_state_cells: limits[8],
+        max_aggregate_state_bytes: limits[9],
+    }
+}
+
 impl Default for Database {
     fn default() -> Self {
         Self {
@@ -520,6 +558,8 @@ impl Default for Database {
                 NonZeroUsize::new(DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP)
                     .expect("the default aggregate worker cap is nonzero"),
             ),
+            #[cfg(unix)]
+            int64_write_ahead_log: None,
         }
     }
 }
@@ -769,6 +809,112 @@ pub enum DatabaseSnapshotSaveError {
     Snapshot(Int64TablePayloadFileSaveError),
 }
 
+/// A failure while opting one existing one-column `Int64` table into a new WAL.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum DatabaseInt64WalEnableError {
+    /// This database already has a table attached to a WAL.
+    AlreadyEnabled,
+    /// Resolving the requested table failed.
+    Table(Error),
+    /// The selected table does not have exactly one physical column.
+    UnsupportedColumnCount { table: String, column_count: usize },
+    /// The selected table's only physical column is not `Int64`.
+    UnsupportedColumnType { column: String, data_type: DataType },
+    /// Encoding, creating, writing, or synchronizing the WAL failed.
+    WriteAheadLog(Int64WriteAheadLogError),
+}
+
+/// A failure while replaying an `Int64` WAL into a fresh database.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum DatabaseInt64WalRecoveryError {
+    /// Reading, bounding, framing, or replaying the WAL failed.
+    WriteAheadLog(Int64WriteAheadLogError),
+    /// Reconstructed catalog metadata or table limits were invalid.
+    Table(Error),
+}
+
+#[cfg(unix)]
+impl fmt::Display for DatabaseInt64WalEnableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyEnabled => {
+                formatter.write_str("an Int64 WAL is already enabled for this database")
+            }
+            Self::Table(error) => error.fmt(formatter),
+            Self::UnsupportedColumnCount {
+                table,
+                column_count,
+            } => write!(
+                formatter,
+                "table '{table}' has {column_count} columns; Int64 WAL requires exactly one"
+            ),
+            Self::UnsupportedColumnType { column, data_type } => write!(
+                formatter,
+                "column '{column}' has type {data_type}; Int64 WAL requires Int64"
+            ),
+            Self::WriteAheadLog(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for DatabaseInt64WalEnableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Table(error) => Some(error),
+            Self::WriteAheadLog(error) => Some(error),
+            Self::AlreadyEnabled
+            | Self::UnsupportedColumnCount { .. }
+            | Self::UnsupportedColumnType { .. } => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for DatabaseInt64WalRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriteAheadLog(error) => write!(formatter, "could not replay Int64 WAL: {error}"),
+            Self::Table(error) => {
+                write!(formatter, "could not reconstruct Int64 WAL table: {error}")
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for DatabaseInt64WalRecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WriteAheadLog(error) => Some(error),
+            Self::Table(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<Int64WriteAheadLogError> for DatabaseInt64WalEnableError {
+    fn from(error: Int64WriteAheadLogError) -> Self {
+        Self::WriteAheadLog(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<Int64WriteAheadLogError> for DatabaseInt64WalRecoveryError {
+    fn from(error: Int64WriteAheadLogError) -> Self {
+        Self::WriteAheadLog(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<Error> for DatabaseInt64WalRecoveryError {
+    fn from(error: Error) -> Self {
+        Self::Table(error)
+    }
+}
+
 #[cfg(unix)]
 impl DatabaseSnapshotSaveError {
     /// Returns whether the destination was replaced before this error occurred.
@@ -931,6 +1077,8 @@ impl Database {
                 NonZeroUsize::new(DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP)
                     .expect("the default aggregate worker cap is nonzero"),
             ),
+            #[cfg(unix)]
+            int64_write_ahead_log: None,
         }
     }
 
@@ -1015,6 +1163,100 @@ impl Database {
         })
     }
 
+    #[cfg(unix)]
+    fn wal_tracks(&self, table_name: &str) -> bool {
+        self.int64_write_ahead_log
+            .as_ref()
+            .is_some_and(|write_ahead_log| write_ahead_log.tracks(table_name))
+    }
+
+    #[cfg(not(unix))]
+    const fn wal_tracks(&self, _table_name: &str) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn log_int64_append(&mut self, table_name: &str, values: &[i64]) -> Result<()> {
+        if let Some(write_ahead_log) = self
+            .int64_write_ahead_log
+            .as_mut()
+            .filter(|write_ahead_log| write_ahead_log.tracks(table_name))
+        {
+            write_ahead_log.append_values(values)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn log_int64_append(&mut self, _table_name: &str, _values: &[i64]) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn log_int64_truncate(&mut self, table_name: &str) -> Result<()> {
+        if let Some(write_ahead_log) = self
+            .int64_write_ahead_log
+            .as_mut()
+            .filter(|write_ahead_log| write_ahead_log.tracks(table_name))
+        {
+            write_ahead_log.truncate()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn log_int64_truncate(&mut self, _table_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn log_int64_replacements(
+        &mut self,
+        table_name: &str,
+        replacements: &[(usize, i64)],
+    ) -> Result<()> {
+        if let Some(write_ahead_log) = self
+            .int64_write_ahead_log
+            .as_mut()
+            .filter(|write_ahead_log| write_ahead_log.tracks(table_name))
+        {
+            write_ahead_log.replace_values(replacements)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn log_int64_replacements(
+        &mut self,
+        _table_name: &str,
+        _replacements: &[(usize, i64)],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn reject_unlogged_wal_mutation(&self, table_name: &str, mutation: &str) -> Result<()> {
+        if self.wal_tracks(table_name) {
+            return Err(Error::InvalidQuery(format!(
+                "{mutation} is not supported while table '{table_name}' has an active Int64 WAL"
+            )));
+        }
+        Ok(())
+    }
+
+    fn log_prepared_int64_append(
+        &mut self,
+        table_name: &str,
+        rows: &PreparedInsertRows,
+    ) -> Result<()> {
+        if !self.wal_tracks(table_name) {
+            return Ok(());
+        }
+        let values = rows
+            .int64_values()
+            .expect("WAL opt-in guarantees one preflighted Int64 column");
+        self.log_int64_append(table_name, &values)
+    }
+
     #[must_use]
     pub const fn query_result_limits(&self) -> QueryResultLimits {
         self.query_result_limits
@@ -1030,6 +1272,141 @@ impl Database {
     #[must_use]
     pub const fn table_limits(&self) -> TableLimits {
         self.table_limits
+    }
+
+    /// Creates and synchronizes a bounded WAL for one existing one-column
+    /// `Int64` table, then logs its successful appends, truncates, and atomic
+    /// value replacements before publishing them in memory.
+    ///
+    /// Opt-in writes a bootstrap containing the table display name, column
+    /// name, rows, table/database caps, query byte and row caps, and aggregate
+    /// worker cap. The destination is created exclusively. The bootstrap is
+    /// synchronized before the new directory entry, and the parent directory
+    /// is then synchronized before this method succeeds.
+    #[cfg(unix)]
+    pub fn enable_int64_write_ahead_log(
+        &mut self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        limits: Int64WriteAheadLogLimits,
+    ) -> std::result::Result<(), DatabaseInt64WalEnableError> {
+        if self.int64_write_ahead_log.is_some() {
+            return Err(DatabaseInt64WalEnableError::AlreadyEnabled);
+        }
+        let table = self
+            .catalog
+            .table(table_name)
+            .map_err(DatabaseInt64WalEnableError::Table)?;
+        if table.schema().len() != 1 {
+            return Err(DatabaseInt64WalEnableError::UnsupportedColumnCount {
+                table: table.name().to_owned(),
+                column_count: table.schema().len(),
+            });
+        }
+        let column = &table.schema()[0];
+        if column.data_type != DataType::Int64 {
+            return Err(DatabaseInt64WalEnableError::UnsupportedColumnType {
+                column: column.name.clone(),
+                data_type: column.data_type,
+            });
+        }
+        let Column::Int64(values) = &table.columns()[0] else {
+            unreachable!("batch table schema and physical storage must agree");
+        };
+        Int64WriteAheadLog::validate_bootstrap_limits(
+            table.name().len(),
+            column.name.len(),
+            values.len(),
+            limits,
+        )?;
+        let table_limits = table.limits();
+        let database_table_limits = self.table_limits;
+        let query = self.query_result_limits;
+        let bootstrap = Int64WalBootstrap {
+            table_name: table.name().to_owned(),
+            column_name: column.name.clone(),
+            table_limits: [
+                table_limits.max_rows,
+                table_limits.max_columns,
+                table_limits.max_cells,
+            ],
+            database_table_limits: [
+                database_table_limits.max_rows,
+                database_table_limits.max_columns,
+                database_table_limits.max_cells,
+            ],
+            query_limits: query_limits_to_array(query),
+            worker_cap: self.global_aggregate_parallelism.worker_cap.get(),
+            values: values.clone(),
+        };
+        let write_ahead_log = Int64WriteAheadLog::create(path.as_ref(), &bootstrap, limits)?;
+        self.int64_write_ahead_log = Some(write_ahead_log);
+        Ok(())
+    }
+
+    /// Replays the complete committed prefix of one bounded WAL into a fresh
+    /// database. A partial final header, payload, or commit footer is ignored.
+    /// Complete-record corruption and every resource failure return a typed
+    /// error without exposing a partially reconstructed database.
+    ///
+    /// Recovery is read-only and does not attach a writer to the returned
+    /// database. It is therefore idempotent and safe to repeat. To resume
+    /// durable writes or compact the history, enable a new WAL at a new path
+    /// after successful recovery.
+    #[cfg(unix)]
+    pub fn recover_int64_write_ahead_log(
+        path: impl AsRef<Path>,
+        limits: Int64WriteAheadLogLimits,
+    ) -> std::result::Result<Self, DatabaseInt64WalRecoveryError> {
+        let recovered = wal::recover(path.as_ref(), limits)?;
+        let Int64WalBootstrap {
+            table_name,
+            column_name,
+            table_limits,
+            database_table_limits,
+            query_limits,
+            worker_cap,
+            values,
+        } = recovered.bootstrap;
+        let table_limits = TableLimits::new(table_limits[0], table_limits[1], table_limits[2]);
+        let database_table_limits = TableLimits::new(
+            database_table_limits[0],
+            database_table_limits[1],
+            database_table_limits[2],
+        );
+        let table = Table::with_int64_values(table_name, column_name, values, table_limits)?;
+        let measurements = TableMeasurements::read(&table);
+        let worker_cap = NonZeroUsize::new(worker_cap).ok_or_else(|| {
+            DatabaseInt64WalRecoveryError::Table(Error::InvalidQuery(
+                "Int64 WAL aggregate worker cap must be nonzero".to_owned(),
+            ))
+        })?;
+        let mut database = Self {
+            catalog: Catalog::new(),
+            measurements: DatabaseMeasurements::default(),
+            query_result_limits: query_limits_from_array(query_limits),
+            table_limits: database_table_limits,
+            global_aggregate_parallelism: GlobalAggregateParallelism::system(worker_cap),
+            int64_write_ahead_log: None,
+        };
+        database.catalog.register_table(table)?;
+        database.measurements.add(measurements);
+        Ok(database)
+    }
+
+    /// Detaches the current WAL after all prior successful mutations have
+    /// already been synchronized. The existing file remains as an immutable
+    /// recovery history.
+    #[cfg(unix)]
+    pub fn disable_int64_write_ahead_log(&mut self) -> bool {
+        self.int64_write_ahead_log.take().is_some()
+    }
+
+    /// Reports whether this database currently has an attached `Int64` WAL.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn int64_write_ahead_log_enabled(&self) -> bool {
+        self.int64_write_ahead_log.is_some()
     }
 
     /// Returns the configured computation-lane cap for supported parallel aggregates.
@@ -1164,6 +1541,7 @@ impl Database {
         snapshot_codec: SnapshotCodec,
         payload_codec: Int64TablePayloadCodec,
     ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
+        self.reject_unlogged_wal_mutation(table_name, "snapshot table replacement")?;
         let display_name = self.catalog.table(table_name)?.name().to_owned();
         let restored = restore_int64_table_payload_from_file(path, snapshot_codec, payload_codec)?;
         self.replace_restored_int64_table(table_name, &display_name, restored)
@@ -1196,6 +1574,7 @@ impl Database {
         payload_codec: Int64TablePayloadCodec,
     ) -> std::result::Result<Int64TablePayloadFileRecoverySource, DatabaseSnapshotRestoreError>
     {
+        self.reject_unlogged_wal_mutation(table_name, "snapshot table replacement")?;
         let display_name = self.catalog.table(table_name)?.name().to_owned();
         let recovered = restore_int64_table_payload_from_file_with_backup(
             primary_path,
@@ -1496,6 +1875,7 @@ impl Database {
             csv::parse_rows_without_names(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
+        self.log_prepared_int64_append(table, &rows)?;
         self.table_mut(table)?.append_prepared_insert_rows(rows);
         Ok(affected_rows)
     }
@@ -1546,6 +1926,7 @@ impl Database {
             csv::parse_rows_with_names(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
+        self.log_prepared_int64_append(table, &rows)?;
         self.table_mut(table)?.append_prepared_insert_rows(rows);
         Ok(affected_rows)
     }
@@ -1590,6 +1971,7 @@ impl Database {
             tsv::parse_rows_without_names(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
+        self.log_prepared_int64_append(table, &rows)?;
         self.table_mut(table)?.append_prepared_insert_rows(rows);
         Ok(affected_rows)
     }
@@ -1636,6 +2018,7 @@ impl Database {
             tsv::parse_rows_with_names(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
+        self.log_prepared_int64_append(table, &rows)?;
         self.table_mut(table)?.append_prepared_insert_rows(rows);
         Ok(affected_rows)
     }
@@ -1753,6 +2136,21 @@ impl Database {
             *cumulative_rows = cumulative_rows.saturating_add(rows.len());
             let rows = target.prepare_insert_rows(columns.as_deref(), rows, *cumulative_rows)?;
             prepared.push((table, rows));
+        }
+
+        let mut wal_table = None;
+        let mut wal_values = Vec::new();
+        for (table, rows) in &prepared {
+            if self.wal_tracks(table) {
+                wal_table.get_or_insert_with(|| table.clone());
+                wal_values.extend(
+                    rows.int64_values()
+                        .expect("WAL opt-in guarantees one preflighted Int64 column"),
+                );
+            }
+        }
+        if let Some(table) = wal_table {
+            self.log_int64_append(&table, &wal_values)?;
         }
 
         let mut results = Vec::with_capacity(prepared.len());
@@ -1907,6 +2305,7 @@ impl Database {
                 })
             }
             Statement::DropTable { name } => {
+                self.reject_unlogged_wal_mutation(&name, "DROP TABLE")?;
                 let measurements = TableMeasurements::read(self.catalog.table(&name)?);
                 self.catalog.drop_table(&name)?;
                 self.measurements.subtract(measurements);
@@ -1916,6 +2315,7 @@ impl Database {
                 })
             }
             Statement::DropTableIfExists { name } => {
+                self.reject_unlogged_wal_mutation(&name, "DROP TABLE")?;
                 let measurements = self.catalog.table(&name).ok().map(TableMeasurements::read);
                 if self.catalog.drop_table_if_exists(&name) {
                     self.measurements.subtract(
@@ -1931,6 +2331,7 @@ impl Database {
                 source,
                 destination,
             } => {
+                self.reject_unlogged_wal_mutation(&source, "RENAME TABLE")?;
                 self.catalog.rename_table(&source, destination)?;
                 Ok(StatementResult::Command {
                     tag: "RENAME TABLE",
@@ -1942,6 +2343,7 @@ impl Database {
                 source,
                 destination,
             } => {
+                self.reject_unlogged_wal_mutation(&table, "ALTER TABLE RENAME COLUMN")?;
                 self.catalog.rename_column(&table, &source, destination)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",
@@ -1949,6 +2351,7 @@ impl Database {
                 })
             }
             Statement::AddColumn { table, column } => {
+                self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
                 self.table_mut(&table)?.add_column(column)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",
@@ -1956,6 +2359,7 @@ impl Database {
                 })
             }
             Statement::DropColumn { table, column } => {
+                self.reject_unlogged_wal_mutation(&table, "ALTER TABLE DROP COLUMN")?;
                 self.table_mut(&table)?.drop_column(&column)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",
@@ -2005,6 +2409,8 @@ impl Database {
                 alter_update_limits,
             ),
             Statement::TruncateTable { name } => {
+                self.catalog.table(&name)?;
+                self.log_int64_truncate(&name)?;
                 let affected_rows = self.table_mut(&name)?.truncate();
                 Ok(StatementResult::Command {
                     tag: "TRUNCATE TABLE",
@@ -2172,6 +2578,7 @@ impl Database {
             incoming_rows,
         )?;
         let affected_rows = rows.len();
+        self.log_prepared_int64_append(&table, &rows)?;
         self.table_mut(&table)?.append_prepared_insert_rows(rows);
         Ok(StatementResult::Command {
             tag: "INSERT",
@@ -2185,6 +2592,7 @@ impl Database {
         predicate: Predicate,
         query_result_limits: QueryResultLimits,
     ) -> Result<StatementResult> {
+        self.reject_unlogged_wal_mutation(&table, "DELETE")?;
         let row_indexes = {
             let target = self.catalog.table(&table)?;
             let predicate = compile_predicate(target, &predicate)?;
@@ -2281,6 +2689,16 @@ impl Database {
             replacements
         };
 
+        if self.wal_tracks(&table) {
+            let wal_replacements = replacements
+                .iter()
+                .map(|(row, value)| match value {
+                    Value::Int64(value) => (*row, *value),
+                    _ => unreachable!("WAL opt-in guarantees one Int64 target column"),
+                })
+                .collect::<Vec<_>>();
+            self.log_int64_replacements(&table, &wal_replacements)?;
+        }
         let affected_rows = self
             .table_mut(&table)
             .expect("ALTER TABLE UPDATE target was resolved before its bounded scan")
