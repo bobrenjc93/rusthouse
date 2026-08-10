@@ -1,10 +1,16 @@
 #![cfg(unix)]
 
-use std::fs;
+use std::ffi::CString;
+use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::num::NonZeroUsize;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
@@ -275,6 +281,82 @@ fn complete_checksum_corruption_is_typed_and_returns_no_database() {
         ))
     ));
     assert_eq!(int64_values(&source, "events"), source_values);
+}
+
+#[test]
+fn committed_final_record_with_increased_payload_length_is_corruption() {
+    let directory = TestDirectory::new();
+    let path = directory.join("length-corrupt.wal");
+    let limits = Int64WriteAheadLogLimits::default();
+    let mut source = Database::new();
+    source.execute("CREATE TABLE events (id Int64);").unwrap();
+    source
+        .enable_int64_write_ahead_log("events", &path, limits)
+        .unwrap();
+    source.execute("INSERT INTO events VALUES (7);").unwrap();
+    source.disable_int64_write_ahead_log();
+
+    let mut bytes = fs::read(&path).unwrap();
+    let append = *frame_starts(&bytes).last().unwrap();
+    let payload_len = u64::from_le_bytes(bytes[append + 20..append + 28].try_into().unwrap());
+    bytes[append + 20..append + 28].copy_from_slice(&(payload_len + 1).to_le_bytes());
+    fs::write(&path, bytes).unwrap();
+
+    assert!(matches!(
+        Database::recover_int64_write_ahead_log(&path, limits),
+        Err(DatabaseInt64WalRecoveryError::WriteAheadLog(
+            Int64WriteAheadLogError::Corruption(Int64WriteAheadLogCorruption::PayloadLength {
+                sequence: 1,
+                declared,
+                committed,
+            })
+        )) if declared == payload_len + 1 && committed == payload_len
+    ));
+}
+
+#[test]
+fn recovery_rejects_a_fifo_without_waiting_for_a_writer() {
+    let directory = TestDirectory::new();
+    let path = directory.join("wal.fifo");
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a NUL-terminated pathname in this test's directory.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+    let recovery_path = path.clone();
+    let (sender, receiver) = mpsc::channel();
+    let recovery = thread::spawn(move || {
+        let rejected = matches!(
+            Database::recover_int64_write_ahead_log(
+                &recovery_path,
+                Int64WriteAheadLogLimits::default(),
+            ),
+            Err(DatabaseInt64WalRecoveryError::WriteAheadLog(
+                Int64WriteAheadLogError::NotRegularFile
+            ))
+        );
+        sender.send(rejected).unwrap();
+    });
+
+    match receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(rejected) => assert!(rejected, "FIFO returned an unexpected recovery result"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Release a regressed blocking read-open so this test can fail
+            // without leaving a permanently blocked test process behind.
+            let _writer = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .expect("blocked FIFO recovery did not expose a waiting reader");
+            let _ = receiver.recv_timeout(Duration::from_secs(1));
+            recovery.join().unwrap();
+            panic!("FIFO recovery blocked while waiting for a writer");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            recovery.join().unwrap();
+            panic!("FIFO recovery thread disconnected")
+        }
+    }
+    recovery.join().unwrap();
 }
 
 #[test]

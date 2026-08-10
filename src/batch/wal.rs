@@ -154,6 +154,11 @@ pub enum Int64WriteAheadLogCorruption {
         expected: u32,
         actual: u32,
     },
+    PayloadLength {
+        sequence: u64,
+        declared: u64,
+        committed: u64,
+    },
     UnexpectedBootstrap {
         sequence: u64,
     },
@@ -210,6 +215,14 @@ impl fmt::Display for Int64WriteAheadLogCorruption {
             } => write!(
                 formatter,
                 "Int64 WAL record {sequence} checksum mismatch: expected {expected:08x}, calculated {actual:08x}"
+            ),
+            Self::PayloadLength {
+                sequence,
+                declared,
+                committed,
+            } => write!(
+                formatter,
+                "Int64 WAL record {sequence} declares {declared} payload bytes but its committed payload has {committed} bytes"
             ),
             Self::UnexpectedBootstrap { sequence } => write!(
                 formatter,
@@ -640,7 +653,16 @@ pub(crate) fn recover(
     path: &Path,
     limits: Int64WriteAheadLogLimits,
 ) -> Result<RecoveredInt64WriteAheadLog, Int64WriteAheadLogError> {
-    let file = File::open(path).map_err(Int64WriteAheadLogError::Open)?;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // A blocking read-only open waits indefinitely for a writer when `path`
+    // is a FIFO. Open nonblocking first, then validate the opened descriptor
+    // so a path replacement cannot bypass the regular-file check.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(Int64WriteAheadLogError::Open)?;
     let metadata = file.metadata().map_err(Int64WriteAheadLogError::Metadata)?;
     if !metadata.is_file() {
         return Err(Int64WriteAheadLogError::NotRegularFile);
@@ -741,8 +763,26 @@ fn replay(
                     bytes: u64::MAX,
                     max_bytes: limits.max_file_bytes,
                 })?;
-        // A partial header, payload, or commit footer is an uncommitted crash tail.
+        // A partial header, payload, or commit footer is an uncommitted crash
+        // tail. Before ignoring it, detect a complete committed record whose
+        // declared payload length was corrupted to extend beyond EOF.
         if frame_end > bytes.len() {
+            if let Some(committed_payload_len) = committed_payload_len_at_end(
+                bytes,
+                offset,
+                version,
+                kind,
+                reserved,
+                sequence,
+                expected_checksum,
+            ) {
+                return Err(Int64WriteAheadLogCorruption::PayloadLength {
+                    sequence,
+                    declared: payload_len_u64,
+                    committed: committed_payload_len as u64,
+                }
+                .into());
+            }
             break;
         }
         let records = expected_sequence.saturating_add(1);
@@ -808,6 +848,35 @@ fn replay(
 
     let bootstrap = bootstrap.ok_or(Int64WriteAheadLogCorruption::MissingBootstrap)?;
     Ok(RecoveredInt64WriteAheadLog { bootstrap })
+}
+
+/// Returns the payload length authenticated by a complete footer at EOF.
+///
+/// This lets replay distinguish a genuinely short body/footer from a complete
+/// committed record whose header length was increased after it was written.
+fn committed_payload_len_at_end(
+    bytes: &[u8],
+    offset: usize,
+    version: u16,
+    kind: u8,
+    reserved: u8,
+    sequence: u64,
+    expected_checksum: u32,
+) -> Option<usize> {
+    let payload_start = offset.checked_add(INT64_WAL_FRAME_HEADER_LEN)?;
+    let footer_start = bytes.len().checked_sub(INT64_WAL_COMMIT_LEN)?;
+    if footer_start < payload_start {
+        return None;
+    }
+    let footer = &bytes[footer_start..];
+    if read_array::<8>(footer, 0) != INT64_WAL_COMMIT_MAGIC
+        || u64::from_le_bytes(read_array::<8>(footer, 8)) != sequence
+    {
+        return None;
+    }
+    let payload = &bytes[payload_start..footer_start];
+    (record_checksum(version, kind, reserved, sequence, payload) == expected_checksum)
+        .then_some(payload.len())
 }
 
 fn validate_record_limits(

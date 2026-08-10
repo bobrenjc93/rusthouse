@@ -52,14 +52,18 @@ only after the footer sync succeeds. A write or sync failure poisons that
 writer; the failed mutation is not published and callers must recover before
 continuing because an I/O error can leave the commit outcome indeterminate.
 
-Recovery reads no more than the configured file-byte bound and checks the
-payload-byte and committed-record bounds before allocation. It replays only a
-contiguous, checksummed sequence beginning with a bootstrap. A final partial
-header, payload, or footer is an uncommitted crash tail and is ignored. Invalid
-bytes in any complete frame, a bad checksum or sequence, malformed mutation,
-or a replayed table-cap violation is a typed error. Replay constructs the
-catalog and cached metrics privately; failure never returns partially visible
-database state.
+Recovery opens its source nonblocking and accepts only a regular-file
+descriptor, so a FIFO or a concurrently replaced special-file path cannot
+stall replay. It reads no more than the configured file-byte bound and checks
+the payload-byte and committed-record bounds before allocation. It replays only
+a contiguous, checksummed sequence beginning with a bootstrap. A final partial
+header, payload, or footer is an uncommitted crash tail and is ignored. A valid
+footer and checksum at the physical end of the file authenticate the actual
+payload boundary, so a corrupted declared length cannot disguise a committed
+record as a torn tail. Invalid bytes in any complete frame, a bad checksum or
+sequence, malformed mutation, or a replayed table-cap violation is a typed
+error. Replay constructs the catalog and cached metrics privately; failure
+never returns partially visible database state.
 
 The current recovery API is read-only and does not append to or truncate the
 source WAL, so repeated recovery is idempotent. A recovered database is not
