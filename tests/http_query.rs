@@ -315,6 +315,31 @@ fn query_executes_to_string_projection_over_http() {
 }
 
 #[test]
+fn query_propagates_nullable_int64_through_to_string_over_http() {
+    let mut inner = Database::new();
+    inner
+        .create_nullable_int64_table(
+            "optional_readings",
+            "value",
+            vec![Some(2), None, Some(10), None, Some(-1)],
+        )
+        .expect("setup");
+    let database = SharedDatabase::new(inner);
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(
+                b"SELECT toString(value) AS rendered FROM optional_readings \
+                  ORDER BY toString(value) LIMIT 3 OFFSET 1;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"rendered","type":"String"}],"rows":[[null],["-1"],["10"]]}"#,
+    );
+}
+
+#[test]
 fn query_executes_empty_count_over_http_and_preserves_its_name() {
     let database = SharedDatabase::default();
     database

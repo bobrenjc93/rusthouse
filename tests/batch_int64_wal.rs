@@ -217,6 +217,21 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
         nullable_int64_minimum(&mut recovered, "READINGS"),
         Value::Int64(i64::MIN)
     );
+    let results = recovered
+        .execute("SELECT toString(Measurement) AS rendered FROM READINGS ORDER BY rendered")
+        .unwrap();
+    let [StatementResult::Query(rendered)] = results.as_slice() else {
+        panic!("expected toString query")
+    };
+    assert_eq!(
+        rendered.rows,
+        [
+            vec![Value::Null(rusthouse::batch::value::DataType::String)],
+            vec![Value::Null(rusthouse::batch::value::DataType::String)],
+            vec![Value::String("-9223372036854775808".to_owned())],
+            vec![Value::String("9223372036854775807".to_owned())],
+        ]
+    );
 
     database
         .replace_nullable_int64_values("readings", &[(0, None), (2, None)])
@@ -229,6 +244,16 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
     assert_eq!(
         nullable_int64_minimum(&mut all_null_recovered, "readings"),
         Value::Null(rusthouse::batch::value::DataType::Int64)
+    );
+    let results = all_null_recovered
+        .execute("SELECT toString(Measurement) FROM readings")
+        .unwrap();
+    let [StatementResult::Query(rendered)] = results.as_slice() else {
+        panic!("expected all-NULL toString query")
+    };
+    assert_eq!(
+        rendered.rows,
+        vec![vec![Value::Null(rusthouse::batch::value::DataType::String)]; 4]
     );
 }
 
