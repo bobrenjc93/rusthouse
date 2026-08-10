@@ -161,6 +161,28 @@ fn json_cli_output_path_preserves_nullable_int64_to_string_nulls() {
 }
 
 #[test]
+fn json_cli_outputs_nullable_int64_to_float64_casts() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE mixed_values (value Nullable(Int64)); \
+          INSERT INTO mixed_values VALUES (NULL), (7), (-2); \
+          SELECT CAST(value AS Float64) AS converted FROM mixed_values \
+          ORDER BY converted DESC; \
+          CREATE TABLE missing_values (value Nullable(Int64)); \
+          INSERT INTO missing_values VALUES (NULL), (NULL); \
+          SELECT CAST(value AS Float64) FROM missing_values;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"converted\",\"type\":\"Float64\"}],\"rows\":[[7.0],[-2.0],[null]]}\n\
+          {\"columns\":[{\"name\":\"CAST(value AS Float64)\",\"type\":\"Float64\"}],\"rows\":[[null],[null]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_executes_int64_alter_update_silently() {
     let output = run(
         &["--format", "json"],

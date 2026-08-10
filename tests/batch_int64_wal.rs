@@ -17,7 +17,7 @@ use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::storage::Column;
 use rusthouse::batch::tsv::{TsvIngestError, TsvIngestLimits};
-use rusthouse::batch::value::Value;
+use rusthouse::batch::value::{DataType, Value};
 use rusthouse::batch::wal::{
     INT64_WAL_FRAME_HEADER_LEN, INT64_WAL_FRAME_OVERHEAD, Int64WriteAheadLogCommitError,
     Int64WriteAheadLogCorruption, Int64WriteAheadLogError, Int64WriteAheadLogLimitError,
@@ -230,6 +230,24 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
         nullable_int64_values(&recovered, "readings"),
         [Some(7), None, Some(-2), None]
     );
+    let cast = recovered
+        .execute(
+            "SELECT CAST(Measurement AS Float64) AS converted FROM readings \
+             ORDER BY converted",
+        )
+        .unwrap();
+    let [StatementResult::Query(cast)] = cast.as_slice() else {
+        panic!("expected recovered cast query result")
+    };
+    assert_eq!(
+        cast.rows,
+        [
+            vec![Value::Null(DataType::Float64)],
+            vec![Value::Null(DataType::Float64)],
+            vec![Value::Float64(-2.0)],
+            vec![Value::Float64(7.0)],
+        ]
+    );
     assert_eq!(
         nullable_int64_sum(&mut recovered, "readings"),
         Value::Int64(5)
@@ -274,6 +292,44 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
     assert!(
         response
             .ends_with(r#"{"columns":[{"name":"Measurement","type":"Int64"}],"rows":[[-2],[7]]}"#)
+    );
+}
+
+#[test]
+fn recovered_all_null_wal_casts_to_typed_float64_nulls() {
+    let directory = TestDirectory::new();
+    let path = directory.join("all-null-cast.wal");
+    let limits = Int64WriteAheadLogLimits::default();
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (measurement Nullable(Int64)); \
+             INSERT INTO readings VALUES (NULL), (NULL);",
+        )
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+    database
+        .execute("INSERT INTO readings VALUES (NULL);")
+        .unwrap();
+
+    let mut recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    let cast = recovered
+        .execute(
+            "SELECT CAST(measurement AS Float64) AS converted FROM readings \
+             ORDER BY converted LIMIT 2 OFFSET 1",
+        )
+        .unwrap();
+    let [StatementResult::Query(cast)] = cast.as_slice() else {
+        panic!("expected recovered all-NULL cast query result")
+    };
+    assert_eq!(
+        cast.rows,
+        [
+            vec![Value::Null(DataType::Float64)],
+            vec![Value::Null(DataType::Float64)],
+        ]
     );
 }
 
