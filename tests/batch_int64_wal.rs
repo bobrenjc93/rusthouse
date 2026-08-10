@@ -94,6 +94,16 @@ fn nullable_int64_sum(database: &mut Database, table_name: &str) -> Value {
     result.rows[0][0].clone()
 }
 
+fn nullable_int64_average(database: &mut Database, table_name: &str) -> Value {
+    let results = database
+        .execute(&format!("SELECT AVG(Measurement) FROM {table_name}"))
+        .unwrap();
+    let [StatementResult::Query(result)] = results.as_slice() else {
+        panic!("expected one AVG query result")
+    };
+    result.rows[0][0].clone()
+}
+
 fn metrics(database: &mut Database) -> Vec<Vec<Value>> {
     let results = database
         .execute("SELECT metric, value FROM system.metrics")
@@ -408,6 +418,10 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
         nullable_int64_sum(&mut recovered, "READINGS"),
         Value::Int64(-1)
     );
+    assert_eq!(
+        nullable_int64_average(&mut recovered, "READINGS"),
+        Value::Float64(-0.5)
+    );
     let results = recovered
         .execute("SELECT toString(Measurement) AS rendered FROM READINGS ORDER BY rendered")
         .unwrap();
@@ -439,6 +453,10 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
     assert_eq!(
         nullable_int64_sum(&mut all_null_recovered, "readings"),
         Value::Null(rusthouse::batch::value::DataType::Int64)
+    );
+    assert_eq!(
+        nullable_int64_average(&mut all_null_recovered, "readings"),
+        Value::Null(rusthouse::batch::value::DataType::Float64)
     );
     let results = all_null_recovered
         .execute("SELECT toString(Measurement) FROM readings")

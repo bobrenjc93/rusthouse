@@ -127,9 +127,13 @@ case-insensitively; other nullable types and nullable multi-column declarations
 remain outside the bounded grammar. Library APIs and WAL recovery can also
 create this physical storage. The index metadata has explicit nullable-block
 semantics for both `Int64` storage forms.
-`COUNT`, `SUM`, `MIN`, and `MAX` accept physical `Nullable(Int64)` arguments.
-`SUM`, `MIN`, and `MAX` ignore absent values and return typed `Int64` `NULL`
-for empty or all-`NULL` inputs; `COUNT(column)` counts only present values.
+`COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` accept physical `Nullable(Int64)`
+arguments. `SUM`, `MIN`, `MAX`, and `AVG` ignore absent values. `SUM`, `MIN`,
+and `MAX` return typed `Int64` `NULL` for empty or all-`NULL` inputs, while
+`AVG` returns typed `Float64` `NULL`; `COUNT(column)` counts only present
+values. Nullable integer `AVG` uses the bounded sequential aggregate path with
+a checked `i128` sum and checked present-value count before producing
+`Float64`.
 These nullable shapes compose with filters, grouping, HAVING, ordering,
 pagination, and other supported aggregate projections. Other operations retain
 their documented nullable restrictions.

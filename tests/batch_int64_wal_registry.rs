@@ -90,7 +90,6 @@ fn create_two_table_registry(path: &Path) {
 
 fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
     for (expression, operation) in [
-        ("AVG(v)", "AVG"),
         ("v - 1", "Int64 subtraction"),
         ("CAST(v AS String)", "CAST"),
         ("ABS(v)", "ABS"),
@@ -141,6 +140,14 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
         panic!("expected MAX query")
     };
     assert_eq!(maximum.rows, [vec![Value::Int64(i64::MAX)]]);
+
+    let results = database
+        .execute(&format!("SELECT AVG(v) FROM {table}"))
+        .unwrap();
+    let [StatementResult::Query(average)] = results.as_slice() else {
+        panic!("expected AVG query")
+    };
+    assert_eq!(average.rows, [vec![Value::Float64(-0.5)]]);
 
     let results = database
         .execute(&format!(

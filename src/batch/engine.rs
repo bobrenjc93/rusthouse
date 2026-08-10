@@ -5514,6 +5514,7 @@ fn resolve_select_items(
                             | AggregateFunction::Sum
                             | AggregateFunction::Min
                             | AggregateFunction::Max
+                            | AggregateFunction::Avg
                     ) && table
                         .column_is_nullable_int64(argument);
                     if !supported_nullable_aggregate {
@@ -6281,7 +6282,10 @@ fn execute_grouped<'a>(
                 input_type: Some(DataType::Int64),
                 ..
             }]
-        );
+        )
+        && aggregate_specs
+            .first()
+            .is_some_and(|spec| aggregate_argument_is_non_nullable_int64(table, spec));
     let sole_global_min_int = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -7637,16 +7641,19 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
-                else {
-                    unreachable!("AVG input type is resolved")
+                let value = match &table.columns()[spec.argument.expect("AVG argument")] {
+                    Column::Int64(values) => Some(values[row]),
+                    Column::NullableInt64(values) => values[row],
+                    _ => unreachable!("AVG input type is resolved"),
                 };
-                *sum = sum
-                    .checked_add(i128::from(values[row]))
-                    .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+                if let Some(value) = value {
+                    *sum = sum
+                        .checked_add(i128::from(value))
+                        .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
+                    *count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+                }
             }
             Self::AvgFloat { sum, count } => {
                 let Column::Float64(values) =
@@ -9760,6 +9767,47 @@ mod tests {
     }
 
     #[test]
+    fn nullable_int64_avg_stays_on_the_checked_sequential_aggregate_path() {
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let values = (0..row_count)
+            .map(|row| (row % 2 == 0).then_some(1))
+            .collect::<Vec<_>>();
+        let mut database = Database::new();
+        database
+            .create_nullable_int64_table("nullable_values", "value", values)
+            .unwrap();
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &OBSERVED_BUDGET,
+        );
+
+        for (sql, expected) in [
+            (
+                "SELECT AVG(value) FROM nullable_values",
+                vec![Value::Float64(1.0)],
+            ),
+            (
+                "SELECT COUNT(*) AS rows, AVG(value) AS mean FROM nullable_values",
+                vec![
+                    Value::Int64(i64::try_from(row_count).unwrap()),
+                    Value::Float64(1.0),
+                ],
+            ),
+        ] {
+            OBSERVED_BUDGET.reset_peak();
+            assert_eq!(query(&mut database, sql).rows, [expected]);
+            assert_eq!(
+                OBSERVED_BUDGET.peak_helpers_in_use(),
+                0,
+                "nullable AVG must not request parallel aggregate helpers"
+            );
+        }
+    }
+
+    #[test]
     fn global_count_sum_int64_parallel_boundary_uses_shared_budget_with_fallback() {
         static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
             GlobalAggregateWorkerBudget::for_test(0);
@@ -11329,6 +11377,39 @@ mod tests {
     }
 
     #[test]
+    fn nullable_int64_average_state_checks_sum_and_count_overflow() {
+        let mut database = Database::new();
+        database
+            .create_nullable_int64_table("readings", "v", vec![Some(1), Some(0)])
+            .unwrap();
+        let table = database.catalog().table("readings").unwrap();
+        let spec = AggregateSpec {
+            function: AggregateFunction::Avg,
+            argument: Some(0),
+            input_type: Some(DataType::Int64),
+        };
+        let mut aggregate_state_bytes = 0;
+
+        let mut sum_overflow = AggregateState::AvgInt {
+            sum: i128::MAX,
+            count: 0,
+        };
+        assert_eq!(
+            sum_overflow.update(&spec, table, 0, &mut aggregate_state_bytes, usize::MAX),
+            Err(Error::NumericOverflow("AVG(Int64) sum".to_owned()))
+        );
+
+        let mut count_overflow = AggregateState::AvgInt {
+            sum: 0,
+            count: u64::MAX,
+        };
+        assert_eq!(
+            count_overflow.update(&spec, table, 1, &mut aggregate_state_bytes, usize::MAX),
+            Err(Error::NumericOverflow("AVG count".to_owned()))
+        );
+    }
+
+    #[test]
     fn configured_cap_one_is_a_deterministic_sequential_differential() {
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
 
@@ -12753,6 +12834,45 @@ mod tests {
             .unwrap();
         assert_eq!(
             limited.execute("SELECT MAX(v) FROM readings"),
+            Err(Error::ResourceLimitExceeded {
+                resource: "SELECT aggregate state bytes",
+                actual: fixed_bytes,
+                max: fixed_bytes - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn nullable_int64_avg_obeys_the_exact_aggregate_state_byte_boundary() {
+        let fixed_bytes =
+            std::mem::size_of::<AggregateState>() + std::mem::size_of::<Vec<AggregateState>>();
+        let exact_limits = QueryResultLimits {
+            max_aggregate_state_cells: 1,
+            max_aggregate_state_bytes: fixed_bytes,
+            ..QueryResultLimits::default()
+        };
+        let mut exact = Database::with_query_result_limits(exact_limits);
+        exact
+            .create_nullable_int64_table(
+                "readings",
+                "v",
+                vec![None, Some(i64::MAX), Some(i64::MIN)],
+            )
+            .unwrap();
+        assert_eq!(
+            query(&mut exact, "SELECT AVG(v) FROM readings").rows,
+            [vec![Value::Float64(-0.5)]]
+        );
+
+        let mut limited = Database::with_query_result_limits(QueryResultLimits {
+            max_aggregate_state_bytes: fixed_bytes - 1,
+            ..exact_limits
+        });
+        limited
+            .create_nullable_int64_table("readings", "v", vec![None, Some(1)])
+            .unwrap();
+        assert_eq!(
+            limited.execute("SELECT AVG(v) FROM readings"),
             Err(Error::ResourceLimitExceeded {
                 resource: "SELECT aggregate state bytes",
                 actual: fixed_bytes,
