@@ -631,6 +631,30 @@ fn batch_formats_emit_canonical_show_create_table_ddl() {
 }
 
 #[test]
+fn json_cli_round_trips_sql_created_nullable_int64_values_and_ddl() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE Readings (measurement Nullable(Int64)); \
+          INSERT INTO readings VALUES (7), (NULL), (-2); \
+          SHOW CREATE TABLE READINGS; \
+          SELECT measurement FROM readings ORDER BY measurement ASC;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        concat!(
+            r#"{"columns":[{"name":"statement","type":"String"}],"rows":[["CREATE TABLE Readings (measurement Nullable(Int64))"]]}"#,
+            "\n",
+            r#"{"columns":[{"name":"measurement","type":"Int64"}],"rows":[[null],[-2],[7]]}"#,
+            "\n",
+        )
+        .as_bytes()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn batch_cli_keeps_drop_table_command_output_silent() {
     for format in [
         "table",

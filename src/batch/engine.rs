@@ -2783,6 +2783,22 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::CreateNullableInt64Table { name, column } => {
+                self.create_nullable_int64_table(name, column, Vec::new())?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::CreateNullableInt64TableIfNotExists { name, column } => {
+                if !self.catalog.table_exists(&name) {
+                    self.create_nullable_int64_table(name, column, Vec::new())?;
+                }
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::DropTable { name } => {
                 self.reject_unlogged_wal_mutation(&name, "DROP TABLE")?;
                 let measurements = TableMeasurements::read(self.catalog.table(&name)?);
@@ -3023,6 +3039,8 @@ impl Database {
             }
             Statement::CreateTable { .. }
             | Statement::CreateTableIfNotExists { .. }
+            | Statement::CreateNullableInt64Table { .. }
+            | Statement::CreateNullableInt64TableIfNotExists { .. }
             | Statement::DropTable { .. }
             | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
@@ -3769,13 +3787,13 @@ impl Database {
         ddl.push_str("CREATE TABLE ");
         ddl.push_str(table.name());
         ddl.push_str(" (");
-        for (index, field) in table.schema().iter().enumerate() {
+        for (index, (field, values)) in table.schema().iter().zip(table.columns()).enumerate() {
             if index != 0 {
                 ddl.push_str(", ");
             }
             ddl.push_str(&field.name);
             ddl.push(' ');
-            ddl.push_str(field.data_type.as_str());
+            ddl.push_str(values.metadata_type_name());
         }
         ddl.push(')');
         debug_assert_eq!(ddl.len(), ddl_bytes);
@@ -4202,7 +4220,10 @@ fn enforce_alter_update_replacement_bytes(
 
 fn statement_name(statement: &Statement) -> &'static str {
     match statement {
-        Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => "CREATE TABLE",
+        Statement::CreateTable { .. }
+        | Statement::CreateTableIfNotExists { .. }
+        | Statement::CreateNullableInt64Table { .. }
+        | Statement::CreateNullableInt64TableIfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. }
@@ -4255,12 +4276,13 @@ fn create_table_ddl_len(table: &Table) -> usize {
     let fields_bytes = table
         .schema()
         .iter()
-        .map(|field| {
+        .zip(table.columns())
+        .map(|(field, values)| {
             field
                 .name
                 .len()
                 .saturating_add(1)
-                .saturating_add(field.data_type.as_str().len())
+                .saturating_add(values.metadata_type_name().len())
         })
         .fold(0_usize, usize::saturating_add);
     let delimiters = table.schema().len().saturating_sub(1).saturating_mul(2);

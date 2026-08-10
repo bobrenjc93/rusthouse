@@ -181,6 +181,43 @@ fn clean_replay_preserves_names_caps_settings_and_cached_metrics() {
 }
 
 #[test]
+fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
+    let directory = TestDirectory::new();
+    let path = directory.join("sql-created-nullable.wal");
+    let limits = Int64WriteAheadLogLimits::default();
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Readings (Measurement Nullable(Int64)); \
+             INSERT INTO readings VALUES (7), (NULL);",
+        )
+        .unwrap();
+
+    database
+        .enable_int64_write_ahead_log("READINGS", &path, limits)
+        .unwrap();
+    database
+        .execute("INSERT INTO readings VALUES (-2), (NULL);")
+        .unwrap();
+
+    let mut recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert_eq!(
+        nullable_int64_values(&recovered, "readings"),
+        [Some(7), None, Some(-2), None]
+    );
+    let results = recovered.execute("SHOW CREATE TABLE READINGS").unwrap();
+    let [StatementResult::Query(result)] = results.as_slice() else {
+        panic!("expected recovered SHOW CREATE result")
+    };
+    assert_eq!(
+        result.rows,
+        [vec![Value::String(
+            "CREATE TABLE Readings (Measurement Nullable(Int64))".to_owned()
+        )]]
+    );
+}
+
+#[test]
 fn sql_null_append_replays_for_nullable_int64_wal() {
     let directory = TestDirectory::new();
     let path = directory.join("nullable-sql.wal");

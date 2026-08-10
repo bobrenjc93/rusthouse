@@ -6353,6 +6353,45 @@ fn authenticated_insert_route_commits_a_batch_and_returns_an_empty_response() {
 }
 
 #[test]
+fn http_insert_and_query_round_trip_sql_created_nullable_int64_values() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE Readings (measurement Nullable(Int64));")
+        .unwrap();
+    let (insert, _) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO readings VALUES (7), (NULL), (-2);",
+        "Authorization: Bearer correct-token\r\n",
+    );
+
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &insert),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target(
+                "/query",
+                b"SELECT measurement FROM readings ORDER BY measurement ASC;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"measurement","type":"Int64"}],"rows":[[null],[-2],[7]]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SHOW CREATE TABLE readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"statement","type":"String"}],"rows":[["CREATE TABLE Readings (measurement Nullable(Int64))"]]}"#,
+    );
+}
+
+#[test]
 fn authenticated_insert_route_rolls_back_invalid_and_mixed_batches() {
     let database = SharedDatabase::default();
     database
