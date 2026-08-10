@@ -1231,7 +1231,7 @@ impl Database {
                 database_table_limits.max_cells,
             ],
             query_limits: query_limits_to_array(query),
-            worker_cap: self.global_aggregate_parallelism.worker_cap.get(),
+            worker_cap: self.global_aggregate_parallelism.worker_cap().get(),
             values: values.clone(),
         };
         let write_ahead_log = Int64WriteAheadLog::create(path.as_ref(), &bootstrap, limits)?;
