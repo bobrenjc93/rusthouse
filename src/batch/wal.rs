@@ -1248,6 +1248,7 @@ pub(crate) struct Int64WriteAheadLogRegistry {
     limits: Int64WriteAheadLogRegistryLimits,
     total_wal_bytes: usize,
     total_records: usize,
+    poisoned: bool,
 }
 
 /// One attached legacy WAL or one attached multi-table registry.
@@ -1353,6 +1354,7 @@ impl ActiveInt64WriteAheadLogs {
             limits,
             total_wal_bytes: bootstrap_bytes,
             total_records: descriptors.len(),
+            poisoned: false,
         }))
     }
 
@@ -1395,6 +1397,9 @@ impl ActiveInt64WriteAheadLogs {
 
 impl Int64WriteAheadLogRegistry {
     fn reserve_record(&self, bytes: usize) -> Result<(), Int64WriteAheadLogCommitError> {
+        if self.poisoned {
+            return Err(Int64WriteAheadLogCommitError::Poisoned);
+        }
         let total_bytes = self.total_wal_bytes.saturating_add(bytes);
         let total_records = self.total_records.saturating_add(1);
         validate_registry_totals(total_bytes, total_records, self.limits).map_err(|error| {
@@ -1403,6 +1408,36 @@ impl Int64WriteAheadLogRegistry {
                 _ => unreachable!("registry total validation only returns limit errors"),
             }
         })
+    }
+
+    fn commit_member_record<F>(
+        &mut self,
+        key: &str,
+        bytes: usize,
+        commit: F,
+    ) -> Result<(), Int64WriteAheadLogCommitError>
+    where
+        F: FnOnce(&mut Int64WriteAheadLog) -> Result<(), Int64WriteAheadLogError>,
+    {
+        self.reserve_record(bytes)?;
+        let result = commit(
+            self.writers
+                .get_mut(key)
+                .expect("the caller checks registry membership"),
+        );
+        match result {
+            Ok(()) => {
+                self.total_wal_bytes += bytes;
+                self.total_records += 1;
+                Ok(())
+            }
+            Err(error) => {
+                if !matches!(error, Int64WriteAheadLogError::Limit(_)) {
+                    self.poisoned = true;
+                }
+                Err(error.into())
+            }
+        }
     }
 
     fn append_values(
@@ -1416,26 +1451,12 @@ impl Int64WriteAheadLogRegistry {
             .get(&key)
             .expect("the caller checks registry membership")
             .next_append_bytes(values.len());
-        self.reserve_record(bytes)?;
-        self.writers
-            .get_mut(&key)
-            .expect("the registry writer remains present")
-            .append_values(values)?;
-        self.total_wal_bytes += bytes;
-        self.total_records += 1;
-        Ok(())
+        self.commit_member_record(&key, bytes, |writer| writer.append_values(values))
     }
 
     fn truncate(&mut self, table: &str) -> Result<(), Int64WriteAheadLogCommitError> {
         let key = table.to_ascii_lowercase();
-        self.reserve_record(INT64_WAL_FRAME_OVERHEAD)?;
-        self.writers
-            .get_mut(&key)
-            .expect("the caller checks registry membership")
-            .truncate()?;
-        self.total_wal_bytes += INT64_WAL_FRAME_OVERHEAD;
-        self.total_records += 1;
-        Ok(())
+        self.commit_member_record(&key, INT64_WAL_FRAME_OVERHEAD, Int64WriteAheadLog::truncate)
     }
 
     fn replace_values(
@@ -1449,14 +1470,7 @@ impl Int64WriteAheadLogRegistry {
             .get(&key)
             .expect("the caller checks registry membership")
             .next_replace_bytes(replacements.len());
-        self.reserve_record(bytes)?;
-        self.writers
-            .get_mut(&key)
-            .expect("the registry writer remains present")
-            .replace_values(replacements)?;
-        self.total_wal_bytes += bytes;
-        self.total_records += 1;
-        Ok(())
+        self.commit_member_record(&key, bytes, |writer| writer.replace_values(replacements))
     }
 }
 
@@ -2856,6 +2870,62 @@ mod tests {
                     | (1 | 3, Int64WriteAheadLogError::SyncFile(_))
             ));
         }
+    }
+
+    #[test]
+    fn indeterminate_member_failure_poisons_registry_before_cross_member_write() {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/wal-registry-poison-tests");
+        fs::create_dir_all(&base).unwrap();
+        let root = loop {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let writer = |name: &str| Int64WriteAheadLog {
+            file: File::create(root.join(format!("{name}.wal"))).unwrap(),
+            normalized_table_name: name.to_owned(),
+            nullable: false,
+            limits: Int64WriteAheadLogLimits::default(),
+            file_bytes: 0,
+            records: 0,
+            poisoned: false,
+        };
+        let mut registry = Int64WriteAheadLogRegistry {
+            writers: HashMap::from([
+                ("alpha".to_owned(), writer("alpha")),
+                ("beta".to_owned(), writer("beta")),
+            ]),
+            limits: Int64WriteAheadLogRegistryLimits::default(),
+            total_wal_bytes: 0,
+            total_records: 0,
+            poisoned: false,
+        };
+        let beta_path = root.join("beta.wal");
+        let mut fault = FaultFile::new(Some(3));
+        let injected = write_committed_record(&mut fault, b"body", &[0; INT64_WAL_COMMIT_LEN])
+            .expect_err("the final sync is injected to fail");
+
+        assert!(matches!(
+            registry.commit_member_record("alpha", INT64_WAL_FRAME_OVERHEAD, |_| Err(injected)),
+            Err(Int64WriteAheadLogCommitError::SyncFile { .. })
+        ));
+        assert!(registry.poisoned);
+        assert_eq!(registry.total_wal_bytes, 0);
+        assert_eq!(registry.total_records, 0);
+        assert!(matches!(
+            registry.append_values("beta", &[Some(1)]),
+            Err(Int64WriteAheadLogCommitError::Poisoned)
+        ));
+        assert_eq!(fs::metadata(beta_path).unwrap().len(), 0);
+
+        drop(registry);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

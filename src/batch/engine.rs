@@ -1421,18 +1421,23 @@ impl Database {
                 data_type: column.data_type,
             });
         }
-        let (nullable, values) = match &table.columns()[0] {
-            Column::Int64(values) => (false, values.iter().copied().map(Some).collect()),
-            Column::NullableInt64(values) => (true, values.clone()),
+        let (nullable, rows) = match &table.columns()[0] {
+            Column::Int64(values) => (false, values.len()),
+            Column::NullableInt64(values) => (true, values.len()),
             _ => unreachable!("batch table schema and physical storage must agree"),
         };
         Int64WriteAheadLog::validate_bootstrap_limits(
             table.name().len(),
             column.name.len(),
-            values.len(),
+            rows,
             nullable,
             limits,
         )?;
+        let values = match &table.columns()[0] {
+            Column::Int64(values) => values.iter().copied().map(Some).collect(),
+            Column::NullableInt64(values) => values.clone(),
+            _ => unreachable!("batch table shape was preflighted"),
+        };
         let table_limits = table.limits();
         let database_table_limits = self.table_limits;
         let query = self.query_result_limits;

@@ -453,6 +453,30 @@ fn record_and_recovery_limits_are_typed_and_failed_publish_is_atomic() {
 }
 
 #[test]
+fn enable_preflights_nullable_bootstrap_limits_before_materializing_wal_values() {
+    let directory = TestDirectory::new();
+    let path = directory.join("too-small.wal");
+    let mut database = Database::new();
+    database
+        .create_nullable_int64_table("Events", "id", vec![Some(7); 100_000])
+        .unwrap();
+    let limits = Int64WriteAheadLogLimits::new(usize::MAX, 1, usize::MAX);
+
+    assert!(matches!(
+        database.enable_int64_write_ahead_log("Events", &path, limits),
+        Err(DatabaseInt64WalEnableError::WriteAheadLog(
+            Int64WriteAheadLogError::Limit(Int64WriteAheadLogLimitError::RecordBytes {
+                sequence: 0,
+                max_bytes: 1,
+                ..
+            })
+        ))
+    ));
+    assert!(!path.exists());
+    assert!(!database.int64_write_ahead_log_enabled());
+}
+
+#[test]
 fn unix_creation_syncs_a_complete_file_and_parent_before_enabling() {
     let directory = TestDirectory::new();
     let path = directory.join("durable.wal");
