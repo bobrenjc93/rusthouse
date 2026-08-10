@@ -61,6 +61,14 @@ fn int64_values(database: &Database, table_name: &str) -> Vec<i64> {
     values.clone()
 }
 
+fn nullable_int64_values(database: &Database, table_name: &str) -> Vec<Option<i64>> {
+    let table = database.catalog().table(table_name).unwrap();
+    let Column::NullableInt64(values) = &table.columns()[0] else {
+        panic!("expected nullable Int64 column");
+    };
+    values.clone()
+}
+
 fn metrics(database: &mut Database) -> Vec<Vec<Value>> {
     let results = database
         .execute("SELECT metric, value FROM system.metrics")
@@ -106,9 +114,13 @@ fn clean_replay_preserves_names_caps_settings_and_cached_metrics() {
     let null_error = database
         .execute("INSERT INTO READINGS VALUES (NULL);")
         .unwrap_err();
-    assert!(
-        matches!(null_error, Error::Sql { .. }),
-        "unexpected NULL rejection: {null_error:?}"
+    assert_eq!(
+        null_error,
+        Error::TypeMismatch {
+            context: "column 'Readings.Measurement'".to_owned(),
+            expected: "Int64".to_owned(),
+            actual: "NULL".to_owned(),
+        }
     );
 
     let mut recovered =
@@ -156,6 +168,65 @@ fn clean_replay_preserves_names_caps_settings_and_cached_metrics() {
         ]
     );
     assert!(!recovered.int64_write_ahead_log_enabled());
+}
+
+#[test]
+fn sql_null_append_replays_for_nullable_int64_wal() {
+    let directory = TestDirectory::new();
+    let path = directory.join("nullable-sql.wal");
+    let limits = Int64WriteAheadLogLimits::default();
+    let mut database = Database::new();
+    database
+        .create_nullable_int64_table("Readings", "Measurement", vec![Some(4)])
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+
+    database
+        .execute(
+            "INSERT INTO READINGS (MEASUREMENT) VALUES \
+             (NULL), (7), (nUlL);",
+        )
+        .unwrap();
+    assert_eq!(
+        nullable_int64_values(&database, "readings"),
+        [Some(4), None, Some(7), None]
+    );
+
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert_eq!(
+        nullable_int64_values(&recovered, "READINGS"),
+        [Some(4), None, Some(7), None]
+    );
+}
+
+#[test]
+fn failed_sql_null_wal_append_is_not_published_to_nullable_storage() {
+    let directory = TestDirectory::new();
+    let path = directory.join("bounded-nullable-sql.wal");
+    let limits = Int64WriteAheadLogLimits::new(64 * 1024, 16 * 1024, 1);
+    let mut database = Database::new();
+    database
+        .create_nullable_int64_table("Readings", "Measurement", Vec::new())
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+
+    assert!(matches!(
+        database.execute("INSERT INTO readings VALUES (NULL);"),
+        Err(Error::WriteAheadLog(Int64WriteAheadLogCommitError::Limit(
+            Int64WriteAheadLogLimitError::Records {
+                records: 2,
+                max_records: 1,
+            }
+        )))
+    ));
+    assert!(nullable_int64_values(&database, "readings").is_empty());
+
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert!(nullable_int64_values(&recovered, "READINGS").is_empty());
 }
 
 #[test]

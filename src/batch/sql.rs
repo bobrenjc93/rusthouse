@@ -1921,7 +1921,7 @@ impl<'a> Parser<'a> {
                             max: self.limits.max_insert_values,
                         });
                     }
-                    row.push(self.parse_literal()?);
+                    row.push(self.parse_insert_literal()?);
                     self.insert_values += 1;
                     if !self.eat(&TokenKind::Comma) {
                         break;
@@ -2905,6 +2905,14 @@ impl<'a> Parser<'a> {
             Ok(Value::Bool(false))
         } else {
             self.error("expected an Int64, Float64, Bool, or String literal")
+        }
+    }
+
+    fn parse_insert_literal(&mut self) -> Result<Value> {
+        if self.eat_keyword("NULL") {
+            Ok(Value::Null(DataType::Int64))
+        } else {
+            self.parse_literal()
         }
     }
 
