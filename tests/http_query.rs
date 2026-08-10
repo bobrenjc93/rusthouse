@@ -164,16 +164,47 @@ fn assert_ok_health_response(response: &[u8]) {
     );
 }
 
-fn metrics_body(
+#[derive(Clone, Copy)]
+struct ExpectedMetrics<'a> {
     tables: usize,
     columns: usize,
     retained_rows: usize,
     retained_value_bytes: usize,
     global_aggregate_worker_cap: usize,
-    index_scanned_blocks: usize,
-    index_pruned_blocks: usize,
-    table_metrics: &[(&str, usize, usize)],
-) -> String {
+    index_pruning: (usize, usize),
+    table_metrics: &'a [(&'a str, usize, usize)],
+}
+
+impl<'a> ExpectedMetrics<'a> {
+    fn new(
+        tables: usize,
+        columns: usize,
+        retained_rows: usize,
+        retained_value_bytes: usize,
+        table_metrics: &'a [(&'a str, usize, usize)],
+    ) -> Self {
+        Self {
+            tables,
+            columns,
+            retained_rows,
+            retained_value_bytes,
+            global_aggregate_worker_cap: DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP,
+            index_pruning: (0, 0),
+            table_metrics,
+        }
+    }
+}
+
+fn metrics_body(expected: ExpectedMetrics<'_>) -> String {
+    let ExpectedMetrics {
+        tables,
+        columns,
+        retained_rows,
+        retained_value_bytes,
+        global_aggregate_worker_cap,
+        index_pruning: (index_scanned_blocks, index_pruned_blocks),
+        table_metrics,
+    } = expected;
     let mut body = format!(
         "# HELP rusthouse_tables Number of tables retained by the database.\n\
          # TYPE rusthouse_tables gauge\n\
@@ -224,15 +255,15 @@ fn assert_ok_metrics_response(
     retained_value_bytes: usize,
     table_metrics: &[(&str, usize, usize)],
 ) {
-    assert_ok_metrics_response_with_worker_cap_and_index_counters(
+    assert_ok_metrics_response_with_expectation(
         response,
-        tables,
-        columns,
-        retained_rows,
-        retained_value_bytes,
-        DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP,
-        (0, 0),
-        table_metrics,
+        ExpectedMetrics::new(
+            tables,
+            columns,
+            retained_rows,
+            retained_value_bytes,
+            table_metrics,
+        ),
     );
 }
 
@@ -245,15 +276,18 @@ fn assert_ok_metrics_response_with_worker_cap(
     global_aggregate_worker_cap: usize,
     table_metrics: &[(&str, usize, usize)],
 ) {
-    assert_ok_metrics_response_with_worker_cap_and_index_counters(
+    assert_ok_metrics_response_with_expectation(
         response,
-        tables,
-        columns,
-        retained_rows,
-        retained_value_bytes,
-        global_aggregate_worker_cap,
-        (0, 0),
-        table_metrics,
+        ExpectedMetrics {
+            global_aggregate_worker_cap,
+            ..ExpectedMetrics::new(
+                tables,
+                columns,
+                retained_rows,
+                retained_value_bytes,
+                table_metrics,
+            )
+        },
     );
 }
 
@@ -266,44 +300,27 @@ fn assert_ok_metrics_response_with_index_counters(
     index_pruning: (usize, usize),
     table_metrics: &[(&str, usize, usize)],
 ) {
-    assert_ok_metrics_response_with_worker_cap_and_index_counters(
+    assert_ok_metrics_response_with_expectation(
         response,
-        tables,
-        columns,
-        retained_rows,
-        retained_value_bytes,
-        DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP,
-        index_pruning,
-        table_metrics,
+        ExpectedMetrics {
+            index_pruning,
+            ..ExpectedMetrics::new(
+                tables,
+                columns,
+                retained_rows,
+                retained_value_bytes,
+                table_metrics,
+            )
+        },
     );
 }
 
-fn assert_ok_metrics_response_with_worker_cap_and_index_counters(
-    response: &[u8],
-    tables: usize,
-    columns: usize,
-    retained_rows: usize,
-    retained_value_bytes: usize,
-    global_aggregate_worker_cap: usize,
-    index_pruning: (usize, usize),
-    table_metrics: &[(&str, usize, usize)],
-) {
-    let (index_scanned_blocks, index_pruned_blocks) = index_pruning;
+fn assert_ok_metrics_response_with_expectation(response: &[u8], expected: ExpectedMetrics<'_>) {
     assert_response_with_content_type(
         response,
         "HTTP/1.1 200 OK",
         "text/plain; version=0.0.4; charset=utf-8",
-        metrics_body(
-            tables,
-            columns,
-            retained_rows,
-            retained_value_bytes,
-            global_aggregate_worker_cap,
-            index_scanned_blocks,
-            index_pruned_blocks,
-            table_metrics,
-        )
-        .as_bytes(),
+        metrics_body(expected).as_bytes(),
     );
 }
 
@@ -6571,15 +6588,17 @@ fn metrics_preflights_the_complete_response_limit_before_materializing_samples()
         .expect("indexed query succeeds");
     let request = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let expected_response = exchange(&database, request);
-    assert_ok_metrics_response_with_worker_cap_and_index_counters(
+    assert_ok_metrics_response_with_expectation(
         &expected_response,
-        1,
-        1,
-        12,
-        96,
-        worker_cap.get(),
-        (1, 2),
-        &[("Observed", 12, 96)],
+        ExpectedMetrics {
+            tables: 1,
+            columns: 1,
+            retained_rows: 12,
+            retained_value_bytes: 96,
+            global_aggregate_worker_cap: worker_cap.get(),
+            index_pruning: (1, 2),
+            table_metrics: &[("Observed", 12, 96)],
+        },
     );
 
     let mut exact_response = Vec::new();
