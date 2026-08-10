@@ -3,10 +3,13 @@
 //! Fields use the same ClickHouse-style backslash escapes as the TSV writer.
 //! Physical records may end in LF or CRLF; escaped line endings remain field
 //! data after decoding. Headerless `TabSeparated` fields map to every physical
-//! schema column in order. `TabSeparatedWithNames` headers must contain a
-//! nonempty, exact-case subset of schema names without duplicates; names may
-//! appear in any order. Each data field is parsed using its selected type, and
-//! omitted named columns use the same typed defaults as an explicit-column SQL
+//! schema column in order. The writer's exact raw `\N` field is a SQL `NULL`
+//! only when the selected physical column is `Nullable(Int64)`; the token is
+//! recognized before ordinary escape decoding so an escaped `\\N` remains
+//! String data. `TabSeparatedWithNames` headers must contain a nonempty,
+//! exact-case subset of schema names without duplicates; names may appear in
+//! any order. Each data field is parsed using its selected type, and omitted
+//! named columns use the same typed defaults as an explicit-column SQL
 //! `INSERT`.
 
 use std::collections::HashMap;
@@ -298,14 +301,8 @@ fn parse_data_rows(
         let mut row = Vec::with_capacity(expected_columns);
         for (offset, field) in record.split('\t').enumerate() {
             let column = offset.saturating_add(1);
-            let decoded = decode_field(field, line, column)?;
             let schema_index = schema_indexes[offset];
-            row.push(parse_value(
-                decoded,
-                table.schema()[schema_index].data_type,
-                line,
-                column,
-            )?);
+            row.push(parse_field(table, schema_index, field, line, column)?);
         }
         value_count = next_value_count;
         rows.push(row);
@@ -414,6 +411,25 @@ fn decode_field(field: &str, line: usize, column: usize) -> Result<String, TsvIn
         cursor += 2;
     }
     Ok(String::from_utf8(decoded).expect("decoding preserves valid UTF-8"))
+}
+
+fn parse_field(
+    table: &Table,
+    schema_index: usize,
+    field: &str,
+    line: usize,
+    column: usize,
+) -> Result<Value, TsvIngestError> {
+    if field == r"\N" && table.column_is_nullable_int64(schema_index) {
+        return Ok(Value::Null(DataType::Int64));
+    }
+
+    parse_value(
+        decode_field(field, line, column)?,
+        table.schema()[schema_index].data_type,
+        line,
+        column,
+    )
 }
 
 fn parse_value(

@@ -8441,6 +8441,49 @@ fn authenticated_csv_insert_ingests_all_physical_types_quoting_and_is_query_visi
 }
 
 #[test]
+fn authenticated_csv_routes_ingest_nullable_int64_writer_tokens() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE readings (value Nullable(Int64));")
+        .unwrap();
+
+    let named_csv = b"value\n-9223372036854775808\nNULL\n";
+    let (named_request, _) = request_with_authorization_for_target(
+        "/insert/readings",
+        named_csv,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &named_request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+
+    let headerless_csv = b"9223372036854775807\nNULL\n";
+    let headerless_request = request_for_target_with_headers(
+        "/?query=INSERT+INTO+readings+FORMAT+CSV",
+        headerless_csv,
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    assert_response_with_content_type(
+        &clickhouse_key_exchange(&database, "correct-key", &headerless_request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT value FROM readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[-9223372036854775808],[null],[9223372036854775807],[null]]}"#,
+    );
+}
+
+#[test]
 fn authenticated_headerless_csv_insert_ingests_all_physical_types_in_schema_order() {
     let database = SharedDatabase::default();
     database
@@ -8514,6 +8557,70 @@ fn authenticated_headerless_tsv_insert_ingests_all_physical_types_and_escapes() 
         "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"id","type":"Int64"},{"name":"score","type":"Float64"},{"name":"active","type":"Bool"},{"name":"label","type":"String"}],"rows":[[-9223372036854775808,2.5,true,"slash\\tab\tcarriage\rline\nnul\u0000backspace\bformfeed\fapostrophe' snow 雪"],[7,-300.0,false,"plain"]]}"#,
     );
+}
+
+#[test]
+fn authenticated_tsv_routes_ingest_nullable_int64_null_tokens() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE direct_rows (value Nullable(Int64)); \
+             CREATE TABLE direct_named (value Nullable(Int64)); \
+             CREATE TABLE query_rows (value Nullable(Int64)); \
+             CREATE TABLE query_named (value Nullable(Int64));",
+        )
+        .unwrap();
+
+    for (target, body, headers) in [
+        (
+            "/insert/direct_rows",
+            b"\\N\n7\n".as_slice(),
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: TabSeparated\r\n",
+        ),
+        (
+            "/insert/direct_named",
+            b"value\n\\N\n8\n".as_slice(),
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        ),
+        (
+            "/?query=INSERT+INTO+query_rows+FORMAT+TabSeparated",
+            b"\\N\n9\n".as_slice(),
+            "Authorization: Bearer correct-token\r\n",
+        ),
+        (
+            "/?query=INSERT+INTO+query_named+FORMAT+TabSeparatedWithNames",
+            b"value\n\\N\n10\n".as_slice(),
+            "Authorization: Bearer correct-token\r\n",
+        ),
+    ] {
+        let request = request_for_target_with_headers(target, body, headers);
+        assert_response_with_content_type(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8",
+            b"",
+        );
+    }
+
+    for (table, present) in [
+        ("direct_rows", 7),
+        ("direct_named", 8),
+        ("query_rows", 9),
+        ("query_named", 10),
+    ] {
+        assert_eq!(
+            database
+                .query(&format!("SELECT value FROM {table};"))
+                .unwrap()
+                .rows,
+            [
+                vec![Value::Null(rusthouse::batch::value::DataType::Int64)],
+                vec![Value::Int64(present)],
+            ],
+        );
+    }
 }
 
 #[test]

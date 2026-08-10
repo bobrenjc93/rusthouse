@@ -665,7 +665,11 @@ results continue in statement order.
 TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
 carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
-column names and strings use ClickHouse's backslash escapes.
+column names and strings use ClickHouse's backslash escapes. Both TSV importers
+accept that exact raw `\N` field as SQL `NULL` only for a physical
+`Nullable(Int64)` column. A String containing the two characters `\N` is
+written as `\\N` and imports as String data rather than being mistaken for
+NULL.
 A table-backed `SELECT`, one- or two-comparison `DELETE` (including `ALTER
 TABLE DELETE`), or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
 by default. This scanned-row limit is checked against the full source table
@@ -962,7 +966,9 @@ The route calls the corresponding nonblocking `SharedDatabase::try_ingest_*`
 method, so typed input, schema, capacity, and format-specific limit failures
 return `400 Bad Request` and append no rows. Empty headerless CSV and TSV are
 successful zero-row inserts. Success returns the same empty `200 OK` response as
-the SQL insert route. The unauthenticated handlers do not recognize it.
+the SQL insert route. For either TSV format, the exact raw `\N` token follows
+the same physical `Nullable(Int64)`-only rule as the library importer. The
+unauthenticated handlers do not recognize it.
 The parameterized `INSERT INTO <table> FORMAT CSV`, `INSERT INTO <table> FORMAT
 CSVWithNames`, `INSERT INTO <table> FORMAT TabSeparated`, and `INSERT INTO
 <table> FORMAT TabSeparatedWithNames` forms call the same headerless CSV, named
@@ -1281,6 +1287,11 @@ complete-input byte, logical-row, and total-value limits, and the table's row
 and cell limits are checked before the one append. Exact lowercase Boolean
 tokens, finite floats, LF and CRLF record endings, quoted commas and multiline
 fields, and doubled quote escapes follow the same rules as `CSVWithNames` below.
+The writer's exact unquoted `NULL` token stores SQL `NULL` only when its target
+is a physical `Nullable(Int64)` column. `NULL` in a `String` field remains the
+four-character string, and quoted `"NULL"`, differently cased tokens, surrounding
+whitespace, and `NULL` for non-nullable numeric fields follow ordinary typed
+parsing and are rejected when they are not valid values.
 Every format, value, limit, or remaining-capacity failure preserves all
 existing rows.
 
@@ -1301,6 +1312,11 @@ typed defaults as an explicit-column SQL `INSERT`: `0` for `Int64`, `0.0` for
 `Int64`, finite `Float64`, `Bool`, and `String`, and callers provide
 complete-input byte, row, and total supplied-value limits. Full physical rows
 remain subject to the table's row and cell capacity limits.
+As in headerless CSV, only the exact unquoted `NULL` field maps to SQL `NULL`,
+and only for a physical `Nullable(Int64)` target. String fields preserve `NULL`
+as text, while quoted or differently spelled tokens do not acquire null
+semantics. This makes the CSV writer's unquoted nullable output directly
+ingestible without making the token special for other physical types.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. Any data field may be double-quoted so it can contain
 commas and LF or CRLF line endings, and doubled quotes inside it decode to one
@@ -1319,8 +1335,12 @@ all byte, row, total-value, and remaining table-capacity checks, and the one
 atomic append. `SharedDatabase::try_ingest_tsv` has the same behavior after one
 immediate lock attempt, returning `DatabaseBusy` before table lookup or input
 access when contended. Fields reuse the typed parsing and ClickHouse-style
-backslash escapes described below for `TabSeparatedWithNames`. Any late row,
-value, escape, line-ending, or capacity failure preserves all existing rows.
+backslash escapes described below for `TabSeparatedWithNames`. Before ordinary
+escape decoding, an exact raw `\N` field becomes NULL only when its selected
+physical column is `Nullable(Int64)`; non-nullable columns reject the token,
+while the writer's escaped `\\N` representation remains literal String data.
+Any late row, value, escape, line-ending, or capacity failure preserves all
+existing rows.
 
 `Database::ingest_tsv_with_names` provides the corresponding bounded,
 multi-column `TabSeparatedWithNames` importer, with
@@ -1336,9 +1356,10 @@ columns with matching case, and may list those names in any order. Missing,
 duplicate, unknown, over-wide, and differently cased header names are rejected.
 Each supplied data field parses as the table type selected by its header;
 omitted `Int64`, `Float64`, `Bool`, and `String` fields receive `0`, `0.0`,
-`false`, and an empty string, respectively. Parsing and the total-value limit
-charge only supplied fields, while projected rows still undergo the existing
-full physical row and cell-capacity preflight before the atomic append.
+`false`, and an empty string, respectively, while an omitted physical
+`Nullable(Int64)` receives NULL. Parsing and the total-value limit charge only
+supplied fields, while projected rows still undergo the existing full physical
+row and cell-capacity preflight before the atomic append.
 Data rows accept the same `Int64`, finite `Float64`, exact lowercase `Bool`, and
 `String` types, with LF or CRLF record endings. Fields decode the escape
 sequences emitted by RustHouse's TSV writer: `\\`, `\t`, `\r`, `\n`, `\0`,
