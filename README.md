@@ -379,7 +379,10 @@ while normalizing type spellings. Ordinary schemas and sole-column
 `Nullable(Int64)` tables use one `CREATE TABLE` statement. If non-nullable
 columns were subsequently appended to a nullable table, the result uses that
 one-column nullable `CREATE TABLE` followed by ordered `ALTER TABLE ... ADD
-COLUMN` statements so it remains inside the bounded grammar.
+COLUMN` statements so it remains inside the bounded grammar. Because the
+normal executor accepts at most 4,096 statements, nullable tables admit at
+most 4,096 columns even when a larger custom table-column limit is configured;
+the rejected addition leaves the table unchanged.
 `DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
 and `type` `String` columns, rendering physical nullable `Int64` storage as
 `Nullable(Int64)`. It uses case-insensitive table lookup and applies the normal

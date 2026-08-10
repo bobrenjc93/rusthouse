@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::mem::size_of;
 
 use rusthouse::SharedDatabase;
@@ -5,8 +6,8 @@ use rusthouse::batch::engine::{
     Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
 };
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{Statement, parse};
-use rusthouse::batch::storage::ColumnDef;
+use rusthouse::batch::sql::{DEFAULT_MAX_BATCH_STATEMENTS, Statement, parse};
+use rusthouse::batch::storage::{ColumnDef, TableLimits};
 use rusthouse::batch::value::{DataType, Value};
 
 const CREATE: &str =
@@ -237,6 +238,55 @@ fn mixed_nullable_schema_show_create_replays_create_and_alter_at_exact_byte_limi
             actual: exact_bytes,
             max: exact_bytes - 1,
         })
+    );
+}
+
+#[test]
+fn nullable_show_create_replay_accepts_4096_and_rejects_4097_statements() {
+    let limits = TableLimits::new(0, DEFAULT_MAX_BATCH_STATEMENTS + 1, 0);
+    let mut database = Database::with_table_limits(limits);
+    let mut setup = String::from("CREATE TABLE Boundary (c0 Nullable(Int64));");
+    for index in 1..DEFAULT_MAX_BATCH_STATEMENTS {
+        write!(setup, "ALTER TABLE Boundary ADD COLUMN c{index} Int64;").unwrap();
+    }
+    database
+        .execute(&setup)
+        .expect("the exact replay statement limit is accepted");
+
+    let shown = query(&mut database, "SHOW CREATE TABLE boundary");
+    let [Value::String(ddl)] = shown.rows[0].as_slice() else {
+        panic!("SHOW CREATE returns one DDL string")
+    };
+    assert_eq!(parse(ddl).unwrap().len(), DEFAULT_MAX_BATCH_STATEMENTS);
+
+    let mut recreated = Database::with_table_limits(limits);
+    recreated
+        .execute(ddl)
+        .expect("the exact-limit SHOW CREATE output is replayable");
+    assert_eq!(
+        recreated
+            .catalog()
+            .table("boundary")
+            .unwrap()
+            .schema()
+            .len(),
+        DEFAULT_MAX_BATCH_STATEMENTS
+    );
+
+    assert_eq!(
+        database.execute(&format!(
+            "ALTER TABLE Boundary ADD COLUMN c{} Int64",
+            DEFAULT_MAX_BATCH_STATEMENTS
+        )),
+        Err(Error::ResourceLimitExceeded {
+            resource: "nullable SHOW CREATE statements",
+            actual: DEFAULT_MAX_BATCH_STATEMENTS + 1,
+            max: DEFAULT_MAX_BATCH_STATEMENTS,
+        })
+    );
+    assert_eq!(
+        database.catalog().table("boundary").unwrap().schema().len(),
+        DEFAULT_MAX_BATCH_STATEMENTS
     );
 }
 

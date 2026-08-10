@@ -2847,6 +2847,18 @@ impl Database {
             }
             Statement::AddColumn { table, column } => {
                 self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
+                let existing = self.catalog.table(&table)?;
+                let show_create_statements = existing.schema().len().saturating_add(1);
+                if starts_with_nullable_int64(existing)
+                    && show_create_statements > sql::DEFAULT_MAX_BATCH_STATEMENTS
+                {
+                    existing.validate_add_column(&column)?;
+                    return Err(Error::ResourceLimitExceeded {
+                        resource: "nullable SHOW CREATE statements",
+                        actual: show_create_statements,
+                        max: sql::DEFAULT_MAX_BATCH_STATEMENTS,
+                    });
+                }
                 self.table_mut(&table)?.add_column(column)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",

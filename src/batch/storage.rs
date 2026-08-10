@@ -1325,10 +1325,29 @@ impl Table {
     /// before either the schema or physical columns are changed. Existing
     /// rows receive ClickHouse-style non-null defaults for the new type.
     pub fn add_column(&mut self, field: ColumnDef) -> Result<()> {
+        self.validate_add_column(&field)?;
+
+        let column = match field.data_type {
+            DataType::Int64 => Column::Int64(vec![0; self.row_count]),
+            DataType::Float64 => Column::Float64(vec![0.0; self.row_count]),
+            DataType::Bool => Column::Bool(vec![false; self.row_count]),
+            DataType::String => Column::String(vec![String::new(); self.row_count]),
+        };
+        let added_value_bytes = column.retained_value_bytes_exact();
+
+        debug_assert_eq!(self.schema.len(), self.columns.len());
+        self.schema.push(field);
+        self.columns.push(column);
+        self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
+        self.mark_values_mutated();
+        Ok(())
+    }
+
+    pub(crate) fn validate_add_column(&self, field: &ColumnDef) -> Result<()> {
         validate_sql_identifier(&field.name, "column name")?;
         if is_reserved_column_name(&field.name) {
             return Err(Error::ReservedIdentifier {
-                identifier: field.name,
+                identifier: field.name.clone(),
                 context: "column name".to_owned(),
             });
         }
@@ -1337,7 +1356,7 @@ impl Table {
             .iter()
             .any(|existing| existing.name.eq_ignore_ascii_case(&field.name))
         {
-            return Err(Error::DuplicateColumn(field.name));
+            return Err(Error::DuplicateColumn(field.name.clone()));
         }
 
         let column_count = self.schema.len().saturating_add(1);
@@ -1356,20 +1375,6 @@ impl Table {
                 max: self.limits.max_cells,
             });
         }
-
-        let column = match field.data_type {
-            DataType::Int64 => Column::Int64(vec![0; self.row_count]),
-            DataType::Float64 => Column::Float64(vec![0.0; self.row_count]),
-            DataType::Bool => Column::Bool(vec![false; self.row_count]),
-            DataType::String => Column::String(vec![String::new(); self.row_count]),
-        };
-        let added_value_bytes = column.retained_value_bytes_exact();
-
-        debug_assert_eq!(self.schema.len(), self.columns.len());
-        self.schema.push(field);
-        self.columns.push(column);
-        self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
-        self.mark_values_mutated();
         Ok(())
     }
 
