@@ -373,9 +373,13 @@ integer conversions are checked before result storage is allocated. The query
 reads constant-time cached database measurements without scanning tables or
 values and is available through the normal `Database`, `SharedDatabase`, CLI,
 and HTTP paths in every supported format.
-`SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
-bounded `String`, preserving the stored table and column display names and
-schema order while normalizing type spellings.
+`SHOW CREATE TABLE <name>` returns canonical, replayable DDL as a bounded
+`String`, preserving the stored table and column display names and schema order
+while normalizing type spellings. Ordinary schemas and sole-column
+`Nullable(Int64)` tables use one `CREATE TABLE` statement. If non-nullable
+columns were subsequently appended to a nullable table, the result uses that
+one-column nullable `CREATE TABLE` followed by ordered `ALTER TABLE ... ADD
+COLUMN` statements so it remains inside the bounded grammar.
 `DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
 and `type` `String` columns, rendering physical nullable `Int64` storage as
 `Nullable(Int64)`. It uses case-insensitive table lookup and applies the normal

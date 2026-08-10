@@ -181,6 +181,66 @@ fn nullable_int64_ddl_obeys_the_exact_show_create_byte_boundary() {
 }
 
 #[test]
+fn mixed_nullable_schema_show_create_replays_create_and_alter_at_exact_byte_limit() {
+    const SETUP: &str = "CREATE TABLE Mixed (v Nullable(Int64)); \
+                         ALTER TABLE Mixed ADD COLUMN tag String; \
+                         ALTER TABLE Mixed ADD COLUMN active Bool;";
+    const REPLAYABLE_DDL: &str = "CREATE TABLE Mixed (v Nullable(Int64)); \
+                                  ALTER TABLE Mixed ADD COLUMN tag String; \
+                                  ALTER TABLE Mixed ADD COLUMN active Bool";
+    let exact_bytes = result_bytes(REPLAYABLE_DDL);
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    database.execute(SETUP).expect("setup succeeds");
+
+    let shown = query(&mut database, "SHOW CREATE TABLE mixed");
+    assert_eq!(shown.rows, [vec![Value::String(REPLAYABLE_DDL.to_owned())]]);
+    assert_eq!(parse(REPLAYABLE_DDL).unwrap().len(), 3);
+
+    let mut recreated = Database::new();
+    recreated
+        .execute(REPLAYABLE_DDL)
+        .expect("SHOW CREATE output is executable");
+    assert_eq!(query(&mut recreated, "SHOW CREATE TABLE MIXED"), shown);
+    recreated
+        .execute("INSERT INTO mixed VALUES (NULL, 'kept', true)")
+        .expect("recreated nullable storage accepts NULL");
+    assert_eq!(
+        query(&mut recreated, "DESCRIBE TABLE mixed").rows,
+        [
+            vec![
+                Value::String("v".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+            vec![
+                Value::String("tag".to_owned()),
+                Value::String("String".to_owned()),
+            ],
+            vec![
+                Value::String("active".to_owned()),
+                Value::String("Bool".to_owned()),
+            ],
+        ]
+    );
+
+    let mut one_short = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_short.execute(SETUP).expect("setup succeeds");
+    assert_eq!(
+        one_short.execute("SHOW CREATE TABLE mixed"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SHOW CREATE TABLE result bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        })
+    );
+}
+
+#[test]
 fn shared_database_reads_show_create_table_under_a_read_lock() {
     let database = SharedDatabase::default();
     database.execute(CREATE).expect("setup succeeds");

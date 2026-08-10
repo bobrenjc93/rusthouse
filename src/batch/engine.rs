@@ -3787,7 +3787,19 @@ impl Database {
         ddl.push_str("CREATE TABLE ");
         ddl.push_str(table.name());
         ddl.push_str(" (");
-        for (index, (field, values)) in table.schema().iter().zip(table.columns()).enumerate() {
+        let nullable_create = starts_with_nullable_int64(table);
+        let create_columns = if nullable_create {
+            1
+        } else {
+            table.schema().len()
+        };
+        for (index, (field, values)) in table
+            .schema()
+            .iter()
+            .zip(table.columns())
+            .take(create_columns)
+            .enumerate()
+        {
             if index != 0 {
                 ddl.push_str(", ");
             }
@@ -3796,6 +3808,16 @@ impl Database {
             ddl.push_str(values.metadata_type_name());
         }
         ddl.push(')');
+        if nullable_create {
+            for (field, values) in table.schema().iter().zip(table.columns()).skip(1) {
+                ddl.push_str("; ALTER TABLE ");
+                ddl.push_str(table.name());
+                ddl.push_str(" ADD COLUMN ");
+                ddl.push_str(&field.name);
+                ddl.push(' ');
+                ddl.push_str(values.metadata_type_name());
+            }
+        }
         debug_assert_eq!(ddl.len(), ddl_bytes);
 
         Ok(QueryResult {
@@ -4273,10 +4295,17 @@ fn delete_comparison_predicate(comparison: DeleteComparisonPredicate) -> Predica
 }
 
 fn create_table_ddl_len(table: &Table) -> usize {
+    let nullable_create = starts_with_nullable_int64(table);
+    let create_columns = if nullable_create {
+        1
+    } else {
+        table.schema().len()
+    };
     let fields_bytes = table
         .schema()
         .iter()
         .zip(table.columns())
+        .take(create_columns)
         .map(|(field, values)| {
             field
                 .name
@@ -4285,7 +4314,26 @@ fn create_table_ddl_len(table: &Table) -> usize {
                 .saturating_add(values.metadata_type_name().len())
         })
         .fold(0_usize, usize::saturating_add);
-    let delimiters = table.schema().len().saturating_sub(1).saturating_mul(2);
+    let delimiters = create_columns.saturating_sub(1).saturating_mul(2);
+    let alter_bytes = if nullable_create {
+        table
+            .schema()
+            .iter()
+            .zip(table.columns())
+            .skip(1)
+            .map(|(field, values)| {
+                "; ALTER TABLE "
+                    .len()
+                    .saturating_add(table.name().len())
+                    .saturating_add(" ADD COLUMN ".len())
+                    .saturating_add(field.name.len())
+                    .saturating_add(1)
+                    .saturating_add(values.metadata_type_name().len())
+            })
+            .fold(0_usize, usize::saturating_add)
+    } else {
+        0
+    };
 
     "CREATE TABLE "
         .len()
@@ -4294,6 +4342,20 @@ fn create_table_ddl_len(table: &Table) -> usize {
         .saturating_add(fields_bytes)
         .saturating_add(delimiters)
         .saturating_add(")".len())
+        .saturating_add(alter_bytes)
+}
+
+fn starts_with_nullable_int64(table: &Table) -> bool {
+    let starts_nullable = matches!(table.columns().first(), Some(Column::NullableInt64(_)));
+    debug_assert!(
+        table
+            .columns()
+            .iter()
+            .skip(1)
+            .all(|column| !matches!(column, Column::NullableInt64(_))),
+        "bounded nullable storage can only occupy the first column"
+    );
+    starts_nullable
 }
 
 fn literal_result_name_len(value: &Value) -> usize {
