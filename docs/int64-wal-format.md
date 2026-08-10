@@ -1,12 +1,12 @@
 # Int64 write-ahead log format
 
-RustHouse can opt one existing batch table with exactly one non-nullable
-`Int64` column into a bounded write-ahead log on Unix. The WAL is independent
-of snapshots and catalogs: its first committed record bootstraps the selected
-table and the later records describe its appends, truncates, and atomic value
-replacements.
+RustHouse can opt one existing batch table with exactly one `Int64` or
+`Nullable(Int64)` column into a bounded write-ahead log on Unix. The WAL is
+independent of snapshots and catalogs: its first committed record bootstraps
+the selected table and the later records describe its appends, truncates, and
+atomic value replacements.
 
-## Version 1 frame
+## Framing and versions
 
 All integers are little-endian. Records are contiguous and sequences begin at
 zero. Every record has this layout:
@@ -14,7 +14,7 @@ zero. Every record has this layout:
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 8 | Magic `RHI64WAL` |
-| 8 | 2 | Version (`1`) |
+| 8 | 2 | Version (`1` or `2`) |
 | 10 | 1 | Kind |
 | 11 | 1 | Reserved (`0`) |
 | 12 | 8 | Sequence (`u64`) |
@@ -29,12 +29,22 @@ and payload. It uses the same CRC-32/ISO-HDLC parameters as snapshot envelopes.
 The repeated commit sequence makes a complete footer the commit boundary.
 
 Kinds are `1` bootstrap, `2` append, `3` truncate, and `4` replacement. The
-bootstrap stores the table and column display names, explicit non-nullability,
-the table-local and database-default row/column/cell caps, all query resource
-caps (including result bytes), the aggregate worker cap, and the current rows.
-Append stores a row count and `i64` values. Truncate has an empty payload.
-Replacement stores a count followed by strictly increasing `(u64 row, i64
-value)` pairs.
+bootstrap stores the table and column display names, explicit nullability, the
+table-local and database-default row/column/cell caps, all query resource caps
+(including result bytes), the aggregate worker cap, and the current rows.
+
+Version 1 remains the byte-for-byte non-nullable encoding: append values are
+raw `i64` values and replacement entries are `(u64 row, i64 value)` pairs.
+Non-nullable writers continue to emit this version, and both versions are
+accepted during recovery.
+
+Version 2 is used only for `Nullable(Int64)`. Every row value is explicitly
+tagged: `0` is `NULL`, while `1` is followed by one little-endian `i64`. Append
+stores a row count followed by tagged values. Replacement stores a count
+followed by strictly increasing row indexes and tagged values. No integer is
+reserved as a NULL sentinel, so all `i64` values remain representable.
+Truncate has an empty payload in both versions. Every record in one WAL must
+use the bootstrap's version.
 
 ## Commit and recovery
 

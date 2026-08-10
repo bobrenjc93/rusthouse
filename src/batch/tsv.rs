@@ -432,6 +432,13 @@ fn parse_value(
             .parse::<i64>()
             .map(Value::Int64)
             .map_err(|_| invalid()),
+        DataType::NullableInt64 if matches!(field.as_str(), "NULL" | "\\N") => {
+            Ok(Value::Null(DataType::Int64))
+        }
+        DataType::NullableInt64 => field
+            .parse::<i64>()
+            .map(Value::Int64)
+            .map_err(|_| invalid()),
         DataType::Float64 => field
             .parse::<f64>()
             .map_err(|_| invalid())

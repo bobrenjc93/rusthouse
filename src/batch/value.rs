@@ -6,6 +6,8 @@ use std::hash::{Hash, Hasher};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DataType {
     Int64,
+    /// A physical `Int64` column whose rows may contain SQL `NULL`.
+    NullableInt64,
     Float64,
     Bool,
     String,
@@ -27,10 +29,32 @@ impl DataType {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Int64 => "Int64",
+            Self::NullableInt64 => "Nullable(Int64)",
             Self::Float64 => "Float64",
             Self::Bool => "Bool",
             Self::String => "String",
         }
+    }
+
+    /// Returns whether this type is the nullable `Int64` physical type.
+    #[must_use]
+    pub const fn is_nullable(self) -> bool {
+        matches!(self, Self::NullableInt64)
+    }
+
+    /// Returns the scalar type accepted by values in this physical type.
+    #[must_use]
+    pub const fn underlying(self) -> Self {
+        match self {
+            Self::NullableInt64 => Self::Int64,
+            data_type => data_type,
+        }
+    }
+
+    /// Returns whether this is either nullable or non-nullable `Int64`.
+    #[must_use]
+    pub const fn is_int64(self) -> bool {
+        matches!(self, Self::Int64 | Self::NullableInt64)
     }
 }
 

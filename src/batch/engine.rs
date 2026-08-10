@@ -435,7 +435,7 @@ pub enum DatabaseSnapshotRestoreError {
     Snapshot(Int64TablePayloadFileRestoreError),
     /// Both the primary and explicit backup snapshots failed bounded restore.
     Recovery(Int64TablePayloadFileRecoveryError),
-    /// Batch tables do not currently support nullable physical columns.
+    /// This snapshot restore path accepts only non-nullable physical columns.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
     /// limits were rejected by batch storage.
@@ -449,7 +449,7 @@ pub enum DatabaseRleSnapshotRestoreError {
     /// Opening or decoding the bounded RLE snapshot failed, or its rows did
     /// not satisfy the caller-supplied schema and row cap.
     Snapshot(Int64TableRleFileRestoreError),
-    /// Batch tables do not currently support nullable physical columns.
+    /// This snapshot restore path accepts only non-nullable physical columns.
     NullableColumn { column: String },
     /// The caller name, schema, duplicate name, or configured table limits
     /// were rejected by batch storage.
@@ -989,7 +989,7 @@ impl Database {
         {
             let target = self.catalog.table(table)?;
             let column_index = target.column_index(column)?;
-            if target.schema()[column_index].data_type != DataType::Int64 {
+            if !target.schema()[column_index].data_type.is_int64() {
                 return Err(Error::TypeMismatch {
                     context: format!(
                         "sparse min-max index column '{}.{}'",
@@ -1070,7 +1070,7 @@ impl Database {
     }
 
     #[cfg(unix)]
-    fn log_int64_append(&mut self, table_name: &str, values: &[i64]) -> Result<()> {
+    fn log_int64_append(&mut self, table_name: &str, values: &[Option<i64>]) -> Result<()> {
         if let Some(write_ahead_log) = self
             .int64_write_ahead_log
             .as_mut()
@@ -1082,7 +1082,7 @@ impl Database {
     }
 
     #[cfg(not(unix))]
-    fn log_int64_append(&mut self, _table_name: &str, _values: &[i64]) -> Result<()> {
+    fn log_int64_append(&mut self, _table_name: &str, _values: &[Option<i64>]) -> Result<()> {
         Ok(())
     }
 
@@ -1107,7 +1107,7 @@ impl Database {
     fn log_int64_replacements(
         &mut self,
         table_name: &str,
-        replacements: &[(usize, i64)],
+        replacements: &[(usize, Option<i64>)],
     ) -> Result<()> {
         if let Some(write_ahead_log) = self
             .int64_write_ahead_log
@@ -1123,7 +1123,7 @@ impl Database {
     fn log_int64_replacements(
         &mut self,
         _table_name: &str,
-        _replacements: &[(usize, i64)],
+        _replacements: &[(usize, Option<i64>)],
     ) -> Result<()> {
         Ok(())
     }
@@ -1169,8 +1169,9 @@ impl Database {
     }
 
     /// Creates and synchronizes a bounded WAL for one existing one-column
-    /// `Int64` table, then logs its successful appends, truncates, and atomic
-    /// value replacements before publishing them in memory.
+    /// `Int64` or `Nullable(Int64)` table, then logs its successful appends,
+    /// truncates, and atomic value replacements before publishing them in
+    /// memory.
     ///
     /// Opt-in writes a bootstrap containing the table display name, column
     /// name, rows, table/database caps, query byte and row caps, and aggregate
@@ -1199,21 +1200,37 @@ impl Database {
             });
         }
         let column = &table.schema()[0];
-        if column.data_type != DataType::Int64 {
+        if !column.data_type.is_int64() {
             return Err(DatabaseInt64WalEnableError::UnsupportedColumnType {
                 column: column.name.clone(),
                 data_type: column.data_type,
             });
         }
-        let Column::Int64(values) = &table.columns()[0] else {
-            unreachable!("batch table schema and physical storage must agree");
+        let (nullable, values) = match &table.columns()[0] {
+            Column::Int64(values) => {
+                Int64WriteAheadLog::validate_bootstrap_limits(
+                    table.name().len(),
+                    column.name.len(),
+                    false,
+                    values.len(),
+                    values.len(),
+                    limits,
+                )?;
+                (false, values.iter().copied().map(Some).collect())
+            }
+            Column::NullableInt64(values) => {
+                Int64WriteAheadLog::validate_bootstrap_limits(
+                    table.name().len(),
+                    column.name.len(),
+                    true,
+                    values.len(),
+                    values.iter().filter(|value| value.is_some()).count(),
+                    limits,
+                )?;
+                (true, values.clone())
+            }
+            _ => unreachable!("batch table schema and physical storage must agree"),
         };
-        Int64WriteAheadLog::validate_bootstrap_limits(
-            table.name().len(),
-            column.name.len(),
-            values.len(),
-            limits,
-        )?;
         let table_limits = table.limits();
         let database_table_limits = self.table_limits;
         let query = self.query_result_limits;
@@ -1232,7 +1249,8 @@ impl Database {
             ],
             query_limits: query_limits_to_array(query),
             worker_cap: self.global_aggregate_parallelism.worker_cap().get(),
-            values: values.clone(),
+            nullable,
+            values,
         };
         let write_ahead_log = Int64WriteAheadLog::create(path.as_ref(), &bootstrap, limits)?;
         self.int64_write_ahead_log = Some(write_ahead_log);
@@ -1261,6 +1279,7 @@ impl Database {
             database_table_limits,
             query_limits,
             worker_cap,
+            nullable,
             values,
         } = recovered.bootstrap;
         let table_limits = TableLimits::new(table_limits[0], table_limits[1], table_limits[2]);
@@ -1269,7 +1288,19 @@ impl Database {
             database_table_limits[1],
             database_table_limits[2],
         );
-        let table = Table::with_int64_values(table_name, column_name, values, table_limits)?;
+        let table = if nullable {
+            Table::with_nullable_int64_values(table_name, column_name, values, table_limits)?
+        } else {
+            Table::with_int64_values(
+                table_name,
+                column_name,
+                values
+                    .into_iter()
+                    .map(|value| value.expect("version 1 WAL values are non-nullable"))
+                    .collect(),
+                table_limits,
+            )?
+        };
         let measurements = TableMeasurements::read(&table);
         let worker_cap = NonZeroUsize::new(worker_cap).ok_or_else(|| {
             DatabaseInt64WalRecoveryError::Table(Error::InvalidQuery(
@@ -2091,7 +2122,9 @@ impl Database {
                 .entry(table.to_ascii_lowercase())
                 .or_default();
             *cumulative_rows = cumulative_rows.saturating_add(rows.len());
-            let rows = target.prepare_insert_rows(columns.as_deref(), rows, *cumulative_rows)?;
+            let rows = target
+                .prepare_insert_rows(columns.as_deref(), rows, *cumulative_rows)
+                .map_err(sql_insert_error)?;
             prepared.push((table, rows));
         }
 
@@ -2529,11 +2562,11 @@ impl Database {
         rows: Vec<Vec<Value>>,
     ) -> Result<StatementResult> {
         let incoming_rows = rows.len();
-        let rows = self.catalog.table(&table)?.prepare_insert_rows(
-            columns.as_deref(),
-            rows,
-            incoming_rows,
-        )?;
+        let rows = self
+            .catalog
+            .table(&table)?
+            .prepare_insert_rows(columns.as_deref(), rows, incoming_rows)
+            .map_err(sql_insert_error)?;
         let affected_rows = rows.len();
         self.log_prepared_int64_append(&table, &rows)?;
         self.table_mut(&table)?.append_prepared_insert_rows(rows);
@@ -2593,7 +2626,17 @@ impl Database {
             ] {
                 let actual = target.schema()[index].data_type;
                 let expected = literal.data_type();
-                if actual != expected {
+                if matches!(literal, AlterUpdateValue::Null) && !actual.is_nullable() {
+                    return Err(Error::TypeMismatch {
+                        context: format!(
+                            "ALTER TABLE UPDATE {role} column '{}.{column}'",
+                            target.name()
+                        ),
+                        expected: actual.to_string(),
+                        actual: "NULL".to_owned(),
+                    });
+                }
+                if actual.underlying() != expected {
                     return Err(Error::TypeMismatch {
                         context: format!(
                             "ALTER TABLE UPDATE {role} column '{}.{column}'",
@@ -2650,7 +2693,8 @@ impl Database {
             let wal_replacements = replacements
                 .iter()
                 .map(|(row, value)| match value {
-                    Value::Int64(value) => (*row, *value),
+                    Value::Int64(value) => (*row, Some(*value)),
+                    Value::Null(DataType::Int64) => (*row, None),
                     _ => unreachable!("WAL opt-in guarantees one Int64 target column"),
                 })
                 .collect::<Vec<_>>();
@@ -3640,6 +3684,11 @@ fn alter_update_matches(column: &Column, literal: &AlterUpdateValue, row: usize)
             values[row] == *value
         }
         (
+            Column::NullableInt64(values),
+            AlterUpdateValue::Literal(AlterUpdateLiteral::Int64(value)),
+        ) => values[row] == Some(*value),
+        (Column::NullableInt64(values), AlterUpdateValue::Null) => values[row].is_none(),
+        (
             Column::Float64(values),
             AlterUpdateValue::Literal(AlterUpdateLiteral::Float64(value)),
         ) => values[row] == *value,
@@ -3670,6 +3719,20 @@ fn enforce_alter_update_replacement_bytes(
         })
     } else {
         Ok(())
+    }
+}
+
+fn sql_insert_error(error: Error) -> Error {
+    match error {
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if actual == "NULL" => Error::Sql {
+            position: 0,
+            message: format!("{context} has type {expected} and does not allow NULL"),
+        },
+        error => error,
     }
 }
 
@@ -4541,6 +4604,7 @@ fn resolve_select_items(
                         DataType::Float64 => "Int64, Bool, or String",
                         DataType::Bool => "Int64, Float64, or String",
                         DataType::Int64 => "Float64, Bool, or String",
+                        DataType::NullableInt64 => "no direct CAST target",
                         DataType::String => "Int64, Float64, or Bool",
                     };
                     return Err(Error::TypeMismatch {
@@ -4708,7 +4772,7 @@ fn resolve_select_items(
                 let item = match actual {
                     DataType::Int64 => ResolvedItem::Int64Abs { source },
                     DataType::Float64 => ResolvedItem::Float64Abs { source },
-                    DataType::Bool | DataType::String => {
+                    DataType::NullableInt64 | DataType::Bool | DataType::String => {
                         return Err(Error::TypeMismatch {
                             context: format!("ABS argument '{name}'"),
                             expected: "Int64 or Float64".to_owned(),
@@ -6851,7 +6915,9 @@ impl AggregateState {
         match self {
             Self::Count(count) => {
                 let should_count = match spec.function {
-                    AggregateFunction::Count => true,
+                    AggregateFunction::Count => spec.argument.is_none_or(|argument| {
+                        !matches!(table.columns()[argument].value_ref(row), ValueRef::Null(_))
+                    }),
                     AggregateFunction::CountIf => {
                         let Column::Bool(values) =
                             &table.columns()[spec.argument.expect("countIf argument")]
@@ -6894,6 +6960,9 @@ impl AggregateState {
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
                 let candidate = column.value_ref(row);
+                if matches!(candidate, ValueRef::Null(_)) {
+                    return Ok(());
+                }
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
@@ -6909,6 +6978,9 @@ impl AggregateState {
             Self::Max(current) => {
                 let column = &table.columns()[spec.argument.expect("MAX argument")];
                 let candidate = column.value_ref(row);
+                if matches!(candidate, ValueRef::Null(_)) {
+                    return Ok(());
+                }
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
@@ -7825,6 +7897,7 @@ fn string_at(table: &Table, source: usize, row: usize) -> &str {
 fn stringify_value(table: &Table, source: usize, row: usize, input_type: DataType) -> Value {
     let value = match input_type {
         DataType::Int64 => int64_at(table, source, row).to_string(),
+        DataType::NullableInt64 => table.columns()[source].value(row).as_display_string(),
         DataType::Float64 => render_float64_text(float64_at(table, source, row)).into_string(),
         DataType::Bool => bool_string(bool_at(table, source, row)).to_owned(),
         DataType::String => string_at(table, source, row).to_owned(),
@@ -7835,6 +7908,7 @@ fn stringify_value(table: &Table, source: usize, row: usize, input_type: DataTyp
 fn stringified_len(table: &Table, source: usize, row: usize, input_type: DataType) -> usize {
     match input_type {
         DataType::Int64 => int64_text_len(int64_at(table, source, row)),
+        DataType::NullableInt64 => table.columns()[source].value(row).as_display_string().len(),
         DataType::Float64 => render_float64_text(float64_at(table, source, row)).len(),
         DataType::Bool => bool_string(bool_at(table, source, row)).len(),
         DataType::String => string_at(table, source, row).len(),
@@ -7853,6 +7927,7 @@ fn stringified_cmp(
             int64_at(table, source, left),
             int64_at(table, source, right),
         ),
+        DataType::NullableInt64 => table.columns()[source].cmp_at(left, right),
         DataType::Float64 => {
             let left = render_float64_text(float64_at(table, source, left));
             let right = render_float64_text(float64_at(table, source, right));
@@ -7961,7 +8036,7 @@ impl CompiledPredicate {
             (
                 CompiledOperand::Column {
                     index,
-                    data_type: DataType::Int64,
+                    data_type: DataType::Int64 | DataType::NullableInt64,
                 },
                 CompiledOperand::Literal(Value::Int64(value)),
             ) => (*index, *value, *operator),
@@ -7969,7 +8044,7 @@ impl CompiledPredicate {
                 CompiledOperand::Literal(Value::Int64(value)),
                 CompiledOperand::Column {
                     index,
-                    data_type: DataType::Int64,
+                    data_type: DataType::Int64 | DataType::NullableInt64,
                 },
             ) => (*index, *value, reverse_comparison(*operator)),
             _ => return None,
@@ -7994,9 +8069,9 @@ impl CompiledPredicate {
             } => {
                 let left = left.value(table, row);
                 let right = right.value(table, row);
-                let comparison = left
-                    .sql_cmp(right)
-                    .expect("predicate operand types are validated");
+                let Some(comparison) = left.sql_cmp(right) else {
+                    return false;
+                };
                 match operator {
                     ComparisonOperator::Equal => comparison == Ordering::Equal,
                     ComparisonOperator::NotEqual => comparison != Ordering::Equal,
@@ -8202,6 +8277,8 @@ fn validate_predicate_literal_value(value: &Value) -> Result<()> {
 }
 
 fn comparable(left: DataType, right: DataType) -> bool {
+    let left = left.underlying();
+    let right = right.underlying();
     left == right
         || matches!(
             (left, right),

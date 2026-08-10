@@ -130,8 +130,8 @@ impl Default for Int64RangePartitionLimits {
 ///
 /// `min` and `max` summarize non-null values only. Both are `None` for an
 /// all-null block; `null_count` distinguishes that case from an empty block.
-/// Batch columns are currently non-nullable, but retaining this metadata makes
-/// block semantics explicit and safe for nullable physical columns.
+/// Nullable and non-nullable `Int64` columns share this representation so
+/// pruning preserves three-valued NULL semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Int64MinMaxBlockMetadata {
     pub first_row: usize,
@@ -387,6 +387,7 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub enum Column {
     Int64(Vec<i64>),
+    NullableInt64(Vec<Option<i64>>),
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
@@ -397,6 +398,7 @@ impl Column {
     pub fn new(data_type: DataType) -> Self {
         match data_type {
             DataType::Int64 => Self::Int64(Vec::new()),
+            DataType::NullableInt64 => Self::NullableInt64(Vec::new()),
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
@@ -407,6 +409,7 @@ impl Column {
     pub fn data_type(&self) -> DataType {
         match self {
             Self::Int64(_) => DataType::Int64,
+            Self::NullableInt64(_) => DataType::NullableInt64,
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
@@ -417,6 +420,7 @@ impl Column {
     pub fn len(&self) -> usize {
         match self {
             Self::Int64(values) => values.len(),
+            Self::NullableInt64(values) => values.len(),
             Self::Float64(values) => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
@@ -441,6 +445,11 @@ impl Column {
     fn retained_value_bytes_exact(&self) -> u128 {
         match self {
             Self::Int64(values) => (values.len() as u128).saturating_mul(8),
+            Self::NullableInt64(values) => values
+                .iter()
+                .filter(|value| value.is_some())
+                .count()
+                .saturating_mul(8) as u128,
             Self::Float64(values) => (values.len() as u128).saturating_mul(8),
             Self::Bool(values) => values.len() as u128,
             Self::String(values) => values
@@ -458,6 +467,9 @@ impl Column {
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
         match self {
             Self::Int64(values) => ValueRef::Int64(values[row]),
+            Self::NullableInt64(values) => {
+                values[row].map_or(ValueRef::Null(DataType::Int64), ValueRef::Int64)
+            }
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
@@ -473,6 +485,14 @@ impl Column {
             (Self::Int64(values), Value::Int64(value)) => {
                 values.push(value);
                 8
+            }
+            (Self::NullableInt64(values), Value::Int64(value)) => {
+                values.push(Some(value));
+                8
+            }
+            (Self::NullableInt64(values), Value::Null(DataType::Int64)) => {
+                values.push(None);
+                0
             }
             (Self::Float64(values), Value::Float64(value)) => {
                 values.push(value);
@@ -494,6 +514,7 @@ impl Column {
     fn clear(&mut self) {
         match self {
             Self::Int64(values) => values.clear(),
+            Self::NullableInt64(values) => values.clear(),
             Self::Float64(values) => values.clear(),
             Self::Bool(values) => values.clear(),
             Self::String(values) => values.clear(),
@@ -503,6 +524,11 @@ impl Column {
     fn delete_rows(&mut self, row_indexes: &[usize]) -> u128 {
         let deleted_value_bytes = match self {
             Self::Int64(_) | Self::Float64(_) => (row_indexes.len() as u128).saturating_mul(8),
+            Self::NullableInt64(values) => row_indexes
+                .iter()
+                .filter(|&&row_index| values[row_index].is_some())
+                .count()
+                .saturating_mul(8) as u128,
             Self::Bool(_) => row_indexes.len() as u128,
             Self::String(values) => row_indexes
                 .iter()
@@ -511,6 +537,7 @@ impl Column {
         };
         match self {
             Self::Int64(values) => compact_deleted_rows(values, row_indexes),
+            Self::NullableInt64(values) => compact_deleted_rows(values, row_indexes),
             Self::Float64(values) => compact_deleted_rows(values, row_indexes),
             Self::Bool(values) => compact_deleted_rows(values, row_indexes),
             Self::String(values) => compact_deleted_rows(values, row_indexes),
@@ -524,6 +551,17 @@ impl Column {
         for (row_index, value) in replacements {
             match (&mut *self, value) {
                 (Self::Int64(values), Value::Int64(value)) => values[row_index] = value,
+                (Self::NullableInt64(values), Value::Int64(value)) => {
+                    removed_value_bytes = removed_value_bytes
+                        .saturating_add(u128::from(values[row_index].is_some()) * 8);
+                    added_value_bytes = added_value_bytes.saturating_add(8);
+                    values[row_index] = Some(value);
+                }
+                (Self::NullableInt64(values), Value::Null(DataType::Int64)) => {
+                    removed_value_bytes = removed_value_bytes
+                        .saturating_add(u128::from(values[row_index].is_some()) * 8);
+                    values[row_index] = None;
+                }
                 (Self::Float64(values), Value::Float64(value)) => values[row_index] = value,
                 (Self::Bool(values), Value::Bool(value)) => values[row_index] = value,
                 (Self::String(values), Value::String(value)) => {
@@ -586,11 +624,12 @@ impl PreparedInsertRows {
     }
 
     /// Returns the preflighted values when the target is one physical Int64 column.
-    pub(crate) fn int64_values(&self) -> Option<Vec<i64>> {
+    pub(crate) fn int64_values(&self) -> Option<Vec<Option<i64>>> {
         self.rows
             .iter()
             .map(|row| match row.as_slice() {
-                [Value::Int64(value)] => Some(*value),
+                [Value::Int64(value)] => Some(Some(*value)),
+                [Value::Null(DataType::Int64)] => Some(None),
                 _ => None,
             })
             .collect()
@@ -694,6 +733,32 @@ impl Table {
         table.row_count = values.len();
         table.retained_value_bytes = (values.len() as u128).saturating_mul(8);
         table.columns = vec![Column::Int64(values)];
+        Ok(table)
+    }
+
+    /// Builds one validated nullable `Int64` table without row materialization.
+    pub(crate) fn with_nullable_int64_values(
+        name: String,
+        column_name: String,
+        values: Vec<Option<i64>>,
+        limits: TableLimits,
+    ) -> Result<Self> {
+        let mut table = Self::with_limits(
+            name,
+            vec![ColumnDef {
+                name: column_name,
+                data_type: DataType::NullableInt64,
+            }],
+            limits,
+        )?;
+        table.validate_row_capacity(values.len())?;
+        table.row_count = values.len();
+        table.retained_value_bytes = values
+            .iter()
+            .filter(|value| value.is_some())
+            .count()
+            .saturating_mul(8) as u128;
+        table.columns = vec![Column::NullableInt64(values)];
         Ok(table)
     }
 
@@ -955,7 +1020,7 @@ impl Table {
         limits: Int64MinMaxIndexLimits,
     ) -> Result<Int64MinMaxIndexAdmission> {
         let column = self.column_index(column)?;
-        if self.schema[column].data_type != DataType::Int64 {
+        if !self.schema[column].data_type.is_int64() {
             return Err(Error::TypeMismatch {
                 context: format!(
                     "sparse min-max index column '{}.{}'",
@@ -1055,15 +1120,25 @@ impl Table {
             });
         }
 
-        let Column::Int64(values) = &self.columns[column] else {
-            unreachable!("the index column type was validated");
-        };
         let mut blocks = Vec::with_capacity(required_blocks);
-        for (block_number, values) in values.chunks(limits.block_rows).enumerate() {
-            blocks.push(summarize_nullable_int64_block(
-                block_number.saturating_mul(limits.block_rows),
-                values.iter().copied().map(Some),
-            ));
+        match &self.columns[column] {
+            Column::Int64(values) => {
+                for (block_number, values) in values.chunks(limits.block_rows).enumerate() {
+                    blocks.push(summarize_nullable_int64_block(
+                        block_number.saturating_mul(limits.block_rows),
+                        values.iter().copied().map(Some),
+                    ));
+                }
+            }
+            Column::NullableInt64(values) => {
+                for (block_number, values) in values.chunks(limits.block_rows).enumerate() {
+                    blocks.push(summarize_nullable_int64_block(
+                        block_number.saturating_mul(limits.block_rows),
+                        values.iter().copied(),
+                    ));
+                }
+            }
+            _ => unreachable!("the index column type was validated"),
         }
         Ok(Int64MinMaxIndex {
             column,
@@ -1284,6 +1359,7 @@ impl Table {
 
         let column = match field.data_type {
             DataType::Int64 => Column::Int64(vec![0; self.row_count]),
+            DataType::NullableInt64 => Column::NullableInt64(vec![None; self.row_count]),
             DataType::Float64 => Column::Float64(vec![0.0; self.row_count]),
             DataType::Bool => Column::Bool(vec![false; self.row_count]),
             DataType::String => Column::String(vec![String::new(); self.row_count]),
@@ -1344,6 +1420,11 @@ impl Table {
     }
 
     fn validate_value(&self, field: &ColumnDef, value: &Value) -> Result<()> {
+        if matches!(value, Value::Null(DataType::Int64))
+            && field.data_type == DataType::NullableInt64
+        {
+            return Ok(());
+        }
         if matches!(value, Value::Null(_)) {
             return Err(Error::TypeMismatch {
                 context: format!("column '{}.{}'", self.name, field.name),
@@ -1351,7 +1432,7 @@ impl Table {
                 actual: "NULL".to_owned(),
             });
         }
-        if field.data_type != value.data_type() {
+        if field.data_type.underlying() != value.data_type() {
             return Err(Error::TypeMismatch {
                 context: format!("column '{}.{}'", self.name, field.name),
                 expected: field.data_type.to_string(),
@@ -1434,6 +1515,7 @@ impl Table {
                 .iter()
                 .map(|field| match field.data_type {
                     DataType::Int64 => Value::Int64(0),
+                    DataType::NullableInt64 => Value::Null(DataType::Int64),
                     DataType::Float64 => Value::Float64(0.0),
                     DataType::Bool => Value::Bool(false),
                     DataType::String => Value::String(String::new()),

@@ -264,6 +264,7 @@ impl AlterUpdateLiteral {
 pub enum AlterUpdateValue {
     Literal(AlterUpdateLiteral),
     String(String),
+    Null,
 }
 
 impl From<AlterUpdateLiteral> for AlterUpdateValue {
@@ -278,6 +279,7 @@ impl AlterUpdateValue {
         match self {
             Self::Literal(value) => value.data_type(),
             Self::String(_) => DataType::String,
+            Self::Null => DataType::Int64,
         }
     }
 
@@ -286,6 +288,7 @@ impl AlterUpdateValue {
         match self {
             Self::Literal(value) => value.value(),
             Self::String(value) => Value::String(value),
+            Self::Null => Value::Null(DataType::Int64),
         }
     }
 }
@@ -1631,14 +1634,7 @@ impl<'a> Parser<'a> {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_storage_data_type()?;
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -1708,14 +1704,7 @@ impl<'a> Parser<'a> {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_storage_data_type()?;
             if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("unexpected trailing input after ALTER TABLE ADD COLUMN");
             }
@@ -1746,7 +1735,7 @@ impl<'a> Parser<'a> {
                 &TokenKind::Equal,
                 "'=' after ALTER TABLE UPDATE target column",
             )?;
-            let value = self.parse_alter_update_literal("ALTER TABLE UPDATE assignment")?;
+            let value = self.parse_alter_update_literal("ALTER TABLE UPDATE assignment", true)?;
             self.expect_keyword("WHERE")?;
             let predicate_column = self.expect_identifier("WHERE column name")?;
             self.expect(
@@ -1754,7 +1743,7 @@ impl<'a> Parser<'a> {
                 "'=' after ALTER TABLE UPDATE WHERE column",
             )?;
             let predicate_value =
-                self.parse_alter_update_literal("ALTER TABLE UPDATE WHERE comparison")?;
+                self.parse_alter_update_literal("ALTER TABLE UPDATE WHERE comparison", false)?;
             if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("unexpected trailing input after ALTER TABLE UPDATE");
             }
@@ -1921,7 +1910,7 @@ impl<'a> Parser<'a> {
                             max: self.limits.max_insert_values,
                         });
                     }
-                    row.push(self.parse_literal()?);
+                    row.push(self.parse_insert_literal()?);
                     self.insert_values += 1;
                     if !self.eat(&TokenKind::Comma) {
                         break;
@@ -2474,7 +2463,14 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_alter_update_literal(&mut self, context: &str) -> Result<AlterUpdateValue> {
+    fn parse_alter_update_literal(
+        &mut self,
+        context: &str,
+        allow_null: bool,
+    ) -> Result<AlterUpdateValue> {
+        if allow_null && self.eat_keyword("NULL") {
+            return Ok(AlterUpdateValue::Null);
+        }
         if matches!(self.peek(), TokenKind::String(_)) {
             let TokenKind::String(value) = self.take_kind() else {
                 unreachable!("matched string token")
@@ -2906,6 +2902,39 @@ impl<'a> Parser<'a> {
         } else {
             self.error("expected an Int64, Float64, Bool, or String literal")
         }
+    }
+
+    fn parse_insert_literal(&mut self) -> Result<Value> {
+        if self.eat_keyword("NULL") {
+            Ok(Value::Null(DataType::Int64))
+        } else {
+            self.parse_literal()
+        }
+    }
+
+    fn parse_storage_data_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        if type_name.eq_ignore_ascii_case("Nullable") {
+            self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
+            let nested = self.expect_identifier("type inside Nullable(...)")?;
+            if !nested.eq_ignore_ascii_case("Int64") {
+                return Err(Error::Sql {
+                    position,
+                    message: format!(
+                        "unsupported nullable type 'Nullable({nested})'; expected Nullable(Int64)"
+                    ),
+                });
+            }
+            self.expect(&TokenKind::RightParen, "')' after Nullable(Int64")?;
+            return Ok(DataType::NullableInt64);
+        }
+        DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Nullable(Int64), Float64, Bool, or String"
+            ),
+        })
     }
 
     fn expect_keyword(&mut self, expected: &str) -> Result<()> {

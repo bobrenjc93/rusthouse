@@ -1,4 +1,5 @@
-//! Crash-recoverable, bounded write-ahead logging for one batch `Int64` table.
+//! Crash-recoverable, bounded write-ahead logging for one batch `Int64` or
+//! `Nullable(Int64)` table.
 //!
 //! The stable framing and lifecycle are documented in `docs/int64-wal-format.md`.
 
@@ -13,8 +14,10 @@ use std::path::Path;
 
 /// Magic at the start of every write-ahead-log frame.
 pub const INT64_WAL_MAGIC: [u8; 8] = *b"RHI64WAL";
-/// Version emitted and accepted by the write-ahead-log codec.
+/// Legacy version emitted for non-nullable tables.
 pub const INT64_WAL_VERSION: u16 = 1;
+/// Tagged nullable-value version emitted for `Nullable(Int64)` tables.
+pub const NULLABLE_INT64_WAL_VERSION: u16 = 2;
 /// Magic in the commit footer of every complete record.
 pub const INT64_WAL_COMMIT_MAGIC: [u8; 8] = *b"RHWLCMIT";
 /// Fixed bytes before one record payload.
@@ -35,6 +38,8 @@ const BOOTSTRAP_KIND: u8 = 1;
 const APPEND_KIND: u8 = 2;
 const TRUNCATE_KIND: u8 = 3;
 const REPLACE_KIND: u8 = 4;
+const NULL_TAG: u8 = 0;
+const VALUE_TAG: u8 = 1;
 const QUERY_LIMIT_FIELD_COUNT: usize = 10;
 
 /// Inclusive storage and replay limits for one `Int64` write-ahead log.
@@ -129,6 +134,11 @@ pub enum Int64WriteAheadLogCorruption {
         found: u16,
         supported: u16,
     },
+    VersionChanged {
+        sequence: u64,
+        expected: u16,
+        found: u16,
+    },
     UnsupportedKind {
         sequence: u64,
         kind: u8,
@@ -185,6 +195,14 @@ impl fmt::Display for Int64WriteAheadLogCorruption {
             } => write!(
                 formatter,
                 "unsupported Int64 WAL version {found} at byte {offset}; this reader supports {supported}"
+            ),
+            Self::VersionChanged {
+                sequence,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "Int64 WAL record {sequence} changes version from {expected} to {found}"
             ),
             Self::UnsupportedKind { sequence, kind } => {
                 write!(
@@ -399,7 +417,8 @@ pub(crate) struct Int64WalBootstrap {
     pub(crate) database_table_limits: [usize; 3],
     pub(crate) query_limits: [usize; QUERY_LIMIT_FIELD_COUNT],
     pub(crate) worker_cap: usize,
-    pub(crate) values: Vec<i64>,
+    pub(crate) nullable: bool,
+    pub(crate) values: Vec<Option<i64>>,
 }
 
 #[derive(Debug)]
@@ -416,17 +435,26 @@ pub(crate) struct Int64WriteAheadLog {
     file_bytes: usize,
     records: usize,
     poisoned: bool,
+    version: u16,
 }
 
 impl Int64WriteAheadLog {
     pub(crate) fn validate_bootstrap_limits(
         table_name_bytes: usize,
         column_name_bytes: usize,
+        nullable: bool,
         rows: usize,
+        present_values: usize,
         limits: Int64WriteAheadLogLimits,
     ) -> Result<(), Int64WriteAheadLogError> {
-        let payload_len =
-            bootstrap_payload_len(table_name_bytes, column_name_bytes, rows).unwrap_or(usize::MAX);
+        let payload_len = bootstrap_payload_len_from_counts(
+            table_name_bytes,
+            column_name_bytes,
+            nullable,
+            rows,
+            present_values,
+        )
+        .unwrap_or(usize::MAX);
         validate_record_limits(0, payload_len, 0, 0, limits).map(|_| ())
     }
 
@@ -438,19 +466,27 @@ impl Int64WriteAheadLog {
         Self::validate_bootstrap_limits(
             bootstrap.table_name.len(),
             bootstrap.column_name.len(),
+            bootstrap.nullable,
             bootstrap.values.len(),
+            bootstrap
+                .values
+                .iter()
+                .filter(|value| value.is_some())
+                .count(),
             limits,
         )?;
+        let version = wal_version(bootstrap.nullable);
         let payload = encode_bootstrap(bootstrap);
         debug_assert_eq!(
             Some(payload.len()),
             bootstrap_payload_len(
                 bootstrap.table_name.len(),
                 bootstrap.column_name.len(),
-                bootstrap.values.len()
+                bootstrap.nullable,
+                &bootstrap.values
             )
         );
-        let (body, footer) = encode_record_parts(BOOTSTRAP_KIND, 0, &payload);
+        let (body, footer) = encode_record_parts(version, BOOTSTRAP_KIND, 0, &payload);
 
         let destination = wal_destination_name(path)?;
         let parent_directory = WalDirectory::open(normalized_parent(path))
@@ -464,6 +500,7 @@ impl Int64WriteAheadLog {
             file_bytes: body.len() + footer.len(),
             records: 1,
             poisoned: false,
+            version,
         })
     }
 
@@ -471,16 +508,15 @@ impl Int64WriteAheadLog {
         self.normalized_table_name.eq_ignore_ascii_case(table_name)
     }
 
-    pub(crate) fn append_values(&mut self, values: &[i64]) -> Result<(), Int64WriteAheadLogError> {
-        let payload_len = 8_usize
-            .checked_add(values.len().checked_mul(8).unwrap_or(usize::MAX))
-            .unwrap_or(usize::MAX);
+    pub(crate) fn append_values(
+        &mut self,
+        values: &[Option<i64>],
+    ) -> Result<(), Int64WriteAheadLogError> {
+        let payload_len = counted_values_payload_len(self.version, values).unwrap_or(usize::MAX);
         self.validate_next_record(payload_len)?;
         let mut payload = Vec::with_capacity(payload_len);
         push_usize(&mut payload, values.len());
-        for value in values {
-            payload.extend_from_slice(&value.to_le_bytes());
-        }
+        encode_values(&mut payload, self.version, values);
         self.append_record(APPEND_KIND, &payload)
     }
 
@@ -491,17 +527,16 @@ impl Int64WriteAheadLog {
 
     pub(crate) fn replace_values(
         &mut self,
-        replacements: &[(usize, i64)],
+        replacements: &[(usize, Option<i64>)],
     ) -> Result<(), Int64WriteAheadLogError> {
-        let payload_len = 8_usize
-            .checked_add(replacements.len().checked_mul(16).unwrap_or(usize::MAX))
-            .unwrap_or(usize::MAX);
+        let payload_len =
+            replacements_payload_len(self.version, replacements).unwrap_or(usize::MAX);
         self.validate_next_record(payload_len)?;
         let mut payload = Vec::with_capacity(payload_len);
         push_usize(&mut payload, replacements.len());
         for (row, value) in replacements {
             push_usize(&mut payload, *row);
-            payload.extend_from_slice(&value.to_le_bytes());
+            encode_value(&mut payload, self.version, *value);
         }
         self.append_record(REPLACE_KIND, &payload)
     }
@@ -532,7 +567,7 @@ impl Int64WriteAheadLog {
             self.records,
             self.limits,
         )?;
-        let (body, footer) = encode_record_parts(kind, sequence, payload);
+        let (body, footer) = encode_record_parts(self.version, kind, sequence, payload);
         if let Err(error) = write_committed_record(&mut self.file, &body, &footer) {
             self.poisoned = true;
             return Err(error);
@@ -697,6 +732,7 @@ fn replay(
     let mut offset = 0_usize;
     let mut expected_sequence = 0_u64;
     let mut bootstrap: Option<Int64WalBootstrap> = None;
+    let mut wal_version = None;
 
     while bytes.len().saturating_sub(offset) >= INT64_WAL_FRAME_HEADER_LEN {
         let header = &bytes[offset..offset + INT64_WAL_FRAME_HEADER_LEN];
@@ -709,11 +745,11 @@ fn replay(
             .into());
         }
         let version = u16::from_le_bytes(read_array::<2>(header, 8));
-        if version != INT64_WAL_VERSION {
+        if !matches!(version, INT64_WAL_VERSION | NULLABLE_INT64_WAL_VERSION) {
             return Err(Int64WriteAheadLogCorruption::UnsupportedVersion {
                 offset: offset as u64,
                 found: version,
-                supported: INT64_WAL_VERSION,
+                supported: NULLABLE_INT64_WAL_VERSION,
             }
             .into());
         }
@@ -735,6 +771,16 @@ fn replay(
                 found: sequence,
             }
             .into());
+        }
+        if let Some(expected) = wal_version {
+            if version != expected {
+                return Err(Int64WriteAheadLogCorruption::VersionChanged {
+                    sequence,
+                    expected,
+                    found: version,
+                }
+                .into());
+            }
         }
         if payload_len_u64 > limits.max_record_bytes as u64 {
             return Err(Int64WriteAheadLogLimitError::RecordBytes {
@@ -828,11 +874,12 @@ fn replay(
                         Int64WriteAheadLogCorruption::UnexpectedBootstrap { sequence }.into(),
                     );
                 }
-                bootstrap = Some(decode_bootstrap(payload, sequence)?);
+                bootstrap = Some(decode_bootstrap(payload, sequence, version)?);
+                wal_version = Some(version);
             }
-            APPEND_KIND => apply_append(bootstrap.as_mut(), payload, sequence)?,
+            APPEND_KIND => apply_append(bootstrap.as_mut(), payload, sequence, version)?,
             TRUNCATE_KIND => apply_truncate(bootstrap.as_mut(), payload, sequence)?,
-            REPLACE_KIND => apply_replace(bootstrap.as_mut(), payload, sequence)?,
+            REPLACE_KIND => apply_replace(bootstrap.as_mut(), payload, sequence, version)?,
             kind => {
                 return Err(
                     Int64WriteAheadLogCorruption::UnsupportedKind { sequence, kind }.into(),
@@ -863,7 +910,7 @@ fn authenticated_payload_len(
     let expected_checksum = u32::from_le_bytes(read_array::<4>(header, 28));
     let payload_start = offset.checked_add(INT64_WAL_FRAME_HEADER_LEN)?;
     let available = bytes.get(payload_start..)?;
-    let payload_len = encoded_payload_len(kind, available)?;
+    let payload_len = encoded_payload_len(version, kind, available, max_record_bytes)?;
     if payload_len > max_record_bytes {
         return None;
     }
@@ -880,25 +927,33 @@ fn authenticated_payload_len(
         .then_some(payload.len())
 }
 
-/// Derives the only payload size emitted by the version-1 writer for `kind`.
-/// Reads are fixed-offset and checked; the caller separately enforces the
+/// Derives the only payload size emitted by the selected version for `kind`.
+/// Reads are checked and bounded; the caller separately enforces the
 /// configured record limit before hashing the resulting payload.
-fn encoded_payload_len(kind: u8, payload_and_tail: &[u8]) -> Option<usize> {
+fn encoded_payload_len(
+    version: u16,
+    kind: u8,
+    payload_and_tail: &[u8],
+    max_record_bytes: usize,
+) -> Option<usize> {
     match kind {
-        BOOTSTRAP_KIND => encoded_bootstrap_payload_len(payload_and_tail),
-        APPEND_KIND => encoded_counted_payload_len(payload_and_tail, 8),
+        BOOTSTRAP_KIND => {
+            encoded_bootstrap_payload_len(version, payload_and_tail, max_record_bytes)
+        }
+        APPEND_KIND => encoded_values_payload_len(version, payload_and_tail, 0, max_record_bytes),
         TRUNCATE_KIND => Some(0),
-        REPLACE_KIND => encoded_counted_payload_len(payload_and_tail, 16),
+        REPLACE_KIND => {
+            encoded_replacements_payload_len(version, payload_and_tail, max_record_bytes)
+        }
         _ => None,
     }
 }
 
-fn encoded_counted_payload_len(payload_and_tail: &[u8], item_bytes: usize) -> Option<usize> {
-    let count = read_usize_at(payload_and_tail, 0)?;
-    8_usize.checked_add(count.checked_mul(item_bytes)?)
-}
-
-fn encoded_bootstrap_payload_len(payload_and_tail: &[u8]) -> Option<usize> {
+fn encoded_bootstrap_payload_len(
+    version: u16,
+    payload_and_tail: &[u8],
+    max_record_bytes: usize,
+) -> Option<usize> {
     let table_name_bytes = read_usize_at(payload_and_tail, 0)?;
     let column_length_offset = 8_usize.checked_add(table_name_bytes)?;
     let column_name_bytes = read_usize_at(payload_and_tail, column_length_offset)?;
@@ -911,9 +966,76 @@ fn encoded_bootstrap_payload_len(payload_and_tail: &[u8]) -> Option<usize> {
         .checked_add(1)?
         .checked_add(17_usize.checked_mul(8)?)?;
     let row_count = read_usize_at(payload_and_tail, row_count_offset)?;
-    row_count_offset
-        .checked_add(8)?
-        .checked_add(row_count.checked_mul(8)?)
+    encoded_values_len_from_count(
+        version,
+        payload_and_tail,
+        row_count_offset.checked_add(8)?,
+        row_count,
+        max_record_bytes,
+    )
+}
+
+fn encoded_values_payload_len(
+    version: u16,
+    payload_and_tail: &[u8],
+    prefix_bytes: usize,
+    max_record_bytes: usize,
+) -> Option<usize> {
+    let count_offset = prefix_bytes;
+    let count = read_usize_at(payload_and_tail, count_offset)?;
+    encoded_values_len_from_count(
+        version,
+        payload_and_tail,
+        count_offset.checked_add(8)?,
+        count,
+        max_record_bytes,
+    )
+}
+
+fn encoded_values_len_from_count(
+    version: u16,
+    payload_and_tail: &[u8],
+    mut offset: usize,
+    count: usize,
+    max_record_bytes: usize,
+) -> Option<usize> {
+    if version == INT64_WAL_VERSION {
+        return offset.checked_add(count.checked_mul(8)?);
+    }
+    for _ in 0..count {
+        if offset >= max_record_bytes {
+            return None;
+        }
+        let tag = *payload_and_tail.get(offset)?;
+        offset = offset.checked_add(1)?;
+        match tag {
+            NULL_TAG => {}
+            VALUE_TAG => offset = offset.checked_add(8)?,
+            _ => return None,
+        }
+        if offset > max_record_bytes || offset > payload_and_tail.len() {
+            return None;
+        }
+    }
+    Some(offset)
+}
+
+fn encoded_replacements_payload_len(
+    version: u16,
+    payload_and_tail: &[u8],
+    max_record_bytes: usize,
+) -> Option<usize> {
+    let count = read_usize_at(payload_and_tail, 0)?;
+    if version == INT64_WAL_VERSION {
+        return 8_usize.checked_add(count.checked_mul(16)?);
+    }
+    let mut offset = 8_usize;
+    for _ in 0..count {
+        offset = offset.checked_add(8)?;
+        offset =
+            encoded_values_len_from_count(version, payload_and_tail, offset, 1, max_record_bytes)?;
+    }
+    Some(offset)
 }
 
 fn read_usize_at(input: &[u8], offset: usize) -> Option<usize> {
@@ -971,14 +1093,15 @@ fn validate_record_limits(
 }
 
 fn encode_record_parts(
+    version: u16,
     kind: u8,
     sequence: u64,
     payload: &[u8],
 ) -> (Vec<u8>, [u8; INT64_WAL_COMMIT_LEN]) {
-    let checksum = record_checksum(INT64_WAL_VERSION, kind, 0, sequence, payload);
+    let checksum = record_checksum(version, kind, 0, sequence, payload);
     let mut body = Vec::with_capacity(INT64_WAL_FRAME_HEADER_LEN + payload.len());
     body.extend_from_slice(&INT64_WAL_MAGIC);
-    body.extend_from_slice(&INT64_WAL_VERSION.to_le_bytes());
+    body.extend_from_slice(&version.to_le_bytes());
     body.push(kind);
     body.push(0);
     body.extend_from_slice(&sequence.to_le_bytes());
@@ -1016,13 +1139,14 @@ fn encode_bootstrap(bootstrap: &Int64WalBootstrap) -> Vec<u8> {
     let capacity = bootstrap_payload_len(
         bootstrap.table_name.len(),
         bootstrap.column_name.len(),
-        bootstrap.values.len(),
+        bootstrap.nullable,
+        &bootstrap.values,
     )
     .expect("validated WAL bootstrap size must be representable");
     let mut payload = Vec::with_capacity(capacity);
     push_bytes(&mut payload, bootstrap.table_name.as_bytes());
     push_bytes(&mut payload, bootstrap.column_name.as_bytes());
-    payload.push(0); // Batch physical Int64 storage is NOT NULL.
+    payload.push(u8::from(bootstrap.nullable));
     for value in bootstrap.table_limits {
         push_usize(&mut payload, value);
     }
@@ -1034,19 +1158,38 @@ fn encode_bootstrap(bootstrap: &Int64WalBootstrap) -> Vec<u8> {
     }
     push_usize(&mut payload, bootstrap.worker_cap);
     push_usize(&mut payload, bootstrap.values.len());
-    for value in &bootstrap.values {
-        payload.extend_from_slice(&value.to_le_bytes());
-    }
+    encode_values(
+        &mut payload,
+        wal_version(bootstrap.nullable),
+        &bootstrap.values,
+    );
     payload
 }
 
 fn bootstrap_payload_len(
     table_name_bytes: usize,
     column_name_bytes: usize,
+    nullable: bool,
+    values: &[Option<i64>],
+) -> Option<usize> {
+    bootstrap_payload_len_from_counts(
+        table_name_bytes,
+        column_name_bytes,
+        nullable,
+        values.len(),
+        values.iter().filter(|value| value.is_some()).count(),
+    )
+}
+
+fn bootstrap_payload_len_from_counts(
+    table_name_bytes: usize,
+    column_name_bytes: usize,
+    nullable: bool,
     rows: usize,
+    present_values: usize,
 ) -> Option<usize> {
     // Two string lengths, nullability, six table-limit fields, ten query-limit
-    // fields, worker cap, row count, then one i64 per row.
+    // fields, worker cap, row count, then versioned row values.
     let fixed = 2_usize
         .checked_mul(8)?
         .checked_add(1)?
@@ -1056,20 +1199,94 @@ fn bootstrap_payload_len(
     fixed
         .checked_add(table_name_bytes)?
         .checked_add(column_name_bytes)?
-        .checked_add(rows.checked_mul(8)?)
+        .checked_add(if nullable {
+            rows.checked_add(present_values.checked_mul(8)?)?
+        } else {
+            rows.checked_mul(8)?
+        })
+}
+
+const fn wal_version(nullable: bool) -> u16 {
+    if nullable {
+        NULLABLE_INT64_WAL_VERSION
+    } else {
+        INT64_WAL_VERSION
+    }
+}
+
+fn encoded_values_bytes(version: u16, values: &[Option<i64>]) -> Option<usize> {
+    if version == INT64_WAL_VERSION {
+        if values.iter().any(Option::is_none) {
+            return None;
+        }
+        return values.len().checked_mul(8);
+    }
+    values.iter().try_fold(0_usize, |bytes, value| {
+        bytes.checked_add(if value.is_some() { 9 } else { 1 })
+    })
+}
+
+fn counted_values_payload_len(version: u16, values: &[Option<i64>]) -> Option<usize> {
+    8_usize.checked_add(encoded_values_bytes(version, values)?)
+}
+
+fn replacements_payload_len(version: u16, replacements: &[(usize, Option<i64>)]) -> Option<usize> {
+    if version == INT64_WAL_VERSION && replacements.iter().any(|(_, value)| value.is_none()) {
+        return None;
+    }
+    replacements.iter().try_fold(8_usize, |bytes, (_, value)| {
+        bytes
+            .checked_add(8)?
+            .checked_add(if version == INT64_WAL_VERSION {
+                8
+            } else if value.is_some() {
+                9
+            } else {
+                1
+            })
+    })
+}
+
+fn encode_values(output: &mut Vec<u8>, version: u16, values: &[Option<i64>]) {
+    for value in values {
+        encode_value(output, version, *value);
+    }
+}
+
+fn encode_value(output: &mut Vec<u8>, version: u16, value: Option<i64>) {
+    if version == INT64_WAL_VERSION {
+        output.extend_from_slice(
+            &value
+                .expect("version 1 is emitted only for non-nullable tables")
+                .to_le_bytes(),
+        );
+        return;
+    }
+    match value {
+        None => output.push(NULL_TAG),
+        Some(value) => {
+            output.push(VALUE_TAG);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+    }
 }
 
 fn decode_bootstrap(
     payload: &[u8],
     sequence: u64,
+    version: u16,
 ) -> Result<Int64WalBootstrap, Int64WriteAheadLogError> {
     let mut reader = PayloadReader::new(payload, sequence);
     let table_name = reader.string("table name")?;
     let column_name = reader.string("column name")?;
     let nullability = reader.byte("nullability")?;
-    if nullability != 0 {
-        return Err(reader.malformed("nullability").into());
-    }
+    let nullable = match (version, nullability) {
+        (INT64_WAL_VERSION, 0) => false,
+        (NULLABLE_INT64_WAL_VERSION, 1) => true,
+        _ => {
+            return Err(reader.malformed("nullability").into());
+        }
+    };
     let table_limits = [
         reader.usize("table row cap")?,
         reader.usize("table column cap")?,
@@ -1090,15 +1307,10 @@ fn decode_bootstrap(
     }
     let row_count = reader.usize("row count")?;
     validate_bootstrap_caps(&reader, table_limits, database_table_limits, row_count)?;
-    let required_value_bytes = row_count
-        .checked_mul(8)
-        .ok_or_else(|| reader.malformed("row count"))?;
-    if reader.remaining() != required_value_bytes {
-        return Err(reader.malformed("row values").into());
-    }
+    validate_value_payload_size(&reader, version, row_count, "row values")?;
     let mut values = Vec::with_capacity(row_count);
     for _ in 0..row_count {
-        values.push(reader.i64("row value")?);
+        values.push(reader.nullable_i64(version, "row value")?);
     }
     reader.finish()?;
     Ok(Int64WalBootstrap {
@@ -1108,6 +1320,7 @@ fn decode_bootstrap(
         database_table_limits,
         query_limits,
         worker_cap,
+        nullable,
         values,
     })
 }
@@ -1134,16 +1347,12 @@ fn apply_append(
     bootstrap: Option<&mut Int64WalBootstrap>,
     payload: &[u8],
     sequence: u64,
+    version: u16,
 ) -> Result<(), Int64WriteAheadLogError> {
     let bootstrap = bootstrap.ok_or(Int64WriteAheadLogCorruption::MissingBootstrap)?;
     let mut reader = PayloadReader::new(payload, sequence);
     let count = reader.usize("append row count")?;
-    let value_bytes = count
-        .checked_mul(8)
-        .ok_or_else(|| reader.malformed("append row count"))?;
-    if reader.remaining() != value_bytes {
-        return Err(reader.malformed("append values").into());
-    }
+    validate_value_payload_size(&reader, version, count, "append values")?;
     let new_rows = bootstrap
         .values
         .len()
@@ -1154,7 +1363,9 @@ fn apply_append(
     }
     bootstrap.values.reserve(count);
     for _ in 0..count {
-        bootstrap.values.push(reader.i64("append value")?);
+        bootstrap
+            .values
+            .push(reader.nullable_i64(version, "append value")?);
     }
     reader.finish()
 }
@@ -1180,21 +1391,25 @@ fn apply_replace(
     bootstrap: Option<&mut Int64WalBootstrap>,
     payload: &[u8],
     sequence: u64,
+    version: u16,
 ) -> Result<(), Int64WriteAheadLogError> {
     let bootstrap = bootstrap.ok_or(Int64WriteAheadLogCorruption::MissingBootstrap)?;
     let mut reader = PayloadReader::new(payload, sequence);
     let count = reader.usize("replacement count")?;
-    let replacement_bytes = count
-        .checked_mul(16)
+    let minimum = count
+        .checked_mul(if version == INT64_WAL_VERSION { 16 } else { 9 })
         .ok_or_else(|| reader.malformed("replacement count"))?;
-    if reader.remaining() != replacement_bytes {
+    let maximum = count
+        .checked_mul(if version == INT64_WAL_VERSION { 16 } else { 17 })
+        .ok_or_else(|| reader.malformed("replacement count"))?;
+    if reader.remaining() < minimum || reader.remaining() > maximum {
         return Err(reader.malformed("replacement values").into());
     }
     let mut replacements = Vec::with_capacity(count);
     let mut previous = None;
     for _ in 0..count {
         let row = reader.usize("replacement row")?;
-        let value = reader.i64("replacement value")?;
+        let value = reader.nullable_i64(version, "replacement value")?;
         if row >= bootstrap.values.len() || previous.is_some_and(|previous| row <= previous) {
             return Err(reader.malformed("replacement row selection").into());
         }
@@ -1204,6 +1419,24 @@ fn apply_replace(
     reader.finish()?;
     for (row, value) in replacements {
         bootstrap.values[row] = value;
+    }
+    Ok(())
+}
+
+fn validate_value_payload_size(
+    reader: &PayloadReader<'_>,
+    version: u16,
+    count: usize,
+    field: &'static str,
+) -> Result<(), Int64WriteAheadLogError> {
+    let minimum = count
+        .checked_mul(if version == INT64_WAL_VERSION { 8 } else { 1 })
+        .ok_or_else(|| reader.malformed(field))?;
+    let maximum = count
+        .checked_mul(if version == INT64_WAL_VERSION { 8 } else { 9 })
+        .ok_or_else(|| reader.malformed(field))?;
+    if reader.remaining() < minimum || reader.remaining() > maximum {
+        return Err(reader.malformed(field).into());
     }
     Ok(())
 }
@@ -1286,6 +1519,21 @@ impl<'a> PayloadReader<'a> {
         Ok(i64::from_le_bytes(
             bytes.try_into().expect("the slice length is eight"),
         ))
+    }
+
+    fn nullable_i64(
+        &mut self,
+        version: u16,
+        field: &'static str,
+    ) -> Result<Option<i64>, Int64WriteAheadLogCorruption> {
+        if version == INT64_WAL_VERSION {
+            return self.i64(field).map(Some);
+        }
+        match self.byte(field)? {
+            NULL_TAG => Ok(None),
+            VALUE_TAG => self.i64(field).map(Some),
+            _ => Err(self.malformed(field)),
+        }
     }
 
     fn string(&mut self, field: &'static str) -> Result<String, Int64WriteAheadLogCorruption> {
@@ -1451,10 +1699,11 @@ mod tests {
             database_table_limits: [1, 1, 1],
             query_limits: [1; QUERY_LIMIT_FIELD_COUNT],
             worker_cap: 1,
+            nullable: false,
             values: vec![],
         };
         let payload = encode_bootstrap(&bootstrap);
-        let (body, footer) = encode_record_parts(BOOTSTRAP_KIND, 0, &payload);
+        let (body, footer) = encode_record_parts(INT64_WAL_VERSION, BOOTSTRAP_KIND, 0, &payload);
         let destination = CString::new("events.wal").unwrap();
         let file = create_committed_wal_file(&directory, &destination, &body, &footer).unwrap();
         drop(file);
