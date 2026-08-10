@@ -438,7 +438,8 @@ pub enum DatabaseSnapshotRestoreError {
     Snapshot(Int64TablePayloadFileRestoreError),
     /// Both the primary and explicit backup snapshots failed bounded restore.
     Recovery(Int64TablePayloadFileRecoveryError),
-    /// Batch tables do not currently support nullable physical columns.
+    /// This snapshot restore adapter currently accepts only non-nullable
+    /// `Int64` columns.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
     /// limits were rejected by batch storage.
@@ -452,7 +453,8 @@ pub enum DatabaseRleSnapshotRestoreError {
     /// Opening or decoding the bounded RLE snapshot failed, or its rows did
     /// not satisfy the caller-supplied schema and row cap.
     Snapshot(Int64TableRleFileRestoreError),
-    /// Batch tables do not currently support nullable physical columns.
+    /// This RLE snapshot import adapter currently accepts only non-nullable
+    /// `Int64` columns.
     NullableColumn { column: String },
     /// The caller name, schema, duplicate name, or configured table limits
     /// were rejected by batch storage.
@@ -650,8 +652,8 @@ pub enum DatabaseSnapshotSaveError {
         /// The physical type found in the batch table.
         data_type: DataType,
     },
-    /// The selected column is logically `Int64` but has nullable physical
-    /// storage, which the legacy snapshot payload cannot represent.
+    /// The selected column is nullable, which this batch snapshot-save
+    /// adapter does not currently accept.
     NullableColumn {
         /// The stored display name of the nullable column.
         column: String,
@@ -690,10 +692,30 @@ pub enum DatabaseInt64WalRecoveryError {
 #[cfg(unix)]
 #[derive(Debug)]
 pub enum DatabaseInt64WalRegistryEnableError {
+    /// This database already has a single-table WAL or registry attached.
     AlreadyEnabled,
-    Table { table: String, error: Error },
-    UnsupportedColumnCount { table: String, column_count: usize },
-    UnsupportedColumnType { column: String, data_type: DataType },
+    /// Resolving or validating one requested table failed.
+    Table {
+        /// Caller-supplied or stored table name associated with the failure.
+        table: String,
+        /// Typed table lookup or validation failure.
+        error: Error,
+    },
+    /// One requested table does not have exactly one physical column.
+    UnsupportedColumnCount {
+        /// Stored display name of the unsupported table.
+        table: String,
+        /// Number of physical columns in the table.
+        column_count: usize,
+    },
+    /// A requested table's only physical column is not `Int64`.
+    UnsupportedColumnType {
+        /// Stored display name of the unsupported column.
+        column: String,
+        /// Physical type found in the batch table.
+        data_type: DataType,
+    },
+    /// Creating, bounding, encoding, or synchronizing the registry failed.
     Registry(Int64WriteAheadLogRegistryError),
 }
 
@@ -701,8 +723,15 @@ pub enum DatabaseInt64WalRegistryEnableError {
 #[cfg(unix)]
 #[derive(Debug)]
 pub enum DatabaseInt64WalRegistryRecoveryError {
+    /// Opening, bounding, validating, or replaying the registry failed.
     Registry(Int64WriteAheadLogRegistryError),
-    Table { table: String, error: Error },
+    /// A replayed member could not be converted into a valid batch table.
+    Table {
+        /// Registry table name or member index associated with the failure.
+        table: String,
+        /// Typed table construction or registration failure.
+        error: Error,
+    },
 }
 
 #[cfg(unix)]
@@ -1846,10 +1875,11 @@ impl Database {
     /// retained for subsequent inserts.
     ///
     /// The current snapshot format contains exactly one table with one `Int64`
-    /// column. Nullable snapshots are rejected because batch storage does not
-    /// currently represent nullable physical columns. Corruption, invalid
-    /// identifiers, duplicate table names, nullability, and every resource
-    /// limit are checked before the catalog or cached metrics are changed.
+    /// column. This adapter currently imports only non-nullable snapshots even
+    /// though batch storage also represents nullable `Int64` columns.
+    /// Corruption, invalid identifiers, duplicate table names, nullability,
+    /// and every resource limit are checked before the catalog or cached
+    /// metrics are changed.
     pub fn restore_int64_table_from_file(
         &mut self,
         table_name: &str,
