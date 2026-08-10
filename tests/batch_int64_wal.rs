@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use rusthouse::batch::csv::{CsvIngestError, CsvIngestLimits};
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::storage::Column;
@@ -232,6 +233,41 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
 }
 
 #[test]
+fn nullable_csv_appends_recover_from_wal_for_named_and_headerless_inputs() {
+    let directory = TestDirectory::new();
+    let path = directory.join("nullable-csv.wal");
+    let limits = Int64WriteAheadLogLimits::default();
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (Measurement Nullable(Int64));")
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("Readings", &path, limits)
+        .unwrap();
+
+    let named = b"Measurement\n-9223372036854775808\nNULL\n";
+    assert_eq!(
+        database.ingest_csv_with_names("readings", named, CsvIngestLimits::new(named.len(), 2, 2),),
+        Ok(2),
+    );
+    let headerless = b"9223372036854775807\nNULL\n";
+    assert_eq!(
+        database.ingest_csv(
+            "READINGS",
+            headerless,
+            CsvIngestLimits::new(headerless.len(), 2, 2),
+        ),
+        Ok(2),
+    );
+
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert_eq!(
+        nullable_int64_values(&recovered, "readings"),
+        [Some(i64::MIN), None, Some(i64::MAX), None]
+    );
+}
+
+#[test]
 fn sql_null_append_replays_for_nullable_int64_wal() {
     let directory = TestDirectory::new();
     let path = directory.join("nullable-sql.wal");
@@ -354,6 +390,35 @@ fn failed_sql_null_wal_append_is_not_published_to_nullable_storage() {
         nullable_int64_sum(&mut recovered, "READINGS"),
         Value::Null(rusthouse::batch::value::DataType::Int64)
     );
+}
+
+#[test]
+fn failed_csv_null_wal_append_is_not_published_to_nullable_storage() {
+    let directory = TestDirectory::new();
+    let path = directory.join("bounded-nullable-csv.wal");
+    let limits = Int64WriteAheadLogLimits::new(64 * 1024, 16 * 1024, 1);
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (Measurement Nullable(Int64));")
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+    let input = b"Measurement\nNULL\n";
+
+    assert!(matches!(
+        database.ingest_csv_with_names("readings", input, CsvIngestLimits::new(input.len(), 1, 1),),
+        Err(CsvIngestError::Database(Error::WriteAheadLog(
+            Int64WriteAheadLogCommitError::Limit(Int64WriteAheadLogLimitError::Records {
+                records: 2,
+                max_records: 1,
+            })
+        )))
+    ));
+    assert!(nullable_int64_values(&database, "readings").is_empty());
+
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert!(nullable_int64_values(&recovered, "readings").is_empty());
 }
 
 #[test]

@@ -8441,6 +8441,49 @@ fn authenticated_csv_insert_ingests_all_physical_types_quoting_and_is_query_visi
 }
 
 #[test]
+fn authenticated_csv_routes_ingest_nullable_int64_writer_tokens() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE readings (value Nullable(Int64));")
+        .unwrap();
+
+    let named_csv = b"value\n-9223372036854775808\nNULL\n";
+    let (named_request, _) = request_with_authorization_for_target(
+        "/insert/readings",
+        named_csv,
+        "Authorization: Bearer correct-token\r\n",
+    );
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &named_request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+
+    let headerless_csv = b"9223372036854775807\nNULL\n";
+    let headerless_request = request_for_target_with_headers(
+        "/?query=INSERT+INTO+readings+FORMAT+CSV",
+        headerless_csv,
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    assert_response_with_content_type(
+        &clickhouse_key_exchange(&database, "correct-key", &headerless_request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT value FROM readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[-9223372036854775808],[null],[9223372036854775807],[null]]}"#,
+    );
+}
+
+#[test]
 fn authenticated_headerless_csv_insert_ingests_all_physical_types_in_schema_order() {
     let database = SharedDatabase::default();
     database

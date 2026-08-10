@@ -1281,6 +1281,11 @@ complete-input byte, logical-row, and total-value limits, and the table's row
 and cell limits are checked before the one append. Exact lowercase Boolean
 tokens, finite floats, LF and CRLF record endings, quoted commas and multiline
 fields, and doubled quote escapes follow the same rules as `CSVWithNames` below.
+The writer's exact unquoted `NULL` token stores SQL `NULL` only when its target
+is a physical `Nullable(Int64)` column. `NULL` in a `String` field remains the
+four-character string, and quoted `"NULL"`, differently cased tokens, surrounding
+whitespace, and `NULL` for non-nullable numeric fields follow ordinary typed
+parsing and are rejected when they are not valid values.
 Every format, value, limit, or remaining-capacity failure preserves all
 existing rows.
 
@@ -1301,6 +1306,11 @@ typed defaults as an explicit-column SQL `INSERT`: `0` for `Int64`, `0.0` for
 `Int64`, finite `Float64`, `Bool`, and `String`, and callers provide
 complete-input byte, row, and total supplied-value limits. Full physical rows
 remain subject to the table's row and cell capacity limits.
+As in headerless CSV, only the exact unquoted `NULL` field maps to SQL `NULL`,
+and only for a physical `Nullable(Int64)` target. String fields preserve `NULL`
+as text, while quoted or differently spelled tokens do not acquire null
+semantics. This makes the CSV writer's unquoted nullable output directly
+ingestible without making the token special for other physical types.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. Any data field may be double-quoted so it can contain
 commas and LF or CRLF line endings, and doubled quotes inside it decode to one
