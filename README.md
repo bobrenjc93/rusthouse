@@ -14,7 +14,8 @@ The first useful release should support:
 - projections, `WHERE` comparisons, `COUNT`, `countIf`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, `LIMIT`, and narrow `OFFSET` pagination;
 - a batch/interactive CLI with readable table, CSV, TSV, JSON, JSONEachRow,
   and JSONCompactEachRow output;
-- durable local snapshots with an explicit, documented file format;
+- durable local snapshots and an opt-in crash-recoverable `Int64` WAL with
+  explicit, documented file formats;
 - an HTTP endpoint for executing SQL;
 - deterministic tests and a small benchmark that demonstrate analytical behavior.
 
@@ -1480,6 +1481,36 @@ without yet choosing catalog serialization. A self-describing payload still
 contains exactly one one-column `Int64Table`; it does not store a catalog,
 catalog table name, or multiple tables. The
 exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.md).
+
+## Int64 write-ahead logging
+
+On Unix, `Database::enable_int64_write_ahead_log` can opt one existing batch
+table with exactly one non-nullable `Int64` column into a bounded WAL. A
+synchronized bootstrap captures its display names, current rows, NULL
+restriction, table/database limits, query row and byte caps, and worker cap.
+Successful SQL/CSV/TSV appends, `TRUNCATE TABLE`, and atomic `ALTER TABLE ...
+UPDATE` replacements are framed, checksummed, committed, and synchronized
+before their in-memory mutations become visible. Each record body is synced
+before its commit footer is written and synced. Creation and parent sync both
+use one opened directory descriptor, so parent-path rebinding cannot split
+them across directories. File bytes, record payload bytes, and committed
+record count all have explicit inclusive limits; a WAL failure leaves that
+mutation unpublished.
+
+`Database::recover_int64_write_ahead_log` replays the complete committed prefix
+into a new database. It ignores only an incomplete final crash tail and returns
+typed limit or corruption errors for invalid complete records. An authenticated
+writer-valid payload boundary prevents an overlong header length in an
+intermediate or final committed record from hiding later records as a torn
+tail. Replay is staged, preserves cached metrics and persisted caps, and
+exposes no database on failure. It is read-only and idempotent. A recovered
+database can compact or resume durability by enabling a new WAL at a new path;
+the source WAL is never modified. There is currently no in-place compaction,
+rotation, multi-table logging, or nullable batch-column storage. Unsupported
+schema, delete, drop, rename, and snapshot-replacement operations are rejected
+while the selected table is attached. The exact format, crash boundary, Unix
+file/parent sync ordering, and lifecycle limits are documented in
+[docs/int64-wal-format.md](docs/int64-wal-format.md).
 
 ## CSV ingestion
 

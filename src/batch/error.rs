@@ -1,6 +1,8 @@
 use std::fmt;
 
 use super::value::DataType;
+#[cfg(unix)]
+use super::wal::{Int64WriteAheadLogCommitError, Int64WriteAheadLogError};
 
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +80,9 @@ pub enum Error {
         actual: usize,
         max: usize,
     },
+    /// A durable mutation could not be committed to the opted-in Int64 WAL.
+    #[cfg(unix)]
+    WriteAheadLog(Int64WriteAheadLogCommitError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -186,8 +191,25 @@ impl fmt::Display for Error {
                 f,
                 "{resource} requires at least {actual}, exceeding the limit of {max}"
             ),
+            #[cfg(unix)]
+            Self::WriteAheadLog(error) => write!(f, "could not commit Int64 WAL record: {error}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(unix)]
+            Self::WriteAheadLog(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<Int64WriteAheadLogError> for Error {
+    fn from(error: Int64WriteAheadLogError) -> Self {
+        Self::WriteAheadLog(error.into())
+    }
+}
