@@ -6283,7 +6283,7 @@ fn execute_grouped<'a>(
         )
         && aggregate_specs
             .first()
-            .is_some_and(|spec| aggregate_argument_is_non_nullable_int64(table, spec));
+            .is_some_and(|spec| aggregate_argument_is_physical_int64(table, spec));
     let sole_global_avg_int = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -6859,15 +6859,13 @@ fn global_int64_sum_partial(
             spec.function,
             sum_int64_chunk,
         ),
-        Column::NullableInt64(values) if spec.function == AggregateFunction::Avg => {
-            reduce_global_int64_sum(
-                values,
-                matching_rows,
-                parallelism,
-                spec.function,
-                avg_nullable_int64_chunk,
-            )
-        }
+        Column::NullableInt64(values) => reduce_global_int64_sum(
+            values,
+            matching_rows,
+            parallelism,
+            spec.function,
+            nullable_int64_chunk,
+        ),
         _ => unreachable!("SUM or AVG input type and physical nullability are resolved"),
     }
 }
@@ -6989,12 +6987,15 @@ fn sum_int64_chunk(
         })
 }
 
-fn avg_nullable_int64_chunk(
+fn nullable_int64_chunk(
     values: &[Option<i64>],
     matching_rows: &[usize],
     function: AggregateFunction,
 ) -> Result<SumIntPartial> {
-    debug_assert_eq!(function, AggregateFunction::Avg);
+    debug_assert!(matches!(
+        function,
+        AggregateFunction::Sum | AggregateFunction::Avg
+    ));
     matching_rows
         .iter()
         .try_fold(SumIntPartial::default(), |partial, row| {
@@ -9788,19 +9789,33 @@ mod tests {
     }
 
     #[test]
-    fn nullable_int64_sum_stays_on_the_sequential_aggregate_path() {
+    fn sole_nullable_int64_sum_crosses_the_parallel_threshold_and_excludes_other_shapes() {
         static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
             GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let values = (0..row_count)
-            .map(|row| (row % 2 == 0).then_some(1))
-            .collect::<Vec<_>>();
-        let expected_sum = i64::try_from(row_count.div_ceil(2)).unwrap();
+        let mut values = vec![Some(3); row_count];
+        values[row_count - 1] = None;
+        let expected_sum = i64::try_from(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD)
+            .unwrap()
+            .checked_mul(3)
+            .unwrap();
         let mut database = Database::new();
         database
             .create_nullable_int64_table("nullable_values", "value", values)
             .unwrap();
+
+        let boundary_sql = "SELECT SUM(value) FROM nullable_values WHERE value IS NOT NULL";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, boundary_sql).rows,
+            [vec![Value::Int64(expected_sum)]]
+        );
+        let above_threshold_sql = "SELECT SUM(value) FROM nullable_values";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, above_threshold_sql).rows,
+            [vec![Value::Int64(expected_sum)]]
+        );
+
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
             database.global_aggregate_worker_cap(),
             &OBSERVED_BUDGET,
@@ -9808,14 +9823,25 @@ mod tests {
 
         OBSERVED_BUDGET.reset_peak();
         assert_eq!(
-            query(&mut database, "SELECT SUM(value) FROM nullable_values").rows,
+            query(&mut database, boundary_sql).rows,
             [vec![Value::Int64(expected_sum)]]
         );
         assert_eq!(
             OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
-            "nullable SUM remains on the bounded sequential state path"
+            "matching rows at the threshold stay sequential"
         );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, above_threshold_sql).rows,
+            [vec![Value::Int64(expected_sum)]]
+        );
+        assert!(
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
+            "a sole nullable SUM above the threshold uses shared helpers"
+        );
+        assert_eq!(OBSERVED_BUDGET.helpers_in_use(), 0);
 
         OBSERVED_BUDGET.reset_peak();
         assert_eq!(
@@ -9834,6 +9860,215 @@ mod tests {
             0,
             "nullable COUNT/SUM remains on the bounded sequential state path"
         );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT value, SUM(value) AS total FROM nullable_values GROUP BY value"
+            )
+            .rows,
+            [
+                vec![Value::Null(DataType::Int64), Value::Null(DataType::Int64)],
+                vec![Value::Int64(3), Value::Int64(expected_sum)],
+            ]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET.peak_helpers_in_use(),
+            0,
+            "grouped nullable SUM remains on the bounded sequential state path"
+        );
+    }
+
+    #[test]
+    fn sole_nullable_int64_sum_forced_workers_match_null_distributions_and_clauses() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
+        let mut all_null = Database::new();
+        all_null
+            .create_nullable_int64_table("all_null", "value", vec![None; row_count])
+            .unwrap();
+        let null_result = assert_global_aggregate_worker_differential(
+            &mut all_null,
+            "SELECT SUM(value) AS total FROM all_null HAVING total IS NULL \
+             ORDER BY total LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(null_result.rows, [vec![Value::Null(DataType::Int64)]]);
+
+        let mut values = vec![None; row_count];
+        values[0] = Some(i64::MIN);
+        values[row_count / 3] = Some(4);
+        values[row_count - 1] = Some(i64::MAX);
+        let mut sparse = Database::new();
+        sparse
+            .create_nullable_int64_table("sparse", "value", values)
+            .unwrap();
+        let mixed_result = assert_global_aggregate_worker_differential(
+            &mut sparse,
+            "SELECT SUM(value) AS total FROM sparse WHERE value IS NULL OR value IS NOT NULL \
+             HAVING total = 3 ORDER BY total DESC LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(mixed_result.rows, [vec![Value::Int64(3)]]);
+    }
+
+    #[test]
+    fn sole_nullable_int64_sum_exhausted_admission_falls_back_completely() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let values = (0..row_count)
+            .map(|row| (row % 5 != 0).then_some(9))
+            .collect::<Vec<_>>();
+        let expected_sum = values.iter().flatten().copied().sum::<i64>();
+        let mut database = Database::new();
+        database
+            .create_nullable_int64_table("nullable_values", "value", values)
+            .unwrap();
+        let sql = &format!(
+            "SELECT SUM(value) AS total FROM nullable_values \
+             HAVING total = {expected_sum} ORDER BY total LIMIT 1"
+        );
+        let sequential = force_global_aggregate_workers(&mut database, 1, sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database.global_aggregate_worker_cap(), &BUDGET);
+
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts aggregate helper admission");
+        let exhausted = query(&mut database, sql);
+        assert_eq!(
+            exhausted, sequential,
+            "exhausted admission repeats the complete computation locally"
+        );
+        assert_eq!(exhausted.rows, [vec![Value::Int64(expected_sum)]]);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+    }
+
+    #[test]
+    fn sole_nullable_int64_sum_worker_failure_repeats_the_complete_input_locally() {
+        let values = [Some(1), None, Some(17)];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_global_int64_sum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            AggregateFunction::Sum,
+            nullable_int64_chunk,
+        )
+        .expect("deterministic parallel nullable SUM succeeds");
+        let partial = reduce_global_int64_sum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            AggregateFunction::Sum,
+            |values, rows, function| {
+                if std::thread::current().name() == Some("rusthouse-sum-int64-1") {
+                    panic!("injected nullable SUM worker failure");
+                }
+                nullable_int64_chunk(values, rows, function)
+            },
+        )
+        .expect("worker failure falls back to a complete local nullable SUM");
+
+        assert_eq!(partial, successful_parallel);
+        assert_eq!(partial.count, u64::try_from(row_count - 1).unwrap());
+        assert_eq!(
+            partial.sum,
+            i128::try_from(row_count).unwrap().saturating_sub(2) + 17
+        );
+    }
+
+    #[test]
+    fn sole_nullable_int64_sum_forced_workers_preserve_resource_limits() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let fixed_bytes =
+            std::mem::size_of::<AggregateState>() + std::mem::size_of::<Vec<AggregateState>>();
+        let exact_limits = QueryResultLimits {
+            max_scan_rows: row_count,
+            max_rows: 1,
+            max_values: 1,
+            max_groups: 1,
+            max_aggregate_state_cells: 1,
+            max_aggregate_state_bytes: fixed_bytes,
+            ..QueryResultLimits::default()
+        };
+        let mut database = Database::with_query_result_limits(exact_limits);
+        database
+            .create_nullable_int64_table(
+                "nullable_values",
+                "value",
+                (0..row_count)
+                    .map(|row| (row % 2 == 0).then_some(5))
+                    .collect(),
+            )
+            .unwrap();
+        let expected_sum = i64::try_from(row_count.div_ceil(2))
+            .unwrap()
+            .checked_mul(5)
+            .unwrap();
+
+        let sequential = force_global_aggregate_workers(
+            &mut database,
+            1,
+            "SELECT SUM(value) FROM nullable_values",
+        );
+        let parallel = force_global_aggregate_workers(
+            &mut database,
+            4,
+            "SELECT SUM(value) FROM nullable_values",
+        );
+        assert_eq!(parallel, sequential);
+        assert_eq!(parallel.rows, [vec![Value::Int64(expected_sum)]]);
+
+        for (limits, expected) in [
+            (
+                QueryResultLimits {
+                    max_scan_rows: row_count - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT scanned rows",
+                    actual: row_count,
+                    max: row_count - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_aggregate_state_bytes: fixed_bytes - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state bytes",
+                    actual: fixed_bytes,
+                    max: fixed_bytes - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_rows: 0,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result rows",
+                    actual: 1,
+                    max: 0,
+                },
+            ),
+        ] {
+            database.query_result_limits = limits;
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+            let sequential = database.execute("SELECT SUM(value) FROM nullable_values");
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
+            let parallel = database.execute("SELECT SUM(value) FROM nullable_values");
+            assert_eq!(parallel, sequential);
+            assert_eq!(parallel, Err(expected));
+        }
     }
 
     #[test]
@@ -9982,7 +10217,7 @@ mod tests {
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
             AggregateFunction::Avg,
-            avg_nullable_int64_chunk,
+            nullable_int64_chunk,
         )
         .expect("deterministic parallel nullable AVG succeeds");
         let partial = reduce_global_int64_sum(
@@ -9994,7 +10229,7 @@ mod tests {
                 if std::thread::current().name() == Some("rusthouse-avg-int64-1") {
                     panic!("injected nullable AVG worker failure");
                 }
-                avg_nullable_int64_chunk(values, rows, function)
+                nullable_int64_chunk(values, rows, function)
             },
         )
         .expect("worker failure falls back to a complete local nullable AVG");

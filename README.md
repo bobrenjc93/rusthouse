@@ -68,7 +68,8 @@ unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` and
 non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
 global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
-Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `MIN(Int64)`,
+Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `SUM(Nullable(Int64))`,
+`MIN(Int64)`,
 `MIN(Float64)`, `MAX(Int64)`, `MAX(Float64)`, `AVG(Int64)`, or
 `AVG(Nullable(Int64))`, and an exact
 two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
@@ -84,8 +85,9 @@ checked conversion of the filtered cardinality while the existing checked
 sum-and-count lanes target about 131,072 rows each. Release-mode crossover
 measurements kept smaller inputs sequential. Int64 scalar and paired shapes
 require a physically non-nullable argument except for the sole
-`AVG(Nullable(Int64))` shape. Its partitions ignore absent values and reduce
-checked i128 sum and present-count partials in chunk order.
+`SUM(Nullable(Int64))` and `AVG(Nullable(Int64))` shapes. Their partitions
+ignore absent values and reduce checked i128 sum and present-count partials in
+chunk order.
 Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
@@ -110,9 +112,9 @@ than one grouping column, non-Bool keys, or multiple aggregates), and
 multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
 row-count/`MAX(Float64)` pairs (including
-`COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema,
-`AVG(Float64)`, `SUM(Nullable(Int64))`, paired or grouped nullable AVG, and
-other aggregate functions remain sequential.
+`COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema, `AVG(Float64)`,
+paired or grouped nullable SUM or AVG, and other aggregate functions remain
+sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
@@ -134,11 +136,12 @@ semantics for both `Int64` storage forms.
 arguments. `SUM`, `MIN`, `MAX`, and `AVG` ignore absent values. `SUM`, `MIN`,
 and `MAX` return typed `Int64` `NULL` for empty or all-`NULL` inputs, while
 `AVG` returns typed `Float64` `NULL`; `COUNT(column)` counts only present
-values. A sole ungrouped nullable integer `AVG` uses deterministic parallel
-chunks above the global threshold; each chunk and the ordered reduction use a
-checked `i128` sum and checked present-value count before producing `Float64`.
-At or below the threshold, without worker admission, or after a worker failure,
-the complete checked computation runs sequentially.
+values. Sole ungrouped nullable integer `SUM` and `AVG` use deterministic
+parallel chunks above the global threshold; each chunk and the ordered reduction
+use a checked `i128` sum and checked present-value count before producing the
+typed result. At or below the threshold, without worker admission, or after a
+worker failure, the complete checked computation runs sequentially. Grouped and
+paired nullable shapes remain sequential.
 These nullable shapes compose with filters, grouping, HAVING, ordering,
 pagination, and other supported aggregate projections. Other operations retain
 their documented nullable restrictions.
