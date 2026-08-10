@@ -75,6 +75,65 @@ fn headerless_csv_ingests_all_types_in_schema_order_with_existing_csv_quoting() 
 }
 
 #[test]
+fn headerless_null_token_is_physical_nullable_only_and_strings_retain_it() {
+    let mut nullable = Database::new();
+    nullable
+        .execute("CREATE TABLE readings (value Nullable(Int64));")
+        .unwrap();
+    let nullable_input = b"-9223372036854775808\nNULL\n9223372036854775807\n";
+    assert_eq!(
+        nullable.ingest_csv(
+            "readings",
+            nullable_input,
+            CsvIngestLimits::new(nullable_input.len(), 3, 3),
+        ),
+        Ok(3),
+    );
+    assert_eq!(
+        query(&mut nullable, "SELECT value FROM readings;").rows,
+        [
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+
+    let mut required = Database::new();
+    required
+        .execute("CREATE TABLE required (value Int64);")
+        .unwrap();
+    assert_eq!(
+        required.ingest_csv("required", b"NULL\n", CsvIngestLimits::new(5, 1, 1)),
+        Err(CsvIngestError::InvalidValue {
+            line: 1,
+            column: 1,
+            expected: DataType::Int64,
+        }),
+    );
+
+    let mut strings = Database::new();
+    strings
+        .execute("CREATE TABLE strings (value String);")
+        .unwrap();
+    let string_input = b"NULL\n\"NULL\"\n";
+    assert_eq!(
+        strings.ingest_csv(
+            "strings",
+            string_input,
+            CsvIngestLimits::new(string_input.len(), 2, 2),
+        ),
+        Ok(2),
+    );
+    assert_eq!(
+        query(&mut strings, "SELECT value FROM strings;").rows,
+        [
+            vec![Value::String("NULL".to_owned())],
+            vec![Value::String("NULL".to_owned())],
+        ]
+    );
+}
+
+#[test]
 fn exact_input_and_remaining_table_limits_succeed_and_empty_input_is_a_no_op() {
     let mut database = database_with_limits(TableLimits::new(3, 4, 12));
     database

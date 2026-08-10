@@ -1,7 +1,8 @@
 use rusthouse::batch::csv::{CsvIngestError, CsvIngestLimits};
 use rusthouse::batch::engine::{Database, QueryResult, ResultColumn, StatementResult};
 use rusthouse::batch::error::Error;
-use rusthouse::batch::format::write_csv;
+use rusthouse::batch::format::{write_csv, write_csv_rows};
+use rusthouse::batch::storage::Column;
 use rusthouse::batch::value::{DataType, Value};
 
 const HEADER: &str = "id,score,active,label";
@@ -452,6 +453,156 @@ fn csv_export_with_multiline_strings_round_trips_into_typed_ingest() {
             "SELECT id, score, active, label FROM metrics ORDER BY id;",
         ),
         exported_result
+    );
+}
+
+#[test]
+fn nullable_int64_csv_export_round_trips_with_names_and_headerless_at_bounds() {
+    let mut source = Database::new();
+    source
+        .execute(
+            "CREATE TABLE Readings (Measurement Nullable(Int64)); \
+             INSERT INTO Readings VALUES (-9223372036854775808), (NULL), \
+             (9223372036854775807);",
+        )
+        .unwrap();
+    let exported_result = query(&mut source, "SELECT Measurement FROM Readings;");
+
+    let mut named_csv = Vec::new();
+    write_csv(&mut named_csv, &exported_result).unwrap();
+    assert_eq!(
+        named_csv,
+        b"Measurement\n-9223372036854775808\nNULL\n9223372036854775807\n"
+    );
+
+    let mut named_target = Database::new();
+    named_target
+        .execute("CREATE TABLE Readings (Measurement Nullable(Int64));")
+        .unwrap();
+    assert_eq!(
+        named_target.ingest_csv_with_names(
+            "Readings",
+            &named_csv,
+            CsvIngestLimits::new(named_csv.len(), 3, 3),
+        ),
+        Ok(3),
+    );
+    assert_eq!(
+        query(&mut named_target, "SELECT Measurement FROM Readings;"),
+        exported_result
+    );
+
+    let mut headerless_csv = Vec::new();
+    write_csv_rows(&mut headerless_csv, &exported_result).unwrap();
+    assert_eq!(
+        headerless_csv,
+        b"-9223372036854775808\nNULL\n9223372036854775807\n"
+    );
+
+    let mut headerless_target = Database::new();
+    headerless_target
+        .execute("CREATE TABLE Readings (Measurement Nullable(Int64));")
+        .unwrap();
+    assert_eq!(
+        headerless_target.ingest_csv(
+            "Readings",
+            &headerless_csv,
+            CsvIngestLimits::new(headerless_csv.len(), 3, 3),
+        ),
+        Ok(3),
+    );
+    assert_eq!(
+        query(&mut headerless_target, "SELECT Measurement FROM Readings;"),
+        exported_result
+    );
+}
+
+#[test]
+fn nullable_null_token_is_exact_unquoted_and_late_errors_are_atomic() {
+    let mut nullable = Database::new();
+    nullable
+        .execute(
+            "CREATE TABLE Readings (Measurement Nullable(Int64)); \
+             INSERT INTO Readings VALUES (9);",
+        )
+        .unwrap();
+    let late_error = b"Measurement\n1\nNULL\nnull\n";
+    assert_eq!(
+        nullable.ingest_csv_with_names(
+            "Readings",
+            late_error,
+            CsvIngestLimits::new(late_error.len(), 3, 3),
+        ),
+        Err(CsvIngestError::InvalidValue {
+            line: 4,
+            column: 1,
+            expected: DataType::Int64,
+        }),
+    );
+    let Column::NullableInt64(values) = &nullable.catalog().table("Readings").unwrap().columns()[0]
+    else {
+        panic!("expected physical Nullable(Int64) storage")
+    };
+    assert_eq!(values, &[Some(9)]);
+
+    for invalid in ["\"NULL\"", "null", "Null", " NULL", "NULL "] {
+        let mut target = Database::new();
+        target
+            .execute("CREATE TABLE Readings (Measurement Nullable(Int64));")
+            .unwrap();
+        let input = format!("Measurement\n{invalid}\n");
+        assert_eq!(
+            target.ingest_csv_with_names(
+                "Readings",
+                input.as_bytes(),
+                CsvIngestLimits::new(input.len(), 1, 1),
+            ),
+            Err(CsvIngestError::InvalidValue {
+                line: 2,
+                column: 1,
+                expected: DataType::Int64,
+            }),
+            "invalid nullable token {invalid:?}",
+        );
+    }
+
+    let mut required = Database::new();
+    required
+        .execute("CREATE TABLE required (value Int64);")
+        .unwrap();
+    let required_input = b"value\nNULL\n";
+    assert_eq!(
+        required.ingest_csv_with_names(
+            "required",
+            required_input,
+            CsvIngestLimits::new(required_input.len(), 1, 1),
+        ),
+        Err(CsvIngestError::InvalidValue {
+            line: 2,
+            column: 1,
+            expected: DataType::Int64,
+        }),
+    );
+
+    let mut strings = Database::new();
+    strings
+        .execute("CREATE TABLE strings (value String);")
+        .unwrap();
+    let string_input = b"value\nNULL\n\"NULL\"\n";
+    assert_eq!(
+        strings.ingest_csv_with_names(
+            "strings",
+            string_input,
+            CsvIngestLimits::new(string_input.len(), 2, 2),
+        ),
+        Ok(2),
+    );
+    assert_eq!(
+        query(&mut strings, "SELECT value FROM strings;").rows,
+        [
+            vec![Value::String("NULL".to_owned())],
+            vec![Value::String("NULL".to_owned())],
+        ]
     );
 }
 

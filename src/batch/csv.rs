@@ -6,7 +6,9 @@
 //! every physical schema column in order. `CSVWithNames` headers must contain a
 //! nonempty, exact-case subset of schema names without duplicates; names may
 //! appear in any order and must remain unquoted. Omitted named columns use the
-//! same typed defaults as an explicit-column SQL `INSERT`.
+//! same typed defaults as an explicit-column SQL `INSERT`. The exact unquoted
+//! token `NULL` stores SQL `NULL` only in a physical `Nullable(Int64)` column;
+//! quoted tokens and all other spellings continue through normal typed parsing.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -294,7 +296,9 @@ fn parse_data_rows(
         scan_record(record, line, |column, field, quoted| {
             let schema_index = schema_indexes[column - 1];
             let data_type = table.schema()[schema_index].data_type;
-            if quoted {
+            if !quoted && field == "NULL" && table.column_is_nullable_int64(schema_index) {
+                row.push(Value::Null(DataType::Int64));
+            } else if quoted {
                 let decoded = field.replace("\"\"", "\"");
                 if data_type == DataType::String {
                     row.push(Value::String(decoded));

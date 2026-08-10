@@ -2309,7 +2309,9 @@ impl Database {
     /// physical schema column, in schema order. Fields parse as `Int64`, finite
     /// `Float64`, `Bool`, or `String`. Double-quoted fields may contain commas,
     /// LF or CRLF line endings, and doubled (`""`) quote escapes. Only LF and
-    /// CRLF record endings are accepted. Empty input appends zero rows.
+    /// CRLF record endings are accepted. The exact unquoted token `NULL` stores
+    /// SQL `NULL` only in a physical `Nullable(Int64)` column. Empty input
+    /// appends zero rows.
     ///
     /// The complete input, every row and value, configured limits, and
     /// remaining table capacity are validated before any physical column is
@@ -2359,8 +2361,9 @@ impl Database {
     /// typed defaults as SQL `INSERT`: `0`, `0.0`, `false`, or an empty string.
     /// Data fields may be double-quoted, allowing commas, LF or CRLF line
     /// endings, and doubled (`""`) quote escapes; decoded contents use the same
-    /// type rules. Headers must remain unquoted. Only LF and CRLF line endings
-    /// are accepted.
+    /// type rules. The exact unquoted token `NULL` stores SQL `NULL` only in a
+    /// physical `Nullable(Int64)` column. Headers must remain unquoted. Only LF
+    /// and CRLF line endings are accepted.
     ///
     /// The complete input, header, every row and value, configured limits, and
     /// remaining table capacity are validated before any physical column is
