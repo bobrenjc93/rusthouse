@@ -906,7 +906,8 @@ fn serve_http_connections(
 /// standard query routes.
 ///
 /// `GET /metrics` accepts no request body and returns four unlabeled Prometheus
-/// gauges for database totals, two sparse-index pruning counters, plus
+/// gauges for database totals, the aggregate worker-cap gauge, two sparse-index
+/// pruning counters, plus
 /// `rusthouse_table_rows` and `rusthouse_table_retained_value_bytes` gauges per
 /// current table. It takes a nonblocking, consistent database metrics snapshot;
 /// lock contention and poisoning return `503`.
@@ -1617,12 +1618,14 @@ fn handle_http_query_exchange(
         HttpRequest::Metrics => {
             let metrics = match database.metrics_snapshot_with_tables(
                 |totals,
+                 global_aggregate_worker_cap,
                  index_pruning,
                  table_name_bytes,
                  row_count_bytes,
                  retained_value_byte_count_bytes| {
                     let body_bytes = prometheus_metrics_body_len(
                         totals,
+                        global_aggregate_worker_cap,
                         index_pruning,
                         table_name_bytes,
                         row_count_bytes,
@@ -3616,6 +3619,11 @@ const RETAINED_VALUE_BYTES_METRIC_PREFIX: &str = concat!(
     "# TYPE rusthouse_retained_value_bytes gauge\n",
     "rusthouse_retained_value_bytes ",
 );
+const GLOBAL_AGGREGATE_WORKER_CAP_METRIC_PREFIX: &str = concat!(
+    "# HELP rusthouse_global_aggregate_worker_cap Configured computation-lane cap for supported aggregate queries.\n",
+    "# TYPE rusthouse_global_aggregate_worker_cap gauge\n",
+    "rusthouse_global_aggregate_worker_cap ",
+);
 const INDEX_SCANNED_BLOCKS_METRIC_PREFIX: &str = concat!(
     "# HELP rusthouse_index_scanned_blocks Sparse-index blocks selected for exact evaluation by indexed query attempts.\n",
     "# TYPE rusthouse_index_scanned_blocks counter\n",
@@ -3641,6 +3649,7 @@ const TABLE_RETAINED_VALUE_BYTES_METRIC_PREFIX: &str =
 
 fn prometheus_metrics_body_len(
     totals: crate::DatabaseMetrics,
+    global_aggregate_worker_cap: NonZeroUsize,
     index_pruning: crate::IndexPruningMetrics,
     table_name_bytes: usize,
     row_count_bytes: usize,
@@ -3651,15 +3660,17 @@ fn prometheus_metrics_body_len(
         .saturating_add(COLUMNS_METRIC_PREFIX.len())
         .saturating_add(RETAINED_ROWS_METRIC_PREFIX.len())
         .saturating_add(RETAINED_VALUE_BYTES_METRIC_PREFIX.len())
+        .saturating_add(GLOBAL_AGGREGATE_WORKER_CAP_METRIC_PREFIX.len())
         .saturating_add(INDEX_SCANNED_BLOCKS_METRIC_PREFIX.len())
         .saturating_add(INDEX_PRUNED_BLOCKS_METRIC_PREFIX.len())
         .saturating_add(TABLE_ROWS_METRIC_HEADER.len())
         .saturating_add(TABLE_RETAINED_VALUE_BYTES_METRIC_HEADER.len())
-        .saturating_add(6)
+        .saturating_add(7)
         .saturating_add(usize_decimal_len(totals.table_count))
         .saturating_add(usize_decimal_len(totals.column_count))
         .saturating_add(usize_decimal_len(totals.retained_row_count))
         .saturating_add(usize_decimal_len(totals.retained_value_bytes))
+        .saturating_add(usize_decimal_len(global_aggregate_worker_cap.get()))
         .saturating_add(usize_decimal_len(index_pruning.scanned_blocks))
         .saturating_add(usize_decimal_len(index_pruning.pruned_blocks));
     let per_table_fixed_bytes = TABLE_ROW_METRIC_PREFIX
@@ -3682,6 +3693,7 @@ fn write_prometheus_metrics(
 ) -> io::Result<()> {
     let DatabaseMetricsWithTables {
         totals,
+        global_aggregate_worker_cap,
         index_pruning,
         tables,
     } = metrics;
@@ -3693,6 +3705,8 @@ fn write_prometheus_metrics(
     writeln!(output, "{}", totals.retained_row_count)?;
     output.write_all(RETAINED_VALUE_BYTES_METRIC_PREFIX.as_bytes())?;
     writeln!(output, "{}", totals.retained_value_bytes)?;
+    output.write_all(GLOBAL_AGGREGATE_WORKER_CAP_METRIC_PREFIX.as_bytes())?;
+    writeln!(output, "{}", global_aggregate_worker_cap.get())?;
     output.write_all(INDEX_SCANNED_BLOCKS_METRIC_PREFIX.as_bytes())?;
     writeln!(output, "{}", index_pruning.scanned_blocks)?;
     output.write_all(INDEX_PRUNED_BLOCKS_METRIC_PREFIX.as_bytes())?;

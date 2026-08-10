@@ -39,6 +39,7 @@ pub struct DatabaseMetrics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DatabaseMetricsWithTables {
     pub(crate) totals: DatabaseMetrics,
+    pub(crate) global_aggregate_worker_cap: NonZeroUsize,
     pub(crate) index_pruning: IndexPruningMetrics,
     pub(crate) tables: Vec<(String, usize, usize)>,
 }
@@ -595,9 +596,9 @@ impl SharedDatabase {
         })
     }
 
-    /// Captures database totals, sparse-index counters, and owned per-table row
-    /// and cached retained-value byte counts under one nonblocking read-lock
-    /// attempt.
+    /// Captures database totals, the aggregate worker cap, sparse-index
+    /// counters, and owned per-table row and cached retained-value byte counts
+    /// under one nonblocking read-lock attempt.
     ///
     /// The allocation-free sizing callback runs before table names are sorted
     /// or cloned. The table entries are sorted by case-insensitive name and the
@@ -605,7 +606,14 @@ impl SharedDatabase {
     /// response writing.
     pub(crate) fn metrics_snapshot_with_tables(
         &self,
-        response_fits: impl FnOnce(DatabaseMetrics, IndexPruningMetrics, usize, usize, usize) -> bool,
+        response_fits: impl FnOnce(
+            DatabaseMetrics,
+            NonZeroUsize,
+            IndexPruningMetrics,
+            usize,
+            usize,
+            usize,
+        ) -> bool,
     ) -> DatabaseMetricsSnapshot {
         let database = match self.inner.try_read() {
             Ok(database) => database,
@@ -621,11 +629,13 @@ impl SharedDatabase {
             retained_row_count,
             retained_value_bytes,
         };
+        let global_aggregate_worker_cap = database.global_aggregate_worker_cap();
         let index_pruning = database.index_pruning_metrics();
         let (table_name_bytes, row_count_bytes, retained_value_byte_count_bytes) =
             database.table_metric_variable_bytes();
         if !response_fits(
             totals,
+            global_aggregate_worker_cap,
             index_pruning,
             table_name_bytes,
             row_count_bytes,
@@ -637,6 +647,7 @@ impl SharedDatabase {
         drop(database);
         DatabaseMetricsSnapshot::Available(DatabaseMetricsWithTables {
             totals,
+            global_aggregate_worker_cap,
             index_pruning,
             tables,
         })
@@ -1132,11 +1143,16 @@ mod tests {
 
         let snapshot = database.metrics_snapshot_with_tables(
             |totals,
+             global_aggregate_worker_cap,
              index_pruning,
              table_name_bytes,
              row_count_bytes,
              retained_value_byte_count_bytes| {
                 assert_eq!(totals.table_count, 2);
+                assert_eq!(
+                    global_aggregate_worker_cap.get(),
+                    crate::batch::DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP
+                );
                 assert_eq!(index_pruning, IndexPruningMetrics::default());
                 assert_eq!(table_name_bytes, "Alpha".len() + "longer_name".len());
                 assert_eq!(row_count_bytes, 3);
