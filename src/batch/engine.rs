@@ -4,9 +4,11 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+#[cfg(test)]
+use crate::batch::aggregate_scheduler::TestGlobalAggregateWorkerBudget as GlobalAggregateWorkerBudget;
+use crate::batch::aggregate_scheduler::{GlobalAggregateParallelism, parallel_aggregate_partition};
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
@@ -36,6 +38,12 @@ use crate::snapshot::{
 };
 use crate::storage::{Int64Table, Schema};
 
+pub use crate::batch::aggregate_scheduler::{
+    COUNT_IF_PARALLEL_ROW_THRESHOLD, COUNT_IF_PARALLEL_ROWS_PER_WORKER,
+    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD,
+    GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER, MAX_COUNT_IF_PARALLEL_WORKERS,
+    MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS,
+};
 pub use crate::batch::storage::{
     DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS, DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS,
     DEFAULT_INT64_MIN_MAX_INDEX_BYTES, DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE,
@@ -77,31 +85,6 @@ pub const ESTIMATED_GROUP_KEY_CELL_BYTES: usize = std::mem::size_of::<ValueRef<'
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS: usize = 500_000;
 /// Maximum estimated aggregate state heap retained by one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
-/// Minimum matched rows that a supported aggregate evaluates sequentially.
-///
-/// Parallel evaluation is considered only when the matched row count is
-/// strictly greater than this threshold.
-pub const GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD: usize = 256 * 1024;
-/// Target matched rows per supported aggregate computation lane.
-pub const GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER: usize = 128 * 1024;
-/// Maximum computation lanes used by one supported aggregate.
-///
-/// The executor also caps this value by [`std::thread::available_parallelism`]
-/// and admits helper threads through one process-wide budget.
-pub const MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS: usize = 16;
-/// Default per-database computation-lane cap for supported aggregates.
-///
-/// The process-wide admission budget and available hardware may lower the
-/// effective lane count further.
-pub const DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP: usize = MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS;
-
-/// Backwards-compatible name for [`GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD`].
-pub const COUNT_IF_PARALLEL_ROW_THRESHOLD: usize = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD;
-/// Backwards-compatible name for [`GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER`].
-pub const COUNT_IF_PARALLEL_ROWS_PER_WORKER: usize = GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER;
-/// Backwards-compatible name for [`MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS`].
-pub const MAX_COUNT_IF_PARALLEL_WORKERS: usize = MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS;
-
 /// Resource limits for source scans, query-result and mutation materialization,
 /// ordering, and grouped working state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,204 +253,6 @@ fn saturating_atomic_add(counter: &AtomicUsize, amount: usize) {
             Err(actual) => current = actual,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct GlobalAggregateParallelism {
-    worker_cap: NonZeroUsize,
-    source: GlobalAggregateParallelismSource,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum GlobalAggregateParallelismSource {
-    System,
-    #[cfg(test)]
-    Fixed(usize),
-    #[cfg(test)]
-    Budgeted(&'static GlobalAggregateWorkerBudget),
-}
-
-impl GlobalAggregateParallelism {
-    const fn system(worker_cap: NonZeroUsize) -> Self {
-        Self {
-            worker_cap,
-            source: GlobalAggregateParallelismSource::System,
-        }
-    }
-
-    #[cfg(test)]
-    fn fixed(workers: usize) -> Self {
-        Self {
-            worker_cap: NonZeroUsize::new(workers).expect("fixed workers must be nonzero"),
-            source: GlobalAggregateParallelismSource::Fixed(workers),
-        }
-    }
-
-    #[cfg(test)]
-    const fn budgeted(
-        worker_cap: NonZeroUsize,
-        budget: &'static GlobalAggregateWorkerBudget,
-    ) -> Self {
-        Self {
-            worker_cap,
-            source: GlobalAggregateParallelismSource::Budgeted(budget),
-        }
-    }
-
-    fn worker_count(self, matched_rows: usize) -> usize {
-        if matched_rows <= GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD {
-            return 1;
-        }
-
-        let worker_limit = match self.source {
-            GlobalAggregateParallelismSource::System => {
-                global_aggregate_worker_budget().worker_limit()
-            }
-            #[cfg(test)]
-            GlobalAggregateParallelismSource::Fixed(workers) => workers,
-            #[cfg(test)]
-            GlobalAggregateParallelismSource::Budgeted(budget) => budget.worker_limit(),
-        };
-        let useful_workers = matched_rows.div_ceil(GLOBAL_AGGREGATE_PARALLEL_ROWS_PER_WORKER);
-        worker_limit
-            .min(self.worker_cap.get())
-            .clamp(1, MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS)
-            .min(useful_workers)
-            .min(matched_rows)
-    }
-
-    fn with_request_worker_cap(self, max_threads: usize) -> Self {
-        if max_threads == 0 {
-            return self;
-        }
-
-        Self {
-            worker_cap: NonZeroUsize::new(self.worker_cap.get().min(max_threads))
-                .expect("a nonzero request cap and database cap have a nonzero minimum"),
-            ..self
-        }
-    }
-
-    fn try_admit(self, matched_rows: usize) -> Option<GlobalAggregateWorkerAdmission> {
-        let helper_threads = self.worker_count(matched_rows).saturating_sub(1);
-        if helper_threads == 0 {
-            return None;
-        }
-
-        match self.source {
-            GlobalAggregateParallelismSource::System => global_aggregate_worker_budget()
-                .try_acquire(helper_threads)
-                .map(GlobalAggregateWorkerAdmission::Budgeted),
-            #[cfg(test)]
-            GlobalAggregateParallelismSource::Fixed(_) => {
-                Some(GlobalAggregateWorkerAdmission::Fixed(helper_threads))
-            }
-            #[cfg(test)]
-            GlobalAggregateParallelismSource::Budgeted(budget) => budget
-                .try_acquire(helper_threads)
-                .map(GlobalAggregateWorkerAdmission::Budgeted),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct GlobalAggregateWorkerBudget {
-    helper_limit: usize,
-    helpers_in_use: AtomicUsize,
-    #[cfg(test)]
-    peak_helpers_in_use: AtomicUsize,
-}
-
-impl GlobalAggregateWorkerBudget {
-    const fn new(helper_limit: usize) -> Self {
-        Self {
-            helper_limit,
-            helpers_in_use: AtomicUsize::new(0),
-            #[cfg(test)]
-            peak_helpers_in_use: AtomicUsize::new(0),
-        }
-    }
-
-    fn worker_limit(&self) -> usize {
-        self.helper_limit.saturating_add(1)
-    }
-
-    fn try_acquire(&'static self, requested: usize) -> Option<GlobalAggregateWorkerPermit> {
-        let mut in_use = self.helpers_in_use.load(AtomicOrdering::Acquire);
-        loop {
-            let acquired = requested.min(self.helper_limit.saturating_sub(in_use));
-            if acquired == 0 {
-                return None;
-            }
-            let next = in_use.saturating_add(acquired);
-            match self.helpers_in_use.compare_exchange_weak(
-                in_use,
-                next,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            ) {
-                Ok(_) => {
-                    #[cfg(test)]
-                    self.peak_helpers_in_use
-                        .fetch_max(next, AtomicOrdering::Relaxed);
-                    return Some(GlobalAggregateWorkerPermit {
-                        budget: self,
-                        helper_threads: acquired,
-                    });
-                }
-                Err(actual) => in_use = actual,
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn reset_peak(&self) {
-        assert_eq!(self.helpers_in_use.load(AtomicOrdering::Acquire), 0);
-        self.peak_helpers_in_use.store(0, AtomicOrdering::Release);
-    }
-}
-
-#[derive(Debug)]
-struct GlobalAggregateWorkerPermit {
-    budget: &'static GlobalAggregateWorkerBudget,
-    helper_threads: usize,
-}
-
-impl Drop for GlobalAggregateWorkerPermit {
-    fn drop(&mut self) {
-        let previous = self
-            .budget
-            .helpers_in_use
-            .fetch_sub(self.helper_threads, AtomicOrdering::AcqRel);
-        debug_assert!(previous >= self.helper_threads);
-    }
-}
-
-#[derive(Debug)]
-enum GlobalAggregateWorkerAdmission {
-    Budgeted(GlobalAggregateWorkerPermit),
-    #[cfg(test)]
-    Fixed(usize),
-}
-
-impl GlobalAggregateWorkerAdmission {
-    fn helper_threads(&self) -> usize {
-        match self {
-            Self::Budgeted(permit) => permit.helper_threads,
-            #[cfg(test)]
-            Self::Fixed(helper_threads) => *helper_threads,
-        }
-    }
-}
-
-fn global_aggregate_worker_budget() -> &'static GlobalAggregateWorkerBudget {
-    static BUDGET: OnceLock<GlobalAggregateWorkerBudget> = OnceLock::new();
-    BUDGET.get_or_init(|| {
-        let worker_limit = std::thread::available_parallelism()
-            .map_or(1, |value| value.get())
-            .min(MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS);
-        GlobalAggregateWorkerBudget::new(worker_limit.saturating_sub(1))
-    })
 }
 
 #[derive(Debug, Default)]
@@ -1523,7 +1308,7 @@ impl Database {
     /// Returns the configured computation-lane cap for supported parallel aggregates.
     #[must_use]
     pub const fn global_aggregate_worker_cap(&self) -> NonZeroUsize {
-        self.global_aggregate_parallelism.worker_cap
+        self.global_aggregate_parallelism.worker_cap()
     }
 
     /// Atomically builds and publishes one caller-named, one-column `Int64`
@@ -1614,9 +1399,8 @@ impl Database {
         &mut self,
         global_aggregate_worker_cap: NonZeroUsize,
     ) -> NonZeroUsize {
-        let previous = self.global_aggregate_parallelism.worker_cap;
-        self.global_aggregate_parallelism.worker_cap = global_aggregate_worker_cap;
-        previous
+        self.global_aggregate_parallelism
+            .set_worker_cap(global_aggregate_worker_cap)
     }
 
     /// Reopens one self-describing, non-nullable `Int64` snapshot as a named
@@ -6284,20 +6068,6 @@ fn try_parallel_count_if(
     })
 }
 
-fn parallel_aggregate_partition(
-    matching_rows: &[usize],
-    worker_count: usize,
-    worker_index: usize,
-) -> &[usize] {
-    debug_assert!(worker_count > 0);
-    debug_assert!(worker_index < worker_count);
-    let rows_per_worker = matching_rows.len() / worker_count;
-    let workers_with_extra_row = matching_rows.len() % worker_count;
-    let start = worker_index * rows_per_worker + worker_index.min(workers_with_extra_row);
-    let partition_len = rows_per_worker + usize::from(worker_index < workers_with_extra_row);
-    &matching_rows[start..start + partition_len]
-}
-
 fn count_if_chunk(values: &[bool], matching_rows: &[usize]) -> Result<i64> {
     matching_rows.iter().try_fold(0_i64, |count, row| {
         if values[*row] {
@@ -8752,7 +8522,7 @@ mod tests {
 
     #[test]
     fn grouped_bool_count_parallel_threshold_budget_fallback_and_shape_are_bounded() {
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 2;
         let mut database = grouped_bool_count_database(row_count);
@@ -8770,7 +8540,7 @@ mod tests {
             ),
         );
         assert_eq!(boundary.rows.len(), 2);
-        assert_eq!(BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire), 0);
+        assert_eq!(BUDGET.peak_helpers_in_use(), 0);
 
         BUDGET.reset_peak();
         let above_boundary = query(
@@ -8782,8 +8552,8 @@ mod tests {
             ),
         );
         assert_eq!(above_boundary.rows.len(), 2);
-        assert!(BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire) > 0);
-        assert_eq!(BUDGET.helpers_in_use.load(AtomicOrdering::Acquire), 0);
+        assert!(BUDGET.peak_helpers_in_use() > 0);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
 
         BUDGET.reset_peak();
         let unsupported = query(
@@ -8792,7 +8562,7 @@ mod tests {
         );
         assert_eq!(unsupported.rows.len(), 2);
         assert_eq!(
-            BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+            BUDGET.peak_helpers_in_use(),
             0,
             "COUNT(column) remains on the sequential grouped path"
         );
@@ -8804,14 +8574,14 @@ mod tests {
         );
         assert_eq!(unsupported.rows.len(), 2);
         assert_eq!(
-            BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+            BUDGET.peak_helpers_in_use(),
             0,
             "multiple aggregates remain on the sequential grouped path"
         );
 
         BUDGET.reset_peak();
         let held = BUDGET
-            .try_acquire(BUDGET.helper_limit)
+            .acquire_for_test(BUDGET.helper_limit())
             .expect("test saturates the helper budget");
         let exhausted = query(
             &mut database,
@@ -8825,12 +8595,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            BUDGET.helpers_in_use.load(AtomicOrdering::Acquire),
-            BUDGET.helper_limit,
+            BUDGET.helpers_in_use(),
+            BUDGET.helper_limit(),
             "the query falls back without exceeding saturated admission"
         );
         drop(held);
-        assert_eq!(BUDGET.helpers_in_use.load(AtomicOrdering::Acquire), 0);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
 
         database.query_result_limits.max_groups = 1;
         database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
@@ -9174,8 +8944,9 @@ mod tests {
     #[test]
     fn global_count_sum_int64_parallel_boundary_uses_shared_budget_with_fallback() {
         static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
-            GlobalAggregateWorkerBudget::new(0);
-        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+            GlobalAggregateWorkerBudget::for_test(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = sum_int64_database(row_count, |_| (1, true));
@@ -9237,9 +9008,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "the paired shape stays sequential at the threshold"
         );
@@ -9257,10 +9026,7 @@ mod tests {
             ]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "the paired COUNT(*) and SUM(Int64) shape uses the shared helper budget"
         );
 
@@ -9277,10 +9043,7 @@ mod tests {
             ]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "the paired COUNT() and SUM(Int64) shape uses the shared helper budget"
         );
 
@@ -9297,9 +9060,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "COUNT(column) plus SUM(Int64) remains on the sequential fallback"
         );
@@ -9479,8 +9240,9 @@ mod tests {
     #[test]
     fn global_count_avg_int64_parallel_boundary_uses_shared_budget_with_sequential_fallback() {
         static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
-            GlobalAggregateWorkerBudget::new(0);
-        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+            GlobalAggregateWorkerBudget::for_test(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = avg_int64_database(row_count, |_| (7, true));
@@ -9531,10 +9293,7 @@ mod tests {
             [vec![Value::Float64(7.0)]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "sole AVG(Int64) uses the shared helper budget"
         );
 
@@ -9555,9 +9314,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "the paired shape stays sequential at the threshold"
         );
@@ -9575,10 +9332,7 @@ mod tests {
             ]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "the paired COUNT(*) and AVG(Int64) shape uses the shared helper budget"
         );
 
@@ -9595,9 +9349,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "COUNT(column) plus AVG(Int64) remains on the sequential fallback"
         );
@@ -9612,9 +9364,7 @@ mod tests {
             [vec![Value::Bool(true), Value::Float64(7.0)]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "grouped AVG(Int64) stays sequential"
         );
@@ -9745,8 +9495,9 @@ mod tests {
     #[test]
     fn global_count_min_int64_parallel_boundary_uses_shared_budget_with_sequential_fallback() {
         static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
-            GlobalAggregateWorkerBudget::new(0);
-        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+            GlobalAggregateWorkerBudget::for_test(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = min_int64_database(row_count, |id| {
@@ -9799,10 +9550,7 @@ mod tests {
             [vec![Value::Int64(0)]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "sole MIN(Int64) uses the shared helper budget"
         );
 
@@ -9822,9 +9570,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "the paired shape stays sequential at the threshold"
         );
@@ -9842,10 +9588,7 @@ mod tests {
             ]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "the paired COUNT(*) and MIN(Int64) shape uses the shared helper budget"
         );
 
@@ -9862,9 +9605,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "COUNT(column) plus MIN(Int64) remains on the sequential fallback"
         );
@@ -9996,8 +9737,10 @@ mod tests {
     #[test]
     fn global_count_min_float64_parallel_boundary_and_admission_exhaustion_fall_back_sequentially()
     {
-        static SATURATED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
-        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+        static SATURATED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = min_float64_database(row_count, |_| (7.25, true));
@@ -10023,7 +9766,7 @@ mod tests {
 
         SATURATED_BUDGET.reset_peak();
         let occupied_helpers = SATURATED_BUDGET
-            .try_acquire(3)
+            .acquire_for_test(3)
             .expect("test reserves every helper");
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
             database.global_aggregate_worker_cap(),
@@ -10064,9 +9807,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "the paired shape stays sequential at the threshold"
         );
@@ -10084,10 +9825,7 @@ mod tests {
             ]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "paired COUNT(*) and MIN(Float64) above the threshold uses the shared helper budget"
         );
 
@@ -10104,9 +9842,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "COUNT(column) plus MIN(Float64) stays sequential"
         );
@@ -10125,9 +9861,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "other multi-aggregate Float64 projections stay sequential"
         );
@@ -10142,9 +9876,7 @@ mod tests {
             [vec![Value::Bool(true), Value::Float64(7.25)]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "grouped MIN(Float64) stays sequential"
         );
@@ -10159,9 +9891,7 @@ mod tests {
             [vec![Value::Bool(true)]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "MAX(Bool) stays sequential"
         );
@@ -10250,8 +9980,10 @@ mod tests {
 
     #[test]
     fn global_max_float64_parallel_boundary_uses_shared_budget_only_for_the_sole_global_shape() {
-        static SATURATED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
-        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+        static SATURATED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = max_float64_database(row_count, |_| (7.25, true));
@@ -10268,7 +10000,7 @@ mod tests {
 
         SATURATED_BUDGET.reset_peak();
         let occupied_helpers = SATURATED_BUDGET
-            .try_acquire(3)
+            .acquire_for_test(3)
             .expect("test reserves every helper");
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
             database.global_aggregate_worker_cap(),
@@ -10299,9 +10031,7 @@ mod tests {
             [vec![Value::Float64(7.25)]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "the threshold itself stays sequential"
         );
@@ -10312,10 +10042,7 @@ mod tests {
             [vec![Value::Float64(7.25)]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "sole MAX(Float64) above the threshold uses the shared helper budget"
         );
 
@@ -10332,9 +10059,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "MAX(Float64) in a multi-aggregate projection stays sequential"
         );
@@ -10349,9 +10074,7 @@ mod tests {
             [vec![Value::Bool(true), Value::Float64(7.25)]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "grouped MAX(Float64) stays sequential"
         );
@@ -10455,8 +10178,9 @@ mod tests {
     #[test]
     fn global_count_max_int64_parallel_boundary_uses_shared_budget_with_sequential_fallback() {
         static UNAVAILABLE_BUDGET: GlobalAggregateWorkerBudget =
-            GlobalAggregateWorkerBudget::new(0);
-        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+            GlobalAggregateWorkerBudget::for_test(0);
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = max_int64_database(row_count, |id| (i64::try_from(id).unwrap(), true));
@@ -10517,9 +10241,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "the paired shape stays sequential at the threshold"
         );
@@ -10537,10 +10259,7 @@ mod tests {
             ]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "the paired COUNT(*) and MAX(Int64) shape uses the shared helper budget"
         );
 
@@ -10557,10 +10276,7 @@ mod tests {
             ]]
         );
         assert!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire)
-                > 0,
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "the paired COUNT() and MAX(Int64) shape uses the shared helper budget"
         );
 
@@ -10577,9 +10293,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            OBSERVED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            OBSERVED_BUDGET.peak_helpers_in_use(),
             0,
             "COUNT(column) plus MAX(Int64) remains on the sequential fallback"
         );
@@ -10641,31 +10355,7 @@ mod tests {
     }
 
     #[test]
-    fn global_aggregate_worker_selection_partitioning_and_reduction_are_checked() {
-        let boundary = COUNT_IF_PARALLEL_ROW_THRESHOLD;
-        assert_eq!(
-            GlobalAggregateParallelism::fixed(1).worker_count(usize::MAX),
-            1
-        );
-        assert_eq!(
-            GlobalAggregateParallelism::fixed(2).worker_count(usize::MAX),
-            2
-        );
-        assert_eq!(
-            GlobalAggregateParallelism::fixed(4).worker_count(boundary),
-            1
-        );
-        assert_eq!(
-            GlobalAggregateParallelism::fixed(4).worker_count(boundary + 1),
-            3
-        );
-        let enough_rows_for_every_worker =
-            COUNT_IF_PARALLEL_ROWS_PER_WORKER.saturating_mul(MAX_COUNT_IF_PARALLEL_WORKERS + 1);
-        assert_eq!(
-            GlobalAggregateParallelism::fixed(MAX_COUNT_IF_PARALLEL_WORKERS + 1)
-                .worker_count(enough_rows_for_every_worker),
-            MAX_COUNT_IF_PARALLEL_WORKERS
-        );
+    fn global_aggregate_reduction_overflows_are_checked() {
         assert_eq!(
             reduce_count_if_counts(vec![i64::MAX, 1]),
             Err(Error::NumericOverflow("countIf".to_owned()))
@@ -10740,15 +10430,11 @@ mod tests {
             reduce_scalar_extremum_partials(Some(4), Some(-7), &i64::max),
             Some(4)
         );
-        let rows = [2, 4, 6, 8, 10, 12, 14];
-        assert_eq!(parallel_aggregate_partition(&rows, 3, 0), [2, 4, 6]);
-        assert_eq!(parallel_aggregate_partition(&rows, 3, 1), [8, 10]);
-        assert_eq!(parallel_aggregate_partition(&rows, 3, 2), [12, 14]);
     }
 
     #[test]
     fn configured_cap_one_is_a_deterministic_sequential_differential() {
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(8);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
 
         let cap = NonZeroUsize::new(1).unwrap();
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
@@ -10758,7 +10444,7 @@ mod tests {
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
         let capped = query(&mut database, "SELECT countIf(active) FROM events");
         assert_eq!(
-            BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+            BUDGET.peak_helpers_in_use(),
             0,
             "a one-lane cap never admits a helper"
         );
@@ -10771,7 +10457,7 @@ mod tests {
 
     #[test]
     fn configured_cap_two_is_a_deterministic_parallel_differential() {
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(8);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
 
         let cap = NonZeroUsize::new(2).unwrap();
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
@@ -10781,7 +10467,7 @@ mod tests {
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
         let capped = query(&mut database, "SELECT countIf(active) FROM events");
         assert_eq!(
-            BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+            BUDGET.peak_helpers_in_use(),
             1,
             "a two-lane cap admits exactly one helper"
         );
@@ -10793,7 +10479,7 @@ mod tests {
 
     #[test]
     fn runtime_cap_one_and_two_match_for_every_supported_global_aggregate() {
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(8);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
 
         let initial = NonZeroUsize::new(7).unwrap();
         let one = NonZeroUsize::new(1).unwrap();
@@ -10823,7 +10509,7 @@ mod tests {
             BUDGET.reset_peak();
             let sequential = query(&mut database, sql);
             assert_eq!(
-                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                BUDGET.peak_helpers_in_use(),
                 0,
                 "the runtime cap of one must keep {sql} sequential"
             );
@@ -10832,7 +10518,7 @@ mod tests {
             BUDGET.reset_peak();
             let parallel = query(&mut database, sql);
             assert_eq!(
-                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                BUDGET.peak_helpers_in_use(),
                 1,
                 "the runtime cap of two must admit one helper for {sql}"
             );
@@ -10845,8 +10531,9 @@ mod tests {
 
     #[test]
     fn request_cap_one_and_two_match_for_every_supported_global_aggregate() {
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(8);
-        static LIMITED_BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(1);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
+        static LIMITED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(1);
 
         let database_cap = NonZeroUsize::new(4).unwrap();
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
@@ -10866,7 +10553,7 @@ mod tests {
             BUDGET.reset_peak();
             let single_worker = query_with_max_threads(&database, sql, 1);
             assert_eq!(
-                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                BUDGET.peak_helpers_in_use(),
                 0,
                 "max_threads=1 must keep {sql} sequential"
             );
@@ -10874,7 +10561,7 @@ mod tests {
             BUDGET.reset_peak();
             let multi_worker = query_with_max_threads(&database, sql, 2);
             assert_eq!(
-                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                BUDGET.peak_helpers_in_use(),
                 1,
                 "max_threads=2 must admit one helper for {sql}"
             );
@@ -10894,7 +10581,7 @@ mod tests {
             );
             assert_eq!(result.rows, [vec![Value::Int64((row_count / 2) as i64)]]);
             assert_eq!(
-                BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire),
+                BUDGET.peak_helpers_in_use(),
                 2,
                 "max_threads={max_threads} must retain the four-lane database cap"
             );
@@ -10911,9 +10598,7 @@ mod tests {
             [vec![Value::Int64((row_count / 2) as i64)]]
         );
         assert_eq!(
-            LIMITED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            LIMITED_BUDGET.peak_helpers_in_use(),
             1,
             "the request cap remains subject to process-wide admission"
         );
@@ -10928,9 +10613,7 @@ mod tests {
             query_with_max_threads(&database, "SELECT countIf(active) FROM events", 2);
         assert_eq!(database_limited, budget_limited);
         assert_eq!(
-            LIMITED_BUDGET
-                .peak_helpers_in_use
-                .load(AtomicOrdering::Acquire),
+            LIMITED_BUDGET.peak_helpers_in_use(),
             0,
             "a larger request value must not relax the database cap"
         );
@@ -10938,15 +10621,11 @@ mod tests {
     }
 
     #[test]
-    fn oversized_configured_cap_preserves_the_hard_ceiling_and_results() {
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(31);
+    fn oversized_configured_cap_preserves_results_and_useful_worker_limit() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(31);
 
         let cap = NonZeroUsize::new(usize::MAX).unwrap();
         let parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
-        assert_eq!(
-            parallelism.worker_count(usize::MAX),
-            MAX_GLOBAL_AGGREGATE_PARALLEL_WORKERS
-        );
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = count_if_database_with_worker_cap(row_count, cap);
@@ -10954,8 +10633,8 @@ mod tests {
         BUDGET.reset_peak();
         database.global_aggregate_parallelism = parallelism;
         let capped = query(&mut database, "SELECT countIf(active) FROM events");
-        let peak_helpers = BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire);
-        assert_eq!(peak_helpers, parallelism.worker_count(row_count) - 1);
+        let peak_helpers = BUDGET.peak_helpers_in_use();
+        assert_eq!(peak_helpers, 2);
 
         let sequential =
             force_global_aggregate_workers(&mut database, 1, "SELECT countIf(active) FROM events");
@@ -10966,7 +10645,7 @@ mod tests {
     fn global_count_if_budget_caps_concurrent_admission() {
         use std::sync::{Arc, Barrier};
 
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
         BUDGET.reset_peak();
         let thread_count = 8;
         let started = Arc::new(Barrier::new(thread_count + 1));
@@ -10979,7 +10658,7 @@ mod tests {
                 let release = Arc::clone(&release);
                 std::thread::spawn(move || {
                     started.wait();
-                    let permit = BUDGET.try_acquire(1);
+                    let permit = BUDGET.acquire_for_test(1);
                     attempted.wait();
                     release.wait();
                     permit
@@ -10989,8 +10668,8 @@ mod tests {
 
         started.wait();
         attempted.wait();
-        assert_eq!(BUDGET.helpers_in_use.load(AtomicOrdering::Acquire), 3);
-        assert_eq!(BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire), 3);
+        assert_eq!(BUDGET.helpers_in_use(), 3);
+        assert_eq!(BUDGET.peak_helpers_in_use(), 3);
         release.wait();
         let admitted = handles
             .into_iter()
@@ -10998,7 +10677,7 @@ mod tests {
             .filter(|admitted| *admitted)
             .count();
         assert_eq!(admitted, 3);
-        assert_eq!(BUDGET.helpers_in_use.load(AtomicOrdering::Acquire), 0);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
     }
 
     #[test]
@@ -11006,7 +10685,7 @@ mod tests {
         use crate::batch::shared_database::SharedDatabase;
         use std::sync::{Arc, Barrier};
 
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::new(3);
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
         let row_count =
             COUNT_IF_PARALLEL_ROW_THRESHOLD.saturating_add(COUNT_IF_PARALLEL_ROWS_PER_WORKER);
         let database_cap = NonZeroUsize::new(4).unwrap();
@@ -11043,9 +10722,9 @@ mod tests {
             let result = handle.join().expect("query worker joins");
             assert_eq!(result, sequential, "concurrent cap-two differential");
         }
-        let peak_helpers = BUDGET.peak_helpers_in_use.load(AtomicOrdering::Acquire);
-        assert!((2..=BUDGET.helper_limit).contains(&peak_helpers));
-        assert_eq!(BUDGET.helpers_in_use.load(AtomicOrdering::Acquire), 0);
+        let peak_helpers = BUDGET.peak_helpers_in_use();
+        assert!((2..=BUDGET.helper_limit()).contains(&peak_helpers));
+        assert_eq!(BUDGET.helpers_in_use(), 0);
         assert_eq!(
             database.global_aggregate_worker_cap().unwrap(),
             database_cap
