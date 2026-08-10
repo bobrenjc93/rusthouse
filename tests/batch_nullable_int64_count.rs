@@ -149,14 +149,14 @@ fn nullable_count_preserves_query_resource_bounds() {
 }
 
 #[test]
-fn nullable_count_sum_and_extrema_coexist_while_avg_remains_rejected() {
+fn every_nullable_int64_aggregate_coexists() {
     let mut database = Database::new();
     create_mixed(&mut database);
 
     assert_eq!(
         query(
             &mut database,
-            "SELECT COUNT(v), SUM(v), MIN(v), MAX(v) FROM mixed"
+            "SELECT COUNT(v), SUM(v), MIN(v), MAX(v), AVG(v) FROM mixed"
         )
         .rows,
         [vec![
@@ -164,15 +164,7 @@ fn nullable_count_sum_and_extrema_coexist_while_avg_remains_rejected() {
             Value::Int64(13),
             Value::Int64(-1),
             Value::Int64(5),
+            Value::Float64(2.6),
         ]]
-    );
-
-    assert_eq!(
-        database.execute("SELECT AVG(v) FROM mixed").unwrap_err(),
-        Error::UnsupportedNullableOperation {
-            table: "mixed".to_owned(),
-            column: "v".to_owned(),
-            operation: "AVG",
-        }
     );
 }
