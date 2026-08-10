@@ -438,7 +438,7 @@ pub enum DatabaseSnapshotRestoreError {
     Snapshot(Int64TablePayloadFileRestoreError),
     /// Both the primary and explicit backup snapshots failed bounded restore.
     Recovery(Int64TablePayloadFileRecoveryError),
-    /// The legacy snapshot adapter accepts only non-nullable `Int64` payloads.
+    /// This `Database` adapter accepts only a non-nullable `Int64` column.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
     /// limits were rejected by batch storage.
@@ -452,7 +452,7 @@ pub enum DatabaseRleSnapshotRestoreError {
     /// Opening or decoding the bounded RLE snapshot failed, or its rows did
     /// not satisfy the caller-supplied schema and row cap.
     Snapshot(Int64TableRleFileRestoreError),
-    /// The legacy row-only RLE adapter accepts only non-nullable `Int64` rows.
+    /// This `Database` adapter accepts only a non-nullable `Int64` column.
     NullableColumn { column: String },
     /// The caller name, schema, duplicate name, or configured table limits
     /// were rejected by batch storage.
@@ -650,8 +650,8 @@ pub enum DatabaseSnapshotSaveError {
         /// The physical type found in the batch table.
         data_type: DataType,
     },
-    /// The selected column is logically `Int64` but has nullable physical
-    /// storage, which the legacy snapshot payload cannot represent.
+    /// The selected column is logically `Int64` but this `Database` save
+    /// adapter accepts only non-nullable physical storage.
     NullableColumn {
         /// The stored display name of the nullable column.
         column: String,
@@ -1920,12 +1920,12 @@ impl Database {
     /// table must fit its column and cell limits. Its persisted row cap is
     /// retained for subsequent inserts.
     ///
-    /// The current snapshot adapter imports exactly one table with one
-    /// non-nullable `Int64` column. Nullable snapshots are rejected by this
-    /// legacy format even though batch tables can represent nullable physical
-    /// `Int64` columns. Corruption, invalid identifiers, duplicate table names,
-    /// nullability, and every resource limit are checked before the catalog or
-    /// cached metrics are changed.
+    /// This `Database` adapter imports exactly one table with one non-nullable
+    /// `Int64` column. The payload codec supports nullable schemas and rows,
+    /// but this adapter rejects a decoded nullable column before registration.
+    /// Corruption, invalid identifiers, duplicate table names, nullability, and
+    /// every resource limit are checked before the catalog or cached metrics
+    /// are changed.
     pub fn restore_int64_table_from_file(
         &mut self,
         table_name: &str,
