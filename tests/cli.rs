@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::process::{Child, Command, Output, Stdio};
 
+use rusthouse::batch::engine::{Database, StatementResult};
+use rusthouse::batch::format::{OutputFormat, render};
 use rusthouse::{DEFAULT_MAX_SESSION_BYTES, DEFAULT_MAX_SESSION_STATEMENTS};
 
 fn run(args: &[&str], input: &[u8]) -> Output {
@@ -134,6 +136,28 @@ fn json_cli_outputs_to_string_for_every_physical_type() {
         b"{\"columns\":[{\"name\":\"i_text\",\"type\":\"String\"},{\"name\":\"f_text\",\"type\":\"String\"},{\"name\":\"b_text\",\"type\":\"String\"},{\"name\":\"s_text\",\"type\":\"String\"}],\"rows\":[[\"-7\",\"-0\",\"true\",\"Tokyo\"]]}\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn json_cli_output_path_preserves_nullable_int64_to_string_nulls() {
+    let mut database = Database::new();
+    database
+        .create_nullable_int64_table("optional_values", "value", vec![Some(-7), None, Some(0)])
+        .expect("setup");
+    let results = database
+        .execute(
+            "SELECT toString(value) AS rendered FROM optional_values \
+             ORDER BY rendered",
+        )
+        .expect("query");
+    let [StatementResult::Query(result)] = results.as_slice() else {
+        panic!("expected query result")
+    };
+
+    assert_eq!(
+        render(result, OutputFormat::Json),
+        r#"{"columns":[{"name":"rendered","type":"String"}],"rows":[[null],["-7"],["0"]]}"#
+    );
 }
 
 #[test]

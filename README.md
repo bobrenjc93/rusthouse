@@ -487,6 +487,11 @@ for every physical type. `Int64`, `Float64`, and `Bool` inputs use exactly the
 same canonical formatting, lexicographic expression ordering, and generated
 payload-byte accounting as their `CAST(column AS String)` equivalents; a
 `String` input is an identity projection, including Unicode and empty values.
+For a physical `Nullable(Int64)` column, present values use the same canonical
+integer formatting and absent values propagate as typed `String` `NULL`s.
+Expression ordering keeps those results as SQL `NULL`s (first ascending and
+last descending), rather than comparing the text `"NULL"`; absent values add
+zero generated payload bytes while present values are charged exactly.
 It accepts an optional `AS alias`; otherwise, its result is named
 `toString(<column>)`. `WHERE` filtering and `ORDER BY` using either the
 normalized expression or its alias happen before `LIMIT`/`OFFSET` pagination

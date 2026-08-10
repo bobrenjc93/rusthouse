@@ -183,6 +183,96 @@ fn preserves_filtering_aliases_expression_ordering_and_pagination() {
 }
 
 #[test]
+fn nullable_int64_propagates_typed_nulls_through_ordering_filtering_and_pagination() {
+    let mut database = Database::new();
+    database
+        .create_nullable_int64_table(
+            "optional_values",
+            "value",
+            vec![Some(2), None, Some(10), Some(-1), None, Some(-10), Some(20)],
+        )
+        .expect("setup");
+
+    let result = query(
+        &mut database,
+        "SELECT toString(value) AS rendered FROM optional_values \
+         ORDER BY rendered LIMIT 5 OFFSET 1",
+    );
+    assert_eq!(
+        result.columns,
+        [ResultColumn {
+            name: "rendered".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert_eq!(
+        result.rows,
+        [
+            vec![Value::Null(DataType::String)],
+            vec![Value::String("-1".to_owned())],
+            vec![Value::String("-10".to_owned())],
+            vec![Value::String("10".to_owned())],
+            vec![Value::String("2".to_owned())],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT toString(value) FROM optional_values \
+             WHERE value >= -9223372036854775808 \
+             ORDER BY toString(value) DESC LIMIT 2",
+        )
+        .rows,
+        [
+            vec![Value::String("20".to_owned())],
+            vec![Value::String("2".to_owned())],
+        ]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT toString(value) AS rendered FROM optional_values \
+             ORDER BY rendered DESC LIMIT 3 OFFSET 4",
+        )
+        .rows,
+        [
+            vec![Value::String("-1".to_owned())],
+            vec![Value::Null(DataType::String)],
+            vec![Value::Null(DataType::String)],
+        ]
+    );
+}
+
+#[test]
+fn nullable_int64_all_null_projection_returns_string_nulls() {
+    let mut database = Database::new();
+    database
+        .create_nullable_int64_table("missing_values", "value", vec![None, None, None])
+        .expect("setup");
+
+    let result = query(
+        &mut database,
+        "SELECT TOSTRING(value) AS rendered FROM missing_values ORDER BY rendered",
+    );
+    assert_eq!(
+        result.columns,
+        [ResultColumn {
+            name: "rendered".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert_eq!(
+        result.rows,
+        [
+            vec![Value::Null(DataType::String)],
+            vec![Value::Null(DataType::String)],
+            vec![Value::Null(DataType::String)],
+        ]
+    );
+}
+
+#[test]
 fn rejects_missing_grouped_and_malformed_to_string_shapes() {
     let mut database = Database::new();
     database
@@ -296,6 +386,54 @@ fn obeys_row_value_and_generated_string_byte_result_bounds() {
             resource: "SELECT result bytes",
             actual: exact_bytes,
             max: exact_bytes - 1,
+        })
+    );
+
+    let nullable_fixed_bytes = size_of::<ResultColumn>()
+        + result_name.len()
+        + 4 * size_of::<Vec<Value>>()
+        + 4 * size_of::<Value>();
+    let nullable_exact_bytes = nullable_fixed_bytes + i64::MIN.to_string().len() + "7".len();
+    let nullable_values = vec![Some(i64::MIN), None, Some(7), None];
+
+    let mut nullable_exact = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 4,
+        max_values: 4,
+        max_bytes: nullable_exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    nullable_exact
+        .create_nullable_int64_table("nullable_samples", "value", nullable_values.clone())
+        .expect("setup");
+    assert_eq!(
+        query(
+            &mut nullable_exact,
+            "SELECT toString(value) AS rendered FROM nullable_samples",
+        )
+        .rows,
+        [
+            vec![Value::String(i64::MIN.to_string())],
+            vec![Value::Null(DataType::String)],
+            vec![Value::String("7".to_owned())],
+            vec![Value::Null(DataType::String)],
+        ]
+    );
+
+    let mut nullable_one_byte_short = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 4,
+        max_values: 4,
+        max_bytes: nullable_exact_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    nullable_one_byte_short
+        .create_nullable_int64_table("nullable_samples", "value", nullable_values)
+        .expect("setup");
+    assert_eq!(
+        nullable_one_byte_short.execute("SELECT toString(value) AS rendered FROM nullable_samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            actual: nullable_exact_bytes,
+            max: nullable_exact_bytes - 1,
         })
     );
 }

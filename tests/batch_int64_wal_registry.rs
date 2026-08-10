@@ -95,7 +95,6 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
         ("AVG(v)", "AVG"),
         ("v - 1", "Int64 subtraction"),
         ("CAST(v AS String)", "CAST"),
-        ("toString(v)", "toString"),
         ("ABS(v)", "ABS"),
         ("ROW_NUMBER() OVER (ORDER BY v ASC)", "ROW_NUMBER ORDER BY"),
     ] {
@@ -140,10 +139,26 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
         panic!("expected MIN query")
     };
     assert_eq!(minimum.rows, [vec![Value::Int64(1)]]);
+
+    let results = database
+        .execute(&format!(
+            "SELECT toString(v) AS rendered FROM {table} ORDER BY rendered"
+        ))
+        .unwrap();
+    let [StatementResult::Query(rendered)] = results.as_slice() else {
+        panic!("expected toString query")
+    };
+    assert_eq!(
+        rendered.rows,
+        [
+            vec![Value::Null(rusthouse::batch::value::DataType::String)],
+            vec![Value::String("1".to_owned())],
+        ]
+    );
 }
 
 #[test]
-fn nullable_created_and_recovered_tables_reject_unsupported_physical_operations() {
+fn nullable_created_and_recovered_tables_support_to_string_and_reject_other_operations() {
     let directory = TestDirectory::new();
     let registry = directory.join("registry");
     let snapshot = directory.join("nullable.snapshot");

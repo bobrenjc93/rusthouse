@@ -5108,7 +5108,6 @@ fn resolve_select_items(
             }
             SelectItem::ToString { name, alias } => {
                 let source = table.column_index(name)?;
-                reject_nullable_operation(table, source, "toString")?;
                 if has_aggregate || !group_columns.is_empty() {
                     return Err(Error::InvalidQuery(
                         "toString projections are only supported in ungrouped SELECT queries"
@@ -8405,21 +8404,46 @@ fn string_at(table: &Table, source: usize, row: usize) -> &str {
 }
 
 fn stringify_value(table: &Table, source: usize, row: usize, input_type: DataType) -> Value {
-    let value = match input_type {
-        DataType::Int64 => int64_at(table, source, row).to_string(),
-        DataType::Float64 => render_float64_text(float64_at(table, source, row)).into_string(),
-        DataType::Bool => bool_string(bool_at(table, source, row)).to_owned(),
-        DataType::String => string_at(table, source, row).to_owned(),
-    };
-    Value::String(value)
+    match table.columns()[source].value_ref(row) {
+        ValueRef::Null(_) => Value::Null(DataType::String),
+        ValueRef::Int64(value) => {
+            debug_assert_eq!(input_type, DataType::Int64);
+            Value::String(value.to_string())
+        }
+        ValueRef::Float64(value) => {
+            debug_assert_eq!(input_type, DataType::Float64);
+            Value::String(render_float64_text(value).into_string())
+        }
+        ValueRef::Bool(value) => {
+            debug_assert_eq!(input_type, DataType::Bool);
+            Value::String(bool_string(value).to_owned())
+        }
+        ValueRef::String(value) => {
+            debug_assert_eq!(input_type, DataType::String);
+            Value::String(value.to_owned())
+        }
+    }
 }
 
 fn stringified_len(table: &Table, source: usize, row: usize, input_type: DataType) -> usize {
-    match input_type {
-        DataType::Int64 => int64_text_len(int64_at(table, source, row)),
-        DataType::Float64 => render_float64_text(float64_at(table, source, row)).len(),
-        DataType::Bool => bool_string(bool_at(table, source, row)).len(),
-        DataType::String => string_at(table, source, row).len(),
+    match table.columns()[source].value_ref(row) {
+        ValueRef::Null(_) => 0,
+        ValueRef::Int64(value) => {
+            debug_assert_eq!(input_type, DataType::Int64);
+            int64_text_len(value)
+        }
+        ValueRef::Float64(value) => {
+            debug_assert_eq!(input_type, DataType::Float64);
+            render_float64_text(value).len()
+        }
+        ValueRef::Bool(value) => {
+            debug_assert_eq!(input_type, DataType::Bool);
+            bool_string(value).len()
+        }
+        ValueRef::String(value) => {
+            debug_assert_eq!(input_type, DataType::String);
+            value.len()
+        }
     }
 }
 
@@ -8430,18 +8454,32 @@ fn stringified_cmp(
     right: usize,
     input_type: DataType,
 ) -> Ordering {
-    match input_type {
-        DataType::Int64 => int64_text_cmp(
-            int64_at(table, source, left),
-            int64_at(table, source, right),
-        ),
-        DataType::Float64 => {
-            let left = render_float64_text(float64_at(table, source, left));
-            let right = render_float64_text(float64_at(table, source, right));
+    match (
+        table.columns()[source].value_ref(left),
+        table.columns()[source].value_ref(right),
+    ) {
+        (ValueRef::Null(_), ValueRef::Null(_)) => Ordering::Equal,
+        (ValueRef::Null(_), _) => Ordering::Less,
+        (_, ValueRef::Null(_)) => Ordering::Greater,
+        (ValueRef::Int64(left), ValueRef::Int64(right)) => {
+            debug_assert_eq!(input_type, DataType::Int64);
+            int64_text_cmp(left, right)
+        }
+        (ValueRef::Float64(left), ValueRef::Float64(right)) => {
+            debug_assert_eq!(input_type, DataType::Float64);
+            let left = render_float64_text(left);
+            let right = render_float64_text(right);
             left.as_str().cmp(right.as_str())
         }
-        DataType::Bool => bool_at(table, source, left).cmp(&bool_at(table, source, right)),
-        DataType::String => string_at(table, source, left).cmp(string_at(table, source, right)),
+        (ValueRef::Bool(left), ValueRef::Bool(right)) => {
+            debug_assert_eq!(input_type, DataType::Bool);
+            left.cmp(&right)
+        }
+        (ValueRef::String(left), ValueRef::String(right)) => {
+            debug_assert_eq!(input_type, DataType::String);
+            left.cmp(right)
+        }
+        _ => unreachable!("toString input type is resolved"),
     }
 }
 
