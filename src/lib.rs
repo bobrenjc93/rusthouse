@@ -1,4 +1,51 @@
 //! RustHouse is an experimental, compact analytical database.
+//!
+//! # Database quickstart
+//!
+//! [`Database`] executes semicolon-delimited SQL batches and returns typed,
+//! owned results. Its default resource limits are bounded; use
+//! [`QueryResultLimits`] when an embedding needs tighter bounds.
+//!
+//! ```
+//! use rusthouse::{
+//!     BatchDataType, Database, DatabaseResult, QueryResult, QueryResultLimits,
+//!     ResultColumn, StatementResult, Value,
+//! };
+//!
+//! # fn main() -> DatabaseResult<()> {
+//! let limits = QueryResultLimits {
+//!     max_rows: 10,
+//!     ..QueryResultLimits::default()
+//! };
+//! let mut database = Database::with_query_result_limits(limits);
+//! let results = database.execute(
+//!     "CREATE TABLE readings (value Int64); \
+//!      INSERT INTO readings VALUES (7), (-2); \
+//!      SELECT value FROM readings ORDER BY value;",
+//! )?;
+//!
+//! let query: &QueryResult = match &results[2] {
+//!     StatementResult::Query(query) => query,
+//!     StatementResult::Command { .. } => panic!("SELECT must return rows"),
+//! };
+//! assert_eq!(
+//!     query.columns,
+//!     vec![ResultColumn {
+//!         name: "value".to_owned(),
+//!         data_type: BatchDataType::Int64,
+//!     }],
+//! );
+//! assert_eq!(
+//!     query.rows,
+//!     vec![vec![Value::Int64(-2)], vec![Value::Int64(7)]],
+//! );
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For concurrent access from cloned handles, use [`SharedDatabase`]. It
+//! serializes mutations while allowing supported read-only queries to share a
+//! read lock.
 
 pub mod aggregate;
 pub mod batch;
@@ -20,6 +67,9 @@ pub use aggregate::{
     AggregateError, AggregateLimits, NullableI64Aggregates, NullableI64Counts, RowSelection,
     aggregate_nullable_i64, count_nullable_i64, min_nullable_i64,
 };
+pub use batch::engine::{QueryResult, QueryResultLimits, ResultColumn, StatementResult};
+pub use batch::error::{Error as DatabaseError, Result as DatabaseResult};
+pub use batch::value::{DataType as BatchDataType, Value};
 pub use batch::{
     DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS,
     DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS, DEFAULT_INT64_MIN_MAX_INDEX_BYTES,
