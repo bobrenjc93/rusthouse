@@ -1550,21 +1550,23 @@ impl Table {
     /// The column name is resolved case-insensitively. `replacements` must be
     /// unique and strictly increasing by row index, and every index must be
     /// less than the row count at the start of this call. Every replacement
-    /// must have the column's physical type; `NULL` and non-finite `Float64`
-    /// values are rejected. The column, complete index selection, and all
-    /// values are validated before mutation, so an error leaves the entire
-    /// table unchanged. Valid owned values are moved into the selected cells
-    /// without cloning. All other cells and persistent table metadata are
-    /// preserved; a nonempty replacement invalidates optional range-pruning
-    /// metadata so subsequent queries use the complete scan path.
+    /// must have the column's physical type; `NULL` is accepted only by a
+    /// physical `Nullable(Int64)` column, and non-finite `Float64` values are
+    /// rejected. The column, complete index selection, and all values are
+    /// validated before mutation, so an error leaves the entire table
+    /// unchanged. Valid owned values are moved into the selected cells without
+    /// cloning. All other cells and persistent table metadata are preserved; a
+    /// nonempty replacement invalidates optional range-pruning metadata so
+    /// subsequent queries use the complete scan path.
     ///
     /// # Errors
     ///
     /// Returns [`Error::ColumnNotFound`] for an unknown column,
     /// [`Error::SelectionIndexOutOfBounds`] for an index outside the table,
     /// [`Error::SelectionNotStrictlyIncreasing`] for a duplicate or decreasing
-    /// index, [`Error::TypeMismatch`] for `NULL` or a different physical type,
-    /// or [`Error::InvalidQuery`] for a non-finite `Float64` value.
+    /// index, [`Error::TypeMismatch`] for `NULL` in a non-nullable column or a
+    /// different physical type, or [`Error::InvalidQuery`] for a non-finite
+    /// `Float64` value.
     pub fn replace_column_values(
         &mut self,
         column: &str,

@@ -179,6 +179,24 @@ fn json_cli_executes_int64_alter_update_silently() {
 }
 
 #[test]
+fn json_cli_executes_nullable_null_alter_update_silently() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE Readings (Measurement Nullable(Int64)); \
+          INSERT INTO Readings VALUES (7), (-2), (7), (NULL); \
+          ALTER TABLE Readings UPDATE Measurement = NULL WHERE Measurement = 7; \
+          SELECT Measurement FROM Readings ORDER BY Measurement;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"Measurement\",\"type\":\"Int64\"}],\"rows\":[[null],[null],[null],[-2]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_executes_bool_alter_update_silently() {
     let output = run(
         &["--format", "json"],
