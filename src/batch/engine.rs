@@ -5163,7 +5163,7 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
-                if actual == DataType::Int64 {
+                if actual == DataType::Int64 && *target_type != DataType::Float64 {
                     reject_nullable_operation(table, source, "CAST")?;
                 }
                 let resolved = match (actual, *target_type) {
@@ -5685,7 +5685,7 @@ fn execute_projection(
                             )?
                         }
                         ResolvedItem::CastInt64ToFloat64 { source } => {
-                            Value::Float64(int64_at(table, *source, *row) as f64)
+                            int64_to_float64_at(table, *source, *row).to_owned()
                         }
                         ResolvedItem::CastBoolToFloat64 { source } => {
                             Value::Float64(if bool_at(table, *source, *row) {
@@ -8009,8 +8009,8 @@ fn order_source_rows(
                     table.columns()[source].cmp_at(left, right)
                 }
                 ResolvedItem::CastInt64ToFloat64 { source } => {
-                    let left = ValueRef::Float64(int64_at(table, source, left) as f64);
-                    let right = ValueRef::Float64(int64_at(table, source, right) as f64);
+                    let left = int64_to_float64_at(table, source, left);
+                    let right = int64_to_float64_at(table, source, right);
                     left.cmp(&right)
                 }
                 ResolvedItem::CastBoolToFloat64 { source } => {
@@ -8329,6 +8329,14 @@ fn int64_at(table: &Table, source: usize, row: usize) -> i64 {
         unreachable!("CAST input type is resolved")
     };
     values[row]
+}
+
+fn int64_to_float64_at(table: &Table, source: usize, row: usize) -> ValueRef<'_> {
+    match table.columns()[source].value_ref(row) {
+        ValueRef::Int64(value) => ValueRef::Float64(value as f64),
+        ValueRef::Null(DataType::Int64) => ValueRef::Null(DataType::Float64),
+        _ => unreachable!("CAST input type is resolved"),
+    }
 }
 
 fn float64_at(table: &Table, source: usize, row: usize) -> f64 {
