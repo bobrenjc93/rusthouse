@@ -8517,6 +8517,70 @@ fn authenticated_headerless_tsv_insert_ingests_all_physical_types_and_escapes() 
 }
 
 #[test]
+fn authenticated_tsv_routes_ingest_nullable_int64_null_tokens() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE direct_rows (value Nullable(Int64)); \
+             CREATE TABLE direct_named (value Nullable(Int64)); \
+             CREATE TABLE query_rows (value Nullable(Int64)); \
+             CREATE TABLE query_named (value Nullable(Int64));",
+        )
+        .unwrap();
+
+    for (target, body, headers) in [
+        (
+            "/insert/direct_rows",
+            b"\\N\n7\n".as_slice(),
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: TabSeparated\r\n",
+        ),
+        (
+            "/insert/direct_named",
+            b"value\n\\N\n8\n".as_slice(),
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        ),
+        (
+            "/?query=INSERT+INTO+query_rows+FORMAT+TabSeparated",
+            b"\\N\n9\n".as_slice(),
+            "Authorization: Bearer correct-token\r\n",
+        ),
+        (
+            "/?query=INSERT+INTO+query_named+FORMAT+TabSeparatedWithNames",
+            b"value\n\\N\n10\n".as_slice(),
+            "Authorization: Bearer correct-token\r\n",
+        ),
+    ] {
+        let request = request_for_target_with_headers(target, body, headers);
+        assert_response_with_content_type(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 200 OK",
+            "text/plain; charset=utf-8",
+            b"",
+        );
+    }
+
+    for (table, present) in [
+        ("direct_rows", 7),
+        ("direct_named", 8),
+        ("query_rows", 9),
+        ("query_named", 10),
+    ] {
+        assert_eq!(
+            database
+                .query(&format!("SELECT value FROM {table};"))
+                .unwrap()
+                .rows,
+            [
+                vec![Value::Null(rusthouse::batch::value::DataType::Int64)],
+                vec![Value::Int64(present)],
+            ],
+        );
+    }
+}
+
+#[test]
 fn headerless_csv_and_tsv_empty_input_are_no_ops_and_named_csv_remains_the_default() {
     let database = SharedDatabase::default();
     database
