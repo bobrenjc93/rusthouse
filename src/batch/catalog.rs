@@ -282,15 +282,17 @@ impl Catalog {
         self.tables
             .values()
             .map(|table| {
+                debug_assert_eq!(table.schema().len(), table.columns().len());
                 table
                     .schema()
                     .iter()
-                    .map(|column| {
+                    .zip(table.columns())
+                    .map(|(column, values)| {
                         database_name
                             .len()
                             .saturating_add(table.name().len())
                             .saturating_add(column.name.len())
-                            .saturating_add(column.data_type.as_str().len())
+                            .saturating_add(values.metadata_type_name().len())
                     })
                     .fold(0_usize, usize::saturating_add)
             })
