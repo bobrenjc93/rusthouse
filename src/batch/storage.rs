@@ -875,6 +875,11 @@ impl Table {
     }
 
     #[must_use]
+    pub(crate) fn column_is_nullable_int64(&self, index: usize) -> bool {
+        matches!(self.columns[index], Column::NullableInt64(_))
+    }
+
+    #[must_use]
     pub fn row_count(&self) -> usize {
         self.row_count
     }

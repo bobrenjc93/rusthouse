@@ -1136,6 +1136,16 @@ struct RegistryDescriptor {
     member: String,
 }
 
+/// Allocation-free table payload metadata used to reject a registry before
+/// any table values are cloned or a manifest buffer is materialized.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Int64WalRegistryTablePreflight<'a> {
+    pub(crate) table_name: &'a str,
+    pub(crate) column_name: &'a str,
+    pub(crate) rows: usize,
+    pub(crate) nullable: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct RecoveredInt64WriteAheadLogRegistry {
     pub(crate) tables: Vec<Int64WalBootstrap>,
@@ -1166,30 +1176,21 @@ impl ActiveInt64WriteAheadLogs {
         mut bootstraps: Vec<Int64WalBootstrap>,
         limits: Int64WriteAheadLogRegistryLimits,
     ) -> Result<Self, Int64WriteAheadLogRegistryError> {
-        validate_registry_table_count(bootstraps.len(), limits)?;
+        let preflight = bootstraps
+            .iter()
+            .map(|bootstrap| Int64WalRegistryTablePreflight {
+                table_name: &bootstrap.table_name,
+                column_name: &bootstrap.column_name,
+                rows: bootstrap.values.len(),
+                nullable: bootstrap.nullable,
+            })
+            .collect::<Vec<_>>();
+        preflight_registry_tables(&preflight, limits)?;
         bootstraps.sort_by(|left, right| {
             left.table_name
                 .to_ascii_lowercase()
                 .cmp(&right.table_name.to_ascii_lowercase())
         });
-        let mut table_names = HashSet::with_capacity(bootstraps.len());
-        for bootstrap in &bootstraps {
-            if !table_names.insert(bootstrap.table_name.to_ascii_lowercase()) {
-                return Err(Int64WriteAheadLogRegistryCorruption::DuplicateTable {
-                    table: bootstrap.table_name.clone(),
-                }
-                .into());
-            }
-            Int64WriteAheadLog::validate_bootstrap_limits(
-                bootstrap.table_name.len(),
-                bootstrap.column_name.len(),
-                bootstrap.values.len(),
-                bootstrap.nullable,
-                limits.per_table,
-            )
-            .map_err(|error| member_error(bootstrap, "bootstrap", error))?;
-        }
-
         let descriptors = bootstraps
             .iter()
             .enumerate()
@@ -1199,7 +1200,6 @@ impl ActiveInt64WriteAheadLogs {
             })
             .collect::<Vec<_>>();
         let manifest = encode_registry_manifest(&descriptors);
-        validate_manifest_size(manifest.len(), limits)?;
 
         let bootstrap_bytes = bootstraps
             .iter()
@@ -1393,7 +1393,7 @@ fn registry_destination_name(path: &Path) -> Result<CString, Int64WriteAheadLogR
     CString::new(name.as_bytes()).map_err(|_| Int64WriteAheadLogRegistryError::InvalidDestination)
 }
 
-fn validate_registry_table_count(
+pub(crate) fn validate_registry_table_count(
     tables: usize,
     limits: Int64WriteAheadLogRegistryLimits,
 ) -> Result<(), Int64WriteAheadLogRegistryError> {
@@ -1408,6 +1408,68 @@ fn validate_registry_table_count(
         .into());
     }
     Ok(())
+}
+
+pub(crate) fn preflight_registry_tables(
+    tables: &[Int64WalRegistryTablePreflight<'_>],
+    limits: Int64WriteAheadLogRegistryLimits,
+) -> Result<(), Int64WriteAheadLogRegistryError> {
+    validate_registry_table_count(tables.len(), limits)?;
+    let mut table_names = HashSet::with_capacity(tables.len());
+    for table in tables {
+        if !table_names.insert(table.table_name.to_ascii_lowercase()) {
+            return Err(Int64WriteAheadLogRegistryCorruption::DuplicateTable {
+                table: table.table_name.to_owned(),
+            }
+            .into());
+        }
+    }
+
+    let mut bootstrap_bytes = 0_usize;
+    let mut manifest_bytes = REGISTRY_MANIFEST_HEADER_LEN;
+    for (index, table) in tables.iter().enumerate() {
+        Int64WriteAheadLog::validate_bootstrap_limits(
+            table.table_name.len(),
+            table.column_name.len(),
+            table.rows,
+            table.nullable,
+            limits.per_table,
+        )
+        .map_err(|error| Int64WriteAheadLogRegistryError::Member {
+            table: table.table_name.to_owned(),
+            member: "bootstrap".to_owned(),
+            error,
+        })?;
+        let member_bytes = generated_registry_member_name_len(index);
+        manifest_bytes = manifest_bytes
+            .saturating_add(4)
+            .saturating_add(table.table_name.len())
+            .saturating_add(4)
+            .saturating_add(member_bytes);
+        bootstrap_bytes = bootstrap_bytes.saturating_add(
+            bootstrap_payload_len(
+                table.table_name.len(),
+                table.column_name.len(),
+                table.rows,
+                table.nullable,
+            )
+            .unwrap_or(usize::MAX)
+            .saturating_add(INT64_WAL_FRAME_OVERHEAD),
+        );
+    }
+    validate_manifest_size(manifest_bytes, limits)?;
+    validate_registry_totals(bootstrap_bytes, tables.len(), limits)
+}
+
+fn generated_registry_member_name_len(index: usize) -> usize {
+    // `table-`, at least eight decimal digits, and `.wal`.
+    let mut digits = 1_usize;
+    let mut remaining = index;
+    while remaining >= 10 {
+        remaining /= 10;
+        digits += 1;
+    }
+    6 + digits.max(8) + 4
 }
 
 fn validate_manifest_size(
@@ -1739,14 +1801,34 @@ pub(crate) fn recover_registry(
             total_records,
             limits,
         )?;
-        let recovered =
-            recover_file(file, member_metadata.len(), limits.per_table).map_err(|error| {
-                Int64WriteAheadLogRegistryError::Member {
+        let remaining_records = limits.max_total_records.saturating_sub(total_records);
+        let aggregate_record_limit_is_binding = remaining_records <= limits.per_table.max_records;
+        let member_limits = Int64WriteAheadLogLimits {
+            max_records: limits.per_table.max_records.min(remaining_records),
+            ..limits.per_table
+        };
+        let recovered = match recover_file(file, member_metadata.len(), member_limits) {
+            Err(Int64WriteAheadLogError::Limit(Int64WriteAheadLogLimitError::Records {
+                records,
+                ..
+            })) if aggregate_record_limit_is_binding => {
+                return Err(Int64WriteAheadLogRegistryLimitError::TotalRecords {
+                    records: u64::try_from(total_records)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(records),
+                    max_records: limits.max_total_records,
+                }
+                .into());
+            }
+            Err(error) => {
+                return Err(Int64WriteAheadLogRegistryError::Member {
                     table: descriptor.table.clone(),
                     member: descriptor.member.clone(),
                     error,
-                }
-            })?;
+                });
+            }
+            Ok(recovered) => recovered,
+        };
         total_bytes = total_bytes.saturating_add(recovered.file_bytes);
         total_records = total_records.saturating_add(recovered.records);
         validate_registry_totals(total_bytes, total_records, limits)?;

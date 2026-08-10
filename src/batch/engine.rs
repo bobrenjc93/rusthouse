@@ -650,6 +650,12 @@ pub enum DatabaseSnapshotSaveError {
         /// The physical type found in the batch table.
         data_type: DataType,
     },
+    /// The selected column is logically `Int64` but has nullable physical
+    /// storage, which the legacy snapshot payload cannot represent.
+    NullableColumn {
+        /// The stored display name of the nullable column.
+        column: String,
+    },
     /// Encoding or atomically replacing the snapshot failed.
     Snapshot(Int64TablePayloadFileSaveError),
 }
@@ -870,7 +876,8 @@ impl DatabaseSnapshotSaveError {
             Self::Snapshot(error) => error.destination_was_replaced(),
             Self::Table(_)
             | Self::UnsupportedColumnCount { .. }
-            | Self::UnsupportedColumnType { .. } => false,
+            | Self::UnsupportedColumnType { .. }
+            | Self::NullableColumn { .. } => false,
         }
     }
 }
@@ -890,6 +897,10 @@ impl fmt::Display for DatabaseSnapshotSaveError {
             Self::UnsupportedColumnType { column, data_type } => write!(
                 formatter,
                 "column '{column}' has type {data_type}; batch snapshot save requires exactly one non-nullable Int64 column"
+            ),
+            Self::NullableColumn { column } => write!(
+                formatter,
+                "column '{column}' is nullable; batch snapshot save requires exactly one non-nullable Int64 column"
             ),
             Self::Snapshot(error) => write!(formatter, "could not save snapshot: {error}"),
         }
@@ -932,7 +943,9 @@ impl std::error::Error for DatabaseSnapshotSaveError {
         match self {
             Self::Table(error) => Some(error),
             Self::Snapshot(error) => Some(error),
-            Self::UnsupportedColumnCount { .. } | Self::UnsupportedColumnType { .. } => None,
+            Self::UnsupportedColumnCount { .. }
+            | Self::UnsupportedColumnType { .. }
+            | Self::NullableColumn { .. } => None,
         }
     }
 }
@@ -1317,10 +1330,6 @@ impl Database {
         table_name: &str,
         values: &[Option<i64>],
     ) -> Result<()> {
-        let rows = values
-            .iter()
-            .map(|value| vec![value.map_or(Value::Null(DataType::Int64), Value::Int64)])
-            .collect::<Vec<_>>();
         {
             let table = self.catalog.table(table_name)?;
             if !matches!(table.columns(), [Column::NullableInt64(_)]) {
@@ -1330,11 +1339,12 @@ impl Database {
                     actual: table.schema()[0].data_type.to_string(),
                 });
             }
-            table.validate_row_capacity(rows.len())?;
-            for row in &rows {
-                table.validate_row(row)?;
-            }
+            table.validate_row_capacity(values.len())?;
         }
+        let rows = values
+            .iter()
+            .map(|value| vec![value.map_or(Value::Null(DataType::Int64), Value::Int64)])
+            .collect::<Vec<_>>();
         self.log_int64_append(table_name, values)?;
         self.table_mut(table_name)?.append_validated_rows(rows);
         Ok(())
@@ -1462,7 +1472,8 @@ impl Database {
         if self.int64_write_ahead_log.is_some() {
             return Err(DatabaseInt64WalRegistryEnableError::AlreadyEnabled);
         }
-        let mut bootstraps = Vec::with_capacity(table_names.len());
+        wal::validate_registry_table_count(table_names.len(), limits)?;
+        let mut preflight = Vec::with_capacity(table_names.len());
         for requested in table_names {
             let requested = requested.as_ref();
             let table = self.catalog.table(requested).map_err(|error| {
@@ -1486,10 +1497,34 @@ impl Database {
                     data_type: column.data_type,
                 });
             }
+            let (nullable, rows) = match &table.columns()[0] {
+                Column::Int64(values) => (false, values.len()),
+                Column::NullableInt64(values) => (true, values.len()),
+                _ => unreachable!("batch table schema and physical storage must agree"),
+            };
+            preflight.push(wal::Int64WalRegistryTablePreflight {
+                table_name: table.name(),
+                column_name: &column.name,
+                rows,
+                nullable,
+            });
+        }
+        wal::preflight_registry_tables(&preflight, limits)?;
+        drop(preflight);
+
+        let mut bootstraps = Vec::with_capacity(table_names.len());
+        for requested in table_names {
+            let table = self.catalog.table(requested.as_ref()).map_err(|error| {
+                DatabaseInt64WalRegistryEnableError::Table {
+                    table: requested.as_ref().to_owned(),
+                    error,
+                }
+            })?;
+            let column = &table.schema()[0];
             let (nullable, values) = match &table.columns()[0] {
                 Column::Int64(values) => (false, values.iter().copied().map(Some).collect()),
                 Column::NullableInt64(values) => (true, values.clone()),
-                _ => unreachable!("batch table schema and physical storage must agree"),
+                _ => unreachable!("registry table shape was preflighted"),
             };
             let table_limits = table.limits();
             let database_table_limits = self.table_limits;
@@ -2168,6 +2203,11 @@ impl Database {
             return Err(DatabaseSnapshotSaveError::UnsupportedColumnType {
                 column: column.name.clone(),
                 data_type: column.data_type,
+            });
+        }
+        if table.column_is_nullable_int64(0) {
+            return Err(DatabaseSnapshotSaveError::NullableColumn {
+                column: column.name.clone(),
             });
         }
         let Column::Int64(values) = &table.columns()[0] else {
@@ -4567,6 +4607,7 @@ fn resolve_row_number_ordering(
             actual: actual.to_string(),
         });
     }
+    reject_nullable_operation(table, source, "ROW_NUMBER ORDER BY")?;
 
     Ok(Some(ResolvedWindowOrder {
         source,
@@ -4803,6 +4844,17 @@ fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> 
     Ok(columns)
 }
 
+fn reject_nullable_operation(table: &Table, column: usize, operation: &'static str) -> Result<()> {
+    if table.column_is_nullable_int64(column) {
+        return Err(Error::UnsupportedNullableOperation {
+            table: table.name().to_owned(),
+            column: table.schema()[column].name.clone(),
+            operation,
+        });
+    }
+    Ok(())
+}
+
 fn resolve_select_items(
     table: &Table,
     requested: &[SelectItem],
@@ -4879,6 +4931,7 @@ fn resolve_select_items(
                         actual: actual.to_string(),
                     });
                 }
+                reject_nullable_operation(table, source, "Int64 subtraction")?;
                 if has_aggregate || !group_columns.is_empty() {
                     return Err(Error::InvalidQuery(
                         "Int64 subtraction projections are only supported in ungrouped SELECT queries"
@@ -4903,6 +4956,9 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
+                if actual == DataType::Int64 {
+                    reject_nullable_operation(table, source, "CAST")?;
+                }
                 let resolved = match (actual, *target_type) {
                     (DataType::Int64, DataType::Float64) => {
                         Some(ResolvedItem::CastInt64ToFloat64 { source })
@@ -4971,6 +5027,7 @@ fn resolve_select_items(
             }
             SelectItem::ToString { name, alias } => {
                 let source = table.column_index(name)?;
+                reject_nullable_operation(table, source, "toString")?;
                 if has_aggregate || !group_columns.is_empty() {
                     return Err(Error::InvalidQuery(
                         "toString projections are only supported in ungrouped SELECT queries"
@@ -5112,7 +5169,10 @@ fn resolve_select_items(
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
                 let item = match actual {
-                    DataType::Int64 => ResolvedItem::Int64Abs { source },
+                    DataType::Int64 => {
+                        reject_nullable_operation(table, source, "ABS")?;
+                        ResolvedItem::Int64Abs { source }
+                    }
                     DataType::Float64 => ResolvedItem::Float64Abs { source },
                     DataType::Bool | DataType::String => {
                         return Err(Error::TypeMismatch {
@@ -5248,6 +5308,9 @@ fn resolve_select_items(
                     }
                 };
                 validate_aggregate(*function, input_type)?;
+                if let Some(argument) = argument_index {
+                    reject_nullable_operation(table, argument, function.name())?;
+                }
                 let state = aggregate_specs.len();
                 aggregate_specs.push(AggregateSpec {
                     function: *function,

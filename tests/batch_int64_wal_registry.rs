@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::batch::engine::{Database, StatementResult};
+use rusthouse::batch::error::Error;
 use rusthouse::batch::storage::{Column, Int64RangePartition, Int64RangePartitionLimits};
 use rusthouse::batch::value::Value;
 use rusthouse::batch::wal::{
@@ -14,7 +15,8 @@ use rusthouse::batch::wal::{
     Int64WriteAheadLogRegistryLimits,
 };
 use rusthouse::{
-    DatabaseInt64WalRegistryEnableError, DatabaseInt64WalRegistryRecoveryError, TableLimits,
+    DatabaseInt64WalRegistryEnableError, DatabaseInt64WalRegistryRecoveryError,
+    DatabaseSnapshotSaveError, Int64TablePayloadCodec, SnapshotCodec, TableLimits,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -84,6 +86,110 @@ fn create_two_table_registry(path: &Path) {
         .enable_int64_write_ahead_log_registry(&["Beta", "Alpha"], path, limits())
         .unwrap();
     database.disable_int64_write_ahead_log();
+}
+
+fn assert_nullable_expressions_are_rejected(database: &mut Database, table: &str) {
+    for (expression, operation) in [
+        ("SUM(v)", "SUM"),
+        ("COUNT(v)", "COUNT"),
+        ("MIN(v)", "MIN"),
+        ("MAX(v)", "MAX"),
+        ("AVG(v)", "AVG"),
+        ("v - 1", "Int64 subtraction"),
+        ("CAST(v AS String)", "CAST"),
+        ("toString(v)", "toString"),
+        ("ABS(v)", "ABS"),
+        ("ROW_NUMBER() OVER (ORDER BY v ASC)", "ROW_NUMBER ORDER BY"),
+    ] {
+        let error = database
+            .execute(&format!("SELECT {expression} FROM {table}"))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            Error::UnsupportedNullableOperation {
+                table: "Alpha".to_owned(),
+                column: "v".to_owned(),
+                operation,
+            },
+            "expression {expression}"
+        );
+    }
+
+    let grouped = database
+        .execute(&format!("SELECT v, SUM(v) FROM {table} GROUP BY v"))
+        .unwrap_err();
+    assert_eq!(
+        grouped,
+        Error::UnsupportedNullableOperation {
+            table: "Alpha".to_owned(),
+            column: "v".to_owned(),
+            operation: "SUM",
+        }
+    );
+
+    let results = database
+        .execute(&format!("SELECT COUNT(*) FROM {table}"))
+        .unwrap();
+    let [StatementResult::Query(count)] = results.as_slice() else {
+        panic!("expected COUNT(*) query")
+    };
+    assert_eq!(count.rows, [vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn nullable_created_and_recovered_tables_reject_unsupported_physical_operations() {
+    let directory = TestDirectory::new();
+    let registry = directory.join("registry");
+    let snapshot = directory.join("nullable.snapshot");
+    let mut database = Database::new();
+    database
+        .create_nullable_int64_table("Alpha", "v", vec![Some(1), None])
+        .unwrap();
+
+    assert_nullable_expressions_are_rejected(&mut database, "alpha");
+    let snapshot_error = database
+        .save_int64_table_to_file(
+            "Alpha",
+            &snapshot,
+            SnapshotCodec::new(1024),
+            Int64TablePayloadCodec::new(1, 2, 1024),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        snapshot_error,
+        DatabaseSnapshotSaveError::NullableColumn { ref column } if column == "v"
+    ));
+    assert!(!snapshot_error.destination_was_replaced());
+    assert!(!snapshot.exists());
+
+    database
+        .enable_int64_write_ahead_log_registry(&["Alpha"], &registry, limits())
+        .unwrap();
+    database.disable_int64_write_ahead_log();
+    let mut recovered =
+        Database::recover_int64_write_ahead_log_registry(&registry, limits()).unwrap();
+    assert_nullable_expressions_are_rejected(&mut recovered, "ALPHA");
+}
+
+#[test]
+fn oversized_nullable_append_is_rejected_before_row_materialization() {
+    let mut database = Database::with_table_limits(TableLimits::new(1, 1, 1));
+    database
+        .create_nullable_int64_table("Alpha", "v", vec![Some(1)])
+        .unwrap();
+    let oversized = vec![None; 100_000];
+
+    assert_eq!(
+        database
+            .append_nullable_int64_values("Alpha", &oversized)
+            .unwrap_err(),
+        Error::ResourceLimitExceeded {
+            resource: "table rows",
+            actual: 100_001,
+            max: 1,
+        }
+    );
+    assert_eq!(nullable(&database, "Alpha"), [Some(1)]);
 }
 
 #[test]
@@ -288,9 +394,32 @@ fn corrupt_missing_special_and_unlisted_members_fail_without_a_database() {
 #[test]
 fn duplicate_inputs_and_aggregate_limits_are_typed_and_prepublication() {
     let directory = TestDirectory::new();
+    let over_table_cap = Int64WriteAheadLogRegistryLimits {
+        max_tables: 1,
+        ..limits()
+    };
+    let count_path = directory.join("count");
+    let mut empty = Database::new();
+    assert!(matches!(
+        empty.enable_int64_write_ahead_log_registry(
+            &["Missing", "StillMissing"],
+            &count_path,
+            over_table_cap,
+        ),
+        Err(DatabaseInt64WalRegistryEnableError::Registry(
+            Int64WriteAheadLogRegistryError::Limit(Int64WriteAheadLogRegistryLimitError::Tables {
+                tables: 2,
+                max_tables: 1,
+            })
+        ))
+    ));
+    assert!(!count_path.exists());
+
     let duplicate_path = directory.join("duplicate");
     let mut database = Database::new();
-    database.execute("CREATE TABLE Events (v Int64)").unwrap();
+    database
+        .create_nullable_int64_table("Events", "v", vec![Some(7); 4_096])
+        .unwrap();
     assert!(matches!(
         database.enable_int64_write_ahead_log_registry(
             &["Events", "events"],
@@ -305,6 +434,43 @@ fn duplicate_inputs_and_aggregate_limits_are_typed_and_prepublication() {
     ));
     assert!(!duplicate_path.exists());
     assert!(!database.int64_write_ahead_log_enabled());
+
+    let aggregate_path = directory.join("aggregate-preflight");
+    let aggregate_limit = Int64WriteAheadLogRegistryLimits {
+        max_total_wal_bytes: 1,
+        per_table: Int64WriteAheadLogLimits::new(1024 * 1024, 1024 * 1024, 64),
+        ..limits()
+    };
+    assert!(matches!(
+        database.enable_int64_write_ahead_log_registry(
+            &["Events"],
+            &aggregate_path,
+            aggregate_limit,
+        ),
+        Err(DatabaseInt64WalRegistryEnableError::Registry(
+            Int64WriteAheadLogRegistryError::Limit(
+                Int64WriteAheadLogRegistryLimitError::TotalWalBytes { .. }
+            )
+        ))
+    ));
+    assert!(!aggregate_path.exists());
+
+    let manifest_path = directory.join("manifest-preflight");
+    let manifest_limit = Int64WriteAheadLogRegistryLimits {
+        max_manifest_bytes: 27,
+        per_table: Int64WriteAheadLogLimits::new(1024 * 1024, 1024 * 1024, 64),
+        ..limits()
+    };
+    assert!(matches!(
+        database
+            .enable_int64_write_ahead_log_registry(&["Events"], &manifest_path, manifest_limit,),
+        Err(DatabaseInt64WalRegistryEnableError::Registry(
+            Int64WriteAheadLogRegistryError::Limit(
+                Int64WriteAheadLogRegistryLimitError::ManifestBytes { .. }
+            )
+        ))
+    ));
+    assert!(!manifest_path.exists());
 
     let registry = directory.join("bounded");
     create_two_table_registry(&registry);
@@ -344,6 +510,42 @@ fn duplicate_inputs_and_aggregate_limits_are_typed_and_prepublication() {
         Err(DatabaseInt64WalRegistryRecoveryError::Registry(
             Int64WriteAheadLogRegistryError::Limit(
                 Int64WriteAheadLogRegistryLimitError::TotalWalBytes { .. }
+            )
+        ))
+    ));
+}
+
+#[test]
+fn recovery_stops_at_the_remaining_aggregate_record_budget() {
+    let directory = TestDirectory::new();
+    let registry = directory.join("registry");
+    let mut database = Database::new();
+    database.execute("CREATE TABLE Events (v Int64)").unwrap();
+    database
+        .enable_int64_write_ahead_log_registry(&["Events"], &registry, limits())
+        .unwrap();
+    database.execute("INSERT INTO Events VALUES (1)").unwrap();
+    database.execute("INSERT INTO Events VALUES (2)").unwrap();
+    database.execute("INSERT INTO Events VALUES (3)").unwrap();
+    database.disable_int64_write_ahead_log();
+
+    let member = registry.join("table-00000000.wal");
+    let mut bytes = fs::read(&member).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    fs::write(&member, bytes).unwrap();
+    let one_record = Int64WriteAheadLogRegistryLimits {
+        max_total_records: 1,
+        ..limits()
+    };
+
+    assert!(matches!(
+        Database::recover_int64_write_ahead_log_registry(&registry, one_record),
+        Err(DatabaseInt64WalRegistryRecoveryError::Registry(
+            Int64WriteAheadLogRegistryError::Limit(
+                Int64WriteAheadLogRegistryLimitError::TotalRecords {
+                    records: 2,
+                    max_records: 1,
+                }
             )
         ))
     ));
