@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use rusthouse::batch::csv::CsvIngestLimits;
 use rusthouse::batch::engine::{Database, QueryResultLimits, ResultColumn};
+use rusthouse::batch::error::Error;
 use rusthouse::batch::tsv::TsvIngestLimits;
 use rusthouse::batch::value::Value;
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, Int64MinMaxIndexAdmission, Int64MinMaxIndexLimits,
-    SharedDatabase, handle_http_query, handle_http_query_read_only_with_bearer_token,
+    SharedDatabase, SharedDatabaseError, handle_http_query,
+    handle_http_query_read_only_with_bearer_token,
     handle_http_query_read_only_with_bearer_token_and_limits,
     handle_http_query_read_only_with_clickhouse_key,
     handle_http_query_read_only_with_clickhouse_key_and_limits,
@@ -184,10 +186,10 @@ fn metrics_body(
          # HELP rusthouse_retained_value_bytes Scalar payload bytes retained across all tables.\n\
          # TYPE rusthouse_retained_value_bytes gauge\n\
          rusthouse_retained_value_bytes {retained_value_bytes}\n\
-         # HELP rusthouse_index_scanned_blocks Sparse-index blocks scanned by successful indexed queries.\n\
+         # HELP rusthouse_index_scanned_blocks Sparse-index blocks selected for exact evaluation by indexed query attempts.\n\
          # TYPE rusthouse_index_scanned_blocks counter\n\
          rusthouse_index_scanned_blocks {index_scanned_blocks}\n\
-         # HELP rusthouse_index_pruned_blocks Sparse-index blocks pruned by successful indexed queries.\n\
+         # HELP rusthouse_index_pruned_blocks Sparse-index blocks rejected using metadata by indexed query attempts.\n\
          # TYPE rusthouse_index_pruned_blocks counter\n\
          rusthouse_index_pruned_blocks {index_pruned_blocks}\n\
          # HELP rusthouse_table_rows Number of rows retained by a table.\n\
@@ -1144,7 +1146,7 @@ fn metrics_reports_state_changes_as_prometheus_gauges() {
 }
 
 #[test]
-fn metrics_reports_zero_and_incremented_index_pruning_counters() {
+fn metrics_reports_index_work_from_failed_and_successful_queries() {
     let database = SharedDatabase::default();
     const REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
@@ -1177,6 +1179,22 @@ fn metrics_reports_zero_and_incremented_index_pruning_counters() {
         (0, 0),
         &[("events", 12, 192)],
     );
+    assert!(matches!(
+        database.query_with_result_limit("SELECT id FROM events WHERE key = 202", 0),
+        Err(SharedDatabaseError::Sql(Error::ResultLimitExceeded {
+            max_bytes: 0,
+            ..
+        }))
+    ));
+    assert_ok_metrics_response_with_index_counters(
+        &exchange(&database, REQUEST),
+        1,
+        2,
+        12,
+        192,
+        (1, 2),
+        &[("events", 12, 192)],
+    );
     database
         .query("SELECT id FROM events WHERE key = 202")
         .expect("indexed query succeeds");
@@ -1186,7 +1204,7 @@ fn metrics_reports_zero_and_incremented_index_pruning_counters() {
         2,
         12,
         192,
-        (1, 2),
+        (2, 4),
         &[("events", 12, 192)],
     );
 }

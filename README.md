@@ -145,8 +145,9 @@ scan-row limit. Inserts, deletes, updates, truncation, and added columns rebuild
 the index within the table mutation; if its original cap is exceeded it is
 invalidated. Dropping a column or replacing/restoring the table invalidates it.
 `Database::index_pruning_metrics` exposes cumulative surviving
-`scanned_blocks` and metadata-rejected `pruned_blocks`; unindexed fallbacks do
-not increment them.
+`scanned_blocks` and metadata-rejected `pruned_blocks` whenever sparse-index
+pruning runs. This work remains counted if later query processing fails;
+unindexed fallbacks and errors before pruning do not increment either counter.
 
 `DELETE FROM <table> WHERE <comparison> [AND <comparison>]` and its ClickHouse
 mutation spelling, `ALTER TABLE <table> DELETE WHERE <comparison> [AND
@@ -1077,9 +1078,10 @@ schema-column count across all tables, the row count retained across all tables,
 and retained scalar payload bytes. The same response includes the unlabeled
 `rusthouse_index_scanned_blocks` and `rusthouse_index_pruned_blocks` counters
 reported by `system.metrics`. They count blocks passed to the exact predicate
-evaluator and blocks rejected from metadata, respectively, across successful
-indexed queries; queries without an applicable current index do not change
-either counter. It also returns
+evaluator and blocks rejected from metadata, respectively, across indexed query
+attempts. Work remains counted when later query processing fails, including
+retained-result validation; queries without an applicable current index do not
+change either counter. It also returns
 `rusthouse_table_rows{table="<display-name>"}` and
 `rusthouse_table_retained_value_bytes{table="<display-name>"}` gauges for every
 current table, ordered case-insensitively by table name within each family. Each

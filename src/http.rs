@@ -3586,12 +3586,12 @@ const RETAINED_VALUE_BYTES_METRIC_PREFIX: &str = concat!(
     "rusthouse_retained_value_bytes ",
 );
 const INDEX_SCANNED_BLOCKS_METRIC_PREFIX: &str = concat!(
-    "# HELP rusthouse_index_scanned_blocks Sparse-index blocks scanned by successful indexed queries.\n",
+    "# HELP rusthouse_index_scanned_blocks Sparse-index blocks selected for exact evaluation by indexed query attempts.\n",
     "# TYPE rusthouse_index_scanned_blocks counter\n",
     "rusthouse_index_scanned_blocks ",
 );
 const INDEX_PRUNED_BLOCKS_METRIC_PREFIX: &str = concat!(
-    "# HELP rusthouse_index_pruned_blocks Sparse-index blocks pruned by successful indexed queries.\n",
+    "# HELP rusthouse_index_pruned_blocks Sparse-index blocks rejected using metadata by indexed query attempts.\n",
     "# TYPE rusthouse_index_pruned_blocks counter\n",
     "rusthouse_index_pruned_blocks ",
 );
