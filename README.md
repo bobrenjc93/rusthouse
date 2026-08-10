@@ -115,10 +115,12 @@ byte caps; a zero granularity, a full database index slot, or either exceeded
 cap is an admission rejection and leaves existing state unchanged. Each block
 records its first row, row count, non-null minimum/maximum, and null count;
 all-null blocks therefore have no extrema. Physical column vectors support
-`Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL DDL
-cannot currently declare nullable columns; `Nullable(Int64)` storage is instead
-created through library APIs or WAL recovery. The index metadata has explicit
-nullable-block semantics for both `Int64` storage forms.
+`Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL accepts
+the exact one-column `CREATE TABLE <name> (<column> Nullable(Int64))` shape
+case-insensitively; other nullable types and nullable multi-column declarations
+remain outside the bounded grammar. Library APIs and WAL recovery can also
+create this physical storage. The index metadata has explicit nullable-block
+semantics for both `Int64` storage forms.
 
 An admitted, current index can reject blocks only for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
@@ -1498,10 +1500,10 @@ exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.m
 ## Int64 write-ahead logging
 
 On Unix, `Database::enable_int64_write_ahead_log` can opt one existing batch
-table with exactly one `Int64` or programmatic `Nullable(Int64)` column into a
-bounded WAL. A synchronized bootstrap captures its display names, current
-rows and nullability, table/database limits, query row and byte caps, and
-worker cap. `Database::create_nullable_int64_table`,
+table with exactly one `Int64` or SQL-created/programmatic `Nullable(Int64)`
+column into a bounded WAL. A synchronized bootstrap captures its display
+names, current rows and nullability, table/database limits, query row and byte
+caps, and worker cap. `Database::create_nullable_int64_table`,
 `append_nullable_int64_values`, and `replace_nullable_int64_values` provide
 the bounded nullable table and mutation paths.
 Successful SQL/CSV/TSV appends, `TRUNCATE TABLE`, and atomic `ALTER TABLE ...

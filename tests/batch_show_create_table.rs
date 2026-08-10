@@ -151,6 +151,36 @@ fn accepts_exact_and_rejects_exceeded_result_limits() {
 }
 
 #[test]
+fn nullable_int64_ddl_obeys_the_exact_show_create_byte_boundary() {
+    const NULLABLE_DDL: &str = "CREATE TABLE Readings (Measurement Nullable(Int64))";
+    let exact_bytes = result_bytes(NULLABLE_DDL);
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    exact.execute(NULLABLE_DDL).expect("setup succeeds");
+    assert_eq!(
+        query(&mut exact, "SHOW CREATE TABLE readings").rows,
+        [vec![Value::String(NULLABLE_DDL.to_owned())]]
+    );
+
+    let mut one_short = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_short.execute(NULLABLE_DDL).expect("setup succeeds");
+    assert_eq!(
+        one_short.execute("SHOW CREATE TABLE readings"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SHOW CREATE TABLE result bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        })
+    );
+}
+
+#[test]
 fn shared_database_reads_show_create_table_under_a_read_lock() {
     let database = SharedDatabase::default();
     database.execute(CREATE).expect("setup succeeds");
