@@ -1339,8 +1339,16 @@ oversized files before decoding, and keeps filesystem, envelope, RLE payload,
 nullability, and capacity failures typed without returning partial tables. The
 legacy high-level restore helper intentionally continues to accept only the
 uncompressed row format.
+`Database::restore_int64_table_rle_from_file` imports that same bounded RLE
+format as one caller-named typed batch table. Case-insensitive duplicate names
+are rejected before the source is opened; decoding, non-nullability, SQL
+identifier, and configured table-limit checks all finish before the catalog or
+cached metrics change. A successful import is immediately queryable by
+`SELECT` and retains the caller-supplied row cap for later inserts.
 The legacy save and restore helpers use row-only payloads, so
-their schema and table row-cap metadata remain caller-supplied. The
+their column schema and table row-cap metadata remain caller-supplied and are
+not authenticated by the snapshot. The destination batch table name is also
+caller-supplied: an RLE file contains rows only, not catalog metadata. The
 self-describing save helper is the metadata-preserving counterpart and reopens
 with `restore_int64_table_payload_from_file`. The codec also composes directly
 with the envelope's lower-level `encode`, `create_new_file`, and Unix

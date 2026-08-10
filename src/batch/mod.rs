@@ -14,8 +14,8 @@ pub mod value;
 #[cfg(unix)]
 pub use engine::DatabaseSnapshotSaveError;
 pub use engine::{
-    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseSnapshotRestoreEntry,
-    DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError,
+    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseRleSnapshotRestoreError,
+    DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError,
 };
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 #[cfg(unix)]
