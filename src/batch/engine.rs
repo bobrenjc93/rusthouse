@@ -3915,6 +3915,9 @@ enum ResolvedItem {
     StringLengthUtf8 {
         source: usize,
     },
+    StringEmpty {
+        source: usize,
+    },
     StringLower {
         source: usize,
     },
@@ -4232,6 +4235,30 @@ fn resolve_select_items(
                     name: alias
                         .clone()
                         .unwrap_or_else(|| format!("lengthUTF8({})", table.schema()[source].name)),
+                    data_type: DataType::Int64,
+                });
+            }
+            SelectItem::Empty { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::String {
+                    return Err(Error::TypeMismatch {
+                        context: format!("empty argument '{name}'"),
+                        expected: DataType::String.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "empty projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::StringEmpty { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("empty({})", table.schema()[source].name)),
                     data_type: DataType::Int64,
                 });
             }
@@ -4625,6 +4652,9 @@ fn execute_projection(
                         ResolvedItem::StringLengthUtf8 { source } => Value::Int64(
                             string_length_utf8_to_i64(string_at(table, *source, *row))?,
                         ),
+                        ResolvedItem::StringEmpty { source } => {
+                            Value::Int64(i64::from(string_at(table, *source, *row).is_empty()))
+                        }
                         ResolvedItem::StringLower { source } => {
                             Value::String(string_at(table, *source, *row).to_ascii_lowercase())
                         }
@@ -4786,6 +4816,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::ToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::StringLengthUtf8 { .. }
+                | ResolvedItem::StringEmpty { .. }
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::Float64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
@@ -4879,6 +4910,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::StringLengthUtf8 { .. } => {
                     unreachable!("lengthUTF8 projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringEmpty { .. } => {
+                    unreachable!("empty projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLower { .. } => {
                     unreachable!("LOWER projections are restricted to ungrouped queries")
@@ -6089,6 +6123,9 @@ impl GroupedData<'_> {
                                 "lengthUTF8 projections are restricted to ungrouped queries"
                             )
                         }
+                        ResolvedItem::StringEmpty { .. } => {
+                            unreachable!("empty projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::StringLower { .. } => {
                             unreachable!("LOWER projections are restricted to ungrouped queries")
                         }
@@ -6477,6 +6514,9 @@ fn resolved_expression_name(
         ResolvedItem::StringLengthUtf8 { source } => {
             format!("lengthUTF8({})", table.schema()[*source].name)
         }
+        ResolvedItem::StringEmpty { source } => {
+            format!("empty({})", table.schema()[*source].name)
+        }
         ResolvedItem::StringLower { source } => {
             format!("LOWER({})", table.schema()[*source].name)
         }
@@ -6651,6 +6691,9 @@ fn order_source_rows(
                     .chars()
                     .count()
                     .cmp(&string_at(table, source, right).chars().count()),
+                ResolvedItem::StringEmpty { source } => string_at(table, source, left)
+                    .is_empty()
+                    .cmp(&string_at(table, source, right).is_empty()),
                 ResolvedItem::StringLower { source } => ascii_lower_cmp(
                     string_at(table, source, left),
                     string_at(table, source, right),
@@ -6863,6 +6906,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::StringLengthUtf8 { .. } => {
                     unreachable!("lengthUTF8 projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringEmpty { .. } => {
+                    unreachable!("empty projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLower { .. } => {
                     unreachable!("LOWER projections are restricted to ungrouped queries")

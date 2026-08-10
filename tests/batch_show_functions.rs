@@ -16,7 +16,7 @@ use rusthouse::{
     handle_http_query_read_only_with_clickhouse_key,
 };
 
-const FUNCTIONS: [&str; 19] = [
+const FUNCTIONS: [&str; 20] = [
     "ABS",
     "AVG",
     "CAST",
@@ -24,6 +24,7 @@ const FUNCTIONS: [&str; 19] = [
     "COUNT",
     "countIf",
     "currentDatabase",
+    "empty",
     "FLOOR",
     "LENGTH",
     "lengthUTF8",
