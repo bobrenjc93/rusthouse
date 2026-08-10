@@ -34,6 +34,8 @@ fn metrics_result(tables: i64, column_count: i64, rows: i64, value_bytes: i64) -
             ("rusthouse_columns", column_count),
             ("rusthouse_retained_rows", rows),
             ("rusthouse_retained_value_bytes", value_bytes),
+            ("rusthouse_index_scanned_blocks", 0),
+            ("rusthouse_index_pruned_blocks", 0),
         ]
         .into_iter()
         .map(|(metric, value)| vec![Value::String(metric.to_owned()), Value::Int64(value)])

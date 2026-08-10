@@ -11,7 +11,8 @@ use super::csv::{CsvIngestError, CsvIngestLimits};
 use super::engine::DatabaseSnapshotSaveError;
 use super::engine::{
     DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, DatabaseSnapshotRestoreEntry,
-    DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, QueryResult, QueryResultLimits,
+    DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, IndexPruningMetrics,
+    Int64MinMaxIndexAdmission, Int64MinMaxIndexLimits, QueryResult, QueryResultLimits,
     StatementResult, TableLimits,
 };
 use super::error::Error;
@@ -407,6 +408,30 @@ impl SharedDatabase {
         Ok(self
             .try_write()?
             .set_global_aggregate_worker_cap(global_aggregate_worker_cap))
+    }
+
+    /// Installs the optional sparse index while holding the database write lock.
+    pub fn create_int64_min_max_index(
+        &self,
+        table: &str,
+        column: &str,
+        limits: Int64MinMaxIndexLimits,
+    ) -> Result<Int64MinMaxIndexAdmission, SharedDatabaseError> {
+        self.write()?
+            .create_int64_min_max_index(table, column, limits)
+            .map_err(Into::into)
+    }
+
+    /// Removes a table's optional sparse index while holding the write lock.
+    pub fn drop_int64_min_max_index(&self, table: &str) -> Result<bool, SharedDatabaseError> {
+        self.write()?
+            .drop_int64_min_max_index(table)
+            .map_err(Into::into)
+    }
+
+    /// Returns cumulative sparse-index scan counters under a shared lock.
+    pub fn index_pruning_metrics(&self) -> Result<IndexPruningMetrics, SharedDatabaseError> {
+        Ok(self.read()?.index_pruning_metrics())
     }
 
     /// Attempts to restore one self-describing, non-nullable `Int64` snapshot.

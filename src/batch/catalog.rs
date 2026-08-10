@@ -247,6 +247,15 @@ impl Catalog {
         self.tables.len()
     }
 
+    /// Returns the display name of the table occupying the database-wide
+    /// sparse-index slot, if any.
+    pub(crate) fn int64_min_max_index_owner(&self) -> Option<&str> {
+        self.tables
+            .values()
+            .find(|table| table.has_int64_min_max_index())
+            .map(Table::name)
+    }
+
     /// Returns the number of columns retained across all registered tables.
     #[must_use]
     pub fn column_count(&self) -> usize {

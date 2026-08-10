@@ -104,6 +104,30 @@ row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, or row-count/`MAX(Int64)` pair
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
+One batch table at a time may hold an optional bounded sparse `Int64` min/max
+index, installed through `Database::create_int64_min_max_index` (or the
+matching `SharedDatabase` method). `Int64MinMaxIndexLimits` selects a fixed
+number of consecutive source rows per block and hard block-count and metadata-
+byte caps; a zero granularity, a full database index slot, or either exceeded
+cap is an admission rejection and leaves existing state unchanged. Each block
+records its first row, row count, non-null minimum/maximum, and null count;
+all-null blocks therefore have no extrema. Batch columns are currently
+non-nullable, but the metadata has explicit nullable-block semantics.
+
+An admitted, current index can reject blocks only for a simple `Int64`
+column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
+order). Every row in a surviving block still follows the normal exact
+predicate evaluator. Compound and `!=` predicates, missing or stale indexes,
+and failed admissions use the unchanged full-scan path. Candidate blocks and
+rows retain source order, so first-row, ordering, pagination, grouping, and
+`HAVING` behavior is identical. The full source row count still pays the query
+scan-row limit. Inserts, deletes, updates, truncation, and added columns rebuild
+the index within the table mutation; if its original cap is exceeded it is
+invalidated. Dropping a column or replacing/restoring the table invalidates it.
+`Database::index_pruning_metrics` exposes cumulative surviving
+`scanned_blocks` and metadata-rejected `pruned_blocks`; unindexed fallbacks do
+not increment them.
+
 `DELETE FROM <table> WHERE <comparison> [AND <comparison>]` and its ClickHouse
 mutation spelling, `ALTER TABLE <table> DELETE WHERE <comparison> [AND
 <comparison>]`, remove rows matching one typed column-to-literal comparison or
@@ -324,11 +348,13 @@ The complete row, value, byte, and retained-result bounds are preflighted before
 result storage is allocated, and the query is available through the normal
 `Database`, `SharedDatabase`, CLI, and HTTP paths in every supported format.
 The exact case-insensitive query
-`SELECT metric, value FROM system.metrics` returns the four cached database
-totals also exposed as unlabeled Prometheus gauges: `rusthouse_tables`,
+`SELECT metric, value FROM system.metrics` returns four cached database totals
+also exposed as unlabeled Prometheus gauges—`rusthouse_tables`,
 `rusthouse_columns`, `rusthouse_retained_rows`, and
-`rusthouse_retained_value_bytes`. Rows remain in that order and contain a
-`String` metric name plus a checked `Int64` value. The totals track table,
+`rusthouse_retained_value_bytes`—followed by the cumulative
+`rusthouse_index_scanned_blocks` and `rusthouse_index_pruned_blocks` counters.
+Rows remain in that order and contain a `String` metric name plus a checked
+`Int64` value. The totals track table,
 column, retained-row, and retained scalar payload-byte lifecycle changes; the
 byte definition matches `GET /metrics`. Other projections, aliases, filters,
 ordering, limits, and trailing clauses are rejected. The fixed result shape,

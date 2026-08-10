@@ -14,8 +14,12 @@ pub mod value;
 #[cfg(unix)]
 pub use engine::DatabaseSnapshotSaveError;
 pub use engine::{
-    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseRleSnapshotRestoreError,
-    DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError,
+    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS,
+    DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS, DEFAULT_INT64_MIN_MAX_INDEX_BYTES, Database,
+    DatabaseRleSnapshotRestoreError, DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError,
+    DatabaseSnapshotSetRestoreError, IndexPruningMetrics, Int64MinMaxBlockMetadata,
+    Int64MinMaxIndexAdmission, Int64MinMaxIndexInfo, Int64MinMaxIndexLimits,
+    Int64MinMaxIndexRejection,
 };
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 #[cfg(unix)]
