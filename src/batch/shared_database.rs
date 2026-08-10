@@ -332,7 +332,7 @@ impl SharedDatabase {
     }
 
     /// Creates an empty shared database with an explicit nonzero computation-lane
-    /// cap for supported global aggregates.
+    /// cap for supported parallel aggregates, including Bool-grouped `COUNT`.
     #[must_use]
     pub fn with_global_aggregate_worker_cap(global_aggregate_worker_cap: NonZeroUsize) -> Self {
         Self::new(Database::with_global_aggregate_worker_cap(
@@ -376,12 +376,12 @@ impl SharedDatabase {
         Ok(self.read()?.table_limits())
     }
 
-    /// Returns the configured computation-lane cap for supported global aggregates.
+    /// Returns the configured computation-lane cap for supported parallel aggregates.
     pub fn global_aggregate_worker_cap(&self) -> Result<NonZeroUsize, SharedDatabaseError> {
         Ok(self.read()?.global_aggregate_worker_cap())
     }
 
-    /// Attempts to replace the computation-lane cap for supported global
+    /// Attempts to replace the computation-lane cap for supported parallel
     /// aggregates, returning the previous cap.
     ///
     /// Exactly one nonblocking write-lock attempt is made. An active reader or
