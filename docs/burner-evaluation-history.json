@@ -2561,6 +2561,22 @@
         "eval_c88a7f3d": 85,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:737",
+      "recordedAt": "2026-08-10T06:59:26.841Z",
+      "label": "PR #737",
+      "kind": "leaf",
+      "prNumber": 737,
+      "title": "Add bounded multi-table Int64 WAL recovery registry",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 90,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
