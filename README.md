@@ -67,7 +67,11 @@ Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `MIN(Int64)`,
 `MIN(Float64)`, `MAX(Int64)`, `MAX(Float64)`, or `AVG(Int64)`, and an exact
 two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
 `SUM(Int64)`, `AVG(Int64)`, `MIN(Int64)`, `MIN(Float64)`, or `MAX(Int64)` use
-deterministic contiguous chunks when more than 262,144 rows match. The paired
+deterministic contiguous chunks when more than 262,144 rows match. A grouped
+query also uses those chunks when it has exactly one non-nullable `Bool`
+grouping column and exactly one `COUNT(*)` or `COUNT()` aggregate. Ordered
+partition reduction preserves first-seen Bool grouping before the normal
+grouped ordering and pagination stages. The paired
 shape preserves either projection order and derives its row count with a
 checked conversion of the filtered cardinality while the existing checked
 sum-and-count lanes target about 131,072 rows each. Release-mode crossover
@@ -91,8 +95,9 @@ Int64 and Float64 extrema partials are reduced directly without
 allocating a partial-results collection. Ordered reduction preserves the first
 occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
-or below the threshold, grouped aggregates, multi-aggregate projections other
-than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
+or below the threshold, other grouped shapes (including `COUNT(column)`, more
+than one grouping column, non-Bool keys, or multiple aggregates), and
+multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, or row-count/`MAX(Int64)` pairs (including
 `COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema,
 `AVG(Float64)`, and other aggregate functions remain sequential.
@@ -649,7 +654,8 @@ all unselected cells and table metadata.
 constructor configure the scan and output limits.
 `Database::with_global_aggregate_worker_cap` and the matching `SharedDatabase`
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
-parallel global aggregates. The configured cap is an upper bound: the
+parallel global aggregates and the narrow Bool-grouped `COUNT` shape. The
+configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
 runtime setters are `Database::set_global_aggregate_worker_cap` and the
@@ -776,8 +782,9 @@ limit. `GROUP BY` and `DISTINCT` charge every distinct working group before
 `HAVING` and `LIMIT`, so those result clauses cannot hide excess groups.
 `max_threads` has the same decimal syntax. Zero retains the database's
 `global_aggregate_worker_cap`; a nonzero value is combined with that cap using
-the smaller value. It applies only to supported parallel global aggregates in
-that request and never changes `SHOW SETTINGS` or `system.settings`. The
+the smaller value. It applies only to supported parallel aggregates in that
+request, including Bool-grouped `COUNT`, and never changes `SHOW SETTINGS` or
+`system.settings`. The
 available-hardware and fixed 16-lane ceilings still apply, and simultaneous
 requests continue to share the process-wide nonblocking helper admission
 budget.
