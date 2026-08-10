@@ -22,11 +22,13 @@ pub use aggregate::{
 };
 pub use batch::{
     DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS,
-    DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS, DEFAULT_INT64_MIN_MAX_INDEX_BYTES, Database,
-    DatabaseMetrics, DatabaseRleSnapshotRestoreError, DatabaseSnapshotRestoreEntry,
-    DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, IndexPruningMetrics,
-    Int64MinMaxBlockMetadata, Int64MinMaxIndexAdmission, Int64MinMaxIndexInfo,
-    Int64MinMaxIndexLimits, Int64MinMaxIndexRejection, SharedDatabase, SharedDatabaseError,
+    DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS, DEFAULT_INT64_MIN_MAX_INDEX_BYTES,
+    DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES, DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS,
+    DEFAULT_MAX_INT64_RANGE_PARTITIONS, Database, DatabaseMetrics, DatabaseRleSnapshotRestoreError,
+    DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError,
+    IndexPruningMetrics, Int64MinMaxBlockMetadata, Int64MinMaxIndexAdmission, Int64MinMaxIndexInfo,
+    Int64MinMaxIndexLimits, Int64MinMaxIndexRejection, Int64RangePartition,
+    Int64RangePartitionError, Int64RangePartitionLimits, SharedDatabase, SharedDatabaseError,
     SharedDatabaseSnapshotRestoreError, SharedDatabaseSnapshotSetRestoreError, TableLimits,
 };
 #[cfg(unix)]
