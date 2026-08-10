@@ -114,8 +114,11 @@ number of consecutive source rows per block and hard block-count and metadata-
 byte caps; a zero granularity, a full database index slot, or either exceeded
 cap is an admission rejection and leaves existing state unchanged. Each block
 records its first row, row count, non-null minimum/maximum, and null count;
-all-null blocks therefore have no extrema. Batch columns are currently
-non-nullable, but the metadata has explicit nullable-block semantics.
+all-null blocks therefore have no extrema. Physical column vectors support
+`Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL DDL
+cannot currently declare nullable columns; `Nullable(Int64)` storage is instead
+created through library APIs or WAL recovery. The index metadata has explicit
+nullable-block semantics for both `Int64` storage forms.
 
 An admitted, current index can reject blocks only for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
@@ -205,9 +208,9 @@ preserved. Invalid, reserved, or already-used names and missing tables fail
 before mutation, leaving schema, data, row count, and row cap unchanged. A
 positional insert or complete explicit list must include the new field, while
 an explicit subset may omit it and receive its typed default. Default
-expressions, nullable storage, placement clauses, and `IF NOT EXISTS` are not
-supported. Each addition is preflighted against the table's persistent column
-and physical-cell caps before its default vector is allocated. A trailing
+expressions, adding nullable columns, placement clauses, and `IF NOT EXISTS`
+are not supported. Each addition is preflighted against the table's persistent
+column and physical-cell caps before its default vector is allocated. A trailing
 semicolon is optional.
 
 `ALTER TABLE <table> RENAME COLUMN <source> TO <destination>` changes only the
@@ -723,8 +726,8 @@ aliases, aggregation, ordering, `LIMIT`, and `OFFSET` paths remain authoritative
 The SELECT scan-row limit is charged to admitted physical ranges. Composite,
 `!=`, cross-type, other-column, and unpartitioned predicates use the complete
 existing scan path. Empty matches therefore preserve typed aggregate `NULL`
-results, while the batch engine's existing non-nullable physical-column and
-NULL-predicate behavior is unchanged. Any successful row or schema mutation
+results, while the batch engine's existing typed nullable/non-nullable column
+and NULL-predicate behavior is unchanged. Any successful row or schema mutation
 that could stale the bounds drops the pruning metadata; later SELECTs safely
 fall back to a complete scan. This is local metadata for the in-memory,
 single-process, single-node engine. It is not SQL `PARTITION BY`, distributed
