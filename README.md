@@ -114,8 +114,8 @@ number of consecutive source rows per block and hard block-count and metadata-
 byte caps; a zero granularity, a full database index slot, or either exceeded
 cap is an admission rejection and leaves existing state unchanged. Each block
 records its first row, row count, non-null minimum/maximum, and null count;
-all-null blocks therefore have no extrema. Batch columns are currently
-non-nullable, but the metadata has explicit nullable-block semantics.
+all-null blocks therefore have no extrema. Both `Int64` and
+`Nullable(Int64)` physical columns use these explicit nullable-block semantics.
 
 An admitted, current index can reject blocks only for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
@@ -205,8 +205,9 @@ preserved. Invalid, reserved, or already-used names and missing tables fail
 before mutation, leaving schema, data, row count, and row cap unchanged. A
 positional insert or complete explicit list must include the new field, while
 an explicit subset may omit it and receive its typed default. Default
-expressions, nullable storage, placement clauses, and `IF NOT EXISTS` are not
-supported. Each addition is preflighted against the table's persistent column
+expressions, `Nullable(...)` column additions, placement clauses, and
+`IF NOT EXISTS` are not supported by this statement. Each addition is
+preflighted against the table's persistent column
 and physical-cell caps before its default vector is allocated. A trailing
 semicolon is optional.
 

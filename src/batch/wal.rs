@@ -92,14 +92,21 @@ impl Default for Int64WriteAheadLogLimits {
 /// Inclusive directory-wide and per-table bounds for a multi-table WAL registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Int64WriteAheadLogRegistryLimits {
+    /// Maximum table descriptors and member WALs in the registry.
     pub max_tables: usize,
+    /// Maximum complete manifest size, including its header and checksum.
     pub max_manifest_bytes: usize,
+    /// Maximum aggregate file size across every member WAL.
     pub max_total_wal_bytes: usize,
+    /// Maximum aggregate committed records across members, including each
+    /// bootstrap record.
     pub max_total_records: usize,
+    /// File, record-payload, and record-count bounds applied to each member.
     pub per_table: Int64WriteAheadLogLimits,
 }
 
 impl Int64WriteAheadLogRegistryLimits {
+    /// Creates explicit table, manifest, aggregate, and per-member bounds.
     #[must_use]
     pub const fn new(
         max_tables: usize,
@@ -133,10 +140,34 @@ impl Default for Int64WriteAheadLogRegistryLimits {
 /// A directory-wide registry bound was exceeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Int64WriteAheadLogRegistryLimitError {
-    Tables { tables: u64, max_tables: usize },
-    ManifestBytes { bytes: u64, max_bytes: usize },
-    TotalWalBytes { bytes: u64, max_bytes: usize },
-    TotalRecords { records: u64, max_records: usize },
+    /// The requested or decoded member count exceeded the registry table cap.
+    Tables {
+        /// Number of member tables encountered.
+        tables: u64,
+        /// Configured maximum number of member tables.
+        max_tables: usize,
+    },
+    /// The encoded or stored manifest exceeded its complete-file byte cap.
+    ManifestBytes {
+        /// Number of manifest bytes required or found.
+        bytes: u64,
+        /// Configured maximum manifest bytes.
+        max_bytes: usize,
+    },
+    /// The combined member WAL sizes exceeded the registry byte cap.
+    TotalWalBytes {
+        /// Aggregate member WAL bytes required or found.
+        bytes: u64,
+        /// Configured maximum aggregate member bytes.
+        max_bytes: usize,
+    },
+    /// The combined committed member records exceeded the registry record cap.
+    TotalRecords {
+        /// Aggregate committed records required or found.
+        records: u64,
+        /// Configured maximum aggregate committed records.
+        max_records: usize,
+    },
 }
 
 impl fmt::Display for Int64WriteAheadLogRegistryLimitError {
@@ -170,22 +201,98 @@ impl StdError for Int64WriteAheadLogRegistryLimitError {}
 /// Typed structural corruption or inconsistency in a registry manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Int64WriteAheadLogRegistryCorruption {
-    ManifestMagic { found: [u8; 8] },
-    ManifestVersion { found: u16, supported: u16 },
-    ManifestReserved { found: u16 },
-    ManifestLength { declared: u64, actual: u64 },
-    ManifestChecksum { expected: u32, actual: u32 },
-    ManifestPayload { field: &'static str },
+    /// The manifest does not start with the registry magic bytes.
+    ManifestMagic {
+        /// Bytes found in the manifest magic field.
+        found: [u8; 8],
+    },
+    /// The manifest version is not supported by this reader.
+    ManifestVersion {
+        /// Version found in the manifest.
+        found: u16,
+        /// Version supported by this reader.
+        supported: u16,
+    },
+    /// The manifest reserved field is nonzero.
+    ManifestReserved {
+        /// Reserved value found in the manifest.
+        found: u16,
+    },
+    /// The declared manifest payload length differs from the stored length.
+    ManifestLength {
+        /// Payload length declared by the manifest header.
+        declared: u64,
+        /// Payload bytes actually stored after the header.
+        actual: u64,
+    },
+    /// The manifest payload checksum does not match its contents.
+    ManifestChecksum {
+        /// Checksum stored in the manifest header.
+        expected: u32,
+        /// Checksum calculated from the stored payload.
+        actual: u32,
+    },
+    /// A named manifest payload field is truncated or malformed.
+    ManifestPayload {
+        /// Static name of the field being decoded.
+        field: &'static str,
+    },
+    /// The manifest contains no table descriptors.
     Empty,
-    DuplicateTable { table: String },
-    DuplicateMember { member: String },
-    InvalidMember { member: String },
-    NonDeterministicOrder { previous: String, table: String },
-    MissingMember { table: String, member: String },
-    DuplicateMemberFile { table: String, member: String },
-    UnexpectedDirectoryEntry { entry: String },
-    TableNameMismatch { expected: String, found: String },
-    DatabaseSettingsMismatch { table: String },
+    /// Two descriptors contain the same case-insensitive table name.
+    DuplicateTable {
+        /// Duplicated table display name.
+        table: String,
+    },
+    /// Two descriptors contain the same case-insensitive member filename.
+    DuplicateMember {
+        /// Duplicated member filename.
+        member: String,
+    },
+    /// A member filename is not a safe, generated path component.
+    InvalidMember {
+        /// Rejected member filename.
+        member: String,
+    },
+    /// Descriptors are not in canonical case-insensitive table-name order.
+    NonDeterministicOrder {
+        /// Table display name in the preceding descriptor.
+        previous: String,
+        /// Out-of-order table display name.
+        table: String,
+    },
+    /// A descriptor's member file is absent from the registry directory.
+    MissingMember {
+        /// Table display name from the descriptor.
+        table: String,
+        /// Missing member filename.
+        member: String,
+    },
+    /// A member file aliases a file already opened for another descriptor.
+    DuplicateMemberFile {
+        /// Table display name from the later descriptor.
+        table: String,
+        /// Aliasing member filename.
+        member: String,
+    },
+    /// The registry directory contains an entry not listed by the manifest.
+    UnexpectedDirectoryEntry {
+        /// Unlisted directory-entry name.
+        entry: String,
+    },
+    /// A member bootstrap names a different table than its descriptor.
+    TableNameMismatch {
+        /// Table display name declared by the registry descriptor.
+        expected: String,
+        /// Table display name stored in the member bootstrap.
+        found: String,
+    },
+    /// A member bootstrap has database-wide settings inconsistent with the
+    /// other members.
+    DatabaseSettingsMismatch {
+        /// Table whose member introduced the inconsistent settings.
+        table: String,
+    },
 }
 
 impl fmt::Display for Int64WriteAheadLogRegistryCorruption {
@@ -267,25 +374,45 @@ impl StdError for Int64WriteAheadLogRegistryCorruption {}
 /// A filesystem, bound, member-WAL, or manifest failure for a registry.
 #[derive(Debug)]
 pub enum Int64WriteAheadLogRegistryError {
+    /// A configured registry-wide bound was exceeded.
     Limit(Int64WriteAheadLogRegistryLimitError),
+    /// The manifest or directory structure is corrupt or inconsistent.
     Corruption(Int64WriteAheadLogRegistryCorruption),
+    /// The destination lacks one safe final path component.
     InvalidDestination,
+    /// Opening the destination's parent directory failed.
     OpenParent(io::Error),
+    /// Exclusively creating the registry directory failed.
     CreateDirectory(io::Error),
+    /// Opening the registry directory failed.
     OpenDirectory(io::Error),
+    /// Synchronizing the registry parent directory failed.
     SyncParent(io::Error),
+    /// Opening the registry manifest failed.
     OpenManifest(io::Error),
+    /// Reading the registry manifest metadata failed.
     ManifestMetadata(io::Error),
+    /// The manifest path does not refer to a regular file.
     ManifestNotRegularFile,
+    /// Reading the bounded registry manifest failed.
     ReadManifest(io::Error),
+    /// Exclusively creating the registry manifest failed.
     CreateManifest(io::Error),
+    /// Writing the registry manifest failed.
     WriteManifest(io::Error),
+    /// Synchronizing the registry manifest failed.
     SyncManifest(io::Error),
+    /// Synchronizing the registry directory failed.
     SyncDirectory(io::Error),
+    /// Enumerating the registry directory failed.
     ReadDirectory(io::Error),
+    /// Creating, opening, bounding, or replaying one member WAL failed.
     Member {
+        /// Table display name associated with the member.
         table: String,
+        /// Generated member filename.
         member: String,
+        /// Typed member WAL failure.
         error: Int64WriteAheadLogError,
     },
 }
