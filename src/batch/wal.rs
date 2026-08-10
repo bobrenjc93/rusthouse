@@ -427,7 +427,7 @@ impl Int64WriteAheadLog {
     ) -> Result<(), Int64WriteAheadLogError> {
         let payload_len =
             bootstrap_payload_len(table_name_bytes, column_name_bytes, rows).unwrap_or(usize::MAX);
-        validate_record_limits(0, payload_len, 0, 0, limits)
+        validate_record_limits(0, payload_len, 0, 0, limits).map(|_| ())
     }
 
     pub(crate) fn create(
@@ -517,6 +517,7 @@ impl Int64WriteAheadLog {
             self.records,
             self.limits,
         )
+        .map(|_| ())
     }
 
     fn append_record(&mut self, kind: u8, payload: &[u8]) -> Result<(), Int64WriteAheadLogError> {
@@ -524,7 +525,7 @@ impl Int64WriteAheadLog {
             return Err(Int64WriteAheadLogError::Poisoned);
         }
         let sequence = self.records as u64;
-        validate_record_limits(
+        let next_file_bytes = validate_record_limits(
             sequence,
             payload.len(),
             self.file_bytes,
@@ -536,7 +537,7 @@ impl Int64WriteAheadLog {
             self.poisoned = true;
             return Err(error);
         }
-        self.file_bytes += body.len() + footer.len();
+        self.file_bytes = next_file_bytes;
         self.records += 1;
         Ok(())
     }
@@ -927,7 +928,7 @@ fn validate_record_limits(
     current_file_bytes: usize,
     current_records: usize,
     limits: Int64WriteAheadLogLimits,
-) -> Result<(), Int64WriteAheadLogError> {
+) -> Result<usize, Int64WriteAheadLogError> {
     if payload_len > limits.max_record_bytes {
         return Err(Int64WriteAheadLogLimitError::RecordBytes {
             sequence,
@@ -944,20 +945,29 @@ fn validate_record_limits(
         }
         .into());
     }
-    let frame_len = INT64_WAL_FRAME_OVERHEAD
-        .checked_add(payload_len)
-        .unwrap_or(usize::MAX);
-    let file_bytes = current_file_bytes
-        .checked_add(frame_len)
-        .unwrap_or(usize::MAX);
+    let attempted_file_bytes =
+        (current_file_bytes as u128) + (INT64_WAL_FRAME_OVERHEAD as u128) + (payload_len as u128);
+    let reported_file_bytes = u64::try_from(attempted_file_bytes).unwrap_or(u64::MAX);
+    let frame_len = INT64_WAL_FRAME_OVERHEAD.checked_add(payload_len).ok_or(
+        Int64WriteAheadLogLimitError::FileBytes {
+            bytes: reported_file_bytes,
+            max_bytes: limits.max_file_bytes,
+        },
+    )?;
+    let file_bytes = current_file_bytes.checked_add(frame_len).ok_or(
+        Int64WriteAheadLogLimitError::FileBytes {
+            bytes: reported_file_bytes,
+            max_bytes: limits.max_file_bytes,
+        },
+    )?;
     if file_bytes > limits.max_file_bytes {
         return Err(Int64WriteAheadLogLimitError::FileBytes {
-            bytes: file_bytes as u64,
+            bytes: reported_file_bytes,
             max_bytes: limits.max_file_bytes,
         }
         .into());
     }
-    Ok(())
+    Ok(file_bytes)
 }
 
 fn encode_record_parts(
@@ -1353,6 +1363,25 @@ mod tests {
             self.steps.push(IoStep::Sync);
             self.complete_step()
         }
+    }
+
+    #[test]
+    fn file_size_overflow_is_rejected_even_when_the_limit_is_usize_max() {
+        let limits = Int64WriteAheadLogLimits::new(usize::MAX, usize::MAX, usize::MAX);
+        let exact_boundary = usize::MAX - INT64_WAL_FRAME_OVERHEAD;
+        assert_eq!(
+            validate_record_limits(0, 0, exact_boundary, 0, limits).unwrap(),
+            usize::MAX
+        );
+
+        let error = validate_record_limits(0, 0, exact_boundary + 1, 0, limits).unwrap_err();
+        assert!(matches!(
+            error,
+            Int64WriteAheadLogError::Limit(Int64WriteAheadLogLimitError::FileBytes {
+                bytes,
+                max_bytes: usize::MAX,
+            }) if bytes == (usize::MAX as u64).saturating_add(1)
+        ));
     }
 
     #[test]
