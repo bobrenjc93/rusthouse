@@ -16,7 +16,7 @@ use crate::batch::sql::{
     HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, SUPPORTED_FUNCTION_NAMES, Select,
     SelectItem, Statement, VersionSelect,
 };
-use crate::batch::storage::{Column, Table, validate_table_name};
+use crate::batch::storage::{Column, Int64RangeFilter, Table, validate_table_name};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
 #[cfg(unix)]
@@ -31,8 +31,10 @@ use crate::snapshot::{
 use crate::storage::{Int64Table, Schema};
 
 pub use crate::batch::storage::{
-    DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_ROWS_PER_TABLE,
-    TableLimits,
+    DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE,
+    DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES, DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS,
+    DEFAULT_MAX_INT64_RANGE_PARTITIONS, DEFAULT_MAX_ROWS_PER_TABLE, Int64RangePartition,
+    Int64RangePartitionError, Int64RangePartitionLimits, TableLimits,
 };
 
 /// Maximum estimated heap retained by the collecting [`Database::execute`] API.
@@ -99,9 +101,10 @@ pub struct QueryResultLimits {
     /// (including `ALTER TABLE DELETE`), or `ALTER TABLE UPDATE`.
     ///
     /// This is checked before row inspection and matching-row or replacement
-    /// allocation. `WHERE` and `LIMIT` therefore cannot reduce the charged
-    /// scan. Each `UNION` operand and each `CROSS JOIN` input is checked
-    /// independently.
+    /// allocation. `WHERE` and `LIMIT` cannot reduce the charged scan for
+    /// ordinary tables; a supported direct predicate on validated `Int64`
+    /// range partitions is charged only for partitions that remain possible.
+    /// Each `UNION` operand and each `CROSS JOIN` input is checked independently.
     pub max_scan_rows: usize,
     pub max_rows: usize,
     pub max_values: usize,
@@ -1036,6 +1039,68 @@ impl Database {
     #[must_use]
     pub const fn global_aggregate_worker_cap(&self) -> NonZeroUsize {
         self.global_aggregate_parallelism.worker_cap
+    }
+
+    /// Atomically builds and publishes one caller-named, one-column `Int64`
+    /// table from deterministic inclusive range partitions.
+    ///
+    /// The database's configured [`TableLimits`] and default partition count,
+    /// row, and scalar-byte bounds are all checked before the catalog or
+    /// cached metrics change. Bounds must be ascending and non-overlapping,
+    /// and every value must belong to its declared partition.
+    pub fn create_int64_range_partitioned_table(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        partitions: Vec<Int64RangePartition>,
+    ) -> std::result::Result<(), Int64RangePartitionError> {
+        let max_rows = self
+            .table_limits
+            .max_rows
+            .min(DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS);
+        self.create_int64_range_partitioned_table_with_limits(
+            table_name,
+            column_name,
+            partitions,
+            Int64RangePartitionLimits {
+                max_partitions: DEFAULT_MAX_INT64_RANGE_PARTITIONS,
+                max_rows,
+                max_bytes: max_rows
+                    .saturating_mul(std::mem::size_of::<i64>())
+                    .min(DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES),
+            },
+        )
+    }
+
+    /// Builds a range-partitioned table with caller-selected construction
+    /// bounds in addition to the database's persistent table limits.
+    ///
+    /// Publication is one catalog insertion after name, range layout, value
+    /// membership, partition count, row count, byte count, and all table caps
+    /// have succeeded. Every error leaves catalog data and cached metrics
+    /// unchanged.
+    pub fn create_int64_range_partitioned_table_with_limits(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        partitions: Vec<Int64RangePartition>,
+        partition_limits: Int64RangePartitionLimits,
+    ) -> std::result::Result<(), Int64RangePartitionError> {
+        if self.catalog.table_exists(table_name) {
+            return Err(Error::TableAlreadyExists(table_name.to_owned()).into());
+        }
+
+        let table = Table::with_int64_range_partitions(
+            table_name.to_owned(),
+            column_name.to_owned(),
+            partitions,
+            partition_limits,
+            self.table_limits,
+        )?;
+        let measurements = TableMeasurements::read(&table);
+        self.catalog.register_table(table)?;
+        self.measurements.add(measurements);
+        Ok(())
     }
 
     /// Replaces the computation-lane cap for supported parallel aggregates and
@@ -3029,10 +3094,16 @@ impl Database {
             validate_union_schema(prefix.operation, prefix.columns, &result_columns)?;
         }
 
-        // The source bound is deliberately independent of WHERE and LIMIT:
-        // both are evaluated only after the executor has admitted the full
-        // source scan. Check before allocating the matching-row index vector.
-        enforce_select_scan_limit(table, query_result_limits)?;
+        // Ordinary tables and unsupported predicates retain the complete-scan
+        // path. A direct Int64 key comparison may first discard impossible
+        // validated partitions; the exact compiled predicate still evaluates
+        // every admitted row before any later SELECT operator runs.
+        let source_rows = predicate
+            .as_ref()
+            .and_then(CompiledPredicate::int64_range_filter)
+            .and_then(|(column, filter)| table.int64_range_partition_rows(column, filter))
+            .unwrap_or(0..table.row_count());
+        enforce_select_scan_rows(source_rows.len(), query_result_limits)?;
         let row_matches = |row| {
             predicate
                 .as_ref()
@@ -3045,9 +3116,7 @@ impl Database {
             // Ordered ROW_NUMBER needs every filtered source index to produce
             // deterministic ties. Count without retaining indices so the
             // complete state can be rejected before its first allocation.
-            let matching_row_count = (0..table.row_count())
-                .filter(|row| row_matches(*row))
-                .count();
+            let matching_row_count = source_rows.clone().filter(|row| row_matches(*row)).count();
             validate_row_number_count(matching_row_count)?;
             let ordering_state_bytes =
                 matching_row_count.saturating_mul(ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES);
@@ -3058,11 +3127,11 @@ impl Database {
             )?;
 
             let mut rows = Vec::with_capacity(matching_row_count);
-            rows.extend((0..table.row_count()).filter(|row| row_matches(*row)));
+            rows.extend(source_rows.clone().filter(|row| row_matches(*row)));
             debug_assert_eq!(rows.len(), matching_row_count);
             rows
         } else {
-            (0..table.row_count())
+            source_rows
                 .filter(|row| row_matches(*row))
                 .collect::<Vec<_>>()
         };
@@ -5094,6 +5163,10 @@ fn usize_decimal_len(mut value: usize) -> usize {
 
 fn enforce_select_scan_limit(table: &Table, limits: QueryResultLimits) -> Result<()> {
     enforce_scan_limit(table, limits, "SELECT scanned rows")
+}
+
+fn enforce_select_scan_rows(rows: usize, limits: QueryResultLimits) -> Result<()> {
+    enforce_resource_limit("SELECT scanned rows", rows, limits.max_scan_rows)
 }
 
 fn enforce_scan_limit(
@@ -7565,6 +7638,44 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
+    fn int64_range_filter(&self) -> Option<(usize, Int64RangeFilter)> {
+        let Self::Comparison {
+            left,
+            operator,
+            right,
+        } = self
+        else {
+            return None;
+        };
+
+        let (column, value, operator) = match (left, right) {
+            (
+                CompiledOperand::Column {
+                    index,
+                    data_type: DataType::Int64,
+                },
+                CompiledOperand::Literal(Value::Int64(value)),
+            ) => (*index, *value, *operator),
+            (
+                CompiledOperand::Literal(Value::Int64(value)),
+                CompiledOperand::Column {
+                    index,
+                    data_type: DataType::Int64,
+                },
+            ) => (*index, *value, reverse_comparison(*operator)),
+            _ => return None,
+        };
+        let filter = match operator {
+            ComparisonOperator::Equal => Int64RangeFilter::Equal(value),
+            ComparisonOperator::Less => Int64RangeFilter::Less(value),
+            ComparisonOperator::LessOrEqual => Int64RangeFilter::LessOrEqual(value),
+            ComparisonOperator::Greater => Int64RangeFilter::Greater(value),
+            ComparisonOperator::GreaterOrEqual => Int64RangeFilter::GreaterOrEqual(value),
+            ComparisonOperator::NotEqual => return None,
+        };
+        Some((column, filter))
+    }
+
     fn evaluate(&self, table: &Table, row: usize) -> bool {
         match self {
             Self::Comparison {
@@ -7739,6 +7850,17 @@ const fn invert_comparison(operator: ComparisonOperator) -> ComparisonOperator {
         ComparisonOperator::LessOrEqual => ComparisonOperator::Greater,
         ComparisonOperator::Greater => ComparisonOperator::LessOrEqual,
         ComparisonOperator::GreaterOrEqual => ComparisonOperator::Less,
+    }
+}
+
+const fn reverse_comparison(operator: ComparisonOperator) -> ComparisonOperator {
+    match operator {
+        ComparisonOperator::Equal => ComparisonOperator::Equal,
+        ComparisonOperator::NotEqual => ComparisonOperator::NotEqual,
+        ComparisonOperator::Less => ComparisonOperator::Greater,
+        ComparisonOperator::LessOrEqual => ComparisonOperator::GreaterOrEqual,
+        ComparisonOperator::Greater => ComparisonOperator::Less,
+        ComparisonOperator::GreaterOrEqual => ComparisonOperator::LessOrEqual,
     }
 }
 

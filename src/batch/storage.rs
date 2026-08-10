@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::ops::Range;
 
 use crate::batch::error::{Error, Result};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -9,6 +11,199 @@ pub const DEFAULT_MAX_ROWS_PER_TABLE: usize = 1_000_000;
 pub const DEFAULT_MAX_COLUMNS_PER_TABLE: usize = 1_024;
 /// Default maximum number of physical scalar cells retained by one typed batch table.
 pub const DEFAULT_MAX_CELLS_PER_TABLE: usize = 4_000_000;
+/// Default maximum number of ranges in one caller-built partitioned table.
+pub const DEFAULT_MAX_INT64_RANGE_PARTITIONS: usize = 1_024;
+/// Default maximum rows accepted by the partition-table construction API.
+pub const DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS: usize = DEFAULT_MAX_ROWS_PER_TABLE;
+/// Default scalar payload bytes accepted by the partition-table construction API.
+pub const DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES: usize =
+    DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS * std::mem::size_of::<i64>();
+
+/// One inclusive `Int64` range and the rows physically assigned to it.
+///
+/// Partition order and membership are validated when a database table is
+/// built. Values retain their order within the supplied partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int64RangePartition {
+    lower_bound: i64,
+    upper_bound: i64,
+    values: Vec<i64>,
+}
+
+impl Int64RangePartition {
+    /// Describes one inclusive `[lower_bound, upper_bound]` partition.
+    #[must_use]
+    pub fn new(lower_bound: i64, upper_bound: i64, values: Vec<i64>) -> Self {
+        Self {
+            lower_bound,
+            upper_bound,
+            values,
+        }
+    }
+
+    #[must_use]
+    pub const fn lower_bound(&self) -> i64 {
+        self.lower_bound
+    }
+
+    #[must_use]
+    pub const fn upper_bound(&self) -> i64 {
+        self.upper_bound
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[i64] {
+        &self.values
+    }
+}
+
+/// Caller limits applied before a range-partitioned table is materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Int64RangePartitionLimits {
+    pub max_partitions: usize,
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl Int64RangePartitionLimits {
+    #[must_use]
+    pub const fn new(max_partitions: usize, max_rows: usize, max_bytes: usize) -> Self {
+        Self {
+            max_partitions,
+            max_rows,
+            max_bytes,
+        }
+    }
+}
+
+impl Default for Int64RangePartitionLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_INT64_RANGE_PARTITIONS,
+            DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS,
+            DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES,
+        )
+    }
+}
+
+/// A typed failure while validating or publishing a range-partitioned table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64RangePartitionError {
+    PartitionLimitExceeded {
+        partitions: usize,
+        max_partitions: usize,
+    },
+    RowLimitExceeded {
+        rows: usize,
+        max_rows: usize,
+    },
+    ByteLimitExceeded {
+        bytes: usize,
+        max_bytes: usize,
+    },
+    InvalidRange {
+        partition_index: usize,
+        lower_bound: i64,
+        upper_bound: i64,
+    },
+    OutOfOrder {
+        partition_index: usize,
+        previous_lower_bound: i64,
+        lower_bound: i64,
+    },
+    Overlap {
+        partition_index: usize,
+        previous_upper_bound: i64,
+        lower_bound: i64,
+    },
+    ValueOutOfRange {
+        partition_index: usize,
+        value_index: usize,
+        value: i64,
+        lower_bound: i64,
+        upper_bound: i64,
+    },
+    /// SQL identifiers, duplicate names, or configured table limits failed.
+    Table(Error),
+}
+
+impl fmt::Display for Int64RangePartitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PartitionLimitExceeded {
+                partitions,
+                max_partitions,
+            } => write!(
+                formatter,
+                "range-partitioned table has {partitions} partitions, exceeding the limit of {max_partitions}"
+            ),
+            Self::RowLimitExceeded { rows, max_rows } => write!(
+                formatter,
+                "range-partitioned table has {rows} rows, exceeding the limit of {max_rows}"
+            ),
+            Self::ByteLimitExceeded { bytes, max_bytes } => write!(
+                formatter,
+                "range-partitioned table retains {bytes} value bytes, exceeding the limit of {max_bytes}"
+            ),
+            Self::InvalidRange {
+                partition_index,
+                lower_bound,
+                upper_bound,
+            } => write!(
+                formatter,
+                "partition {partition_index} has descending bounds [{lower_bound}, {upper_bound}]"
+            ),
+            Self::OutOfOrder {
+                partition_index,
+                previous_lower_bound,
+                lower_bound,
+            } => write!(
+                formatter,
+                "partition {partition_index} starts at {lower_bound}, before the previous partition start {previous_lower_bound}"
+            ),
+            Self::Overlap {
+                partition_index,
+                previous_upper_bound,
+                lower_bound,
+            } => write!(
+                formatter,
+                "partition {partition_index} starts at {lower_bound}, overlapping the previous inclusive upper bound {previous_upper_bound}"
+            ),
+            Self::ValueOutOfRange {
+                partition_index,
+                value_index,
+                value,
+                lower_bound,
+                upper_bound,
+            } => write!(
+                formatter,
+                "partition {partition_index} value {value_index} ({value}) is outside inclusive bounds [{lower_bound}, {upper_bound}]"
+            ),
+            Self::Table(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for Int64RangePartitionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Table(error) => Some(error),
+            Self::PartitionLimitExceeded { .. }
+            | Self::RowLimitExceeded { .. }
+            | Self::ByteLimitExceeded { .. }
+            | Self::InvalidRange { .. }
+            | Self::OutOfOrder { .. }
+            | Self::Overlap { .. }
+            | Self::ValueOutOfRange { .. } => None,
+        }
+    }
+}
+
+impl From<Error> for Int64RangePartitionError {
+    fn from(error: Error) -> Self {
+        Self::Table(error)
+    }
+}
 
 /// Persistent resource limits applied to one typed batch table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +459,29 @@ pub(crate) struct PreparedInsertRows {
     schema_indexes: Option<Vec<usize>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Int64RangePartitionMetadata {
+    lower_bound: i64,
+    upper_bound: i64,
+    row_start: usize,
+    row_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Int64RangePartitionSet {
+    column_index: usize,
+    partitions: Vec<Int64RangePartitionMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Int64RangeFilter {
+    Equal(i64),
+    Less(i64),
+    LessOrEqual(i64),
+    Greater(i64),
+    GreaterOrEqual(i64),
+}
+
 impl PreparedInsertRows {
     #[must_use]
     pub(crate) fn len(&self) -> usize {
@@ -280,6 +498,7 @@ pub struct Table {
     row_count: usize,
     retained_value_bytes: u128,
     limits: TableLimits,
+    int64_range_partitions: Option<Int64RangePartitionSet>,
 }
 
 impl Table {
@@ -339,6 +558,7 @@ impl Table {
             row_count: 0,
             retained_value_bytes: 0,
             limits,
+            int64_range_partitions: None,
         })
     }
 
@@ -365,6 +585,114 @@ impl Table {
         Ok(table)
     }
 
+    /// Builds a fully validated one-column table and its range-pruning metadata.
+    pub(crate) fn with_int64_range_partitions(
+        name: String,
+        column_name: String,
+        partitions: Vec<Int64RangePartition>,
+        partition_limits: Int64RangePartitionLimits,
+        table_limits: TableLimits,
+    ) -> std::result::Result<Self, Int64RangePartitionError> {
+        if partitions.len() > partition_limits.max_partitions {
+            return Err(Int64RangePartitionError::PartitionLimitExceeded {
+                partitions: partitions.len(),
+                max_partitions: partition_limits.max_partitions,
+            });
+        }
+
+        let rows = partitions
+            .iter()
+            .map(|partition| partition.values.len())
+            .fold(0_usize, usize::saturating_add);
+        if rows > partition_limits.max_rows {
+            return Err(Int64RangePartitionError::RowLimitExceeded {
+                rows,
+                max_rows: partition_limits.max_rows,
+            });
+        }
+        let exact_bytes = (rows as u128).saturating_mul(std::mem::size_of::<i64>() as u128);
+        let bytes = saturating_usize(exact_bytes);
+        if exact_bytes > partition_limits.max_bytes as u128 {
+            return Err(Int64RangePartitionError::ByteLimitExceeded {
+                bytes,
+                max_bytes: partition_limits.max_bytes,
+            });
+        }
+
+        for (partition_index, partition) in partitions.iter().enumerate() {
+            if partition.lower_bound > partition.upper_bound {
+                return Err(Int64RangePartitionError::InvalidRange {
+                    partition_index,
+                    lower_bound: partition.lower_bound,
+                    upper_bound: partition.upper_bound,
+                });
+            }
+            if let Some(previous) = partition_index
+                .checked_sub(1)
+                .map(|index| &partitions[index])
+            {
+                if partition.lower_bound < previous.lower_bound {
+                    return Err(Int64RangePartitionError::OutOfOrder {
+                        partition_index,
+                        previous_lower_bound: previous.lower_bound,
+                        lower_bound: partition.lower_bound,
+                    });
+                }
+                if partition.lower_bound <= previous.upper_bound {
+                    return Err(Int64RangePartitionError::Overlap {
+                        partition_index,
+                        previous_upper_bound: previous.upper_bound,
+                        lower_bound: partition.lower_bound,
+                    });
+                }
+            }
+            if let Some((value_index, &value)) =
+                partition.values.iter().enumerate().find(|(_, value)| {
+                    **value < partition.lower_bound || **value > partition.upper_bound
+                })
+            {
+                return Err(Int64RangePartitionError::ValueOutOfRange {
+                    partition_index,
+                    value_index,
+                    value,
+                    lower_bound: partition.lower_bound,
+                    upper_bound: partition.upper_bound,
+                });
+            }
+        }
+
+        let mut table = Self::with_limits(
+            name,
+            vec![ColumnDef {
+                name: column_name,
+                data_type: DataType::Int64,
+            }],
+            table_limits,
+        )?;
+        table.validate_row_capacity(rows)?;
+
+        let mut values = Vec::with_capacity(rows);
+        let mut metadata = Vec::with_capacity(partitions.len());
+        for partition in partitions {
+            let row_start = values.len();
+            values.extend(partition.values);
+            metadata.push(Int64RangePartitionMetadata {
+                lower_bound: partition.lower_bound,
+                upper_bound: partition.upper_bound,
+                row_start,
+                row_end: values.len(),
+            });
+        }
+        table.row_count = rows;
+        table.retained_value_bytes = exact_bytes;
+        table.columns = vec![Column::Int64(values)];
+        table.int64_range_partitions = Some(Int64RangePartitionSet {
+            column_index: 0,
+            partitions: metadata,
+        });
+        Ok(table)
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -388,6 +716,47 @@ impl Table {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    /// Returns the number of validated range partitions, or `None` after a
+    /// mutation has invalidated pruning metadata (and for ordinary tables).
+    #[must_use]
+    pub fn int64_range_partition_count(&self) -> Option<usize> {
+        self.int64_range_partitions
+            .as_ref()
+            .map(|set| set.partitions.len())
+    }
+
+    /// Narrows a direct key comparison to the contiguous physical rows in
+    /// partitions that can possibly satisfy it. `None` means complete-scan
+    /// fallback; an empty range means every partition was pruned.
+    pub(crate) fn int64_range_partition_rows(
+        &self,
+        column_index: usize,
+        filter: Int64RangeFilter,
+    ) -> Option<Range<usize>> {
+        let set = self.int64_range_partitions.as_ref()?;
+        if set.column_index != column_index {
+            return None;
+        }
+
+        let mut selected = set.partitions.iter().filter(|partition| match filter {
+            Int64RangeFilter::Equal(value) => {
+                partition.lower_bound <= value && value <= partition.upper_bound
+            }
+            Int64RangeFilter::Less(value) => partition.lower_bound < value,
+            Int64RangeFilter::LessOrEqual(value) => partition.lower_bound <= value,
+            Int64RangeFilter::Greater(value) => partition.upper_bound > value,
+            Int64RangeFilter::GreaterOrEqual(value) => partition.upper_bound >= value,
+        });
+        let Some(first) = selected.next() else {
+            return Some(0..0);
+        };
+        let mut row_end = first.row_end;
+        for partition in selected {
+            row_end = partition.row_end;
+        }
+        Some(first.row_start..row_end)
     }
 
     /// Returns the maximum number of rows this table can retain.
@@ -598,6 +967,7 @@ impl Table {
         }
 
         self.schema[source_index].name = destination;
+        self.int64_range_partitions = None;
         Ok(())
     }
 
@@ -651,6 +1021,7 @@ impl Table {
         self.schema.push(field);
         self.columns.push(column);
         self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
+        self.int64_range_partitions = None;
         Ok(())
     }
 
@@ -674,6 +1045,7 @@ impl Table {
         self.retained_value_bytes = self
             .retained_value_bytes
             .saturating_sub(removed_column.retained_value_bytes_exact());
+        self.int64_range_partitions = None;
         Ok(())
     }
 
@@ -792,6 +1164,7 @@ impl Table {
     }
 
     fn append_validated_row(&mut self, row: Vec<Value>) {
+        self.int64_range_partitions = None;
         let mut added_value_bytes = 0_u128;
         for (column, value) in self.columns.iter_mut().zip(row) {
             added_value_bytes = added_value_bytes.saturating_add(column.push(value));
@@ -809,7 +1182,9 @@ impl Table {
     /// values are rejected. The column, complete index selection, and all
     /// values are validated before mutation, so an error leaves the entire
     /// table unchanged. Valid owned values are moved into the selected cells
-    /// without cloning. All other cells and table metadata are preserved.
+    /// without cloning. All other cells and persistent table metadata are
+    /// preserved; a nonempty replacement invalidates optional range-pruning
+    /// metadata so subsequent queries use the complete scan path.
     ///
     /// # Errors
     ///
@@ -841,6 +1216,9 @@ impl Table {
             .retained_value_bytes
             .saturating_sub(removed_value_bytes)
             .saturating_add(added_value_bytes);
+        if replaced != 0 {
+            self.int64_range_partitions = None;
+        }
         Ok(replaced)
     }
 
@@ -873,6 +1251,7 @@ impl Table {
         self.retained_value_bytes = self
             .retained_value_bytes
             .saturating_sub(deleted_value_bytes);
+        self.int64_range_partitions = None;
         Ok(row_indexes.len())
     }
 
@@ -884,6 +1263,9 @@ impl Table {
         }
         self.row_count = 0;
         self.retained_value_bytes = 0;
+        if removed_rows != 0 {
+            self.int64_range_partitions = None;
+        }
         removed_rows
     }
 }

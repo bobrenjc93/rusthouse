@@ -621,7 +621,9 @@ A table-backed `SELECT`, one- or two-comparison `DELETE` (including `ALTER
 TABLE DELETE`), or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
 by default. This scanned-row limit is checked against the full source table
 before matching-row indices or replacement values are allocated, so `WHERE`
-selectivity and `LIMIT` do not reduce it; each `UNION` operand and each `CROSS
+selectivity and `LIMIT` do not reduce it for ordinary tables. A supported
+direct predicate on validated `Int64` range partitions instead charges only
+physical ranges that remain possible; each `UNION` operand and each `CROSS
 JOIN` input has its own source scan. String assignments additionally bound
 their matched replacement payload to 16 MiB by default before cloning any
 replacement values.
@@ -665,6 +667,37 @@ the previous nonzero cap.
 row cap while retaining the default column and cell caps. `TableLimits` with
 `Database::with_table_limits` or `SharedDatabase::with_table_limits` configures
 all three per-table caps.
+
+`Database::create_int64_range_partitioned_table` atomically publishes a
+caller-named, one-column `Int64` table from ordered, non-overlapping inclusive
+ranges. Inclusive bounds represent both `i64::MIN` and `i64::MAX` without
+sentinels. Every input value must belong to its declared range; physical rows
+retain partition order and then caller order within each partition. The
+default construction path is bounded to 1,024 partitions, 1,000,000 rows, and
+8,000,000 scalar payload bytes, tightened by the database's configured
+`TableLimits`. The `_with_limits` form accepts explicit partition, row, and
+byte caps. Descending bounds, out-of-order ranges, overlap, misplaced
+values, and each construction limit have distinct typed errors. All validation
+and table materialization finish before one catalog insertion, so failures do
+not publish a partial table or change cached catalog metrics. A successful
+partitioned table remains one physical catalog table: existing table, column,
+row, and retained-value-byte metrics report its normal flattened storage and
+do not count pruning metadata as scalar payload.
+
+For a direct comparison between that `Int64` key and an `Int64` literal using
+`=`, `<`, `<=`, `>`, or `>=` (in either operand order), SELECT discards ranges
+whose inclusive bounds make a match impossible. The normal compiled predicate
+still checks every row in the admitted ranges, and the existing projection,
+aliases, aggregation, ordering, `LIMIT`, and `OFFSET` paths remain authoritative.
+The SELECT scan-row limit is charged to admitted physical ranges. Composite,
+`!=`, cross-type, other-column, and unpartitioned predicates use the complete
+existing scan path. Empty matches therefore preserve typed aggregate `NULL`
+results, while the batch engine's existing non-nullable physical-column and
+NULL-predicate behavior is unchanged. Any successful row or schema mutation
+that could stale the bounds drops the pruning metadata; later SELECTs safely
+fall back to a complete scan. This is local metadata for the in-memory,
+single-process, single-node engine. It is not SQL `PARTITION BY`, distributed
+partition routing, sharding, replication, or a durable partition format.
 
 Running `rusthouse` without options retains the legacy line-oriented `Int64`
 session. It reads one statement from each nonempty input line and prints a row

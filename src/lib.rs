@@ -21,9 +21,11 @@ pub use aggregate::{
     aggregate_nullable_i64, count_nullable_i64, min_nullable_i64,
 };
 pub use batch::{
-    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseMetrics,
-    DatabaseRleSnapshotRestoreError, DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError,
-    DatabaseSnapshotSetRestoreError, SharedDatabase, SharedDatabaseError,
+    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES,
+    DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS, DEFAULT_MAX_INT64_RANGE_PARTITIONS, Database,
+    DatabaseMetrics, DatabaseRleSnapshotRestoreError, DatabaseSnapshotRestoreEntry,
+    DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, Int64RangePartition,
+    Int64RangePartitionError, Int64RangePartitionLimits, SharedDatabase, SharedDatabaseError,
     SharedDatabaseSnapshotRestoreError, SharedDatabaseSnapshotSetRestoreError, TableLimits,
 };
 #[cfg(unix)]

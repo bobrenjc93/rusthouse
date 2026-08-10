@@ -14,8 +14,11 @@ pub mod value;
 #[cfg(unix)]
 pub use engine::DatabaseSnapshotSaveError;
 pub use engine::{
-    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, Database, DatabaseRleSnapshotRestoreError,
-    DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError,
+    DEFAULT_GLOBAL_AGGREGATE_WORKER_CAP, DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES,
+    DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS, DEFAULT_MAX_INT64_RANGE_PARTITIONS, Database,
+    DatabaseRleSnapshotRestoreError, DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError,
+    DatabaseSnapshotSetRestoreError, Int64RangePartition, Int64RangePartitionError,
+    Int64RangePartitionLimits,
 };
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 #[cfg(unix)]
