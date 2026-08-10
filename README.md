@@ -104,6 +104,30 @@ row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, or row-count/`MAX(Int64)` pair
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
+One batch table at a time may hold an optional bounded sparse `Int64` min/max
+index, installed through `Database::create_int64_min_max_index` (or the
+matching `SharedDatabase` method). `Int64MinMaxIndexLimits` selects a fixed
+number of consecutive source rows per block and hard block-count and metadata-
+byte caps; a zero granularity, a full database index slot, or either exceeded
+cap is an admission rejection and leaves existing state unchanged. Each block
+records its first row, row count, non-null minimum/maximum, and null count;
+all-null blocks therefore have no extrema. Batch columns are currently
+non-nullable, but the metadata has explicit nullable-block semantics.
+
+An admitted, current index can reject blocks only for a simple `Int64`
+column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
+order). Every row in a surviving block still follows the normal exact
+predicate evaluator. Compound and `!=` predicates, missing or stale indexes,
+and failed admissions use the unchanged full-scan path. Candidate blocks and
+rows retain source order, so first-row, ordering, pagination, grouping, and
+`HAVING` behavior is identical. The full source row count still pays the query
+scan-row limit. Inserts, deletes, updates, truncation, and added columns rebuild
+the index within the table mutation; if its original cap is exceeded it is
+invalidated. Dropping a column or replacing/restoring the table invalidates it.
+`Database::index_pruning_metrics` exposes cumulative surviving
+`scanned_blocks` and metadata-rejected `pruned_blocks`; unindexed fallbacks do
+not increment them.
+
 `DELETE FROM <table> WHERE <comparison> [AND <comparison>]` and its ClickHouse
 mutation spelling, `ALTER TABLE <table> DELETE WHERE <comparison> [AND
 <comparison>]`, remove rows matching one typed column-to-literal comparison or
@@ -324,11 +348,13 @@ The complete row, value, byte, and retained-result bounds are preflighted before
 result storage is allocated, and the query is available through the normal
 `Database`, `SharedDatabase`, CLI, and HTTP paths in every supported format.
 The exact case-insensitive query
-`SELECT metric, value FROM system.metrics` returns the four cached database
-totals also exposed as unlabeled Prometheus gauges: `rusthouse_tables`,
+`SELECT metric, value FROM system.metrics` returns four cached database totals
+also exposed as unlabeled Prometheus gauges—`rusthouse_tables`,
 `rusthouse_columns`, `rusthouse_retained_rows`, and
-`rusthouse_retained_value_bytes`. Rows remain in that order and contain a
-`String` metric name plus a checked `Int64` value. The totals track table,
+`rusthouse_retained_value_bytes`—followed by the cumulative
+`rusthouse_index_scanned_blocks` and `rusthouse_index_pruned_blocks` counters.
+Rows remain in that order and contain a `String` metric name plus a checked
+`Int64` value. The totals track table,
 column, retained-row, and retained scalar payload-byte lifecycle changes; the
 byte definition matches `GET /metrics`. Other projections, aliases, filters,
 ordering, limits, and trailing clauses are rejected. The fixed result shape,
@@ -621,7 +647,9 @@ A table-backed `SELECT`, one- or two-comparison `DELETE` (including `ALTER
 TABLE DELETE`), or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
 by default. This scanned-row limit is checked against the full source table
 before matching-row indices or replacement values are allocated, so `WHERE`
-selectivity and `LIMIT` do not reduce it; each `UNION` operand and each `CROSS
+selectivity and `LIMIT` do not reduce it for ordinary tables. A supported
+direct predicate on validated `Int64` range partitions instead charges only
+physical ranges that remain possible; each `UNION` operand and each `CROSS
 JOIN` input has its own source scan. String assignments additionally bound
 their matched replacement payload to 16 MiB by default before cloning any
 replacement values.
@@ -665,6 +693,37 @@ the previous nonzero cap.
 row cap while retaining the default column and cell caps. `TableLimits` with
 `Database::with_table_limits` or `SharedDatabase::with_table_limits` configures
 all three per-table caps.
+
+`Database::create_int64_range_partitioned_table` atomically publishes a
+caller-named, one-column `Int64` table from ordered, non-overlapping inclusive
+ranges. Inclusive bounds represent both `i64::MIN` and `i64::MAX` without
+sentinels. Every input value must belong to its declared range; physical rows
+retain partition order and then caller order within each partition. The
+default construction path is bounded to 1,024 partitions, 1,000,000 rows, and
+8,000,000 scalar payload bytes, tightened by the database's configured
+`TableLimits`. The `_with_limits` form accepts explicit partition, row, and
+byte caps. Descending bounds, out-of-order ranges, overlap, misplaced
+values, and each construction limit have distinct typed errors. All validation
+and table materialization finish before one catalog insertion, so failures do
+not publish a partial table or change cached catalog metrics. A successful
+partitioned table remains one physical catalog table: existing table, column,
+row, and retained-value-byte metrics report its normal flattened storage and
+do not count pruning metadata as scalar payload.
+
+For a direct comparison between that `Int64` key and an `Int64` literal using
+`=`, `<`, `<=`, `>`, or `>=` (in either operand order), SELECT discards ranges
+whose inclusive bounds make a match impossible. The normal compiled predicate
+still checks every row in the admitted ranges, and the existing projection,
+aliases, aggregation, ordering, `LIMIT`, and `OFFSET` paths remain authoritative.
+The SELECT scan-row limit is charged to admitted physical ranges. Composite,
+`!=`, cross-type, other-column, and unpartitioned predicates use the complete
+existing scan path. Empty matches therefore preserve typed aggregate `NULL`
+results, while the batch engine's existing non-nullable physical-column and
+NULL-predicate behavior is unchanged. Any successful row or schema mutation
+that could stale the bounds drops the pruning metadata; later SELECTs safely
+fall back to a complete scan. This is local metadata for the in-memory,
+single-process, single-node engine. It is not SQL `PARTITION BY`, distributed
+partition routing, sharding, replication, or a durable partition format.
 
 Running `rusthouse` without options retains the legacy line-oriented `Int64`
 session. It reads one statement from each nonempty input line and prints a row

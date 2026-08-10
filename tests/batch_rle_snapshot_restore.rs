@@ -123,6 +123,14 @@ fn existing_rle_saver_imports_to_select_at_every_exact_limit() {
                 Value::String("rusthouse_retained_value_bytes".to_owned()),
                 Value::Int64(24),
             ],
+            vec![
+                Value::String("rusthouse_index_scanned_blocks".to_owned()),
+                Value::Int64(0),
+            ],
+            vec![
+                Value::String("rusthouse_index_pruned_blocks".to_owned()),
+                Value::Int64(0),
+            ],
         ]
     );
     assert!(matches!(

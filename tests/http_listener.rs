@@ -667,7 +667,7 @@ fn sequential_connections_observe_updated_cached_system_metrics() {
     assert!(empty.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert_eq!(
         body(&empty),
-        br#"{"columns":[{"name":"metric","type":"String"},{"name":"value","type":"Int64"}],"rows":[["rusthouse_tables",0],["rusthouse_columns",0],["rusthouse_retained_rows",0],["rusthouse_retained_value_bytes",0]]}"#
+        br#"{"columns":[{"name":"metric","type":"String"},{"name":"value","type":"Int64"}],"rows":[["rusthouse_tables",0],["rusthouse_columns",0],["rusthouse_retained_rows",0],["rusthouse_retained_value_bytes",0],["rusthouse_index_scanned_blocks",0],["rusthouse_index_pruned_blocks",0]]}"#
     );
 
     database
@@ -681,7 +681,7 @@ fn sequential_connections_observe_updated_cached_system_metrics() {
     assert!(populated.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert_eq!(
         body(&populated),
-        br#"{"columns":[{"name":"metric","type":"String"},{"name":"value","type":"Int64"}],"rows":[["rusthouse_tables",1],["rusthouse_columns",2],["rusthouse_retained_rows",2],["rusthouse_retained_value_bytes",19]]}"#
+        br#"{"columns":[{"name":"metric","type":"String"},{"name":"value","type":"Int64"}],"rows":[["rusthouse_tables",1],["rusthouse_columns",2],["rusthouse_retained_rows",2],["rusthouse_retained_value_bytes",19],["rusthouse_index_scanned_blocks",0],["rusthouse_index_pruned_blocks",0]]}"#
     );
 
     let report = worker.join().unwrap().unwrap();

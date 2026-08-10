@@ -1,4 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::mem::size_of;
+use std::ops::Range;
 
 use crate::batch::error::{Error, Result};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -9,6 +12,304 @@ pub const DEFAULT_MAX_ROWS_PER_TABLE: usize = 1_000_000;
 pub const DEFAULT_MAX_COLUMNS_PER_TABLE: usize = 1_024;
 /// Default maximum number of physical scalar cells retained by one typed batch table.
 pub const DEFAULT_MAX_CELLS_PER_TABLE: usize = 4_000_000;
+/// Default number of consecutive source rows summarized by one sparse index block.
+pub const DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS: usize = 1_024;
+/// Default maximum number of metadata blocks retained by one sparse index.
+pub const DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS: usize = 4_096;
+/// Default maximum metadata bytes retained by one sparse index.
+pub const DEFAULT_INT64_MIN_MAX_INDEX_BYTES: usize = 1024 * 1024;
+
+/// Admission limits for one optional sparse `Int64` min/max index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Int64MinMaxIndexLimits {
+    /// Deterministic number of source rows represented by each block.
+    pub block_rows: usize,
+    /// Maximum number of block metadata entries.
+    pub max_blocks: usize,
+    /// Maximum bytes occupied by block metadata, excluding the `Vec` header.
+    pub max_bytes: usize,
+}
+
+impl Int64MinMaxIndexLimits {
+    #[must_use]
+    pub const fn new(block_rows: usize, max_blocks: usize, max_bytes: usize) -> Self {
+        Self {
+            block_rows,
+            max_blocks,
+            max_bytes,
+        }
+    }
+}
+
+/// Default maximum number of ranges in one caller-built partitioned table.
+pub const DEFAULT_MAX_INT64_RANGE_PARTITIONS: usize = 1_024;
+/// Default maximum rows accepted by the partition-table construction API.
+pub const DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS: usize = DEFAULT_MAX_ROWS_PER_TABLE;
+/// Default scalar payload bytes accepted by the partition-table construction API.
+pub const DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES: usize =
+    DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS * std::mem::size_of::<i64>();
+
+/// One inclusive `Int64` range and the rows physically assigned to it.
+///
+/// Partition order and membership are validated when a database table is
+/// built. Values retain their order within the supplied partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int64RangePartition {
+    lower_bound: i64,
+    upper_bound: i64,
+    values: Vec<i64>,
+}
+
+impl Int64RangePartition {
+    /// Describes one inclusive `[lower_bound, upper_bound]` partition.
+    #[must_use]
+    pub fn new(lower_bound: i64, upper_bound: i64, values: Vec<i64>) -> Self {
+        Self {
+            lower_bound,
+            upper_bound,
+            values,
+        }
+    }
+
+    #[must_use]
+    pub const fn lower_bound(&self) -> i64 {
+        self.lower_bound
+    }
+
+    #[must_use]
+    pub const fn upper_bound(&self) -> i64 {
+        self.upper_bound
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[i64] {
+        &self.values
+    }
+}
+
+/// Caller limits applied before a range-partitioned table is materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Int64RangePartitionLimits {
+    pub max_partitions: usize,
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl Int64RangePartitionLimits {
+    #[must_use]
+    pub const fn new(max_partitions: usize, max_rows: usize, max_bytes: usize) -> Self {
+        Self {
+            max_partitions,
+            max_rows,
+            max_bytes,
+        }
+    }
+}
+
+impl Default for Int64MinMaxIndexLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_INT64_MIN_MAX_INDEX_BLOCK_ROWS,
+            DEFAULT_INT64_MIN_MAX_INDEX_BLOCKS,
+            DEFAULT_INT64_MIN_MAX_INDEX_BYTES,
+        )
+    }
+}
+
+impl Default for Int64RangePartitionLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_INT64_RANGE_PARTITIONS,
+            DEFAULT_MAX_INT64_RANGE_PARTITION_ROWS,
+            DEFAULT_MAX_INT64_RANGE_PARTITION_BYTES,
+        )
+    }
+}
+
+/// Immutable summary for one deterministic sparse-index row block.
+///
+/// `min` and `max` summarize non-null values only. Both are `None` for an
+/// all-null block; `null_count` distinguishes that case from an empty block.
+/// Batch columns are currently non-nullable, but retaining this metadata makes
+/// block semantics explicit and safe for nullable physical columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Int64MinMaxBlockMetadata {
+    pub first_row: usize,
+    pub row_count: usize,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+    pub null_count: usize,
+}
+
+/// Public metadata about an admitted sparse index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int64MinMaxIndexInfo {
+    pub column: String,
+    pub block_rows: usize,
+    pub block_count: usize,
+    pub indexed_rows: usize,
+    pub retained_bytes: usize,
+}
+
+/// A non-error reason why a sparse-index request was not admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64MinMaxIndexRejection {
+    ZeroBlockRows,
+    SlotOccupied { table: String },
+    BlockLimitExceeded { required: usize, max: usize },
+    ByteLimitExceeded { required: usize, max: usize },
+}
+
+/// Result of attempting to admit an optional sparse index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64MinMaxIndexAdmission {
+    Created(Int64MinMaxIndexInfo),
+    Rejected(Int64MinMaxIndexRejection),
+}
+
+#[derive(Debug, Clone)]
+struct Int64MinMaxIndex {
+    column: usize,
+    limits: Int64MinMaxIndexLimits,
+    indexed_rows: usize,
+    source_generation: u64,
+    blocks: Vec<Int64MinMaxBlockMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Int64Filter {
+    Equal(i64),
+    Less(i64),
+    LessOrEqual(i64),
+    Greater(i64),
+    GreaterOrEqual(i64),
+}
+
+#[derive(Debug)]
+pub(crate) struct Int64MinMaxIndexScan {
+    pub(crate) ranges: Vec<Range<usize>>,
+    pub(crate) scanned_blocks: usize,
+    pub(crate) pruned_blocks: usize,
+}
+
+/// A typed failure while validating or publishing a range-partitioned table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64RangePartitionError {
+    PartitionLimitExceeded {
+        partitions: usize,
+        max_partitions: usize,
+    },
+    RowLimitExceeded {
+        rows: usize,
+        max_rows: usize,
+    },
+    ByteLimitExceeded {
+        bytes: usize,
+        max_bytes: usize,
+    },
+    InvalidRange {
+        partition_index: usize,
+        lower_bound: i64,
+        upper_bound: i64,
+    },
+    OutOfOrder {
+        partition_index: usize,
+        previous_lower_bound: i64,
+        lower_bound: i64,
+    },
+    Overlap {
+        partition_index: usize,
+        previous_upper_bound: i64,
+        lower_bound: i64,
+    },
+    ValueOutOfRange {
+        partition_index: usize,
+        value_index: usize,
+        value: i64,
+        lower_bound: i64,
+        upper_bound: i64,
+    },
+    /// SQL identifiers, duplicate names, or configured table limits failed.
+    Table(Error),
+}
+
+impl fmt::Display for Int64RangePartitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PartitionLimitExceeded {
+                partitions,
+                max_partitions,
+            } => write!(
+                formatter,
+                "range-partitioned table has {partitions} partitions, exceeding the limit of {max_partitions}"
+            ),
+            Self::RowLimitExceeded { rows, max_rows } => write!(
+                formatter,
+                "range-partitioned table has {rows} rows, exceeding the limit of {max_rows}"
+            ),
+            Self::ByteLimitExceeded { bytes, max_bytes } => write!(
+                formatter,
+                "range-partitioned table retains {bytes} value bytes, exceeding the limit of {max_bytes}"
+            ),
+            Self::InvalidRange {
+                partition_index,
+                lower_bound,
+                upper_bound,
+            } => write!(
+                formatter,
+                "partition {partition_index} has descending bounds [{lower_bound}, {upper_bound}]"
+            ),
+            Self::OutOfOrder {
+                partition_index,
+                previous_lower_bound,
+                lower_bound,
+            } => write!(
+                formatter,
+                "partition {partition_index} starts at {lower_bound}, before the previous partition start {previous_lower_bound}"
+            ),
+            Self::Overlap {
+                partition_index,
+                previous_upper_bound,
+                lower_bound,
+            } => write!(
+                formatter,
+                "partition {partition_index} starts at {lower_bound}, overlapping the previous inclusive upper bound {previous_upper_bound}"
+            ),
+            Self::ValueOutOfRange {
+                partition_index,
+                value_index,
+                value,
+                lower_bound,
+                upper_bound,
+            } => write!(
+                formatter,
+                "partition {partition_index} value {value_index} ({value}) is outside inclusive bounds [{lower_bound}, {upper_bound}]"
+            ),
+            Self::Table(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for Int64RangePartitionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Table(error) => Some(error),
+            Self::PartitionLimitExceeded { .. }
+            | Self::RowLimitExceeded { .. }
+            | Self::ByteLimitExceeded { .. }
+            | Self::InvalidRange { .. }
+            | Self::OutOfOrder { .. }
+            | Self::Overlap { .. }
+            | Self::ValueOutOfRange { .. } => None,
+        }
+    }
+}
+
+impl From<Error> for Int64RangePartitionError {
+    fn from(error: Error) -> Self {
+        Self::Table(error)
+    }
+}
 
 /// Persistent resource limits applied to one typed batch table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +565,20 @@ pub(crate) struct PreparedInsertRows {
     schema_indexes: Option<Vec<usize>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Int64RangePartitionMetadata {
+    lower_bound: i64,
+    upper_bound: i64,
+    row_start: usize,
+    row_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Int64RangePartitionSet {
+    column_index: usize,
+    partitions: Vec<Int64RangePartitionMetadata>,
+}
+
 impl PreparedInsertRows {
     #[must_use]
     pub(crate) fn len(&self) -> usize {
@@ -280,6 +595,9 @@ pub struct Table {
     row_count: usize,
     retained_value_bytes: u128,
     limits: TableLimits,
+    mutation_generation: u64,
+    int64_min_max_index: Option<Int64MinMaxIndex>,
+    int64_range_partitions: Option<Int64RangePartitionSet>,
 }
 
 impl Table {
@@ -339,6 +657,9 @@ impl Table {
             row_count: 0,
             retained_value_bytes: 0,
             limits,
+            mutation_generation: 0,
+            int64_min_max_index: None,
+            int64_range_partitions: None,
         })
     }
 
@@ -365,6 +686,114 @@ impl Table {
         Ok(table)
     }
 
+    /// Builds a fully validated one-column table and its range-pruning metadata.
+    pub(crate) fn with_int64_range_partitions(
+        name: String,
+        column_name: String,
+        partitions: Vec<Int64RangePartition>,
+        partition_limits: Int64RangePartitionLimits,
+        table_limits: TableLimits,
+    ) -> std::result::Result<Self, Int64RangePartitionError> {
+        if partitions.len() > partition_limits.max_partitions {
+            return Err(Int64RangePartitionError::PartitionLimitExceeded {
+                partitions: partitions.len(),
+                max_partitions: partition_limits.max_partitions,
+            });
+        }
+
+        let rows = partitions
+            .iter()
+            .map(|partition| partition.values.len())
+            .fold(0_usize, usize::saturating_add);
+        if rows > partition_limits.max_rows {
+            return Err(Int64RangePartitionError::RowLimitExceeded {
+                rows,
+                max_rows: partition_limits.max_rows,
+            });
+        }
+        let exact_bytes = (rows as u128).saturating_mul(std::mem::size_of::<i64>() as u128);
+        let bytes = saturating_usize(exact_bytes);
+        if exact_bytes > partition_limits.max_bytes as u128 {
+            return Err(Int64RangePartitionError::ByteLimitExceeded {
+                bytes,
+                max_bytes: partition_limits.max_bytes,
+            });
+        }
+
+        for (partition_index, partition) in partitions.iter().enumerate() {
+            if partition.lower_bound > partition.upper_bound {
+                return Err(Int64RangePartitionError::InvalidRange {
+                    partition_index,
+                    lower_bound: partition.lower_bound,
+                    upper_bound: partition.upper_bound,
+                });
+            }
+            if let Some(previous) = partition_index
+                .checked_sub(1)
+                .map(|index| &partitions[index])
+            {
+                if partition.lower_bound < previous.lower_bound {
+                    return Err(Int64RangePartitionError::OutOfOrder {
+                        partition_index,
+                        previous_lower_bound: previous.lower_bound,
+                        lower_bound: partition.lower_bound,
+                    });
+                }
+                if partition.lower_bound <= previous.upper_bound {
+                    return Err(Int64RangePartitionError::Overlap {
+                        partition_index,
+                        previous_upper_bound: previous.upper_bound,
+                        lower_bound: partition.lower_bound,
+                    });
+                }
+            }
+            if let Some((value_index, &value)) =
+                partition.values.iter().enumerate().find(|(_, value)| {
+                    **value < partition.lower_bound || **value > partition.upper_bound
+                })
+            {
+                return Err(Int64RangePartitionError::ValueOutOfRange {
+                    partition_index,
+                    value_index,
+                    value,
+                    lower_bound: partition.lower_bound,
+                    upper_bound: partition.upper_bound,
+                });
+            }
+        }
+
+        let mut table = Self::with_limits(
+            name,
+            vec![ColumnDef {
+                name: column_name,
+                data_type: DataType::Int64,
+            }],
+            table_limits,
+        )?;
+        table.validate_row_capacity(rows)?;
+
+        let mut values = Vec::with_capacity(rows);
+        let mut metadata = Vec::with_capacity(partitions.len());
+        for partition in partitions {
+            let row_start = values.len();
+            values.extend(partition.values);
+            metadata.push(Int64RangePartitionMetadata {
+                lower_bound: partition.lower_bound,
+                upper_bound: partition.upper_bound,
+                row_start,
+                row_end: values.len(),
+            });
+        }
+        table.row_count = rows;
+        table.retained_value_bytes = exact_bytes;
+        table.columns = vec![Column::Int64(values)];
+        table.int64_range_partitions = Some(Int64RangePartitionSet {
+            column_index: 0,
+            partitions: metadata,
+        });
+        Ok(table)
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -388,6 +817,47 @@ impl Table {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    /// Returns the number of validated range partitions, or `None` after a
+    /// mutation has invalidated pruning metadata (and for ordinary tables).
+    #[must_use]
+    pub fn int64_range_partition_count(&self) -> Option<usize> {
+        self.int64_range_partitions
+            .as_ref()
+            .map(|set| set.partitions.len())
+    }
+
+    /// Narrows a direct key comparison to the contiguous physical rows in
+    /// partitions that can possibly satisfy it. `None` means complete-scan
+    /// fallback; an empty range means every partition was pruned.
+    pub(crate) fn int64_range_partition_rows(
+        &self,
+        column_index: usize,
+        filter: Int64Filter,
+    ) -> Option<Range<usize>> {
+        let set = self.int64_range_partitions.as_ref()?;
+        if set.column_index != column_index {
+            return None;
+        }
+
+        let mut selected = set.partitions.iter().filter(|partition| match filter {
+            Int64Filter::Equal(value) => {
+                partition.lower_bound <= value && value <= partition.upper_bound
+            }
+            Int64Filter::Less(value) => partition.lower_bound < value,
+            Int64Filter::LessOrEqual(value) => partition.lower_bound <= value,
+            Int64Filter::Greater(value) => partition.upper_bound > value,
+            Int64Filter::GreaterOrEqual(value) => partition.upper_bound >= value,
+        });
+        let Some(first) = selected.next() else {
+            return Some(0..0);
+        };
+        let mut row_end = first.row_end;
+        for partition in selected {
+            row_end = partition.row_end;
+        }
+        Some(first.row_start..row_end)
     }
 
     /// Returns the maximum number of rows this table can retain.
@@ -441,6 +911,167 @@ impl Table {
                 table: self.name.clone(),
                 column: name.to_owned(),
             })
+    }
+
+    /// Returns metadata for this table's optional sparse `Int64` index.
+    #[must_use]
+    pub fn int64_min_max_index_info(&self) -> Option<Int64MinMaxIndexInfo> {
+        let index = self.int64_min_max_index.as_ref()?;
+        let column = self.schema.get(index.column)?;
+        Some(Int64MinMaxIndexInfo {
+            column: column.name.clone(),
+            block_rows: index.limits.block_rows,
+            block_count: index.blocks.len(),
+            indexed_rows: index.indexed_rows,
+            retained_bytes: index
+                .blocks
+                .len()
+                .saturating_mul(size_of::<Int64MinMaxBlockMetadata>()),
+        })
+    }
+
+    /// Returns immutable block summaries for this table's optional sparse index.
+    #[must_use]
+    pub fn int64_min_max_index_blocks(&self) -> Option<&[Int64MinMaxBlockMetadata]> {
+        self.int64_min_max_index
+            .as_ref()
+            .map(|index| index.blocks.as_slice())
+    }
+
+    pub(crate) fn try_create_int64_min_max_index(
+        &mut self,
+        column: &str,
+        limits: Int64MinMaxIndexLimits,
+    ) -> Result<Int64MinMaxIndexAdmission> {
+        let column = self.column_index(column)?;
+        if self.schema[column].data_type != DataType::Int64 {
+            return Err(Error::TypeMismatch {
+                context: format!(
+                    "sparse min-max index column '{}.{}'",
+                    self.name, self.schema[column].name
+                ),
+                expected: DataType::Int64.to_string(),
+                actual: self.schema[column].data_type.to_string(),
+            });
+        }
+        if limits.block_rows == 0 {
+            return Ok(Int64MinMaxIndexAdmission::Rejected(
+                Int64MinMaxIndexRejection::ZeroBlockRows,
+            ));
+        }
+
+        let index = match self.build_int64_min_max_index(column, limits) {
+            Ok(index) => index,
+            Err(rejection) => return Ok(Int64MinMaxIndexAdmission::Rejected(rejection)),
+        };
+        self.int64_min_max_index = Some(index);
+        Ok(Int64MinMaxIndexAdmission::Created(
+            self.int64_min_max_index_info()
+                .expect("the admitted index has a valid schema column"),
+        ))
+    }
+
+    pub(crate) fn drop_int64_min_max_index(&mut self) -> bool {
+        self.int64_min_max_index.take().is_some()
+    }
+
+    pub(crate) fn has_int64_min_max_index(&self) -> bool {
+        self.int64_min_max_index.is_some()
+    }
+
+    pub(crate) fn int64_min_max_index_scan(
+        &self,
+        column: usize,
+        filter: Int64Filter,
+        source_rows: Range<usize>,
+    ) -> Option<Int64MinMaxIndexScan> {
+        let index = self.int64_min_max_index.as_ref()?;
+        if index.column != column
+            || index.source_generation != self.mutation_generation
+            || index.indexed_rows != self.row_count
+            || index.limits.block_rows == 0
+            || !index_has_valid_layout(index)
+        {
+            return None;
+        }
+        debug_assert!(source_rows.start <= source_rows.end);
+        debug_assert!(source_rows.end <= self.row_count);
+
+        let mut ranges = Vec::with_capacity(index.blocks.len());
+        let mut scanned_blocks = 0_usize;
+        let mut pruned_blocks = 0_usize;
+        for block in &index.blocks {
+            let start = block.first_row.max(source_rows.start);
+            let end = block
+                .first_row
+                .saturating_add(block.row_count)
+                .min(source_rows.end);
+            if start >= end {
+                continue;
+            }
+            if block_may_match(*block, filter) {
+                scanned_blocks = scanned_blocks.saturating_add(1);
+                ranges.push(start..end);
+            } else {
+                pruned_blocks = pruned_blocks.saturating_add(1);
+            }
+        }
+        Some(Int64MinMaxIndexScan {
+            scanned_blocks,
+            pruned_blocks,
+            ranges,
+        })
+    }
+
+    fn build_int64_min_max_index(
+        &self,
+        column: usize,
+        limits: Int64MinMaxIndexLimits,
+    ) -> std::result::Result<Int64MinMaxIndex, Int64MinMaxIndexRejection> {
+        debug_assert!(limits.block_rows != 0);
+        let required_blocks = self.row_count.div_ceil(limits.block_rows);
+        if required_blocks > limits.max_blocks {
+            return Err(Int64MinMaxIndexRejection::BlockLimitExceeded {
+                required: required_blocks,
+                max: limits.max_blocks,
+            });
+        }
+        let required_bytes = required_blocks.saturating_mul(size_of::<Int64MinMaxBlockMetadata>());
+        if required_bytes > limits.max_bytes {
+            return Err(Int64MinMaxIndexRejection::ByteLimitExceeded {
+                required: required_bytes,
+                max: limits.max_bytes,
+            });
+        }
+
+        let Column::Int64(values) = &self.columns[column] else {
+            unreachable!("the index column type was validated");
+        };
+        let mut blocks = Vec::with_capacity(required_blocks);
+        for (block_number, values) in values.chunks(limits.block_rows).enumerate() {
+            blocks.push(summarize_nullable_int64_block(
+                block_number.saturating_mul(limits.block_rows),
+                values.iter().copied().map(Some),
+            ));
+        }
+        Ok(Int64MinMaxIndex {
+            column,
+            limits,
+            indexed_rows: self.row_count,
+            source_generation: self.mutation_generation,
+            blocks,
+        })
+    }
+
+    fn mark_values_mutated(&mut self) {
+        self.int64_range_partitions = None;
+        self.mutation_generation = self.mutation_generation.wrapping_add(1);
+        let Some(previous) = self.int64_min_max_index.take() else {
+            return;
+        };
+        self.int64_min_max_index = self
+            .build_int64_min_max_index(previous.column, previous.limits)
+            .ok();
     }
 
     /// Resolves and validates a nonempty explicit INSERT column list without
@@ -598,6 +1229,7 @@ impl Table {
         }
 
         self.schema[source_index].name = destination;
+        self.int64_range_partitions = None;
         Ok(())
     }
 
@@ -651,6 +1283,7 @@ impl Table {
         self.schema.push(field);
         self.columns.push(column);
         self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
+        self.mark_values_mutated();
         Ok(())
     }
 
@@ -674,6 +1307,11 @@ impl Table {
         self.retained_value_bytes = self
             .retained_value_bytes
             .saturating_sub(removed_column.retained_value_bytes_exact());
+        // A physical position may have shifted, so retaining any index would
+        // risk associating its metadata with the wrong column.
+        self.int64_min_max_index = None;
+        self.int64_range_partitions = None;
+        self.mutation_generation = self.mutation_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -723,6 +1361,7 @@ impl Table {
         self.validate_row_capacity(1)?;
         self.validate_row(&row)?;
         self.append_validated_row(row);
+        self.mark_values_mutated();
         Ok(())
     }
 
@@ -757,8 +1396,12 @@ impl Table {
     }
 
     pub(crate) fn append_validated_rows(&mut self, rows: Vec<Vec<Value>>) {
+        let changed = !rows.is_empty();
         for row in rows {
             self.append_validated_row(row);
+        }
+        if changed {
+            self.mark_values_mutated();
         }
     }
 
@@ -773,6 +1416,7 @@ impl Table {
             return;
         };
 
+        let changed = !rows.is_empty();
         for source in rows {
             let mut row = self
                 .schema
@@ -788,6 +1432,9 @@ impl Table {
                 row[schema_index] = value;
             }
             self.append_validated_row(row);
+        }
+        if changed {
+            self.mark_values_mutated();
         }
     }
 
@@ -809,7 +1456,9 @@ impl Table {
     /// values are rejected. The column, complete index selection, and all
     /// values are validated before mutation, so an error leaves the entire
     /// table unchanged. Valid owned values are moved into the selected cells
-    /// without cloning. All other cells and table metadata are preserved.
+    /// without cloning. All other cells and persistent table metadata are
+    /// preserved; a nonempty replacement invalidates optional range-pruning
+    /// metadata so subsequent queries use the complete scan path.
     ///
     /// # Errors
     ///
@@ -841,6 +1490,9 @@ impl Table {
             .retained_value_bytes
             .saturating_sub(removed_value_bytes)
             .saturating_add(added_value_bytes);
+        if replaced != 0 {
+            self.mark_values_mutated();
+        }
         Ok(replaced)
     }
 
@@ -873,6 +1525,7 @@ impl Table {
         self.retained_value_bytes = self
             .retained_value_bytes
             .saturating_sub(deleted_value_bytes);
+        self.mark_values_mutated();
         Ok(row_indexes.len())
     }
 
@@ -884,7 +1537,73 @@ impl Table {
         }
         self.row_count = 0;
         self.retained_value_bytes = 0;
+        if removed_rows != 0 {
+            self.mark_values_mutated();
+        }
         removed_rows
+    }
+}
+
+fn summarize_nullable_int64_block(
+    first_row: usize,
+    values: impl IntoIterator<Item = Option<i64>>,
+) -> Int64MinMaxBlockMetadata {
+    let mut row_count = 0_usize;
+    let mut null_count = 0_usize;
+    let mut min = None::<i64>;
+    let mut max = None::<i64>;
+    for value in values {
+        row_count = row_count.saturating_add(1);
+        if let Some(value) = value {
+            min = Some(min.map_or(value, |current| current.min(value)));
+            max = Some(max.map_or(value, |current| current.max(value)));
+        } else {
+            null_count = null_count.saturating_add(1);
+        }
+    }
+    Int64MinMaxBlockMetadata {
+        first_row,
+        row_count,
+        min,
+        max,
+        null_count,
+    }
+}
+
+fn index_has_valid_layout(index: &Int64MinMaxIndex) -> bool {
+    let expected_blocks = index.indexed_rows.div_ceil(index.limits.block_rows);
+    if index.blocks.len() != expected_blocks {
+        return false;
+    }
+    index.blocks.iter().enumerate().all(|(position, block)| {
+        let first_row = position.saturating_mul(index.limits.block_rows);
+        let expected_rows = index
+            .indexed_rows
+            .saturating_sub(first_row)
+            .min(index.limits.block_rows);
+        block.first_row == first_row
+            && block.row_count == expected_rows
+            && block.null_count <= block.row_count
+            && (block.min.is_some() == block.max.is_some())
+            && if block.min.is_some() {
+                block.null_count < block.row_count
+            } else {
+                block.null_count == block.row_count
+            }
+            && block.min.zip(block.max).is_none_or(|(min, max)| min <= max)
+    })
+}
+
+fn block_may_match(block: Int64MinMaxBlockMetadata, filter: Int64Filter) -> bool {
+    let (Some(min), Some(max)) = (block.min, block.max) else {
+        return false;
+    };
+    match filter {
+        Int64Filter::Equal(value) => min <= value && value <= max,
+        Int64Filter::Less(value) => min < value,
+        Int64Filter::LessOrEqual(value) => min <= value,
+        Int64Filter::Greater(value) => max > value,
+        Int64Filter::GreaterOrEqual(value) => max >= value,
     }
 }
 
@@ -1043,5 +1762,72 @@ mod tests {
         );
         assert_eq!(table.row_count(), 1);
         assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[1]));
+    }
+
+    #[test]
+    fn nullable_block_metadata_distinguishes_all_null_mixed_and_present_blocks() {
+        assert_eq!(
+            summarize_nullable_int64_block(0, [None, None, None]),
+            Int64MinMaxBlockMetadata {
+                first_row: 0,
+                row_count: 3,
+                min: None,
+                max: None,
+                null_count: 3,
+            }
+        );
+        assert_eq!(
+            summarize_nullable_int64_block(3, [Some(7), None, Some(-2), Some(7)]),
+            Int64MinMaxBlockMetadata {
+                first_row: 3,
+                row_count: 4,
+                min: Some(-2),
+                max: Some(7),
+                null_count: 1,
+            }
+        );
+        assert!(!block_may_match(
+            summarize_nullable_int64_block(0, [None, None]),
+            Int64Filter::Equal(0),
+        ));
+    }
+
+    #[test]
+    fn stale_generation_and_malformed_layout_fall_back_without_pruning() {
+        let mut table = test_table();
+        table
+            .insert_rows(vec![
+                vec![Value::Int64(1), Value::String("a".to_owned())],
+                vec![Value::Int64(2), Value::String("b".to_owned())],
+            ])
+            .unwrap();
+        assert!(matches!(
+            table
+                .try_create_int64_min_max_index(
+                    "id",
+                    Int64MinMaxIndexLimits::new(1, 2, usize::MAX),
+                )
+                .unwrap(),
+            Int64MinMaxIndexAdmission::Created(_)
+        ));
+        assert!(
+            table
+                .int64_min_max_index_scan(0, Int64Filter::Equal(2), 0..table.row_count())
+                .is_some()
+        );
+
+        table.mutation_generation = table.mutation_generation.wrapping_add(1);
+        assert!(
+            table
+                .int64_min_max_index_scan(0, Int64Filter::Equal(2), 0..table.row_count())
+                .is_none()
+        );
+        table.mutation_generation = table.mutation_generation.wrapping_sub(1);
+        table.int64_min_max_index.as_mut().unwrap().blocks[1].first_row = 0;
+        assert!(
+            table
+                .int64_min_max_index_scan(0, Int64Filter::Equal(2), 0..table.row_count())
+                .is_none()
+        );
     }
 }
