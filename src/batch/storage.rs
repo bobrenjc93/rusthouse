@@ -387,6 +387,9 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub enum Column {
     Int64(Vec<i64>),
+    /// Nullable `Int64` values. The logical type remains [`DataType::Int64`],
+    /// while `None` is exposed as a typed SQL `NULL`.
+    NullableInt64(Vec<Option<i64>>),
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
@@ -406,7 +409,7 @@ impl Column {
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
-            Self::Int64(_) => DataType::Int64,
+            Self::Int64(_) | Self::NullableInt64(_) => DataType::Int64,
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
@@ -417,6 +420,7 @@ impl Column {
     pub fn len(&self) -> usize {
         match self {
             Self::Int64(values) => values.len(),
+            Self::NullableInt64(values) => values.len(),
             Self::Float64(values) => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
@@ -441,6 +445,7 @@ impl Column {
     fn retained_value_bytes_exact(&self) -> u128 {
         match self {
             Self::Int64(values) => (values.len() as u128).saturating_mul(8),
+            Self::NullableInt64(values) => (values.len() as u128).saturating_mul(9),
             Self::Float64(values) => (values.len() as u128).saturating_mul(8),
             Self::Bool(values) => values.len() as u128,
             Self::String(values) => values
@@ -458,6 +463,9 @@ impl Column {
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
         match self {
             Self::Int64(values) => ValueRef::Int64(values[row]),
+            Self::NullableInt64(values) => {
+                values[row].map_or(ValueRef::Null(DataType::Int64), ValueRef::Int64)
+            }
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
@@ -473,6 +481,14 @@ impl Column {
             (Self::Int64(values), Value::Int64(value)) => {
                 values.push(value);
                 8
+            }
+            (Self::NullableInt64(values), Value::Int64(value)) => {
+                values.push(Some(value));
+                9
+            }
+            (Self::NullableInt64(values), Value::Null(DataType::Int64)) => {
+                values.push(None);
+                9
             }
             (Self::Float64(values), Value::Float64(value)) => {
                 values.push(value);
@@ -494,6 +510,7 @@ impl Column {
     fn clear(&mut self) {
         match self {
             Self::Int64(values) => values.clear(),
+            Self::NullableInt64(values) => values.clear(),
             Self::Float64(values) => values.clear(),
             Self::Bool(values) => values.clear(),
             Self::String(values) => values.clear(),
@@ -503,6 +520,7 @@ impl Column {
     fn delete_rows(&mut self, row_indexes: &[usize]) -> u128 {
         let deleted_value_bytes = match self {
             Self::Int64(_) | Self::Float64(_) => (row_indexes.len() as u128).saturating_mul(8),
+            Self::NullableInt64(_) => (row_indexes.len() as u128).saturating_mul(9),
             Self::Bool(_) => row_indexes.len() as u128,
             Self::String(values) => row_indexes
                 .iter()
@@ -511,6 +529,7 @@ impl Column {
         };
         match self {
             Self::Int64(values) => compact_deleted_rows(values, row_indexes),
+            Self::NullableInt64(values) => compact_deleted_rows(values, row_indexes),
             Self::Float64(values) => compact_deleted_rows(values, row_indexes),
             Self::Bool(values) => compact_deleted_rows(values, row_indexes),
             Self::String(values) => compact_deleted_rows(values, row_indexes),
@@ -524,6 +543,12 @@ impl Column {
         for (row_index, value) in replacements {
             match (&mut *self, value) {
                 (Self::Int64(values), Value::Int64(value)) => values[row_index] = value,
+                (Self::NullableInt64(values), Value::Int64(value)) => {
+                    values[row_index] = Some(value);
+                }
+                (Self::NullableInt64(values), Value::Null(DataType::Int64)) => {
+                    values[row_index] = None;
+                }
                 (Self::Float64(values), Value::Float64(value)) => values[row_index] = value,
                 (Self::Bool(values), Value::Bool(value)) => values[row_index] = value,
                 (Self::String(values), Value::String(value)) => {
@@ -586,11 +611,12 @@ impl PreparedInsertRows {
     }
 
     /// Returns the preflighted values when the target is one physical Int64 column.
-    pub(crate) fn int64_values(&self) -> Option<Vec<i64>> {
+    pub(crate) fn int64_values(&self) -> Option<Vec<Option<i64>>> {
         self.rows
             .iter()
             .map(|row| match row.as_slice() {
-                [Value::Int64(value)] => Some(*value),
+                [Value::Int64(value)] => Some(Some(*value)),
+                [Value::Null(DataType::Int64)] => Some(None),
                 _ => None,
             })
             .collect()
@@ -694,6 +720,29 @@ impl Table {
         table.row_count = values.len();
         table.retained_value_bytes = (values.len() as u128).saturating_mul(8);
         table.columns = vec![Column::Int64(values)];
+        Ok(table)
+    }
+
+    /// Builds one fully validated nullable `Int64` table without temporary
+    /// row materialization.
+    pub(crate) fn with_nullable_int64_values(
+        name: String,
+        column_name: String,
+        values: Vec<Option<i64>>,
+        limits: TableLimits,
+    ) -> Result<Self> {
+        let mut table = Self::with_limits(
+            name,
+            vec![ColumnDef {
+                name: column_name,
+                data_type: DataType::Int64,
+            }],
+            limits,
+        )?;
+        table.validate_row_capacity(values.len())?;
+        table.row_count = values.len();
+        table.retained_value_bytes = (values.len() as u128).saturating_mul(9);
+        table.columns = vec![Column::NullableInt64(values)];
         Ok(table)
     }
 
@@ -1055,15 +1104,25 @@ impl Table {
             });
         }
 
-        let Column::Int64(values) = &self.columns[column] else {
-            unreachable!("the index column type was validated");
-        };
         let mut blocks = Vec::with_capacity(required_blocks);
-        for (block_number, values) in values.chunks(limits.block_rows).enumerate() {
-            blocks.push(summarize_nullable_int64_block(
-                block_number.saturating_mul(limits.block_rows),
-                values.iter().copied().map(Some),
-            ));
+        match &self.columns[column] {
+            Column::Int64(values) => {
+                for (block_number, values) in values.chunks(limits.block_rows).enumerate() {
+                    blocks.push(summarize_nullable_int64_block(
+                        block_number.saturating_mul(limits.block_rows),
+                        values.iter().copied().map(Some),
+                    ));
+                }
+            }
+            Column::NullableInt64(values) => {
+                for (block_number, values) in values.chunks(limits.block_rows).enumerate() {
+                    blocks.push(summarize_nullable_int64_block(
+                        block_number.saturating_mul(limits.block_rows),
+                        values.iter().copied(),
+                    ));
+                }
+            }
+            _ => unreachable!("the index column type was validated"),
         }
         Ok(Int64MinMaxIndex {
             column,
@@ -1203,9 +1262,11 @@ impl Table {
         self.validate_row_capacity(capacity_rows)?;
 
         for row in &rows {
-            for (field, input_index) in self.schema.iter().zip(&input_indexes_by_schema) {
+            for (schema_index, (field, input_index)) in
+                self.schema.iter().zip(&input_indexes_by_schema).enumerate()
+            {
                 if let Some(input_index) = input_index {
-                    self.validate_value(field, &row[*input_index])?;
+                    self.validate_value(schema_index, field, &row[*input_index])?;
                 }
             }
         }
@@ -1336,15 +1397,20 @@ impl Table {
             });
         }
 
-        for (field, value) in self.schema.iter().zip(row) {
-            self.validate_value(field, value)?;
+        for (index, (field, value)) in self.schema.iter().zip(row).enumerate() {
+            self.validate_value(index, field, value)?;
         }
 
         Ok(())
     }
 
-    fn validate_value(&self, field: &ColumnDef, value: &Value) -> Result<()> {
+    fn validate_value(&self, column: usize, field: &ColumnDef, value: &Value) -> Result<()> {
         if matches!(value, Value::Null(_)) {
+            if matches!(self.columns[column], Column::NullableInt64(_))
+                && matches!(value, Value::Null(DataType::Int64))
+            {
+                return Ok(());
+            }
             return Err(Error::TypeMismatch {
                 context: format!("column '{}.{}'", self.name, field.name),
                 expected: field.data_type.to_string(),
@@ -1432,11 +1498,13 @@ impl Table {
             let mut row = self
                 .schema
                 .iter()
-                .map(|field| match field.data_type {
-                    DataType::Int64 => Value::Int64(0),
-                    DataType::Float64 => Value::Float64(0.0),
-                    DataType::Bool => Value::Bool(false),
-                    DataType::String => Value::String(String::new()),
+                .zip(&self.columns)
+                .map(|(_, column)| match column {
+                    Column::NullableInt64(_) => Value::Null(DataType::Int64),
+                    Column::Int64(_) => Value::Int64(0),
+                    Column::Float64(_) => Value::Float64(0.0),
+                    Column::Bool(_) => Value::Bool(false),
+                    Column::String(_) => Value::String(String::new()),
                 })
                 .collect::<Vec<_>>();
             for (value, schema_index) in source.into_iter().zip(schema_indexes.iter().copied()) {
@@ -1491,7 +1559,7 @@ impl Table {
 
         let field = &self.schema[column_index];
         for (_, value) in &replacements {
-            self.validate_value(field, value)?;
+            self.validate_value(column_index, field, value)?;
         }
 
         let replaced = replacements.len();
@@ -1618,7 +1686,7 @@ fn block_may_match(block: Int64MinMaxBlockMetadata, filter: Int64Filter) -> bool
     }
 }
 
-fn validate_row_selection(
+pub(crate) fn validate_row_selection(
     row_indexes: impl IntoIterator<Item = usize>,
     input_rows: usize,
 ) -> Result<()> {

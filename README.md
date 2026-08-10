@@ -14,8 +14,8 @@ The first useful release should support:
 - projections, `WHERE` comparisons, `COUNT`, `countIf`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, `LIMIT`, and narrow `OFFSET` pagination;
 - a batch/interactive CLI with readable table, CSV, TSV, JSON, JSONEachRow,
   and JSONCompactEachRow output;
-- durable local snapshots and an opt-in crash-recoverable `Int64` WAL with
-  explicit, documented file formats;
+- durable local snapshots and opt-in crash-recoverable single- or multi-table
+  `Int64`/`Nullable(Int64)` WALs with explicit, documented file formats;
 - an HTTP endpoint for executing SQL;
 - deterministic tests and a small benchmark that demonstrate analytical behavior.
 
@@ -1485,9 +1485,12 @@ exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.m
 ## Int64 write-ahead logging
 
 On Unix, `Database::enable_int64_write_ahead_log` can opt one existing batch
-table with exactly one non-nullable `Int64` column into a bounded WAL. A
-synchronized bootstrap captures its display names, current rows, NULL
-restriction, table/database limits, query row and byte caps, and worker cap.
+table with exactly one `Int64` or programmatic `Nullable(Int64)` column into a
+bounded WAL. A synchronized bootstrap captures its display names, current
+rows and nullability, table/database limits, query row and byte caps, and
+worker cap. `Database::create_nullable_int64_table`,
+`append_nullable_int64_values`, and `replace_nullable_int64_values` provide
+the bounded nullable table and mutation paths.
 Successful SQL/CSV/TSV appends, `TRUNCATE TABLE`, and atomic `ALTER TABLE ...
 UPDATE` replacements are framed, checksummed, committed, and synchronized
 before their in-memory mutations become visible. Each record body is synced
@@ -1505,11 +1508,28 @@ intermediate or final committed record from hiding later records as a torn
 tail. Replay is staged, preserves cached metrics and persisted caps, and
 exposes no database on failure. It is read-only and idempotent. A recovered
 database can compact or resume durability by enabling a new WAL at a new path;
-the source WAL is never modified. There is currently no in-place compaction,
-rotation, multi-table logging, or nullable batch-column storage. Unsupported
-schema, delete, drop, rename, and snapshot-replacement operations are rejected
-while the selected table is attached. The exact format, crash boundary, Unix
-file/parent sync ordering, and lifecycle limits are documented in
+the source WAL is never modified.
+
+`Database::enable_int64_write_ahead_log_registry` durably attaches a
+caller-bounded set of independently named one-column tables to one exclusive
+WAL directory. Per-table file/record caps and directory-wide table, manifest,
+member-byte, and record caps apply during both mutation and recovery. Member
+filenames are generated rather than derived from table names. A versioned,
+checksummed manifest lists them in canonical case-insensitive table-name order
+and is synced only after the new directory and every bootstrap member are
+durable. Recovery uses descriptor-relative, no-follow opens, rejects missing,
+duplicate/aliased, special, unlisted, oversized, corrupt, path-traversing, or
+settings-inconsistent members, stages every table and metric, and returns no
+database unless the whole registry succeeds. The plural `enable_*_logs` and
+`recover_*_logs` names are aliases. Existing version-1 single-file WALs and
+their APIs remain compatible.
+
+There is currently no in-place compaction, rotation, or cross-table
+transaction log. The atomic INSERT-batch API rejects a batch spanning multiple
+independently logged registry tables. Unsupported schema, delete, drop, rename,
+and snapshot-replacement operations are rejected while the selected table is
+attached. The exact formats, crash boundary, Unix file/directory sync ordering,
+and lifecycle limits are documented in
 [docs/int64-wal-format.md](docs/int64-wal-format.md).
 
 ## CSV ingestion

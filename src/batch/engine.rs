@@ -19,13 +19,16 @@ use crate::batch::sql::{
     SelectItem, Statement, VersionSelect,
 };
 use crate::batch::storage::{
-    Column, Int64Filter, Int64MinMaxIndexScan, PreparedInsertRows, Table, validate_table_name,
+    Column, Int64Filter, Int64MinMaxIndexScan, PreparedInsertRows, Table, validate_row_selection,
+    validate_table_name,
 };
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
 #[cfg(unix)]
 use crate::batch::wal::{
-    self, Int64WalBootstrap, Int64WriteAheadLog, Int64WriteAheadLogError, Int64WriteAheadLogLimits,
+    self, ActiveInt64WriteAheadLogs, Int64WalBootstrap, Int64WriteAheadLog,
+    Int64WriteAheadLogError, Int64WriteAheadLogLimits, Int64WriteAheadLogRegistryError,
+    Int64WriteAheadLogRegistryLimits,
 };
 #[cfg(unix)]
 use crate::snapshot::Int64TablePayloadFileSaveError;
@@ -205,7 +208,7 @@ pub struct Database {
     global_aggregate_parallelism: GlobalAggregateParallelism,
     index_pruning_counters: IndexPruningCounters,
     #[cfg(unix)]
-    int64_write_ahead_log: Option<Int64WriteAheadLog>,
+    int64_write_ahead_log: Option<ActiveInt64WriteAheadLogs>,
 }
 
 /// Cumulative sparse-index work performed by successful indexed scans.
@@ -677,6 +680,104 @@ pub enum DatabaseInt64WalRecoveryError {
     Table(Error),
 }
 
+/// A failure while atomically attaching a bounded multi-table WAL registry.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum DatabaseInt64WalRegistryEnableError {
+    AlreadyEnabled,
+    Table { table: String, error: Error },
+    UnsupportedColumnCount { table: String, column_count: usize },
+    UnsupportedColumnType { column: String, data_type: DataType },
+    Registry(Int64WriteAheadLogRegistryError),
+}
+
+/// A failure while staging every registry member into a fresh database.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum DatabaseInt64WalRegistryRecoveryError {
+    Registry(Int64WriteAheadLogRegistryError),
+    Table { table: String, error: Error },
+}
+
+#[cfg(unix)]
+impl fmt::Display for DatabaseInt64WalRegistryEnableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyEnabled => {
+                formatter.write_str("an Int64 WAL is already enabled for this database")
+            }
+            Self::Table { table, error } => write!(
+                formatter,
+                "could not attach registry table '{table}': {error}"
+            ),
+            Self::UnsupportedColumnCount {
+                table,
+                column_count,
+            } => write!(
+                formatter,
+                "table '{table}' has {column_count} columns; Int64 WAL registry requires exactly one"
+            ),
+            Self::UnsupportedColumnType { column, data_type } => write!(
+                formatter,
+                "column '{column}' has type {data_type}; Int64 WAL registry requires Int64 or Nullable(Int64)"
+            ),
+            Self::Registry(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for DatabaseInt64WalRegistryEnableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Table { error, .. } => Some(error),
+            Self::Registry(error) => Some(error),
+            Self::AlreadyEnabled
+            | Self::UnsupportedColumnCount { .. }
+            | Self::UnsupportedColumnType { .. } => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for DatabaseInt64WalRegistryRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(error) => {
+                write!(formatter, "could not replay Int64 WAL registry: {error}")
+            }
+            Self::Table { table, error } => write!(
+                formatter,
+                "could not reconstruct Int64 WAL registry table '{table}': {error}"
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for DatabaseInt64WalRegistryRecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registry(error) => Some(error),
+            Self::Table { error, .. } => Some(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<Int64WriteAheadLogRegistryError> for DatabaseInt64WalRegistryEnableError {
+    fn from(error: Int64WriteAheadLogRegistryError) -> Self {
+        Self::Registry(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<Int64WriteAheadLogRegistryError> for DatabaseInt64WalRegistryRecoveryError {
+    fn from(error: Int64WriteAheadLogRegistryError) -> Self {
+        Self::Registry(error)
+    }
+}
+
 #[cfg(unix)]
 impl fmt::Display for DatabaseInt64WalEnableError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1070,19 +1171,21 @@ impl Database {
     }
 
     #[cfg(unix)]
-    fn log_int64_append(&mut self, table_name: &str, values: &[i64]) -> Result<()> {
+    fn log_int64_append(&mut self, table_name: &str, values: &[Option<i64>]) -> Result<()> {
         if let Some(write_ahead_log) = self
             .int64_write_ahead_log
             .as_mut()
-            .filter(|write_ahead_log| write_ahead_log.tracks(table_name))
+            .filter(|write_ahead_logs| write_ahead_logs.tracks(table_name))
         {
-            write_ahead_log.append_values(values)?;
+            write_ahead_log
+                .append_values(table_name, values)
+                .map_err(Error::WriteAheadLog)?;
         }
         Ok(())
     }
 
     #[cfg(not(unix))]
-    fn log_int64_append(&mut self, _table_name: &str, _values: &[i64]) -> Result<()> {
+    fn log_int64_append(&mut self, _table_name: &str, _values: &[Option<i64>]) -> Result<()> {
         Ok(())
     }
 
@@ -1091,9 +1194,11 @@ impl Database {
         if let Some(write_ahead_log) = self
             .int64_write_ahead_log
             .as_mut()
-            .filter(|write_ahead_log| write_ahead_log.tracks(table_name))
+            .filter(|write_ahead_logs| write_ahead_logs.tracks(table_name))
         {
-            write_ahead_log.truncate()?;
+            write_ahead_log
+                .truncate(table_name)
+                .map_err(Error::WriteAheadLog)?;
         }
         Ok(())
     }
@@ -1107,14 +1212,16 @@ impl Database {
     fn log_int64_replacements(
         &mut self,
         table_name: &str,
-        replacements: &[(usize, i64)],
+        replacements: &[(usize, Option<i64>)],
     ) -> Result<()> {
         if let Some(write_ahead_log) = self
             .int64_write_ahead_log
             .as_mut()
-            .filter(|write_ahead_log| write_ahead_log.tracks(table_name))
+            .filter(|write_ahead_logs| write_ahead_logs.tracks(table_name))
         {
-            write_ahead_log.replace_values(replacements)?;
+            write_ahead_log
+                .replace_values(table_name, replacements)
+                .map_err(Error::WriteAheadLog)?;
         }
         Ok(())
     }
@@ -1123,7 +1230,7 @@ impl Database {
     fn log_int64_replacements(
         &mut self,
         _table_name: &str,
-        _replacements: &[(usize, i64)],
+        _replacements: &[(usize, Option<i64>)],
     ) -> Result<()> {
         Ok(())
     }
@@ -1168,6 +1275,105 @@ impl Database {
         self.table_limits
     }
 
+    /// Atomically creates one programmatic `Nullable(Int64)` table.
+    pub fn create_nullable_int64_table(
+        &mut self,
+        table_name: impl Into<String>,
+        column_name: impl Into<String>,
+        values: Vec<Option<i64>>,
+    ) -> Result<()> {
+        self.create_nullable_int64_table_with_limits(
+            table_name,
+            column_name,
+            values,
+            self.table_limits,
+        )
+    }
+
+    /// Atomically creates one bounded programmatic `Nullable(Int64)` table.
+    pub fn create_nullable_int64_table_with_limits(
+        &mut self,
+        table_name: impl Into<String>,
+        column_name: impl Into<String>,
+        values: Vec<Option<i64>>,
+        limits: TableLimits,
+    ) -> Result<()> {
+        let table = Table::with_nullable_int64_values(
+            table_name.into(),
+            column_name.into(),
+            values,
+            limits,
+        )?;
+        let measurements = TableMeasurements::read(&table);
+        self.catalog.register_table(table)?;
+        self.measurements.add(measurements);
+        Ok(())
+    }
+
+    /// Appends validated nullable values, committing an attached table WAL
+    /// before publishing any row in memory.
+    pub fn append_nullable_int64_values(
+        &mut self,
+        table_name: &str,
+        values: &[Option<i64>],
+    ) -> Result<()> {
+        let rows = values
+            .iter()
+            .map(|value| vec![value.map_or(Value::Null(DataType::Int64), Value::Int64)])
+            .collect::<Vec<_>>();
+        {
+            let table = self.catalog.table(table_name)?;
+            if !matches!(table.columns(), [Column::NullableInt64(_)]) {
+                return Err(Error::TypeMismatch {
+                    context: format!("nullable Int64 append table '{}'", table.name()),
+                    expected: "Nullable(Int64)".to_owned(),
+                    actual: table.schema()[0].data_type.to_string(),
+                });
+            }
+            table.validate_row_capacity(rows.len())?;
+            for row in &rows {
+                table.validate_row(row)?;
+            }
+        }
+        self.log_int64_append(table_name, values)?;
+        self.table_mut(table_name)?.append_validated_rows(rows);
+        Ok(())
+    }
+
+    /// Replaces a strictly increasing selection in a nullable table, including
+    /// transitions to and from `NULL`, after durably logging the full change.
+    pub fn replace_nullable_int64_values(
+        &mut self,
+        table_name: &str,
+        replacements: &[(usize, Option<i64>)],
+    ) -> Result<usize> {
+        let (column_name, row_count) = {
+            let table = self.catalog.table(table_name)?;
+            if !matches!(table.columns(), [Column::NullableInt64(_)]) {
+                return Err(Error::TypeMismatch {
+                    context: format!("nullable Int64 replacement table '{}'", table.name()),
+                    expected: "Nullable(Int64)".to_owned(),
+                    actual: table.schema()[0].data_type.to_string(),
+                });
+            }
+            (table.schema()[0].name.clone(), table.row_count())
+        };
+        validate_row_selection(replacements.iter().map(|(row, _)| *row), row_count)?;
+        self.log_int64_replacements(table_name, replacements)?;
+        self.table_mut(table_name)?.replace_column_values(
+            &column_name,
+            replacements
+                .iter()
+                .map(|(row, value)| {
+                    (
+                        *row,
+                        value.map_or(Value::Null(DataType::Int64), Value::Int64),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     /// Creates and synchronizes a bounded WAL for one existing one-column
     /// `Int64` table, then logs its successful appends, truncates, and atomic
     /// value replacements before publishing them in memory.
@@ -1205,13 +1411,16 @@ impl Database {
                 data_type: column.data_type,
             });
         }
-        let Column::Int64(values) = &table.columns()[0] else {
-            unreachable!("batch table schema and physical storage must agree");
+        let (nullable, values) = match &table.columns()[0] {
+            Column::Int64(values) => (false, values.iter().copied().map(Some).collect()),
+            Column::NullableInt64(values) => (true, values.clone()),
+            _ => unreachable!("batch table schema and physical storage must agree"),
         };
         Int64WriteAheadLog::validate_bootstrap_limits(
             table.name().len(),
             column.name.len(),
             values.len(),
+            nullable,
             limits,
         )?;
         let table_limits = table.limits();
@@ -1232,11 +1441,93 @@ impl Database {
             ],
             query_limits: query_limits_to_array(query),
             worker_cap: self.global_aggregate_parallelism.worker_cap().get(),
-            values: values.clone(),
+            nullable,
+            values,
         };
         let write_ahead_log = Int64WriteAheadLog::create(path.as_ref(), &bootstrap, limits)?;
-        self.int64_write_ahead_log = Some(write_ahead_log);
+        self.int64_write_ahead_log = Some(ActiveInt64WriteAheadLogs::single(write_ahead_log));
         Ok(())
+    }
+
+    /// Creates an exclusive, checksummed WAL directory for multiple existing
+    /// one-column `Int64` or nullable `Int64` tables. Member files and the new
+    /// directory are synchronized before the manifest is durably published.
+    #[cfg(unix)]
+    pub fn enable_int64_write_ahead_log_registry<S: AsRef<str>>(
+        &mut self,
+        table_names: &[S],
+        path: impl AsRef<Path>,
+        limits: Int64WriteAheadLogRegistryLimits,
+    ) -> std::result::Result<(), DatabaseInt64WalRegistryEnableError> {
+        if self.int64_write_ahead_log.is_some() {
+            return Err(DatabaseInt64WalRegistryEnableError::AlreadyEnabled);
+        }
+        let mut bootstraps = Vec::with_capacity(table_names.len());
+        for requested in table_names {
+            let requested = requested.as_ref();
+            let table = self.catalog.table(requested).map_err(|error| {
+                DatabaseInt64WalRegistryEnableError::Table {
+                    table: requested.to_owned(),
+                    error,
+                }
+            })?;
+            if table.schema().len() != 1 {
+                return Err(
+                    DatabaseInt64WalRegistryEnableError::UnsupportedColumnCount {
+                        table: table.name().to_owned(),
+                        column_count: table.schema().len(),
+                    },
+                );
+            }
+            let column = &table.schema()[0];
+            if column.data_type != DataType::Int64 {
+                return Err(DatabaseInt64WalRegistryEnableError::UnsupportedColumnType {
+                    column: column.name.clone(),
+                    data_type: column.data_type,
+                });
+            }
+            let (nullable, values) = match &table.columns()[0] {
+                Column::Int64(values) => (false, values.iter().copied().map(Some).collect()),
+                Column::NullableInt64(values) => (true, values.clone()),
+                _ => unreachable!("batch table schema and physical storage must agree"),
+            };
+            let table_limits = table.limits();
+            let database_table_limits = self.table_limits;
+            bootstraps.push(Int64WalBootstrap {
+                table_name: table.name().to_owned(),
+                column_name: column.name.clone(),
+                table_limits: [
+                    table_limits.max_rows,
+                    table_limits.max_columns,
+                    table_limits.max_cells,
+                ],
+                database_table_limits: [
+                    database_table_limits.max_rows,
+                    database_table_limits.max_columns,
+                    database_table_limits.max_cells,
+                ],
+                query_limits: query_limits_to_array(self.query_result_limits),
+                worker_cap: self.global_aggregate_parallelism.worker_cap().get(),
+                nullable,
+                values,
+            });
+        }
+        let registry =
+            ActiveInt64WriteAheadLogs::create_registry(path.as_ref(), bootstraps, limits)?;
+        self.int64_write_ahead_log = Some(registry);
+        Ok(())
+    }
+
+    /// Alias using the plural form for callers treating the registry as a set
+    /// of independent table logs.
+    #[cfg(unix)]
+    pub fn enable_int64_write_ahead_logs<S: AsRef<str>>(
+        &mut self,
+        table_names: &[S],
+        path: impl AsRef<Path>,
+        limits: Int64WriteAheadLogRegistryLimits,
+    ) -> std::result::Result<(), DatabaseInt64WalRegistryEnableError> {
+        self.enable_int64_write_ahead_log_registry(table_names, path, limits)
     }
 
     /// Replays the complete committed prefix of one bounded WAL into a fresh
@@ -1261,6 +1552,7 @@ impl Database {
             database_table_limits,
             query_limits,
             worker_cap,
+            nullable,
             values,
         } = recovered.bootstrap;
         let table_limits = TableLimits::new(table_limits[0], table_limits[1], table_limits[2]);
@@ -1269,7 +1561,19 @@ impl Database {
             database_table_limits[1],
             database_table_limits[2],
         );
-        let table = Table::with_int64_values(table_name, column_name, values, table_limits)?;
+        let table = if nullable {
+            Table::with_nullable_int64_values(table_name, column_name, values, table_limits)?
+        } else {
+            Table::with_int64_values(
+                table_name,
+                column_name,
+                values
+                    .into_iter()
+                    .map(|value| value.expect("non-nullable WAL replay contains no NULL"))
+                    .collect(),
+                table_limits,
+            )?
+        };
         let measurements = TableMeasurements::read(&table);
         let worker_cap = NonZeroUsize::new(worker_cap).ok_or_else(|| {
             DatabaseInt64WalRecoveryError::Table(Error::InvalidQuery(
@@ -1288,6 +1592,94 @@ impl Database {
         database.catalog.register_table(table)?;
         database.measurements.add(measurements);
         Ok(database)
+    }
+
+    /// Replays every checksummed registry member in canonical table-name order
+    /// and publishes them only by returning one completely constructed database.
+    #[cfg(unix)]
+    pub fn recover_int64_write_ahead_log_registry(
+        path: impl AsRef<Path>,
+        limits: Int64WriteAheadLogRegistryLimits,
+    ) -> std::result::Result<Self, DatabaseInt64WalRegistryRecoveryError> {
+        let recovered = wal::recover_registry(path.as_ref(), limits)?;
+        let first = recovered
+            .tables
+            .first()
+            .expect("registry validation rejects an empty manifest");
+        let database_table_limits = TableLimits::new(
+            first.database_table_limits[0],
+            first.database_table_limits[1],
+            first.database_table_limits[2],
+        );
+        let query_result_limits = query_limits_from_array(first.query_limits);
+        let worker_cap = NonZeroUsize::new(first.worker_cap).expect("WAL decoder rejects zero");
+
+        let mut tables = Vec::with_capacity(recovered.tables.len());
+        for bootstrap in recovered.tables {
+            let table_name = bootstrap.table_name.clone();
+            let table_limits = TableLimits::new(
+                bootstrap.table_limits[0],
+                bootstrap.table_limits[1],
+                bootstrap.table_limits[2],
+            );
+            let table = if bootstrap.nullable {
+                Table::with_nullable_int64_values(
+                    bootstrap.table_name,
+                    bootstrap.column_name,
+                    bootstrap.values,
+                    table_limits,
+                )
+            } else {
+                Table::with_int64_values(
+                    bootstrap.table_name,
+                    bootstrap.column_name,
+                    bootstrap
+                        .values
+                        .into_iter()
+                        .map(|value| value.expect("non-nullable WAL replay contains no NULL"))
+                        .collect(),
+                    table_limits,
+                )
+            }
+            .map_err(|error| DatabaseInt64WalRegistryRecoveryError::Table {
+                table: table_name,
+                error,
+            })?;
+            tables.push(table);
+        }
+
+        let measurements = tables.iter().map(TableMeasurements::read).fold(
+            DatabaseMeasurements::default(),
+            |mut total, table| {
+                total.add(table);
+                total
+            },
+        );
+        let mut catalog = Catalog::new();
+        if let Err((index, error)) = catalog.register_tables(tables) {
+            return Err(DatabaseInt64WalRegistryRecoveryError::Table {
+                table: format!("registry member {index}"),
+                error,
+            });
+        }
+        Ok(Self {
+            catalog,
+            measurements,
+            query_result_limits,
+            table_limits: database_table_limits,
+            global_aggregate_parallelism: GlobalAggregateParallelism::system(worker_cap),
+            index_pruning_counters: IndexPruningCounters::default(),
+            int64_write_ahead_log: None,
+        })
+    }
+
+    /// Plural alias for [`Self::recover_int64_write_ahead_log_registry`].
+    #[cfg(unix)]
+    pub fn recover_int64_write_ahead_logs(
+        path: impl AsRef<Path>,
+        limits: Int64WriteAheadLogRegistryLimits,
+    ) -> std::result::Result<Self, DatabaseInt64WalRegistryRecoveryError> {
+        Self::recover_int64_write_ahead_log_registry(path, limits)
     }
 
     /// Detaches the current WAL after all prior successful mutations have
@@ -2095,10 +2487,19 @@ impl Database {
             prepared.push((table, rows));
         }
 
-        let mut wal_table = None;
+        let mut wal_table: Option<String> = None;
         let mut wal_values = Vec::new();
         for (table, rows) in &prepared {
             if self.wal_tracks(table) {
+                if wal_table
+                    .as_ref()
+                    .is_some_and(|tracked| !tracked.eq_ignore_ascii_case(table))
+                {
+                    return Err(Error::InvalidQuery(
+                        "an atomic INSERT batch cannot span multiple independently logged WAL registry tables"
+                            .to_owned(),
+                    ));
+                }
                 wal_table.get_or_insert_with(|| table.clone());
                 wal_values.extend(
                     rows.int64_values()
@@ -2650,7 +3051,8 @@ impl Database {
             let wal_replacements = replacements
                 .iter()
                 .map(|(row, value)| match value {
-                    Value::Int64(value) => (*row, *value),
+                    Value::Int64(value) => (*row, Some(*value)),
+                    Value::Null(DataType::Int64) => (*row, None),
                     _ => unreachable!("WAL opt-in guarantees one Int64 target column"),
                 })
                 .collect::<Vec<_>>();
@@ -3639,6 +4041,10 @@ fn alter_update_matches(column: &Column, literal: &AlterUpdateValue, row: usize)
         (Column::Int64(values), AlterUpdateValue::Literal(AlterUpdateLiteral::Int64(value))) => {
             values[row] == *value
         }
+        (
+            Column::NullableInt64(values),
+            AlterUpdateValue::Literal(AlterUpdateLiteral::Int64(value)),
+        ) => values[row] == Some(*value),
         (
             Column::Float64(values),
             AlterUpdateValue::Literal(AlterUpdateLiteral::Float64(value)),
@@ -7994,9 +8400,9 @@ impl CompiledPredicate {
             } => {
                 let left = left.value(table, row);
                 let right = right.value(table, row);
-                let comparison = left
-                    .sql_cmp(right)
-                    .expect("predicate operand types are validated");
+                let Some(comparison) = left.sql_cmp(right) else {
+                    return false;
+                };
                 match operator {
                     ComparisonOperator::Equal => comparison == Ordering::Equal,
                     ComparisonOperator::NotEqual => comparison != Ordering::Equal,
