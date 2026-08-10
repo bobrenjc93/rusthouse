@@ -33,9 +33,13 @@ pub use batch::{
 };
 #[cfg(unix)]
 pub use batch::{
-    DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError, DatabaseSnapshotSaveError,
-    Int64WriteAheadLogCommitError, Int64WriteAheadLogCorruption, Int64WriteAheadLogError,
-    Int64WriteAheadLogLimitError, Int64WriteAheadLogLimits, SharedDatabaseSnapshotSaveError,
+    DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError,
+    DatabaseInt64WalRegistryEnableError, DatabaseInt64WalRegistryRecoveryError,
+    DatabaseSnapshotSaveError, Int64WriteAheadLogCommitError, Int64WriteAheadLogCorruption,
+    Int64WriteAheadLogError, Int64WriteAheadLogLimitError, Int64WriteAheadLogLimits,
+    Int64WriteAheadLogRegistryCorruption, Int64WriteAheadLogRegistryError,
+    Int64WriteAheadLogRegistryLimitError, Int64WriteAheadLogRegistryLimits,
+    SharedDatabaseSnapshotSaveError,
 };
 pub use catalog::{
     Catalog, CatalogCsvIngestError, CatalogCsvReaderIngestError, CatalogError, CatalogLimits,

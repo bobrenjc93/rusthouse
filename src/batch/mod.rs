@@ -27,7 +27,9 @@ pub use engine::{
 };
 #[cfg(unix)]
 pub use engine::{
-    DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError, DatabaseSnapshotSaveError,
+    DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError,
+    DatabaseInt64WalRegistryEnableError, DatabaseInt64WalRegistryRecoveryError,
+    DatabaseSnapshotSaveError,
 };
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 #[cfg(unix)]
@@ -40,9 +42,13 @@ pub use storage::TableLimits;
 #[cfg(unix)]
 pub use wal::{
     DEFAULT_MAX_INT64_WAL_BYTES, DEFAULT_MAX_INT64_WAL_RECORD_BYTES, DEFAULT_MAX_INT64_WAL_RECORDS,
+    DEFAULT_MAX_INT64_WAL_REGISTRY_BYTES, DEFAULT_MAX_INT64_WAL_REGISTRY_MANIFEST_BYTES,
+    DEFAULT_MAX_INT64_WAL_REGISTRY_RECORDS, DEFAULT_MAX_INT64_WAL_REGISTRY_TABLES,
     INT64_WAL_COMMIT_LEN, INT64_WAL_FRAME_HEADER_LEN, INT64_WAL_FRAME_OVERHEAD,
     Int64WriteAheadLogCommitError, Int64WriteAheadLogCorruption, Int64WriteAheadLogError,
-    Int64WriteAheadLogLimitError, Int64WriteAheadLogLimits,
+    Int64WriteAheadLogLimitError, Int64WriteAheadLogLimits, Int64WriteAheadLogRegistryCorruption,
+    Int64WriteAheadLogRegistryError, Int64WriteAheadLogRegistryLimitError,
+    Int64WriteAheadLogRegistryLimits,
 };
 
 use std::error::Error as StdError;

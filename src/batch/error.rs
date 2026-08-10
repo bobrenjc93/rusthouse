@@ -62,6 +62,13 @@ pub enum Error {
         left: usize,
         right: usize,
     },
+    /// The selected expression currently requires non-nullable physical
+    /// storage even though the column has the same logical scalar type.
+    UnsupportedNullableOperation {
+        table: String,
+        column: String,
+        operation: &'static str,
+    },
     InvalidQuery(String),
     NumericOverflow(String),
     InsertOnlyStatementRequired {
@@ -163,6 +170,14 @@ impl fmt::Display for Error {
             Self::UnionDistinctColumnCountMismatch { left, right } => write!(
                 f,
                 "UNION DISTINCT column count mismatch: left operand has {left}, right operand has {right}"
+            ),
+            Self::UnsupportedNullableOperation {
+                table,
+                column,
+                operation,
+            } => write!(
+                f,
+                "{operation} does not support nullable column '{column}' in table '{table}'"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {

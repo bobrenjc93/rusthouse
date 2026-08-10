@@ -1,15 +1,32 @@
-//! Crash-recoverable, bounded write-ahead logging for one batch `Int64` table.
+//! Crash-recoverable, bounded write-ahead logging for batch `Int64` tables.
 //!
 //! The stable framing and lifecycle are documented in `docs/int64-wal-format.md`.
 
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+
+const REGISTRY_MANIFEST_NAME: &str = "manifest.rhi64";
+const REGISTRY_MANIFEST_MAGIC: [u8; 8] = *b"RHI64REG";
+const REGISTRY_MANIFEST_VERSION: u16 = 1;
+const REGISTRY_MANIFEST_HEADER_LEN: usize = 28;
+const REGISTRY_DESCRIPTOR_MIN_PAYLOAD_LEN: usize = 8;
+
+/// Default maximum number of table WALs in one registry directory.
+pub const DEFAULT_MAX_INT64_WAL_REGISTRY_TABLES: usize = 1_024;
+/// Default maximum registry manifest size.
+pub const DEFAULT_MAX_INT64_WAL_REGISTRY_MANIFEST_BYTES: usize = 1024 * 1024;
+/// Default aggregate byte cap across registry member WALs.
+pub const DEFAULT_MAX_INT64_WAL_REGISTRY_BYTES: usize = 256 * 1024 * 1024;
+/// Default aggregate committed-record cap across registry member WALs.
+pub const DEFAULT_MAX_INT64_WAL_REGISTRY_RECORDS: usize = 4_000_000;
 
 /// Magic at the start of every write-ahead-log frame.
 pub const INT64_WAL_MAGIC: [u8; 8] = *b"RHI64WAL";
@@ -35,6 +52,8 @@ const BOOTSTRAP_KIND: u8 = 1;
 const APPEND_KIND: u8 = 2;
 const TRUNCATE_KIND: u8 = 3;
 const REPLACE_KIND: u8 = 4;
+const NULLABLE_APPEND_KIND: u8 = 5;
+const NULLABLE_REPLACE_KIND: u8 = 6;
 const QUERY_LIMIT_FIELD_COUNT: usize = 10;
 
 /// Inclusive storage and replay limits for one `Int64` write-ahead log.
@@ -67,6 +86,308 @@ impl Default for Int64WriteAheadLogLimits {
             DEFAULT_MAX_INT64_WAL_RECORD_BYTES,
             DEFAULT_MAX_INT64_WAL_RECORDS,
         )
+    }
+}
+
+/// Inclusive directory-wide and per-table bounds for a multi-table WAL registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Int64WriteAheadLogRegistryLimits {
+    pub max_tables: usize,
+    pub max_manifest_bytes: usize,
+    pub max_total_wal_bytes: usize,
+    pub max_total_records: usize,
+    pub per_table: Int64WriteAheadLogLimits,
+}
+
+impl Int64WriteAheadLogRegistryLimits {
+    #[must_use]
+    pub const fn new(
+        max_tables: usize,
+        max_manifest_bytes: usize,
+        max_total_wal_bytes: usize,
+        max_total_records: usize,
+        per_table: Int64WriteAheadLogLimits,
+    ) -> Self {
+        Self {
+            max_tables,
+            max_manifest_bytes,
+            max_total_wal_bytes,
+            max_total_records,
+            per_table,
+        }
+    }
+}
+
+impl Default for Int64WriteAheadLogRegistryLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_INT64_WAL_REGISTRY_TABLES,
+            DEFAULT_MAX_INT64_WAL_REGISTRY_MANIFEST_BYTES,
+            DEFAULT_MAX_INT64_WAL_REGISTRY_BYTES,
+            DEFAULT_MAX_INT64_WAL_REGISTRY_RECORDS,
+            Int64WriteAheadLogLimits::default(),
+        )
+    }
+}
+
+/// A directory-wide registry bound was exceeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64WriteAheadLogRegistryLimitError {
+    Tables { tables: u64, max_tables: usize },
+    ManifestBytes { bytes: u64, max_bytes: usize },
+    TotalWalBytes { bytes: u64, max_bytes: usize },
+    TotalRecords { records: u64, max_records: usize },
+}
+
+impl fmt::Display for Int64WriteAheadLogRegistryLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tables { tables, max_tables } => write!(
+                formatter,
+                "Int64 WAL registry has {tables} tables, exceeding the limit of {max_tables}"
+            ),
+            Self::ManifestBytes { bytes, max_bytes } => write!(
+                formatter,
+                "Int64 WAL registry manifest has {bytes} bytes, exceeding the limit of {max_bytes}"
+            ),
+            Self::TotalWalBytes { bytes, max_bytes } => write!(
+                formatter,
+                "Int64 WAL registry members have {bytes} bytes, exceeding the aggregate limit of {max_bytes}"
+            ),
+            Self::TotalRecords {
+                records,
+                max_records,
+            } => write!(
+                formatter,
+                "Int64 WAL registry members have {records} records, exceeding the aggregate limit of {max_records}"
+            ),
+        }
+    }
+}
+
+impl StdError for Int64WriteAheadLogRegistryLimitError {}
+
+/// Typed structural corruption or inconsistency in a registry manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64WriteAheadLogRegistryCorruption {
+    ManifestMagic { found: [u8; 8] },
+    ManifestVersion { found: u16, supported: u16 },
+    ManifestReserved { found: u16 },
+    ManifestLength { declared: u64, actual: u64 },
+    ManifestChecksum { expected: u32, actual: u32 },
+    ManifestPayload { field: &'static str },
+    Empty,
+    DuplicateTable { table: String },
+    DuplicateMember { member: String },
+    InvalidMember { member: String },
+    NonDeterministicOrder { previous: String, table: String },
+    MissingMember { table: String, member: String },
+    DuplicateMemberFile { table: String, member: String },
+    UnexpectedDirectoryEntry { entry: String },
+    TableNameMismatch { expected: String, found: String },
+    DatabaseSettingsMismatch { table: String },
+}
+
+impl fmt::Display for Int64WriteAheadLogRegistryCorruption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ManifestMagic { found } => {
+                write!(
+                    formatter,
+                    "incompatible Int64 WAL registry manifest magic: {found:02x?}"
+                )
+            }
+            Self::ManifestVersion { found, supported } => write!(
+                formatter,
+                "unsupported Int64 WAL registry manifest version {found}; this reader supports {supported}"
+            ),
+            Self::ManifestReserved { found } => write!(
+                formatter,
+                "Int64 WAL registry manifest has nonzero reserved field {found}"
+            ),
+            Self::ManifestLength { declared, actual } => write!(
+                formatter,
+                "Int64 WAL registry manifest declares {declared} payload bytes but contains {actual}"
+            ),
+            Self::ManifestChecksum { expected, actual } => write!(
+                formatter,
+                "Int64 WAL registry manifest checksum mismatch: expected {expected:08x}, calculated {actual:08x}"
+            ),
+            Self::ManifestPayload { field } => {
+                write!(
+                    formatter,
+                    "Int64 WAL registry manifest has malformed {field}"
+                )
+            }
+            Self::Empty => formatter.write_str("Int64 WAL registry contains no table descriptors"),
+            Self::DuplicateTable { table } => write!(
+                formatter,
+                "Int64 WAL registry contains duplicate case-insensitive table '{table}'"
+            ),
+            Self::DuplicateMember { member } => {
+                write!(
+                    formatter,
+                    "Int64 WAL registry contains duplicate member '{member}'"
+                )
+            }
+            Self::InvalidMember { member } => write!(
+                formatter,
+                "Int64 WAL registry member '{member}' is not a safe single path component"
+            ),
+            Self::NonDeterministicOrder { previous, table } => write!(
+                formatter,
+                "Int64 WAL registry table order is not canonical: '{table}' follows '{previous}'"
+            ),
+            Self::MissingMember { table, member } => write!(
+                formatter,
+                "Int64 WAL registry table '{table}' is missing member '{member}'"
+            ),
+            Self::DuplicateMemberFile { table, member } => write!(
+                formatter,
+                "Int64 WAL registry table '{table}' member '{member}' aliases another member file"
+            ),
+            Self::UnexpectedDirectoryEntry { entry } => write!(
+                formatter,
+                "Int64 WAL registry contains unlisted directory entry '{entry}'"
+            ),
+            Self::TableNameMismatch { expected, found } => write!(
+                formatter,
+                "Int64 WAL registry descriptor table '{expected}' does not match member bootstrap '{found}'"
+            ),
+            Self::DatabaseSettingsMismatch { table } => write!(
+                formatter,
+                "Int64 WAL registry table '{table}' has database settings inconsistent with earlier members"
+            ),
+        }
+    }
+}
+
+impl StdError for Int64WriteAheadLogRegistryCorruption {}
+
+/// A filesystem, bound, member-WAL, or manifest failure for a registry.
+#[derive(Debug)]
+pub enum Int64WriteAheadLogRegistryError {
+    Limit(Int64WriteAheadLogRegistryLimitError),
+    Corruption(Int64WriteAheadLogRegistryCorruption),
+    InvalidDestination,
+    OpenParent(io::Error),
+    CreateDirectory(io::Error),
+    OpenDirectory(io::Error),
+    SyncParent(io::Error),
+    OpenManifest(io::Error),
+    ManifestMetadata(io::Error),
+    ManifestNotRegularFile,
+    ReadManifest(io::Error),
+    CreateManifest(io::Error),
+    WriteManifest(io::Error),
+    SyncManifest(io::Error),
+    SyncDirectory(io::Error),
+    ReadDirectory(io::Error),
+    Member {
+        table: String,
+        member: String,
+        error: Int64WriteAheadLogError,
+    },
+}
+
+impl fmt::Display for Int64WriteAheadLogRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Limit(error) => error.fmt(formatter),
+            Self::Corruption(error) => write!(formatter, "corrupt Int64 WAL registry: {error}"),
+            Self::InvalidDestination => formatter.write_str(
+                "Int64 WAL registry destination must have one normal non-NUL final path component",
+            ),
+            Self::OpenParent(error) => write!(formatter, "could not open registry parent: {error}"),
+            Self::CreateDirectory(error) => {
+                write!(
+                    formatter,
+                    "could not exclusively create WAL registry directory: {error}"
+                )
+            }
+            Self::OpenDirectory(error) => {
+                write!(formatter, "could not open WAL registry directory: {error}")
+            }
+            Self::SyncParent(error) => write!(
+                formatter,
+                "could not sync registry parent directory: {error}"
+            ),
+            Self::OpenManifest(error) => {
+                write!(formatter, "could not open WAL registry manifest: {error}")
+            }
+            Self::ManifestMetadata(error) => write!(
+                formatter,
+                "could not inspect WAL registry manifest: {error}"
+            ),
+            Self::ManifestNotRegularFile => {
+                formatter.write_str("WAL registry manifest is not a regular file")
+            }
+            Self::ReadManifest(error) => {
+                write!(formatter, "could not read WAL registry manifest: {error}")
+            }
+            Self::CreateManifest(error) => write!(
+                formatter,
+                "could not exclusively create WAL registry manifest: {error}"
+            ),
+            Self::WriteManifest(error) => {
+                write!(formatter, "could not write WAL registry manifest: {error}")
+            }
+            Self::SyncManifest(error) => {
+                write!(formatter, "could not sync WAL registry manifest: {error}")
+            }
+            Self::SyncDirectory(error) => {
+                write!(formatter, "could not sync WAL registry directory: {error}")
+            }
+            Self::ReadDirectory(error) => {
+                write!(
+                    formatter,
+                    "could not enumerate WAL registry directory: {error}"
+                )
+            }
+            Self::Member {
+                table,
+                member,
+                error,
+            } => write!(
+                formatter,
+                "could not process Int64 WAL registry table '{table}' member '{member}': {error}"
+            ),
+        }
+    }
+}
+
+impl StdError for Int64WriteAheadLogRegistryError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Limit(error) => Some(error),
+            Self::Corruption(error) => Some(error),
+            Self::OpenParent(error)
+            | Self::CreateDirectory(error)
+            | Self::OpenDirectory(error)
+            | Self::SyncParent(error)
+            | Self::OpenManifest(error)
+            | Self::ManifestMetadata(error)
+            | Self::ReadManifest(error)
+            | Self::CreateManifest(error)
+            | Self::WriteManifest(error)
+            | Self::SyncManifest(error)
+            | Self::SyncDirectory(error)
+            | Self::ReadDirectory(error) => Some(error),
+            Self::Member { error, .. } => Some(error),
+            Self::InvalidDestination | Self::ManifestNotRegularFile => None,
+        }
+    }
+}
+
+impl From<Int64WriteAheadLogRegistryLimitError> for Int64WriteAheadLogRegistryError {
+    fn from(error: Int64WriteAheadLogRegistryLimitError) -> Self {
+        Self::Limit(error)
+    }
+}
+
+impl From<Int64WriteAheadLogRegistryCorruption> for Int64WriteAheadLogRegistryError {
+    fn from(error: Int64WriteAheadLogRegistryCorruption) -> Self {
+        Self::Corruption(error)
     }
 }
 
@@ -325,6 +646,7 @@ impl From<Int64WriteAheadLogCorruption> for Int64WriteAheadLogError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Int64WriteAheadLogCommitError {
     Limit(Int64WriteAheadLogLimitError),
+    RegistryLimit(Int64WriteAheadLogRegistryLimitError),
     Poisoned,
     Write {
         kind: io::ErrorKind,
@@ -343,6 +665,7 @@ impl fmt::Display for Int64WriteAheadLogCommitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Limit(error) => error.fmt(formatter),
+            Self::RegistryLimit(error) => error.fmt(formatter),
             Self::Poisoned => {
                 formatter.write_str("Int64 WAL is unusable after an earlier write or sync failure")
             }
@@ -361,11 +684,18 @@ impl StdError for Int64WriteAheadLogCommitError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Limit(error) => Some(error),
+            Self::RegistryLimit(error) => Some(error),
             Self::Poisoned
             | Self::Write { .. }
             | Self::SyncFile { .. }
             | Self::Unexpected { .. } => None,
         }
+    }
+}
+
+impl From<Int64WriteAheadLogRegistryLimitError> for Int64WriteAheadLogCommitError {
+    fn from(error: Int64WriteAheadLogRegistryLimitError) -> Self {
+        Self::RegistryLimit(error)
     }
 }
 
@@ -399,12 +729,15 @@ pub(crate) struct Int64WalBootstrap {
     pub(crate) database_table_limits: [usize; 3],
     pub(crate) query_limits: [usize; QUERY_LIMIT_FIELD_COUNT],
     pub(crate) worker_cap: usize,
-    pub(crate) values: Vec<i64>,
+    pub(crate) nullable: bool,
+    pub(crate) values: Vec<Option<i64>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct RecoveredInt64WriteAheadLog {
     pub(crate) bootstrap: Int64WalBootstrap,
+    pub(crate) file_bytes: usize,
+    pub(crate) records: usize,
 }
 
 /// Open single-table WAL writer. The database owns this after opt-in.
@@ -412,6 +745,7 @@ pub(crate) struct RecoveredInt64WriteAheadLog {
 pub(crate) struct Int64WriteAheadLog {
     file: File,
     normalized_table_name: String,
+    nullable: bool,
     limits: Int64WriteAheadLogLimits,
     file_bytes: usize,
     records: usize,
@@ -423,10 +757,12 @@ impl Int64WriteAheadLog {
         table_name_bytes: usize,
         column_name_bytes: usize,
         rows: usize,
+        nullable: bool,
         limits: Int64WriteAheadLogLimits,
     ) -> Result<(), Int64WriteAheadLogError> {
         let payload_len =
-            bootstrap_payload_len(table_name_bytes, column_name_bytes, rows).unwrap_or(usize::MAX);
+            bootstrap_payload_len(table_name_bytes, column_name_bytes, rows, nullable)
+                .unwrap_or(usize::MAX);
         validate_record_limits(0, payload_len, 0, 0, limits).map(|_| ())
     }
 
@@ -439,6 +775,7 @@ impl Int64WriteAheadLog {
             bootstrap.table_name.len(),
             bootstrap.column_name.len(),
             bootstrap.values.len(),
+            bootstrap.nullable,
             limits,
         )?;
         let payload = encode_bootstrap(bootstrap);
@@ -447,19 +784,37 @@ impl Int64WriteAheadLog {
             bootstrap_payload_len(
                 bootstrap.table_name.len(),
                 bootstrap.column_name.len(),
-                bootstrap.values.len()
+                bootstrap.values.len(),
+                bootstrap.nullable
             )
         );
-        let (body, footer) = encode_record_parts(BOOTSTRAP_KIND, 0, &payload);
-
         let destination = wal_destination_name(path)?;
         let parent_directory = WalDirectory::open(normalized_parent(path))
             .map_err(Int64WriteAheadLogError::OpenParent)?;
-        let file = create_committed_wal_file(&parent_directory, &destination, &body, &footer)?;
+        Self::create_in_directory(&parent_directory, &destination, bootstrap, limits)
+    }
+
+    fn create_in_directory(
+        directory: &WalDirectory,
+        destination: &CStr,
+        bootstrap: &Int64WalBootstrap,
+        limits: Int64WriteAheadLogLimits,
+    ) -> Result<Self, Int64WriteAheadLogError> {
+        Self::validate_bootstrap_limits(
+            bootstrap.table_name.len(),
+            bootstrap.column_name.len(),
+            bootstrap.values.len(),
+            bootstrap.nullable,
+            limits,
+        )?;
+        let payload = encode_bootstrap(bootstrap);
+        let (body, footer) = encode_record_parts(BOOTSTRAP_KIND, 0, &payload);
+        let file = create_committed_wal_file(directory, destination, &body, &footer)?;
 
         Ok(Self {
             file,
             normalized_table_name: bootstrap.table_name.to_ascii_lowercase(),
+            nullable: bootstrap.nullable,
             limits,
             file_bytes: body.len() + footer.len(),
             records: 1,
@@ -471,17 +826,51 @@ impl Int64WriteAheadLog {
         self.normalized_table_name.eq_ignore_ascii_case(table_name)
     }
 
-    pub(crate) fn append_values(&mut self, values: &[i64]) -> Result<(), Int64WriteAheadLogError> {
+    fn next_append_bytes(&self, values: usize) -> usize {
+        let value_bytes = if self.nullable { 9 } else { 8 };
+        INT64_WAL_FRAME_OVERHEAD
+            .saturating_add(8)
+            .saturating_add(values.saturating_mul(value_bytes))
+    }
+
+    fn next_replace_bytes(&self, replacements: usize) -> usize {
+        let value_bytes = if self.nullable { 17 } else { 16 };
+        INT64_WAL_FRAME_OVERHEAD
+            .saturating_add(8)
+            .saturating_add(replacements.saturating_mul(value_bytes))
+    }
+
+    pub(crate) fn append_values(
+        &mut self,
+        values: &[Option<i64>],
+    ) -> Result<(), Int64WriteAheadLogError> {
+        debug_assert!(self.nullable || values.iter().all(Option::is_some));
+        let value_bytes = if self.nullable { 9 } else { 8 };
         let payload_len = 8_usize
-            .checked_add(values.len().checked_mul(8).unwrap_or(usize::MAX))
+            .checked_add(values.len().checked_mul(value_bytes).unwrap_or(usize::MAX))
             .unwrap_or(usize::MAX);
         self.validate_next_record(payload_len)?;
         let mut payload = Vec::with_capacity(payload_len);
         push_usize(&mut payload, values.len());
         for value in values {
-            payload.extend_from_slice(&value.to_le_bytes());
+            if self.nullable {
+                push_nullable_i64(&mut payload, *value);
+            } else {
+                payload.extend_from_slice(
+                    &value
+                        .expect("a non-nullable WAL cannot receive NULL")
+                        .to_le_bytes(),
+                );
+            }
         }
-        self.append_record(APPEND_KIND, &payload)
+        self.append_record(
+            if self.nullable {
+                NULLABLE_APPEND_KIND
+            } else {
+                APPEND_KIND
+            },
+            &payload,
+        )
     }
 
     pub(crate) fn truncate(&mut self) -> Result<(), Int64WriteAheadLogError> {
@@ -491,19 +880,41 @@ impl Int64WriteAheadLog {
 
     pub(crate) fn replace_values(
         &mut self,
-        replacements: &[(usize, i64)],
+        replacements: &[(usize, Option<i64>)],
     ) -> Result<(), Int64WriteAheadLogError> {
+        debug_assert!(self.nullable || replacements.iter().all(|(_, value)| value.is_some()));
+        let replacement_bytes = if self.nullable { 17 } else { 16 };
         let payload_len = 8_usize
-            .checked_add(replacements.len().checked_mul(16).unwrap_or(usize::MAX))
+            .checked_add(
+                replacements
+                    .len()
+                    .checked_mul(replacement_bytes)
+                    .unwrap_or(usize::MAX),
+            )
             .unwrap_or(usize::MAX);
         self.validate_next_record(payload_len)?;
         let mut payload = Vec::with_capacity(payload_len);
         push_usize(&mut payload, replacements.len());
         for (row, value) in replacements {
             push_usize(&mut payload, *row);
-            payload.extend_from_slice(&value.to_le_bytes());
+            if self.nullable {
+                push_nullable_i64(&mut payload, *value);
+            } else {
+                payload.extend_from_slice(
+                    &value
+                        .expect("a non-nullable WAL cannot receive NULL")
+                        .to_le_bytes(),
+                );
+            }
         }
-        self.append_record(REPLACE_KIND, &payload)
+        self.append_record(
+            if self.nullable {
+                NULLABLE_REPLACE_KIND
+            } else {
+                REPLACE_KIND
+            },
+            &payload,
+        )
     }
 
     fn validate_next_record(&self, payload_len: usize) -> Result<(), Int64WriteAheadLogError> {
@@ -645,9 +1056,918 @@ impl WalDirectory {
         Ok(unsafe { File::from_raw_fd(descriptor) })
     }
 
+    fn open_file(&self, name: &CStr) -> io::Result<File> {
+        // `O_NONBLOCK` prevents a malicious FIFO manifest/member from waiting
+        // for a writer. `O_NOFOLLOW` binds validation to the opened inode.
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn create_directory(&self, name: &CStr) -> io::Result<()> {
+        let result =
+            unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o777 as libc::mode_t) };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn open_directory(&self, name: &CStr) -> io::Result<Self> {
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            file: unsafe { File::from_raw_fd(descriptor) },
+        })
+    }
+
+    fn first_unexpected_entry(&self, expected: &HashSet<Vec<u8>>) -> io::Result<Option<Vec<u8>>> {
+        let descriptor = unsafe { libc::dup(self.file.as_raw_fd()) };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(descriptor) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(descriptor);
+            }
+            return Err(error);
+        }
+        let mut entry_buffer = MaybeUninit::<libc::dirent>::uninit();
+        let result = loop {
+            let entry = match next_directory_entry(stream, &mut entry_buffer) {
+                Ok(entry) if entry.is_null() => break Ok(None),
+                Ok(entry) => entry,
+                Err(error) => break Err(error),
+            };
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." && !expected.contains(name) {
+                break Ok(Some(name.to_vec()));
+            }
+        };
+        let close_result = unsafe { libc::closedir(stream) };
+        match result {
+            Err(error) => Err(error),
+            Ok(_) if close_result == -1 => Err(io::Error::last_os_error()),
+            Ok(unexpected) => Ok(unexpected),
+        }
+    }
+
     fn sync(&self) -> io::Result<()> {
         self.file.sync_all()
     }
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "redox",
+    target_os = "android",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+fn next_directory_entry(
+    stream: *mut libc::DIR,
+    _entry_buffer: &mut MaybeUninit<libc::dirent>,
+) -> io::Result<*mut libc::dirent> {
+    // `readdir` distinguishes EOF from failure only through thread-local
+    // errno, so clear it before every call and inspect it on a null result.
+    let errno = directory_errno_location();
+    unsafe {
+        *errno = 0;
+    }
+    let entry = unsafe { libc::readdir(stream) };
+    let error = unsafe { *errno };
+    if entry.is_null() && error != 0 {
+        Err(io::Error::from_raw_os_error(error))
+    } else {
+        Ok(entry)
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "redox"
+))]
+fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::___errno() }
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "redox",
+    target_os = "android",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
+fn next_directory_entry(
+    stream: *mut libc::DIR,
+    entry_buffer: &mut MaybeUninit<libc::dirent>,
+) -> io::Result<*mut libc::dirent> {
+    let mut entry = std::ptr::null_mut();
+    let error = unsafe { libc::readdir_r(stream, entry_buffer.as_mut_ptr(), &mut entry) };
+    if error == 0 {
+        Ok(entry)
+    } else {
+        Err(io::Error::from_raw_os_error(error))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RegistryDescriptor {
+    table: String,
+    member: String,
+}
+
+/// Allocation-free table payload metadata used to reject a registry before
+/// any table values are cloned or a manifest buffer is materialized.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Int64WalRegistryTablePreflight<'a> {
+    pub(crate) table_name: &'a str,
+    pub(crate) column_name: &'a str,
+    pub(crate) rows: usize,
+    pub(crate) nullable: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveredInt64WriteAheadLogRegistry {
+    pub(crate) tables: Vec<Int64WalBootstrap>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Int64WriteAheadLogRegistry {
+    writers: HashMap<String, Int64WriteAheadLog>,
+    limits: Int64WriteAheadLogRegistryLimits,
+    total_wal_bytes: usize,
+    total_records: usize,
+    poisoned: bool,
+}
+
+/// One attached legacy WAL or one attached multi-table registry.
+#[derive(Debug)]
+pub(crate) enum ActiveInt64WriteAheadLogs {
+    Single(Int64WriteAheadLog),
+    Registry(Int64WriteAheadLogRegistry),
+}
+
+impl ActiveInt64WriteAheadLogs {
+    pub(crate) fn single(writer: Int64WriteAheadLog) -> Self {
+        Self::Single(writer)
+    }
+
+    pub(crate) fn create_registry(
+        path: &Path,
+        mut bootstraps: Vec<Int64WalBootstrap>,
+        limits: Int64WriteAheadLogRegistryLimits,
+    ) -> Result<Self, Int64WriteAheadLogRegistryError> {
+        let preflight = bootstraps
+            .iter()
+            .map(|bootstrap| Int64WalRegistryTablePreflight {
+                table_name: &bootstrap.table_name,
+                column_name: &bootstrap.column_name,
+                rows: bootstrap.values.len(),
+                nullable: bootstrap.nullable,
+            })
+            .collect::<Vec<_>>();
+        preflight_registry_tables(&preflight, limits)?;
+        bootstraps.sort_by(|left, right| {
+            left.table_name
+                .to_ascii_lowercase()
+                .cmp(&right.table_name.to_ascii_lowercase())
+        });
+        let descriptors = bootstraps
+            .iter()
+            .enumerate()
+            .map(|(index, bootstrap)| RegistryDescriptor {
+                table: bootstrap.table_name.clone(),
+                member: format!("table-{index:08}.wal"),
+            })
+            .collect::<Vec<_>>();
+        let manifest = encode_registry_manifest(&descriptors);
+
+        let bootstrap_bytes = bootstraps
+            .iter()
+            .map(|bootstrap| {
+                bootstrap_payload_len(
+                    bootstrap.table_name.len(),
+                    bootstrap.column_name.len(),
+                    bootstrap.values.len(),
+                    bootstrap.nullable,
+                )
+                .unwrap_or(usize::MAX)
+                .saturating_add(INT64_WAL_FRAME_OVERHEAD)
+            })
+            .fold(0_usize, usize::saturating_add);
+        validate_registry_totals(bootstrap_bytes, bootstraps.len(), limits)?;
+
+        let destination = registry_destination_name(path)?;
+        let parent = WalDirectory::open(normalized_parent(path))
+            .map_err(Int64WriteAheadLogRegistryError::OpenParent)?;
+        parent
+            .create_directory(&destination)
+            .map_err(Int64WriteAheadLogRegistryError::CreateDirectory)?;
+        parent
+            .sync()
+            .map_err(Int64WriteAheadLogRegistryError::SyncParent)?;
+        let directory = parent
+            .open_directory(&destination)
+            .map_err(Int64WriteAheadLogRegistryError::OpenDirectory)?;
+
+        let mut writers = HashMap::with_capacity(bootstraps.len());
+        for (bootstrap, descriptor) in bootstraps.iter().zip(&descriptors) {
+            let member = CString::new(descriptor.member.as_bytes())
+                .expect("generated registry member names contain no NUL");
+            let writer = Int64WriteAheadLog::create_in_directory(
+                &directory,
+                &member,
+                bootstrap,
+                limits.per_table,
+            )
+            .map_err(|error| member_error(bootstrap, &descriptor.member, error))?;
+            writers.insert(bootstrap.table_name.to_ascii_lowercase(), writer);
+        }
+
+        let manifest_name = CString::new(REGISTRY_MANIFEST_NAME).expect("manifest name is valid");
+        let mut manifest_file = directory
+            .create(&manifest_name)
+            .map_err(Int64WriteAheadLogRegistryError::CreateManifest)?;
+        manifest_file
+            .write_all(&manifest)
+            .map_err(Int64WriteAheadLogRegistryError::WriteManifest)?;
+        manifest_file
+            .sync_all()
+            .map_err(Int64WriteAheadLogRegistryError::SyncManifest)?;
+        directory
+            .sync()
+            .map_err(Int64WriteAheadLogRegistryError::SyncDirectory)?;
+
+        Ok(Self::Registry(Int64WriteAheadLogRegistry {
+            writers,
+            limits,
+            total_wal_bytes: bootstrap_bytes,
+            total_records: descriptors.len(),
+            poisoned: false,
+        }))
+    }
+
+    pub(crate) fn tracks(&self, table: &str) -> bool {
+        match self {
+            Self::Single(writer) => writer.tracks(table),
+            Self::Registry(registry) => registry.writers.contains_key(&table.to_ascii_lowercase()),
+        }
+    }
+
+    pub(crate) fn append_values(
+        &mut self,
+        table: &str,
+        values: &[Option<i64>],
+    ) -> Result<(), Int64WriteAheadLogCommitError> {
+        match self {
+            Self::Single(writer) => writer.append_values(values).map_err(Into::into),
+            Self::Registry(registry) => registry.append_values(table, values),
+        }
+    }
+
+    pub(crate) fn truncate(&mut self, table: &str) -> Result<(), Int64WriteAheadLogCommitError> {
+        match self {
+            Self::Single(writer) => writer.truncate().map_err(Into::into),
+            Self::Registry(registry) => registry.truncate(table),
+        }
+    }
+
+    pub(crate) fn replace_values(
+        &mut self,
+        table: &str,
+        replacements: &[(usize, Option<i64>)],
+    ) -> Result<(), Int64WriteAheadLogCommitError> {
+        match self {
+            Self::Single(writer) => writer.replace_values(replacements).map_err(Into::into),
+            Self::Registry(registry) => registry.replace_values(table, replacements),
+        }
+    }
+}
+
+impl Int64WriteAheadLogRegistry {
+    fn reserve_record(&self, bytes: usize) -> Result<(), Int64WriteAheadLogCommitError> {
+        if self.poisoned {
+            return Err(Int64WriteAheadLogCommitError::Poisoned);
+        }
+        let total_bytes = self.total_wal_bytes.saturating_add(bytes);
+        let total_records = self.total_records.saturating_add(1);
+        validate_registry_totals(total_bytes, total_records, self.limits).map_err(|error| {
+            match error {
+                Int64WriteAheadLogRegistryError::Limit(error) => error.into(),
+                _ => unreachable!("registry total validation only returns limit errors"),
+            }
+        })
+    }
+
+    fn commit_member_record<F>(
+        &mut self,
+        key: &str,
+        bytes: usize,
+        commit: F,
+    ) -> Result<(), Int64WriteAheadLogCommitError>
+    where
+        F: FnOnce(&mut Int64WriteAheadLog) -> Result<(), Int64WriteAheadLogError>,
+    {
+        self.reserve_record(bytes)?;
+        let result = commit(
+            self.writers
+                .get_mut(key)
+                .expect("the caller checks registry membership"),
+        );
+        match result {
+            Ok(()) => {
+                self.total_wal_bytes += bytes;
+                self.total_records += 1;
+                Ok(())
+            }
+            Err(error) => {
+                if !matches!(error, Int64WriteAheadLogError::Limit(_)) {
+                    self.poisoned = true;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn append_values(
+        &mut self,
+        table: &str,
+        values: &[Option<i64>],
+    ) -> Result<(), Int64WriteAheadLogCommitError> {
+        let key = table.to_ascii_lowercase();
+        let bytes = self
+            .writers
+            .get(&key)
+            .expect("the caller checks registry membership")
+            .next_append_bytes(values.len());
+        self.commit_member_record(&key, bytes, |writer| writer.append_values(values))
+    }
+
+    fn truncate(&mut self, table: &str) -> Result<(), Int64WriteAheadLogCommitError> {
+        let key = table.to_ascii_lowercase();
+        self.commit_member_record(&key, INT64_WAL_FRAME_OVERHEAD, Int64WriteAheadLog::truncate)
+    }
+
+    fn replace_values(
+        &mut self,
+        table: &str,
+        replacements: &[(usize, Option<i64>)],
+    ) -> Result<(), Int64WriteAheadLogCommitError> {
+        let key = table.to_ascii_lowercase();
+        let bytes = self
+            .writers
+            .get(&key)
+            .expect("the caller checks registry membership")
+            .next_replace_bytes(replacements.len());
+        self.commit_member_record(&key, bytes, |writer| writer.replace_values(replacements))
+    }
+}
+
+fn member_error(
+    bootstrap: &Int64WalBootstrap,
+    member: &str,
+    error: Int64WriteAheadLogError,
+) -> Int64WriteAheadLogRegistryError {
+    Int64WriteAheadLogRegistryError::Member {
+        table: bootstrap.table_name.clone(),
+        member: member.to_owned(),
+        error,
+    }
+}
+
+fn registry_destination_name(path: &Path) -> Result<CString, Int64WriteAheadLogRegistryError> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.ends_with(b"/") || bytes.ends_with(b"/.") {
+        return Err(Int64WriteAheadLogRegistryError::InvalidDestination);
+    }
+    let name = match path.components().next_back() {
+        Some(std::path::Component::Normal(name)) => name,
+        _ => return Err(Int64WriteAheadLogRegistryError::InvalidDestination),
+    };
+    CString::new(name.as_bytes()).map_err(|_| Int64WriteAheadLogRegistryError::InvalidDestination)
+}
+
+pub(crate) fn validate_registry_table_count(
+    tables: usize,
+    limits: Int64WriteAheadLogRegistryLimits,
+) -> Result<(), Int64WriteAheadLogRegistryError> {
+    if tables == 0 {
+        return Err(Int64WriteAheadLogRegistryCorruption::Empty.into());
+    }
+    if tables > limits.max_tables {
+        return Err(Int64WriteAheadLogRegistryLimitError::Tables {
+            tables: tables as u64,
+            max_tables: limits.max_tables,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+pub(crate) fn preflight_registry_tables(
+    tables: &[Int64WalRegistryTablePreflight<'_>],
+    limits: Int64WriteAheadLogRegistryLimits,
+) -> Result<(), Int64WriteAheadLogRegistryError> {
+    validate_registry_table_count(tables.len(), limits)?;
+    let mut table_names = HashSet::with_capacity(tables.len());
+    for table in tables {
+        if !table_names.insert(table.table_name.to_ascii_lowercase()) {
+            return Err(Int64WriteAheadLogRegistryCorruption::DuplicateTable {
+                table: table.table_name.to_owned(),
+            }
+            .into());
+        }
+    }
+
+    let mut bootstrap_bytes = 0_usize;
+    let mut manifest_bytes = REGISTRY_MANIFEST_HEADER_LEN;
+    for (index, table) in tables.iter().enumerate() {
+        Int64WriteAheadLog::validate_bootstrap_limits(
+            table.table_name.len(),
+            table.column_name.len(),
+            table.rows,
+            table.nullable,
+            limits.per_table,
+        )
+        .map_err(|error| Int64WriteAheadLogRegistryError::Member {
+            table: table.table_name.to_owned(),
+            member: "bootstrap".to_owned(),
+            error,
+        })?;
+        let member_bytes = generated_registry_member_name_len(index);
+        manifest_bytes = manifest_bytes
+            .saturating_add(4)
+            .saturating_add(table.table_name.len())
+            .saturating_add(4)
+            .saturating_add(member_bytes);
+        bootstrap_bytes = bootstrap_bytes.saturating_add(
+            bootstrap_payload_len(
+                table.table_name.len(),
+                table.column_name.len(),
+                table.rows,
+                table.nullable,
+            )
+            .unwrap_or(usize::MAX)
+            .saturating_add(INT64_WAL_FRAME_OVERHEAD),
+        );
+    }
+    validate_manifest_size(manifest_bytes, limits)?;
+    validate_registry_totals(bootstrap_bytes, tables.len(), limits)
+}
+
+fn generated_registry_member_name_len(index: usize) -> usize {
+    // `table-`, at least eight decimal digits, and `.wal`.
+    let mut digits = 1_usize;
+    let mut remaining = index;
+    while remaining >= 10 {
+        remaining /= 10;
+        digits += 1;
+    }
+    6 + digits.max(8) + 4
+}
+
+fn validate_manifest_size(
+    bytes: usize,
+    limits: Int64WriteAheadLogRegistryLimits,
+) -> Result<(), Int64WriteAheadLogRegistryError> {
+    if bytes > limits.max_manifest_bytes {
+        return Err(Int64WriteAheadLogRegistryLimitError::ManifestBytes {
+            bytes: bytes as u64,
+            max_bytes: limits.max_manifest_bytes,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_registry_totals(
+    bytes: usize,
+    records: usize,
+    limits: Int64WriteAheadLogRegistryLimits,
+) -> Result<(), Int64WriteAheadLogRegistryError> {
+    if bytes > limits.max_total_wal_bytes {
+        return Err(Int64WriteAheadLogRegistryLimitError::TotalWalBytes {
+            bytes: bytes as u64,
+            max_bytes: limits.max_total_wal_bytes,
+        }
+        .into());
+    }
+    if records > limits.max_total_records {
+        return Err(Int64WriteAheadLogRegistryLimitError::TotalRecords {
+            records: records as u64,
+            max_records: limits.max_total_records,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn encode_registry_manifest(descriptors: &[RegistryDescriptor]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for descriptor in descriptors {
+        push_registry_bytes(&mut payload, descriptor.table.as_bytes());
+        push_registry_bytes(&mut payload, descriptor.member.as_bytes());
+    }
+    let checksum = registry_manifest_checksum(descriptors.len(), &payload);
+    let mut manifest = Vec::with_capacity(REGISTRY_MANIFEST_HEADER_LEN + payload.len());
+    manifest.extend_from_slice(&REGISTRY_MANIFEST_MAGIC);
+    manifest.extend_from_slice(&REGISTRY_MANIFEST_VERSION.to_le_bytes());
+    manifest.extend_from_slice(&0_u16.to_le_bytes());
+    manifest.extend_from_slice(&(descriptors.len() as u32).to_le_bytes());
+    manifest.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    manifest.extend_from_slice(&checksum.to_le_bytes());
+    manifest.extend_from_slice(&payload);
+    manifest
+}
+
+fn push_registry_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
+fn registry_manifest_checksum(entries: usize, payload: &[u8]) -> u32 {
+    let mut checksum = u32::MAX;
+    checksum = crc32_update(checksum, &REGISTRY_MANIFEST_VERSION.to_le_bytes());
+    checksum = crc32_update(checksum, &0_u16.to_le_bytes());
+    checksum = crc32_update(checksum, &(entries as u32).to_le_bytes());
+    checksum = crc32_update(checksum, &(payload.len() as u64).to_le_bytes());
+    checksum = crc32_update(checksum, payload);
+    !checksum
+}
+
+fn decode_registry_manifest(
+    bytes: &[u8],
+    limits: Int64WriteAheadLogRegistryLimits,
+) -> Result<Vec<RegistryDescriptor>, Int64WriteAheadLogRegistryError> {
+    if bytes.len() < REGISTRY_MANIFEST_HEADER_LEN {
+        return Err(
+            Int64WriteAheadLogRegistryCorruption::ManifestPayload { field: "header" }.into(),
+        );
+    }
+    let magic = read_array::<8>(bytes, 0);
+    if magic != REGISTRY_MANIFEST_MAGIC {
+        return Err(Int64WriteAheadLogRegistryCorruption::ManifestMagic { found: magic }.into());
+    }
+    let version = u16::from_le_bytes(read_array::<2>(bytes, 8));
+    if version != REGISTRY_MANIFEST_VERSION {
+        return Err(Int64WriteAheadLogRegistryCorruption::ManifestVersion {
+            found: version,
+            supported: REGISTRY_MANIFEST_VERSION,
+        }
+        .into());
+    }
+    let reserved = u16::from_le_bytes(read_array::<2>(bytes, 10));
+    if reserved != 0 {
+        return Err(
+            Int64WriteAheadLogRegistryCorruption::ManifestReserved { found: reserved }.into(),
+        );
+    }
+    let count = u32::from_le_bytes(read_array::<4>(bytes, 12)) as usize;
+    validate_registry_table_count(count, limits)?;
+    let declared = u64::from_le_bytes(read_array::<8>(bytes, 16));
+    let actual = bytes.len().saturating_sub(REGISTRY_MANIFEST_HEADER_LEN) as u64;
+    if declared != actual {
+        return Err(
+            Int64WriteAheadLogRegistryCorruption::ManifestLength { declared, actual }.into(),
+        );
+    }
+    let expected = u32::from_le_bytes(read_array::<4>(bytes, 24));
+    let payload = &bytes[REGISTRY_MANIFEST_HEADER_LEN..];
+    let actual_checksum = registry_manifest_checksum(count, payload);
+    if expected != actual_checksum {
+        return Err(Int64WriteAheadLogRegistryCorruption::ManifestChecksum {
+            expected,
+            actual: actual_checksum,
+        }
+        .into());
+    }
+    if count > payload.len() / REGISTRY_DESCRIPTOR_MIN_PAYLOAD_LEN {
+        return Err(Int64WriteAheadLogRegistryCorruption::ManifestPayload {
+            field: "descriptor count",
+        }
+        .into());
+    }
+
+    let mut reader = RegistryManifestReader::new(payload);
+    let mut descriptors = Vec::new();
+    let mut tables = HashSet::new();
+    let mut members = HashSet::new();
+    let mut previous: Option<String> = None;
+    for _ in 0..count {
+        let table = reader.string("table name")?;
+        let member = reader.string("member name")?;
+        let normalized = table.to_ascii_lowercase();
+        if !tables.insert(normalized.clone()) {
+            return Err(Int64WriteAheadLogRegistryCorruption::DuplicateTable { table }.into());
+        }
+        if let Some(previous) = &previous {
+            if normalized <= *previous {
+                return Err(
+                    Int64WriteAheadLogRegistryCorruption::NonDeterministicOrder {
+                        previous: descriptors
+                            .last()
+                            .map_or_else(String::new, |descriptor: &RegistryDescriptor| {
+                                descriptor.table.clone()
+                            }),
+                        table,
+                    }
+                    .into(),
+                );
+            }
+        }
+        previous = Some(normalized);
+        let normalized_member = member.to_ascii_lowercase();
+        if !members.insert(normalized_member) {
+            return Err(Int64WriteAheadLogRegistryCorruption::DuplicateMember { member }.into());
+        }
+        if !safe_registry_member(&member) {
+            return Err(Int64WriteAheadLogRegistryCorruption::InvalidMember { member }.into());
+        }
+        descriptors.push(RegistryDescriptor { table, member });
+    }
+    reader.finish()?;
+    Ok(descriptors)
+}
+
+fn safe_registry_member(member: &str) -> bool {
+    !member.is_empty()
+        && member != "."
+        && member != ".."
+        && !member.eq_ignore_ascii_case(REGISTRY_MANIFEST_NAME)
+        && !member.as_bytes().contains(&0)
+        && !member.as_bytes().contains(&b'/')
+        && Path::new(member)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+struct RegistryManifestReader<'a> {
+    payload: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RegistryManifestReader<'a> {
+    const fn new(payload: &'a [u8]) -> Self {
+        Self { payload, offset: 0 }
+    }
+
+    fn string(&mut self, field: &'static str) -> Result<String, Int64WriteAheadLogRegistryError> {
+        let length_end = self
+            .offset
+            .checked_add(4)
+            .ok_or(Int64WriteAheadLogRegistryCorruption::ManifestPayload { field })?;
+        let length_bytes = self
+            .payload
+            .get(self.offset..length_end)
+            .ok_or(Int64WriteAheadLogRegistryCorruption::ManifestPayload { field })?;
+        let length = u32::from_le_bytes(
+            length_bytes
+                .try_into()
+                .expect("manifest length field has four bytes"),
+        ) as usize;
+        let end = length_end
+            .checked_add(length)
+            .ok_or(Int64WriteAheadLogRegistryCorruption::ManifestPayload { field })?;
+        let value = std::str::from_utf8(
+            self.payload
+                .get(length_end..end)
+                .ok_or(Int64WriteAheadLogRegistryCorruption::ManifestPayload { field })?,
+        )
+        .map_err(|_| Int64WriteAheadLogRegistryCorruption::ManifestPayload { field })?
+        .to_owned();
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn finish(self) -> Result<(), Int64WriteAheadLogRegistryError> {
+        if self.offset == self.payload.len() {
+            Ok(())
+        } else {
+            Err(Int64WriteAheadLogRegistryCorruption::ManifestPayload {
+                field: "trailing bytes",
+            }
+            .into())
+        }
+    }
+}
+
+pub(crate) fn recover_registry(
+    path: &Path,
+    limits: Int64WriteAheadLogRegistryLimits,
+) -> Result<RecoveredInt64WriteAheadLogRegistry, Int64WriteAheadLogRegistryError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let destination = registry_destination_name(path)?;
+    let parent = WalDirectory::open(normalized_parent(path))
+        .map_err(Int64WriteAheadLogRegistryError::OpenParent)?;
+    let directory = parent
+        .open_directory(&destination)
+        .map_err(Int64WriteAheadLogRegistryError::OpenDirectory)?;
+    let manifest_name = CString::new(REGISTRY_MANIFEST_NAME).expect("manifest name is valid");
+    let manifest_file = directory
+        .open_file(&manifest_name)
+        .map_err(Int64WriteAheadLogRegistryError::OpenManifest)?;
+    let metadata = manifest_file
+        .metadata()
+        .map_err(Int64WriteAheadLogRegistryError::ManifestMetadata)?;
+    if !metadata.is_file() {
+        return Err(Int64WriteAheadLogRegistryError::ManifestNotRegularFile);
+    }
+    if metadata.len() > limits.max_manifest_bytes as u64 {
+        return Err(Int64WriteAheadLogRegistryLimitError::ManifestBytes {
+            bytes: metadata.len(),
+            max_bytes: limits.max_manifest_bytes,
+        }
+        .into());
+    }
+    let mut manifest = Vec::with_capacity(metadata.len() as usize);
+    manifest_file
+        .take((limits.max_manifest_bytes as u64).saturating_add(1))
+        .read_to_end(&mut manifest)
+        .map_err(Int64WriteAheadLogRegistryError::ReadManifest)?;
+    validate_manifest_size(manifest.len(), limits)?;
+    let descriptors = decode_registry_manifest(&manifest, limits)?;
+    let expected_entries = descriptors
+        .iter()
+        .map(|descriptor| descriptor.member.as_bytes().to_vec())
+        .chain(std::iter::once(REGISTRY_MANIFEST_NAME.as_bytes().to_vec()))
+        .collect::<HashSet<_>>();
+    if let Some(entry) = directory
+        .first_unexpected_entry(&expected_entries)
+        .map_err(Int64WriteAheadLogRegistryError::ReadDirectory)?
+    {
+        return Err(
+            Int64WriteAheadLogRegistryCorruption::UnexpectedDirectoryEntry {
+                entry: String::from_utf8_lossy(&entry).into_owned(),
+            }
+            .into(),
+        );
+    }
+
+    let mut tables = Vec::with_capacity(descriptors.len());
+    let mut inodes = HashSet::with_capacity(descriptors.len());
+    let mut total_bytes = 0_usize;
+    let mut total_records = 0_usize;
+    let mut database_settings: Option<([usize; 3], [usize; QUERY_LIMIT_FIELD_COUNT], usize)> = None;
+    for descriptor in descriptors {
+        let member_name = CString::new(descriptor.member.as_bytes()).map_err(|_| {
+            Int64WriteAheadLogRegistryCorruption::InvalidMember {
+                member: descriptor.member.clone(),
+            }
+        })?;
+        let file = match directory.open_file(&member_name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Int64WriteAheadLogRegistryCorruption::MissingMember {
+                    table: descriptor.table,
+                    member: descriptor.member,
+                }
+                .into());
+            }
+            Err(error) => {
+                return Err(Int64WriteAheadLogRegistryError::Member {
+                    table: descriptor.table,
+                    member: descriptor.member,
+                    error: Int64WriteAheadLogError::Open(error),
+                });
+            }
+        };
+        let member_metadata =
+            file.metadata()
+                .map_err(|error| Int64WriteAheadLogRegistryError::Member {
+                    table: descriptor.table.clone(),
+                    member: descriptor.member.clone(),
+                    error: Int64WriteAheadLogError::Metadata(error),
+                })?;
+        if !member_metadata.is_file() {
+            return Err(Int64WriteAheadLogRegistryError::Member {
+                table: descriptor.table,
+                member: descriptor.member,
+                error: Int64WriteAheadLogError::NotRegularFile,
+            });
+        }
+        if !inodes.insert((member_metadata.dev(), member_metadata.ino())) {
+            return Err(Int64WriteAheadLogRegistryCorruption::DuplicateMemberFile {
+                table: descriptor.table,
+                member: descriptor.member,
+            }
+            .into());
+        }
+        let metadata_bytes = usize::try_from(member_metadata.len()).unwrap_or(usize::MAX);
+        validate_registry_totals(
+            total_bytes.saturating_add(metadata_bytes),
+            total_records,
+            limits,
+        )?;
+        let remaining_records = limits.max_total_records.saturating_sub(total_records);
+        let aggregate_record_limit_is_binding = remaining_records <= limits.per_table.max_records;
+        let member_limits = Int64WriteAheadLogLimits {
+            max_records: limits.per_table.max_records.min(remaining_records),
+            ..limits.per_table
+        };
+        let recovered = match recover_file(file, member_metadata.len(), member_limits) {
+            Err(Int64WriteAheadLogError::Limit(Int64WriteAheadLogLimitError::Records {
+                records,
+                ..
+            })) if aggregate_record_limit_is_binding => {
+                return Err(Int64WriteAheadLogRegistryLimitError::TotalRecords {
+                    records: u64::try_from(total_records)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(records),
+                    max_records: limits.max_total_records,
+                }
+                .into());
+            }
+            Err(error) => {
+                return Err(Int64WriteAheadLogRegistryError::Member {
+                    table: descriptor.table.clone(),
+                    member: descriptor.member.clone(),
+                    error,
+                });
+            }
+            Ok(recovered) => recovered,
+        };
+        total_bytes = total_bytes.saturating_add(recovered.file_bytes);
+        total_records = total_records.saturating_add(recovered.records);
+        validate_registry_totals(total_bytes, total_records, limits)?;
+        if recovered.bootstrap.table_name != descriptor.table {
+            return Err(Int64WriteAheadLogRegistryCorruption::TableNameMismatch {
+                expected: descriptor.table,
+                found: recovered.bootstrap.table_name,
+            }
+            .into());
+        }
+        let settings = (
+            recovered.bootstrap.database_table_limits,
+            recovered.bootstrap.query_limits,
+            recovered.bootstrap.worker_cap,
+        );
+        if let Some(expected) = database_settings {
+            if settings != expected {
+                return Err(
+                    Int64WriteAheadLogRegistryCorruption::DatabaseSettingsMismatch {
+                        table: recovered.bootstrap.table_name,
+                    }
+                    .into(),
+                );
+            }
+        } else {
+            database_settings = Some(settings);
+        }
+        tables.push(recovered.bootstrap);
+    }
+    Ok(RecoveredInt64WriteAheadLogRegistry { tables })
 }
 
 pub(crate) fn recover(
@@ -668,15 +1988,23 @@ pub(crate) fn recover(
     if !metadata.is_file() {
         return Err(Int64WriteAheadLogError::NotRegularFile);
     }
-    if metadata.len() > limits.max_file_bytes as u64 {
+    recover_file(file, metadata.len(), limits)
+}
+
+fn recover_file(
+    file: File,
+    metadata_len: u64,
+    limits: Int64WriteAheadLogLimits,
+) -> Result<RecoveredInt64WriteAheadLog, Int64WriteAheadLogError> {
+    if metadata_len > limits.max_file_bytes as u64 {
         return Err(Int64WriteAheadLogLimitError::FileBytes {
-            bytes: metadata.len(),
+            bytes: metadata_len,
             max_bytes: limits.max_file_bytes,
         }
         .into());
     }
     let read_limit = (limits.max_file_bytes as u64).saturating_add(1);
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut bytes = Vec::with_capacity(metadata_len as usize);
     file.take(read_limit)
         .read_to_end(&mut bytes)
         .map_err(Int64WriteAheadLogError::Read)?;
@@ -831,8 +2159,14 @@ fn replay(
                 bootstrap = Some(decode_bootstrap(payload, sequence)?);
             }
             APPEND_KIND => apply_append(bootstrap.as_mut(), payload, sequence)?,
+            NULLABLE_APPEND_KIND => {
+                apply_nullable_append(bootstrap.as_mut(), payload, sequence)?;
+            }
             TRUNCATE_KIND => apply_truncate(bootstrap.as_mut(), payload, sequence)?,
             REPLACE_KIND => apply_replace(bootstrap.as_mut(), payload, sequence)?,
+            NULLABLE_REPLACE_KIND => {
+                apply_nullable_replace(bootstrap.as_mut(), payload, sequence)?;
+            }
             kind => {
                 return Err(
                     Int64WriteAheadLogCorruption::UnsupportedKind { sequence, kind }.into(),
@@ -845,7 +2179,11 @@ fn replay(
     }
 
     let bootstrap = bootstrap.ok_or(Int64WriteAheadLogCorruption::MissingBootstrap)?;
-    Ok(RecoveredInt64WriteAheadLog { bootstrap })
+    Ok(RecoveredInt64WriteAheadLog {
+        bootstrap,
+        file_bytes: bytes.len(),
+        records: usize::try_from(expected_sequence).unwrap_or(usize::MAX),
+    })
 }
 
 /// Returns the writer-valid payload length when its exact footer and checksum
@@ -887,8 +2225,10 @@ fn encoded_payload_len(kind: u8, payload_and_tail: &[u8]) -> Option<usize> {
     match kind {
         BOOTSTRAP_KIND => encoded_bootstrap_payload_len(payload_and_tail),
         APPEND_KIND => encoded_counted_payload_len(payload_and_tail, 8),
+        NULLABLE_APPEND_KIND => encoded_counted_payload_len(payload_and_tail, 9),
         TRUNCATE_KIND => Some(0),
         REPLACE_KIND => encoded_counted_payload_len(payload_and_tail, 16),
+        NULLABLE_REPLACE_KIND => encoded_counted_payload_len(payload_and_tail, 17),
         _ => None,
     }
 }
@@ -910,10 +2250,16 @@ fn encoded_bootstrap_payload_len(payload_and_tail: &[u8]) -> Option<usize> {
     let row_count_offset = column_end
         .checked_add(1)?
         .checked_add(17_usize.checked_mul(8)?)?;
+    let nullable = *payload_and_tail.get(column_end)?;
     let row_count = read_usize_at(payload_and_tail, row_count_offset)?;
+    let value_bytes = match nullable {
+        0 => 8,
+        1 => 9,
+        _ => return None,
+    };
     row_count_offset
         .checked_add(8)?
-        .checked_add(row_count.checked_mul(8)?)
+        .checked_add(row_count.checked_mul(value_bytes)?)
 }
 
 fn read_usize_at(input: &[u8], offset: usize) -> Option<usize> {
@@ -1017,12 +2363,13 @@ fn encode_bootstrap(bootstrap: &Int64WalBootstrap) -> Vec<u8> {
         bootstrap.table_name.len(),
         bootstrap.column_name.len(),
         bootstrap.values.len(),
+        bootstrap.nullable,
     )
     .expect("validated WAL bootstrap size must be representable");
     let mut payload = Vec::with_capacity(capacity);
     push_bytes(&mut payload, bootstrap.table_name.as_bytes());
     push_bytes(&mut payload, bootstrap.column_name.as_bytes());
-    payload.push(0); // Batch physical Int64 storage is NOT NULL.
+    payload.push(u8::from(bootstrap.nullable));
     for value in bootstrap.table_limits {
         push_usize(&mut payload, value);
     }
@@ -1035,7 +2382,15 @@ fn encode_bootstrap(bootstrap: &Int64WalBootstrap) -> Vec<u8> {
     push_usize(&mut payload, bootstrap.worker_cap);
     push_usize(&mut payload, bootstrap.values.len());
     for value in &bootstrap.values {
-        payload.extend_from_slice(&value.to_le_bytes());
+        if bootstrap.nullable {
+            push_nullable_i64(&mut payload, *value);
+        } else {
+            payload.extend_from_slice(
+                &value
+                    .expect("a non-nullable WAL bootstrap cannot contain NULL")
+                    .to_le_bytes(),
+            );
+        }
     }
     payload
 }
@@ -1044,6 +2399,7 @@ fn bootstrap_payload_len(
     table_name_bytes: usize,
     column_name_bytes: usize,
     rows: usize,
+    nullable: bool,
 ) -> Option<usize> {
     // Two string lengths, nullability, six table-limit fields, ten query-limit
     // fields, worker cap, row count, then one i64 per row.
@@ -1056,7 +2412,7 @@ fn bootstrap_payload_len(
     fixed
         .checked_add(table_name_bytes)?
         .checked_add(column_name_bytes)?
-        .checked_add(rows.checked_mul(8)?)
+        .checked_add(rows.checked_mul(if nullable { 9 } else { 8 })?)
 }
 
 fn decode_bootstrap(
@@ -1067,9 +2423,10 @@ fn decode_bootstrap(
     let table_name = reader.string("table name")?;
     let column_name = reader.string("column name")?;
     let nullability = reader.byte("nullability")?;
-    if nullability != 0 {
+    if nullability > 1 {
         return Err(reader.malformed("nullability").into());
     }
+    let nullable = nullability == 1;
     let table_limits = [
         reader.usize("table row cap")?,
         reader.usize("table column cap")?,
@@ -1089,16 +2446,20 @@ fn decode_bootstrap(
         return Err(reader.malformed("worker cap").into());
     }
     let row_count = reader.usize("row count")?;
-    validate_bootstrap_caps(&reader, table_limits, database_table_limits, row_count)?;
+    validate_bootstrap_caps(&reader, table_limits, row_count)?;
     let required_value_bytes = row_count
-        .checked_mul(8)
+        .checked_mul(if nullable { 9 } else { 8 })
         .ok_or_else(|| reader.malformed("row count"))?;
     if reader.remaining() != required_value_bytes {
         return Err(reader.malformed("row values").into());
     }
     let mut values = Vec::with_capacity(row_count);
     for _ in 0..row_count {
-        values.push(reader.i64("row value")?);
+        values.push(if nullable {
+            reader.nullable_i64("row value")?
+        } else {
+            Some(reader.i64("row value")?)
+        });
     }
     reader.finish()?;
     Ok(Int64WalBootstrap {
@@ -1108,6 +2469,7 @@ fn decode_bootstrap(
         database_table_limits,
         query_limits,
         worker_cap,
+        nullable,
         values,
     })
 }
@@ -1115,16 +2477,13 @@ fn decode_bootstrap(
 fn validate_bootstrap_caps(
     reader: &PayloadReader<'_>,
     table_limits: [usize; 3],
-    database_table_limits: [usize; 3],
     row_count: usize,
 ) -> Result<(), Int64WriteAheadLogError> {
-    if table_limits[1] < 1
-        || table_limits[2] < row_count
-        || table_limits[0] < row_count
-        || database_table_limits[0] < table_limits[0]
-        || database_table_limits[1] < 1
-        || database_table_limits[2] < row_count
-    {
+    // Database table limits are defaults for future SQL-created tables. An
+    // explicitly created table can validly carry larger local limits (or live
+    // in a database whose defaults admit no ordinary table), so replay only
+    // requires the persisted table-local limits to cover its current shape.
+    if table_limits[1] < 1 || table_limits[2] < row_count || table_limits[0] < row_count {
         return Err(reader.malformed("table resource limits").into());
     }
     Ok(())
@@ -1138,6 +2497,9 @@ fn apply_append(
     let bootstrap = bootstrap.ok_or(Int64WriteAheadLogCorruption::MissingBootstrap)?;
     let mut reader = PayloadReader::new(payload, sequence);
     let count = reader.usize("append row count")?;
+    if bootstrap.nullable {
+        return Err(reader.malformed("non-nullable append kind").into());
+    }
     let value_bytes = count
         .checked_mul(8)
         .ok_or_else(|| reader.malformed("append row count"))?;
@@ -1154,7 +2516,7 @@ fn apply_append(
     }
     bootstrap.values.reserve(count);
     for _ in 0..count {
-        bootstrap.values.push(reader.i64("append value")?);
+        bootstrap.values.push(Some(reader.i64("append value")?));
     }
     reader.finish()
 }
@@ -1183,6 +2545,9 @@ fn apply_replace(
 ) -> Result<(), Int64WriteAheadLogError> {
     let bootstrap = bootstrap.ok_or(Int64WriteAheadLogCorruption::MissingBootstrap)?;
     let mut reader = PayloadReader::new(payload, sequence);
+    if bootstrap.nullable {
+        return Err(reader.malformed("non-nullable replacement kind").into());
+    }
     let count = reader.usize("replacement count")?;
     let replacement_bytes = count
         .checked_mul(16)
@@ -1194,7 +2559,7 @@ fn apply_replace(
     let mut previous = None;
     for _ in 0..count {
         let row = reader.usize("replacement row")?;
-        let value = reader.i64("replacement value")?;
+        let value = Some(reader.i64("replacement value")?);
         if row >= bootstrap.values.len() || previous.is_some_and(|previous| row <= previous) {
             return Err(reader.malformed("replacement row selection").into());
         }
@@ -1206,6 +2571,78 @@ fn apply_replace(
         bootstrap.values[row] = value;
     }
     Ok(())
+}
+
+fn apply_nullable_append(
+    bootstrap: Option<&mut Int64WalBootstrap>,
+    payload: &[u8],
+    sequence: u64,
+) -> Result<(), Int64WriteAheadLogError> {
+    let bootstrap = bootstrap.ok_or(Int64WriteAheadLogCorruption::MissingBootstrap)?;
+    let mut reader = PayloadReader::new(payload, sequence);
+    if !bootstrap.nullable {
+        return Err(reader.malformed("nullable append kind").into());
+    }
+    let count = reader.usize("append row count")?;
+    let value_bytes = count
+        .checked_mul(9)
+        .ok_or_else(|| reader.malformed("append row count"))?;
+    if reader.remaining() != value_bytes {
+        return Err(reader.malformed("append values").into());
+    }
+    let new_rows = bootstrap
+        .values
+        .len()
+        .checked_add(count)
+        .ok_or_else(|| reader.malformed("append row count"))?;
+    if new_rows > bootstrap.table_limits[0] || new_rows > bootstrap.table_limits[2] {
+        return Err(reader.malformed("append table resource limits").into());
+    }
+    bootstrap.values.reserve(count);
+    for _ in 0..count {
+        bootstrap.values.push(reader.nullable_i64("append value")?);
+    }
+    reader.finish()
+}
+
+fn apply_nullable_replace(
+    bootstrap: Option<&mut Int64WalBootstrap>,
+    payload: &[u8],
+    sequence: u64,
+) -> Result<(), Int64WriteAheadLogError> {
+    let bootstrap = bootstrap.ok_or(Int64WriteAheadLogCorruption::MissingBootstrap)?;
+    let mut reader = PayloadReader::new(payload, sequence);
+    if !bootstrap.nullable {
+        return Err(reader.malformed("nullable replacement kind").into());
+    }
+    let count = reader.usize("replacement count")?;
+    let replacement_bytes = count
+        .checked_mul(17)
+        .ok_or_else(|| reader.malformed("replacement count"))?;
+    if reader.remaining() != replacement_bytes {
+        return Err(reader.malformed("replacement values").into());
+    }
+    let mut replacements = Vec::with_capacity(count);
+    let mut previous = None;
+    for _ in 0..count {
+        let row = reader.usize("replacement row")?;
+        let value = reader.nullable_i64("replacement value")?;
+        if row >= bootstrap.values.len() || previous.is_some_and(|previous| row <= previous) {
+            return Err(reader.malformed("replacement row selection").into());
+        }
+        previous = Some(row);
+        replacements.push((row, value));
+    }
+    reader.finish()?;
+    for (row, value) in replacements {
+        bootstrap.values[row] = value;
+    }
+    Ok(())
+}
+
+fn push_nullable_i64(output: &mut Vec<u8>, value: Option<i64>) {
+    output.push(u8::from(value.is_some()));
+    output.extend_from_slice(&value.unwrap_or_default().to_le_bytes());
 }
 
 fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
@@ -1286,6 +2723,19 @@ impl<'a> PayloadReader<'a> {
         Ok(i64::from_le_bytes(
             bytes.try_into().expect("the slice length is eight"),
         ))
+    }
+
+    fn nullable_i64(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Option<i64>, Int64WriteAheadLogCorruption> {
+        let present = self.byte(field)?;
+        let value = self.i64(field)?;
+        match present {
+            0 if value == 0 => Ok(None),
+            1 => Ok(Some(value)),
+            _ => Err(self.malformed(field)),
+        }
     }
 
     fn string(&mut self, field: &'static str) -> Result<String, Int64WriteAheadLogCorruption> {
@@ -1423,6 +2873,62 @@ mod tests {
     }
 
     #[test]
+    fn indeterminate_member_failure_poisons_registry_before_cross_member_write() {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/wal-registry-poison-tests");
+        fs::create_dir_all(&base).unwrap();
+        let root = loop {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let writer = |name: &str| Int64WriteAheadLog {
+            file: File::create(root.join(format!("{name}.wal"))).unwrap(),
+            normalized_table_name: name.to_owned(),
+            nullable: false,
+            limits: Int64WriteAheadLogLimits::default(),
+            file_bytes: 0,
+            records: 0,
+            poisoned: false,
+        };
+        let mut registry = Int64WriteAheadLogRegistry {
+            writers: HashMap::from([
+                ("alpha".to_owned(), writer("alpha")),
+                ("beta".to_owned(), writer("beta")),
+            ]),
+            limits: Int64WriteAheadLogRegistryLimits::default(),
+            total_wal_bytes: 0,
+            total_records: 0,
+            poisoned: false,
+        };
+        let beta_path = root.join("beta.wal");
+        let mut fault = FaultFile::new(Some(3));
+        let injected = write_committed_record(&mut fault, b"body", &[0; INT64_WAL_COMMIT_LEN])
+            .expect_err("the final sync is injected to fail");
+
+        assert!(matches!(
+            registry.commit_member_record("alpha", INT64_WAL_FRAME_OVERHEAD, |_| Err(injected)),
+            Err(Int64WriteAheadLogCommitError::SyncFile { .. })
+        ));
+        assert!(registry.poisoned);
+        assert_eq!(registry.total_wal_bytes, 0);
+        assert_eq!(registry.total_records, 0);
+        assert!(matches!(
+            registry.append_values("beta", &[Some(1)]),
+            Err(Int64WriteAheadLogCommitError::Poisoned)
+        ));
+        assert_eq!(fs::metadata(beta_path).unwrap().len(), 0);
+
+        drop(registry);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn creation_stays_with_the_open_parent_when_its_path_is_rebound() {
         static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -1451,6 +2957,7 @@ mod tests {
             database_table_limits: [1, 1, 1],
             query_limits: [1; QUERY_LIMIT_FIELD_COUNT],
             worker_cap: 1,
+            nullable: false,
             values: vec![],
         };
         let payload = encode_bootstrap(&bootstrap);
