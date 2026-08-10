@@ -57,6 +57,24 @@ fn metadata_result(rows: &[(&str, &str, DataType, i64)]) -> QueryResult {
     }
 }
 
+fn metadata_result_with_type_names(rows: &[(&str, &str, &str, i64)]) -> QueryResult {
+    QueryResult {
+        columns: columns(),
+        rows: rows
+            .iter()
+            .map(|(table, name, type_name, position)| {
+                vec![
+                    Value::String("default".to_owned()),
+                    Value::String((*table).to_owned()),
+                    Value::String((*name).to_owned()),
+                    Value::String((*type_name).to_owned()),
+                    Value::Int64(*position),
+                ]
+            })
+            .collect(),
+    }
+}
+
 fn retained_bytes(result: &QueryResult) -> usize {
     result.columns.len() * size_of::<ResultColumn>()
         + result
@@ -248,6 +266,44 @@ fn metadata_tracks_column_and_table_lifecycle_in_required_order() {
             ("zoo", "Rating", DataType::Float64, 1),
             ("zoo", "Label", DataType::String, 2),
         ])
+    );
+}
+
+#[test]
+fn reports_physical_nullable_int64_and_preflights_its_exact_type_bytes() {
+    let expected =
+        metadata_result_with_type_names(&[("Readings", "Measurement", "Nullable(Int64)", 1)]);
+    let exact_bytes = retained_bytes(&expected);
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_scan_rows: 0,
+        max_rows: 1,
+        max_values: 5,
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    exact
+        .create_nullable_int64_table("Readings", "Measurement", vec![Some(7), None])
+        .expect("create nullable table");
+    assert_eq!(query(&mut exact), expected);
+
+    let mut one_byte_short = Database::with_query_result_limits(QueryResultLimits {
+        max_scan_rows: 0,
+        max_rows: 1,
+        max_values: 5,
+        max_bytes: exact_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_byte_short
+        .create_nullable_int64_table("Readings", "Measurement", vec![None])
+        .expect("create nullable table");
+    assert_eq!(
+        one_byte_short.execute(SYSTEM_COLUMNS_QUERY),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        })
     );
 }
 

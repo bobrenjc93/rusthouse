@@ -416,6 +416,15 @@ impl Column {
         }
     }
 
+    /// Returns the canonical SQL spelling for schema metadata.
+    #[must_use]
+    pub(crate) fn metadata_type_name(&self) -> &'static str {
+        match self {
+            Self::NullableInt64(_) => "Nullable(Int64)",
+            _ => self.data_type().as_str(),
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         match self {

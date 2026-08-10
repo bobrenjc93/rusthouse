@@ -344,7 +344,8 @@ The exact case-insensitive query
 catalog column as five typed columns. Tables use deterministic case-insensitive
 name order, columns retain schema order, and each row contains `default`, the
 stored table and column display names, the canonical type spelling, and a
-checked one-based `Int64` position. An empty catalog returns the five-column
+checked one-based `Int64` position. Physical nullable `Int64` columns use the
+canonical `Nullable(Int64)` spelling. An empty catalog returns the five-column
 schema with no rows; create, add, rename, drop, and table rename/drop changes
 are visible on the next query. Other shapes and trailing clauses are rejected.
 The complete row, value, byte, and retained-result bounds are preflighted before
@@ -370,8 +371,9 @@ and HTTP paths in every supported format.
 bounded `String`, preserving the stored table and column display names and
 schema order while normalizing type spellings.
 `DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
-and `type` `String` columns. It uses case-insensitive table lookup and applies
-the normal result row, value, and byte limits before allocating result storage.
+and `type` `String` columns, rendering physical nullable `Int64` storage as
+`Nullable(Int64)`. It uses case-insensitive table lookup and applies the normal
+result row, value, and byte limits before allocating result storage.
 `EXISTS TABLE <name>` performs the same case-insensitive catalog lookup and
 returns exactly one `Bool` column named `result` with one row: `true` when the
 table is present and `false` when it is missing, including after `DROP TABLE`.
