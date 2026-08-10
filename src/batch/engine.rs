@@ -5313,10 +5313,13 @@ fn resolve_select_items(
                     }
                 };
                 validate_aggregate(*function, input_type)?;
-                if let Some(argument) =
-                    argument_index.filter(|_| *function != AggregateFunction::Count)
-                {
-                    reject_nullable_operation(table, argument, function.name())?;
+                if let Some(argument) = argument_index {
+                    let supported_nullable_aggregate =
+                        matches!(function, AggregateFunction::Count | AggregateFunction::Min)
+                            && table.column_is_nullable_int64(argument);
+                    if !supported_nullable_aggregate {
+                        reject_nullable_operation(table, argument, function.name())?;
+                    }
                 }
                 let state = aggregate_specs.len();
                 aggregate_specs.push(AggregateSpec {
@@ -6085,7 +6088,10 @@ fn execute_grouped<'a>(
                 input_type: Some(DataType::Int64),
                 ..
             }]
-        );
+        )
+        && aggregate_specs
+            .first()
+            .is_some_and(|spec| aggregate_argument_is_non_nullable_int64(table, spec));
     let sole_global_min_float = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -6114,7 +6120,7 @@ fn execute_grouped<'a>(
             }]
         );
     let paired_global_count = if group_columns.is_empty() {
-        paired_global_count_aggregate(aggregate_specs)
+        paired_global_count_aggregate(table, aggregate_specs)
     } else {
         None
     };
@@ -6446,6 +6452,7 @@ fn reduce_grouped_bool_count_partials(
 }
 
 fn paired_global_count_aggregate(
+    table: &Table,
     aggregate_specs: &[AggregateSpec],
 ) -> Option<(usize, usize, AggregateFunction, DataType)> {
     if aggregate_specs.len() != 2 {
@@ -6474,7 +6481,19 @@ fn paired_global_count_aggregate(
     let input_type = aggregate_specs[aggregate_state]
         .input_type
         .expect("paired aggregate input type is resolved");
+    if table.column_is_nullable_int64(
+        aggregate_specs[aggregate_state]
+            .argument
+            .expect("paired aggregate has a column argument"),
+    ) {
+        return None;
+    }
     (count_state != aggregate_state).then_some((count_state, aggregate_state, function, input_type))
+}
+
+fn aggregate_argument_is_non_nullable_int64(table: &Table, spec: &AggregateSpec) -> bool {
+    spec.argument
+        .is_some_and(|argument| matches!(table.columns()[argument], Column::Int64(_)))
 }
 
 fn count_matched_rows(matched_rows: usize) -> Result<i64> {
@@ -7380,9 +7399,10 @@ impl AggregateState {
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
                 let candidate = column.value_ref(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| candidate < existing.as_ref())
+                if !matches!(candidate, ValueRef::Null(_))
+                    && current
+                        .as_ref()
+                        .is_none_or(|existing| candidate < existing.as_ref())
                 {
                     replace_extreme(
                         current,
@@ -11020,6 +11040,41 @@ mod tests {
     }
 
     #[test]
+    fn nullable_int64_minimum_stays_sequential_above_the_parallel_threshold() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
+
+        let cap = NonZeroUsize::new(2).unwrap();
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut values = vec![None; row_count];
+        values[0] = Some(i64::MAX);
+        values[row_count - 1] = Some(i64::MIN);
+        let mut database = Database::with_global_aggregate_worker_cap(cap);
+        database
+            .create_nullable_int64_table("readings", "v", values)
+            .unwrap();
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
+
+        for (sql, expected) in [
+            ("SELECT MIN(v) FROM readings", vec![Value::Int64(i64::MIN)]),
+            (
+                "SELECT COUNT(*), MIN(v) FROM readings",
+                vec![
+                    Value::Int64(i64::try_from(row_count).unwrap()),
+                    Value::Int64(i64::MIN),
+                ],
+            ),
+        ] {
+            BUDGET.reset_peak();
+            assert_eq!(query(&mut database, sql).rows, [expected]);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use(),
+                0,
+                "nullable MIN must not request parallel aggregate helpers"
+            );
+        }
+    }
+
+    #[test]
     fn configured_cap_two_is_a_deterministic_parallel_differential() {
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
 
@@ -12340,6 +12395,45 @@ mod tests {
                 actual: fixed_bytes + 16,
                 max: fixed_bytes + 15,
             }
+        );
+    }
+
+    #[test]
+    fn nullable_int64_minimum_obeys_the_exact_aggregate_state_byte_boundary() {
+        let fixed_bytes =
+            std::mem::size_of::<AggregateState>() + std::mem::size_of::<Vec<AggregateState>>();
+        let exact_limits = QueryResultLimits {
+            max_aggregate_state_cells: 1,
+            max_aggregate_state_bytes: fixed_bytes,
+            ..QueryResultLimits::default()
+        };
+        let mut exact = Database::with_query_result_limits(exact_limits);
+        exact
+            .create_nullable_int64_table(
+                "readings",
+                "v",
+                vec![None, Some(i64::MAX), Some(i64::MIN)],
+            )
+            .unwrap();
+        assert_eq!(
+            query(&mut exact, "SELECT MIN(v) FROM readings").rows,
+            [vec![Value::Int64(i64::MIN)]]
+        );
+
+        let mut limited = Database::with_query_result_limits(QueryResultLimits {
+            max_aggregate_state_bytes: fixed_bytes - 1,
+            ..exact_limits
+        });
+        limited
+            .create_nullable_int64_table("readings", "v", vec![None, Some(1)])
+            .unwrap();
+        assert_eq!(
+            limited.execute("SELECT MIN(v) FROM readings"),
+            Err(Error::ResourceLimitExceeded {
+                resource: "SELECT aggregate state bytes",
+                actual: fixed_bytes,
+                max: fixed_bytes - 1,
+            })
         );
     }
 
