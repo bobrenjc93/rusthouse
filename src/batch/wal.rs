@@ -90,16 +90,59 @@ impl Default for Int64WriteAheadLogLimits {
 }
 
 /// Inclusive directory-wide and per-table bounds for a multi-table WAL registry.
+///
+/// # Examples
+///
+/// ```no_run
+/// use rusthouse::{
+///     Database, Int64WriteAheadLogLimits, Int64WriteAheadLogRegistryLimits,
+/// };
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let limits = Int64WriteAheadLogRegistryLimits::new(
+///     2,
+///     16 * 1024,
+///     1024 * 1024,
+///     128,
+///     Int64WriteAheadLogLimits::new(512 * 1024, 64 * 1024, 64),
+/// );
+/// let mut database = Database::new();
+/// database.create_nullable_int64_table("events", "value", vec![Some(1), None])?;
+/// database.create_nullable_int64_table("metrics", "value", vec![Some(2)])?;
+///
+/// database.enable_int64_write_ahead_log_registry(
+///     &["events", "metrics"],
+///     "example-wal-registry",
+///     limits,
+/// )?;
+/// database.append_nullable_int64_values("events", &[Some(3)])?;
+/// assert!(database.disable_int64_write_ahead_log());
+///
+/// // Recovery returns the complete registry or an error, never a partial database.
+/// let _recovered = Database::recover_int64_write_ahead_log_registry(
+///     "example-wal-registry",
+///     limits,
+/// )?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Int64WriteAheadLogRegistryLimits {
+    /// Maximum number of table WALs and manifest descriptors.
     pub max_tables: usize,
+    /// Maximum complete manifest size, including its header and descriptors.
     pub max_manifest_bytes: usize,
+    /// Maximum aggregate size of all member WAL files, including framing.
     pub max_total_wal_bytes: usize,
+    /// Maximum aggregate committed records, including every bootstrap record.
     pub max_total_records: usize,
+    /// File, record-payload, and committed-record limits applied independently
+    /// to every table WAL.
     pub per_table: Int64WriteAheadLogLimits,
 }
 
 impl Int64WriteAheadLogRegistryLimits {
+    /// Creates explicit table-count, manifest, aggregate, and per-table bounds.
     #[must_use]
     pub const fn new(
         max_tables: usize,
@@ -133,10 +176,34 @@ impl Default for Int64WriteAheadLogRegistryLimits {
 /// A directory-wide registry bound was exceeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Int64WriteAheadLogRegistryLimitError {
-    Tables { tables: u64, max_tables: usize },
-    ManifestBytes { bytes: u64, max_bytes: usize },
-    TotalWalBytes { bytes: u64, max_bytes: usize },
-    TotalRecords { records: u64, max_records: usize },
+    /// The registry contains or requested more tables than allowed.
+    Tables {
+        /// Number of tables found or requested.
+        tables: u64,
+        /// Configured inclusive table-count limit.
+        max_tables: usize,
+    },
+    /// The complete manifest is larger than allowed.
+    ManifestBytes {
+        /// Manifest size found or required, in bytes.
+        bytes: u64,
+        /// Configured inclusive manifest-size limit, in bytes.
+        max_bytes: usize,
+    },
+    /// The aggregate member-WAL size is larger than allowed.
+    TotalWalBytes {
+        /// Aggregate member-WAL size found or required, in bytes.
+        bytes: u64,
+        /// Configured inclusive aggregate member-size limit, in bytes.
+        max_bytes: usize,
+    },
+    /// The aggregate committed-record count is larger than allowed.
+    TotalRecords {
+        /// Aggregate committed records found or required.
+        records: u64,
+        /// Configured inclusive aggregate record-count limit.
+        max_records: usize,
+    },
 }
 
 impl fmt::Display for Int64WriteAheadLogRegistryLimitError {
@@ -167,25 +234,101 @@ impl fmt::Display for Int64WriteAheadLogRegistryLimitError {
 
 impl StdError for Int64WriteAheadLogRegistryLimitError {}
 
-/// Typed structural corruption or inconsistency in a registry manifest.
+/// Typed structural corruption or inconsistency in a registry manifest,
+/// directory, or member set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Int64WriteAheadLogRegistryCorruption {
-    ManifestMagic { found: [u8; 8] },
-    ManifestVersion { found: u16, supported: u16 },
-    ManifestReserved { found: u16 },
-    ManifestLength { declared: u64, actual: u64 },
-    ManifestChecksum { expected: u32, actual: u32 },
-    ManifestPayload { field: &'static str },
+    /// The manifest does not begin with the registry magic bytes.
+    ManifestMagic {
+        /// Bytes found in the manifest magic field.
+        found: [u8; 8],
+    },
+    /// The manifest uses a version this reader does not support.
+    ManifestVersion {
+        /// Version found in the manifest.
+        found: u16,
+        /// Version supported by this reader.
+        supported: u16,
+    },
+    /// The manifest's reserved field is not zero.
+    ManifestReserved {
+        /// Value found in the reserved field.
+        found: u16,
+    },
+    /// The declared manifest payload length differs from the available bytes.
+    ManifestLength {
+        /// Payload length declared by the manifest header.
+        declared: u64,
+        /// Payload bytes actually present after the header.
+        actual: u64,
+    },
+    /// The manifest checksum does not authenticate its header and payload.
+    ManifestChecksum {
+        /// Checksum stored in the manifest.
+        expected: u32,
+        /// Checksum calculated from the manifest bytes.
+        actual: u32,
+    },
+    /// A required manifest header or descriptor field is malformed.
+    ManifestPayload {
+        /// Name of the field that could not be decoded.
+        field: &'static str,
+    },
+    /// The manifest contains no table descriptors.
     Empty,
-    DuplicateTable { table: String },
-    DuplicateMember { member: String },
-    InvalidMember { member: String },
-    NonDeterministicOrder { previous: String, table: String },
-    MissingMember { table: String, member: String },
-    DuplicateMemberFile { table: String, member: String },
-    UnexpectedDirectoryEntry { entry: String },
-    TableNameMismatch { expected: String, found: String },
-    DatabaseSettingsMismatch { table: String },
+    /// Two descriptors have the same case-insensitive table name.
+    DuplicateTable {
+        /// Repeated table name found in the manifest or enable request.
+        table: String,
+    },
+    /// Two descriptors have the same case-insensitive member filename.
+    DuplicateMember {
+        /// Repeated member filename found in the manifest.
+        member: String,
+    },
+    /// A member filename is not a safe normal path component.
+    InvalidMember {
+        /// Unsafe member filename found in the manifest.
+        member: String,
+    },
+    /// Descriptors are not in strict canonical case-insensitive table order.
+    NonDeterministicOrder {
+        /// Display name of the preceding descriptor.
+        previous: String,
+        /// Out-of-order table display name.
+        table: String,
+    },
+    /// A listed member file is absent from the registry directory.
+    MissingMember {
+        /// Table whose member is absent.
+        table: String,
+        /// Missing member filename.
+        member: String,
+    },
+    /// A member file aliases an earlier member's filesystem identity.
+    DuplicateMemberFile {
+        /// Table whose member aliases another member.
+        table: String,
+        /// Aliased member filename.
+        member: String,
+    },
+    /// The registry directory contains an entry not listed by the manifest.
+    UnexpectedDirectoryEntry {
+        /// Unlisted directory-entry name, lossily decoded when necessary.
+        entry: String,
+    },
+    /// A descriptor table name differs from its member bootstrap table name.
+    TableNameMismatch {
+        /// Table name recorded by the manifest descriptor.
+        expected: String,
+        /// Table name recorded by the member bootstrap.
+        found: String,
+    },
+    /// A member's database-wide settings differ from earlier members.
+    DatabaseSettingsMismatch {
+        /// Table whose member carries inconsistent settings.
+        table: String,
+    },
 }
 
 impl fmt::Display for Int64WriteAheadLogRegistryCorruption {
@@ -267,25 +410,45 @@ impl StdError for Int64WriteAheadLogRegistryCorruption {}
 /// A filesystem, bound, member-WAL, or manifest failure for a registry.
 #[derive(Debug)]
 pub enum Int64WriteAheadLogRegistryError {
+    /// A directory-wide configured bound was exceeded.
     Limit(Int64WriteAheadLogRegistryLimitError),
+    /// The manifest, directory, or member set is structurally inconsistent.
     Corruption(Int64WriteAheadLogRegistryCorruption),
+    /// The registry path has no safe, normal, non-NUL final component.
     InvalidDestination,
+    /// Opening the registry path's parent directory failed.
     OpenParent(io::Error),
+    /// Exclusively creating the registry directory failed.
     CreateDirectory(io::Error),
+    /// Opening the created or existing registry directory failed.
     OpenDirectory(io::Error),
+    /// Synchronizing the parent after directory creation failed.
     SyncParent(io::Error),
+    /// Opening the registry manifest for recovery failed.
     OpenManifest(io::Error),
+    /// Reading manifest filesystem metadata failed.
     ManifestMetadata(io::Error),
+    /// The opened manifest is not a regular file.
     ManifestNotRegularFile,
+    /// Reading the bounded manifest failed.
     ReadManifest(io::Error),
+    /// Exclusively creating the registry manifest failed.
     CreateManifest(io::Error),
+    /// Writing the registry manifest failed.
     WriteManifest(io::Error),
+    /// Synchronizing the registry manifest failed.
     SyncManifest(io::Error),
+    /// Synchronizing the registry directory failed.
     SyncDirectory(io::Error),
+    /// Enumerating the registry directory for unlisted entries failed.
     ReadDirectory(io::Error),
+    /// Creating, opening, bounding, or replaying one member WAL failed.
     Member {
+        /// Table associated with the failed member.
         table: String,
+        /// Generated or manifest-provided member filename.
         member: String,
+        /// Typed member-WAL failure.
         error: Int64WriteAheadLogError,
     },
 }
@@ -646,6 +809,7 @@ impl From<Int64WriteAheadLogCorruption> for Int64WriteAheadLogError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Int64WriteAheadLogCommitError {
     Limit(Int64WriteAheadLogLimitError),
+    /// A live registry mutation would exceed a directory-wide bound.
     RegistryLimit(Int64WriteAheadLogRegistryLimitError),
     Poisoned,
     Write {

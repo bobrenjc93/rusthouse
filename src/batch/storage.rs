@@ -130,8 +130,8 @@ impl Default for Int64RangePartitionLimits {
 ///
 /// `min` and `max` summarize non-null values only. Both are `None` for an
 /// all-null block; `null_count` distinguishes that case from an empty block.
-/// Batch columns are currently non-nullable, but retaining this metadata makes
-/// block semantics explicit and safe for nullable physical columns.
+/// Batch `Int64` columns may be nullable, so the metadata retains nullness
+/// explicitly without inventing sentinel minimum or maximum values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Int64MinMaxBlockMetadata {
     pub first_row: usize,
