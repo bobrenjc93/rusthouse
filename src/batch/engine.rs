@@ -6297,7 +6297,7 @@ fn execute_grouped<'a>(
         )
         && aggregate_specs
             .first()
-            .is_some_and(|spec| aggregate_argument_is_non_nullable_int64(table, spec));
+            .is_some_and(|spec| aggregate_argument_is_physical_int64(table, spec));
     let sole_global_min_int = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -6717,6 +6717,15 @@ fn aggregate_argument_is_non_nullable_int64(table: &Table, spec: &AggregateSpec)
         .is_some_and(|argument| matches!(table.columns()[argument], Column::Int64(_)))
 }
 
+fn aggregate_argument_is_physical_int64(table: &Table, spec: &AggregateSpec) -> bool {
+    spec.argument.is_some_and(|argument| {
+        matches!(
+            table.columns()[argument],
+            Column::Int64(_) | Column::NullableInt64(_)
+        )
+    })
+}
+
 fn count_matched_rows(matched_rows: usize) -> Result<i64> {
     i64::try_from(matched_rows).map_err(|_| Error::NumericOverflow("COUNT".to_owned()))
 }
@@ -6844,28 +6853,37 @@ fn global_int64_sum_partial(
         AggregateFunction::Sum | AggregateFunction::Avg
     ));
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
-    let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM or AVG argument")]
-    else {
-        unreachable!("SUM or AVG input type is resolved")
-    };
-    reduce_global_int64_sum(
-        values,
-        matching_rows,
-        parallelism,
-        spec.function,
-        sum_int64_chunk,
-    )
+    match &table.columns()[spec.argument.expect("SUM or AVG argument")] {
+        Column::Int64(values) => reduce_global_int64_sum(
+            values,
+            matching_rows,
+            parallelism,
+            spec.function,
+            sum_int64_chunk,
+        ),
+        Column::NullableInt64(values) if spec.function == AggregateFunction::Avg => {
+            reduce_global_int64_sum(
+                values,
+                matching_rows,
+                parallelism,
+                spec.function,
+                avg_nullable_int64_chunk,
+            )
+        }
+        _ => unreachable!("SUM or AVG input type and physical nullability are resolved"),
+    }
 }
 
-fn reduce_global_int64_sum<C>(
-    values: &[i64],
+fn reduce_global_int64_sum<T, C>(
+    values: &[T],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
     function: AggregateFunction,
     chunk: C,
 ) -> Result<SumIntPartial>
 where
-    C: Fn(&[i64], &[usize], AggregateFunction) -> Result<SumIntPartial> + Sync,
+    T: Sync,
+    C: Fn(&[T], &[usize], AggregateFunction) -> Result<SumIntPartial> + Sync,
 {
     let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
         return chunk(values, matching_rows, function);
@@ -6887,15 +6905,16 @@ where
     parallel_result.unwrap_or_else(|| chunk(values, matching_rows, function))
 }
 
-fn try_parallel_sum_int64<C>(
-    values: &[i64],
+fn try_parallel_sum_int64<T, C>(
+    values: &[T],
     matching_rows: &[usize],
     helper_threads: usize,
     function: AggregateFunction,
     chunk: &C,
 ) -> Option<Result<SumIntPartial>>
 where
-    C: Fn(&[i64], &[usize], AggregateFunction) -> Result<SumIntPartial> + Sync,
+    T: Sync,
+    C: Fn(&[T], &[usize], AggregateFunction) -> Result<SumIntPartial> + Sync,
 {
     debug_assert!(helper_threads > 0);
     debug_assert!(matches!(
@@ -6965,6 +6984,29 @@ fn sum_int64_chunk(
                     .ok_or_else(|| {
                         Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
                     })?,
+                count: partial.count.checked_add(1).ok_or_else(|| {
+                    Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
+                })?,
+            })
+        })
+}
+
+fn avg_nullable_int64_chunk(
+    values: &[Option<i64>],
+    matching_rows: &[usize],
+    function: AggregateFunction,
+) -> Result<SumIntPartial> {
+    debug_assert_eq!(function, AggregateFunction::Avg);
+    matching_rows
+        .iter()
+        .try_fold(SumIntPartial::default(), |partial, row| {
+            let Some(value) = values[*row] else {
+                return Ok(partial);
+            };
+            Ok(SumIntPartial {
+                sum: partial.sum.checked_add(i128::from(value)).ok_or_else(|| {
+                    Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
+                })?,
                 count: partial.count.checked_add(1).ok_or_else(|| {
                     Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
                 })?,
@@ -9797,43 +9839,256 @@ mod tests {
     }
 
     #[test]
-    fn nullable_int64_avg_stays_on_the_checked_sequential_aggregate_path() {
+    fn sole_nullable_int64_avg_crosses_the_parallel_threshold_and_excludes_other_shapes() {
         static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
             GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let values = (0..row_count)
-            .map(|row| (row % 2 == 0).then_some(1))
-            .collect::<Vec<_>>();
+        let mut values = vec![Some(3); row_count];
+        values[row_count - 1] = None;
         let mut database = Database::new();
         database
             .create_nullable_int64_table("nullable_values", "value", values)
             .unwrap();
+
+        let boundary_sql = "SELECT AVG(value) FROM nullable_values WHERE value IS NOT NULL";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, boundary_sql).rows,
+            [vec![Value::Float64(3.0)]]
+        );
+        let above_threshold_sql = "SELECT AVG(value) FROM nullable_values";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, above_threshold_sql).rows,
+            [vec![Value::Float64(3.0)]]
+        );
+
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
             database.global_aggregate_worker_cap(),
             &OBSERVED_BUDGET,
         );
 
-        for (sql, expected) in [
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, boundary_sql).rows,
+            [vec![Value::Float64(3.0)]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET.peak_helpers_in_use(),
+            0,
+            "matching rows at the threshold stay sequential"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, above_threshold_sql).rows,
+            [vec![Value::Float64(3.0)]]
+        );
+        assert!(
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
+            "a sole nullable AVG above the threshold uses shared helpers"
+        );
+        assert_eq!(OBSERVED_BUDGET.helpers_in_use(), 0);
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(*) AS rows, AVG(value) AS mean FROM nullable_values"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Float64(3.0),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET.peak_helpers_in_use(),
+            0,
+            "the COUNT plus nullable AVG shape remains sequential"
+        );
+    }
+
+    #[test]
+    fn sole_nullable_int64_avg_forced_workers_match_null_distributions_and_clauses() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
+        let mut all_null = Database::new();
+        all_null
+            .create_nullable_int64_table("all_null", "value", vec![None; row_count])
+            .unwrap();
+        let null_result = assert_global_aggregate_worker_differential(
+            &mut all_null,
+            "SELECT AVG(value) AS mean FROM all_null HAVING mean IS NULL \
+             ORDER BY mean LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(null_result.rows, [vec![Value::Null(DataType::Float64)]]);
+
+        let mut values = vec![None; row_count];
+        values[0] = Some(i64::MIN);
+        values[row_count / 3] = Some(4);
+        values[row_count - 1] = Some(i64::MAX);
+        let mut sparse = Database::new();
+        sparse
+            .create_nullable_int64_table("sparse", "value", values)
+            .unwrap();
+        let mixed_result = assert_global_aggregate_worker_differential(
+            &mut sparse,
+            "SELECT AVG(value) AS mean FROM sparse WHERE value IS NULL OR value IS NOT NULL \
+             HAVING mean = 1 ORDER BY mean DESC LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(mixed_result.rows, [vec![Value::Float64(1.0)]]);
+    }
+
+    #[test]
+    fn sole_nullable_int64_avg_exhausted_admission_falls_back_completely() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let values = (0..row_count)
+            .map(|row| (row % 5 != 0).then_some(9))
+            .collect::<Vec<_>>();
+        let mut database = Database::new();
+        database
+            .create_nullable_int64_table("nullable_values", "value", values)
+            .unwrap();
+        let sql = "SELECT AVG(value) AS mean FROM nullable_values \
+                   HAVING mean = 9 ORDER BY mean LIMIT 1";
+        let sequential = force_global_aggregate_workers(&mut database, 1, sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database.global_aggregate_worker_cap(), &BUDGET);
+
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts aggregate helper admission");
+        let exhausted = query(&mut database, sql);
+        assert_eq!(
+            exhausted, sequential,
+            "exhausted admission repeats the complete computation locally"
+        );
+        assert_eq!(exhausted.rows, [vec![Value::Float64(9.0)]]);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+    }
+
+    #[test]
+    fn sole_nullable_int64_avg_worker_failure_repeats_the_complete_input_locally() {
+        let values = [Some(1), None, Some(17)];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_global_int64_sum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            AggregateFunction::Avg,
+            avg_nullable_int64_chunk,
+        )
+        .expect("deterministic parallel nullable AVG succeeds");
+        let partial = reduce_global_int64_sum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            AggregateFunction::Avg,
+            |values, rows, function| {
+                if std::thread::current().name() == Some("rusthouse-avg-int64-1") {
+                    panic!("injected nullable AVG worker failure");
+                }
+                avg_nullable_int64_chunk(values, rows, function)
+            },
+        )
+        .expect("worker failure falls back to a complete local nullable AVG");
+
+        assert_eq!(partial, successful_parallel);
+        assert_eq!(partial.count, u64::try_from(row_count - 1).unwrap());
+        assert_eq!(
+            partial.sum,
+            i128::try_from(row_count).unwrap().saturating_sub(2) + 17
+        );
+    }
+
+    #[test]
+    fn sole_nullable_int64_avg_forced_workers_preserve_resource_limits() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let fixed_bytes =
+            std::mem::size_of::<AggregateState>() + std::mem::size_of::<Vec<AggregateState>>();
+        let exact_limits = QueryResultLimits {
+            max_scan_rows: row_count,
+            max_rows: 1,
+            max_values: 1,
+            max_groups: 1,
+            max_aggregate_state_cells: 1,
+            max_aggregate_state_bytes: fixed_bytes,
+            ..QueryResultLimits::default()
+        };
+        let mut database = Database::with_query_result_limits(exact_limits);
+        database
+            .create_nullable_int64_table(
+                "nullable_values",
+                "value",
+                (0..row_count)
+                    .map(|row| (row % 2 == 0).then_some(5))
+                    .collect(),
+            )
+            .unwrap();
+
+        let sequential = force_global_aggregate_workers(
+            &mut database,
+            1,
+            "SELECT AVG(value) FROM nullable_values",
+        );
+        let parallel = force_global_aggregate_workers(
+            &mut database,
+            4,
+            "SELECT AVG(value) FROM nullable_values",
+        );
+        assert_eq!(parallel, sequential);
+        assert_eq!(parallel.rows, [vec![Value::Float64(5.0)]]);
+
+        for (limits, expected) in [
             (
-                "SELECT AVG(value) FROM nullable_values",
-                vec![Value::Float64(1.0)],
+                QueryResultLimits {
+                    max_scan_rows: row_count - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT scanned rows",
+                    actual: row_count,
+                    max: row_count - 1,
+                },
             ),
             (
-                "SELECT COUNT(*) AS rows, AVG(value) AS mean FROM nullable_values",
-                vec![
-                    Value::Int64(i64::try_from(row_count).unwrap()),
-                    Value::Float64(1.0),
-                ],
+                QueryResultLimits {
+                    max_aggregate_state_bytes: fixed_bytes - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state bytes",
+                    actual: fixed_bytes,
+                    max: fixed_bytes - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_rows: 0,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result rows",
+                    actual: 1,
+                    max: 0,
+                },
             ),
         ] {
-            OBSERVED_BUDGET.reset_peak();
-            assert_eq!(query(&mut database, sql).rows, [expected]);
-            assert_eq!(
-                OBSERVED_BUDGET.peak_helpers_in_use(),
-                0,
-                "nullable AVG must not request parallel aggregate helpers"
-            );
+            database.query_result_limits = limits;
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+            let sequential = database.execute("SELECT AVG(value) FROM nullable_values");
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
+            let parallel = database.execute("SELECT AVG(value) FROM nullable_values");
+            assert_eq!(parallel, sequential);
+            assert_eq!(parallel, Err(expected));
         }
     }
 
