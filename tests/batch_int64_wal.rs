@@ -79,6 +79,16 @@ fn nullable_int64_minimum(database: &mut Database, table_name: &str) -> Value {
     result.rows[0][0].clone()
 }
 
+fn nullable_int64_sum(database: &mut Database, table_name: &str) -> Value {
+    let results = database
+        .execute(&format!("SELECT SUM(Measurement) FROM {table_name}"))
+        .unwrap();
+    let [StatementResult::Query(result)] = results.as_slice() else {
+        panic!("expected one SUM query result")
+    };
+    result.rows[0][0].clone()
+}
+
 fn metrics(database: &mut Database) -> Vec<Vec<Value>> {
     let results = database
         .execute("SELECT metric, value FROM system.metrics")
@@ -205,6 +215,10 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
         nullable_int64_values(&recovered, "readings"),
         [Some(7), None, Some(-2), None]
     );
+    assert_eq!(
+        nullable_int64_sum(&mut recovered, "readings"),
+        Value::Int64(5)
+    );
     let results = recovered.execute("SHOW CREATE TABLE READINGS").unwrap();
     let [StatementResult::Query(result)] = results.as_slice() else {
         panic!("expected recovered SHOW CREATE result")
@@ -244,6 +258,10 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
         nullable_int64_minimum(&mut database, "readings"),
         Value::Int64(i64::MIN)
     );
+    assert_eq!(
+        nullable_int64_sum(&mut database, "readings"),
+        Value::Int64(-1)
+    );
 
     let mut recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
     assert_eq!(
@@ -253,6 +271,10 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
     assert_eq!(
         nullable_int64_minimum(&mut recovered, "READINGS"),
         Value::Int64(i64::MIN)
+    );
+    assert_eq!(
+        nullable_int64_sum(&mut recovered, "READINGS"),
+        Value::Int64(-1)
     );
     let results = recovered
         .execute("SELECT toString(Measurement) AS rendered FROM READINGS ORDER BY rendered")
@@ -280,6 +302,10 @@ fn sql_null_append_replays_for_nullable_int64_wal() {
     );
     assert_eq!(
         nullable_int64_minimum(&mut all_null_recovered, "readings"),
+        Value::Null(rusthouse::batch::value::DataType::Int64)
+    );
+    assert_eq!(
+        nullable_int64_sum(&mut all_null_recovered, "readings"),
         Value::Null(rusthouse::batch::value::DataType::Int64)
     );
     let results = all_null_recovered
@@ -322,6 +348,10 @@ fn failed_sql_null_wal_append_is_not_published_to_nullable_storage() {
     assert!(nullable_int64_values(&recovered, "READINGS").is_empty());
     assert_eq!(
         nullable_int64_minimum(&mut recovered, "READINGS"),
+        Value::Null(rusthouse::batch::value::DataType::Int64)
+    );
+    assert_eq!(
+        nullable_int64_sum(&mut recovered, "READINGS"),
         Value::Null(rusthouse::batch::value::DataType::Int64)
     );
 }
