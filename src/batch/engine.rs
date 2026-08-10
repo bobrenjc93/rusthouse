@@ -3576,11 +3576,8 @@ impl Database {
             .tables_in_name_order()
             .into_iter()
             .flat_map(|table| {
-                table
-                    .schema()
-                    .iter()
-                    .enumerate()
-                    .map(move |(index, column)| {
+                table.schema().iter().zip(table.columns()).enumerate().map(
+                    move |(index, (column, values))| {
                         let position = index
                             .checked_add(1)
                             .and_then(|position| i64::try_from(position).ok())
@@ -3589,10 +3586,11 @@ impl Database {
                             Value::String(DATABASE_NAME.to_owned()),
                             Value::String(table.name().to_owned()),
                             Value::String(column.name.clone()),
-                            Value::String(column.data_type.as_str().to_owned()),
+                            Value::String(values.metadata_type_name().to_owned()),
                             Value::Int64(position),
                         ]
-                    })
+                    },
+                )
             })
             .collect::<Vec<_>>();
         debug_assert_eq!(rows.len(), row_count);
@@ -3736,11 +3734,12 @@ impl Database {
         let value_bytes = table
             .schema()
             .iter()
-            .map(|field| {
+            .zip(table.columns())
+            .map(|(field, values)| {
                 field
                     .name
                     .len()
-                    .saturating_add(field.data_type.as_str().len())
+                    .saturating_add(values.metadata_type_name().len())
             })
             .fold(0_usize, usize::saturating_add);
         let bytes = fixed_bytes.saturating_add(value_bytes);
@@ -3763,10 +3762,11 @@ impl Database {
         let rows = table
             .schema()
             .iter()
-            .map(|field| {
+            .zip(table.columns())
+            .map(|(field, values)| {
                 vec![
                     Value::String(field.name.clone()),
-                    Value::String(field.data_type.as_str().to_owned()),
+                    Value::String(values.metadata_type_name().to_owned()),
                 ]
             })
             .collect();

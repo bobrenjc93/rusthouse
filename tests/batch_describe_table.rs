@@ -29,6 +29,19 @@ fn describe_result_bytes(schema: &[(&str, DataType)]) -> usize {
             .sum::<usize>()
 }
 
+fn describe_result_bytes_with_type_names(schema: &[(&str, &str)]) -> usize {
+    let row_count = schema.len();
+    2 * size_of::<ResultColumn>()
+        + "name".len()
+        + "type".len()
+        + row_count * size_of::<Vec<Value>>()
+        + row_count * 2 * size_of::<Value>()
+        + schema
+            .iter()
+            .map(|(name, type_name)| name.len() + type_name.len())
+            .sum::<usize>()
+}
+
 #[test]
 fn parses_only_describe_table_name_with_an_optional_semicolon() {
     for sql in ["DESCRIBE TABLE metrics", "describe table Metrics;"] {
@@ -102,6 +115,48 @@ fn returns_all_four_types_in_schema_order_and_reports_missing_tables() {
     assert_eq!(
         database.execute("DESCRIBE TABLE absent;"),
         Err(Error::TableNotFound("absent".to_owned()))
+    );
+}
+
+#[test]
+fn reports_physical_nullable_int64_and_preflights_its_exact_type_bytes() {
+    const TYPE_NAME: &str = "Nullable(Int64)";
+    let expected_rows = [vec![
+        Value::String("Measurement".to_owned()),
+        Value::String(TYPE_NAME.to_owned()),
+    ]];
+    let exact_bytes = describe_result_bytes_with_type_names(&[("Measurement", TYPE_NAME)]);
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 2,
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    exact
+        .create_nullable_int64_table("Readings", "Measurement", vec![Some(7), None])
+        .expect("create nullable table");
+    assert_eq!(
+        query(&mut exact, "DESCRIBE TABLE readings").rows,
+        expected_rows
+    );
+
+    let mut one_byte_short = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 2,
+        max_bytes: exact_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_byte_short
+        .create_nullable_int64_table("Readings", "Measurement", vec![None])
+        .expect("create nullable table");
+    assert_eq!(
+        one_byte_short.execute("DESCRIBE TABLE readings"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "DESCRIBE TABLE result bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        })
     );
 }
 

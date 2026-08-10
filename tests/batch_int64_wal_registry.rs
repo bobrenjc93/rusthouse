@@ -175,6 +175,35 @@ fn nullable_created_and_recovered_tables_reject_unsupported_physical_operations(
     let mut recovered =
         Database::recover_int64_write_ahead_log_registry(&registry, limits()).unwrap();
     assert_nullable_aggregate_behavior(&mut recovered, "ALPHA");
+
+    let results = recovered.execute("DESCRIBE TABLE Alpha").unwrap();
+    let [StatementResult::Query(describe)] = results.as_slice() else {
+        panic!("expected DESCRIBE TABLE query")
+    };
+    assert_eq!(
+        describe.rows,
+        [vec![
+            Value::String("v".to_owned()),
+            Value::String("Nullable(Int64)".to_owned()),
+        ]]
+    );
+
+    let results = recovered
+        .execute("SELECT database, table, name, type, position FROM system.columns")
+        .unwrap();
+    let [StatementResult::Query(system_columns)] = results.as_slice() else {
+        panic!("expected system.columns query")
+    };
+    assert_eq!(
+        system_columns.rows,
+        [vec![
+            Value::String("default".to_owned()),
+            Value::String("Alpha".to_owned()),
+            Value::String("v".to_owned()),
+            Value::String("Nullable(Int64)".to_owned()),
+            Value::Int64(1),
+        ]]
+    );
 }
 
 #[test]
