@@ -12,8 +12,8 @@ use super::engine::DatabaseSnapshotSaveError;
 use super::engine::{
     DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, DatabaseSnapshotRestoreEntry,
     DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, IndexPruningMetrics,
-    Int64MinMaxIndexAdmission, Int64MinMaxIndexLimits, QueryResult, QueryResultLimits,
-    StatementResult, TableLimits,
+    Int64MinMaxIndexAdmission, Int64MinMaxIndexLimits, ParameterizedQueryLimits, QueryResult,
+    QueryResultLimits, StatementResult, TableLimits,
 };
 use super::error::Error;
 use super::sql::{self, Statement};
@@ -955,32 +955,28 @@ impl SharedDatabase {
     ///
     /// Parsing and read-only validation finish before the single nonblocking
     /// read-lock attempt. Nonzero supplied limits can tighten, but cannot
-    /// relax, the database's configured result-byte, result-row, scan-row,
-    /// group-count, and supported global-aggregate worker limits or the default
-    /// retained-result byte limit. Zero retains the corresponding defaults.
+    /// relax, the database's configured result-byte, result-row, result-value,
+    /// scan-row, group-count, and supported global-aggregate worker limits or
+    /// the default retained-result byte limit. Zero retains the corresponding
+    /// defaults.
     pub(crate) fn try_query_with_parameterized_workload_limits(
         &self,
         input: &str,
-        max_result_bytes: usize,
-        max_result_rows: usize,
-        max_scan_rows: usize,
-        max_groups: usize,
-        max_threads: usize,
+        requested_limits: ParameterizedQueryLimits,
     ) -> Result<QueryResult, SharedDatabaseError> {
         let statement = parse_query_statement(input)?;
-        let max_result_bytes = if max_result_bytes == 0 {
+        let max_result_bytes = if requested_limits.max_result_bytes == 0 {
             DEFAULT_MAX_RETAINED_RESULT_BYTES
         } else {
-            DEFAULT_MAX_RETAINED_RESULT_BYTES.min(max_result_bytes)
+            DEFAULT_MAX_RETAINED_RESULT_BYTES.min(requested_limits.max_result_bytes)
         };
         self.try_read()?
             .execute_query_statement_with_parameterized_limits(
                 statement,
-                max_result_bytes,
-                max_result_rows,
-                max_scan_rows,
-                max_groups,
-                max_threads,
+                ParameterizedQueryLimits {
+                    max_result_bytes,
+                    ..requested_limits
+                },
             )
             .map_err(Into::into)
     }

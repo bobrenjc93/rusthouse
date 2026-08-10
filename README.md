@@ -879,12 +879,12 @@ case-insensitive, permit one optional trailing semicolon, and otherwise must be
 exact: an explicit column list, another format, or any extra SQL is not
 accepted as query-plus-data. Both parameterized request forms also accept one
 optional `database=default` parameter, one optional decimal `max_result_rows`
-parameter, one optional decimal `max_result_bytes` parameter, one optional
-decimal `max_rows_to_read` parameter, one optional decimal
-`max_rows_to_group_by` parameter, one optional decimal `max_threads` parameter,
-one optional decimal `readonly` parameter, and one optional `default_format`
-parameter in any order with `query`, including percent-encoded parameter names
-and values.
+parameter, one optional decimal `max_result_values` parameter, one optional
+decimal `max_result_bytes` parameter, one optional decimal `max_rows_to_read`
+parameter, one optional decimal `max_rows_to_group_by` parameter, one optional
+decimal `max_threads` parameter, one optional decimal `readonly` parameter, and
+one optional `default_format` parameter in any order with `query`, including
+percent-encoded parameter names and values.
 All names and values use form-style decoding: each `%HH` escape becomes one
 byte and `+` becomes a space. `default_format` accepts the exact case-sensitive values
 `JSON`, `CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`,
@@ -895,6 +895,12 @@ database's configured query-result row limit for that request, while zero
 disables the request-level limit and retains the configured cap. A larger value
 never relaxes the configured limit. The effective row limit is checked with
 the other query-result shape limits before result rows are materialized.
+`max_result_values` has the same decimal syntax and zero behavior. A nonzero
+value tightens the database's configured query-result value-cell limit for that
+request, while a larger value never relaxes the configured limit. The effective
+cap counts rows multiplied by projected columns and is checked before result
+values are materialized. It does not change `SHOW SETTINGS`, `system.settings`,
+or the persistent database configuration.
 `max_result_bytes` has the same decimal syntax and zero behavior. A nonzero
 value tightens both the configured per-query result-byte limit and the default
 retained-result byte limit for that request; a larger value never relaxes
@@ -927,12 +933,12 @@ or changes persistent configuration.
 The decoded SQL then undergoes strict UTF-8 validation and is subject to the
 same SQL byte limit as a POST body; the database, workload-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
-duplicate `query`, `database`, `max_result_rows`, `max_result_bytes`,
-`max_rows_to_read`, `max_rows_to_group_by`, `max_threads`, `readonly`, or
-`default_format` parameters, malformed or overflowing workload limits,
-malformed or out-of-range `readonly` values, unknown parameters, malformed
-escapes, non-default database values, unsupported formats, and invalid SQL
-UTF-8 are rejected.
+duplicate `query`, `database`, `max_result_rows`, `max_result_values`,
+`max_result_bytes`, `max_rows_to_read`, `max_rows_to_group_by`, `max_threads`,
+`readonly`, or `default_format` parameters, malformed or overflowing workload
+limits, malformed or out-of-range `readonly` values, unknown parameters,
+malformed escapes, non-default database values, unsupported formats, and
+invalid SQL UTF-8 are rejected.
 Parameter validation follows configured authentication and precedes database
 lock admission. GET requests and every request handled by any read-only API use
 the read-only, exactly-one-statement nonblocking `SharedDatabase::try_query`
