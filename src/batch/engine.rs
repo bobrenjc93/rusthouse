@@ -5132,7 +5132,6 @@ fn resolve_select_items(
                         actual: actual.to_string(),
                     });
                 }
-                reject_nullable_operation(table, source, "Int64 subtraction")?;
                 if has_aggregate || !group_columns.is_empty() {
                     return Err(Error::InvalidQuery(
                         "Int64 subtraction projections are only supported in ungrouped SELECT queries"
@@ -5672,9 +5671,12 @@ fn execute_projection(
                 .map(|item| {
                     Ok(match item {
                         ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                        ResolvedItem::Int64Subtract { source, literal } => Value::Int64(
-                            checked_int64_subtract(int64_at(table, *source, *row), *literal)?,
-                        ),
+                        ResolvedItem::Int64Subtract { source, literal } => {
+                            checked_nullable_int64_subtract(
+                                table.columns()[*source].value_ref(*row),
+                                *literal,
+                            )?
+                        }
                         ResolvedItem::CastInt64ToFloat64 { source } => {
                             Value::Float64(int64_at(table, *source, *row) as f64)
                         }
@@ -7949,11 +7951,12 @@ fn order_source_rows(
         for order in ordering {
             let comparison = match items[order.output] {
                 ResolvedItem::Column { source, .. } => table.columns()[source].cmp_at(left, right),
-                // Subtracting one constant is monotonic over mathematical
-                // integers. Compare the source values so overflow is checked
-                // only after ORDER BY and LIMIT have selected output rows.
+                // Subtracting one constant is monotonic over present
+                // mathematical integers and propagates NULL. Compare the
+                // source values so NULL placement is preserved and overflow
+                // is checked only after ordering and pagination select rows.
                 ResolvedItem::Int64Subtract { source, .. } => {
-                    int64_at(table, source, left).cmp(&int64_at(table, source, right))
+                    table.columns()[source].cmp_at(left, right)
                 }
                 ResolvedItem::CastInt64ToFloat64 { source } => {
                     let left = ValueRef::Float64(int64_at(table, source, left) as f64);
@@ -8656,6 +8659,16 @@ fn checked_int64_subtract(value: i64, literal: i64) -> Result<i64> {
     value
         .checked_sub(literal)
         .ok_or_else(|| Error::NumericOverflow("Int64 subtraction".to_owned()))
+}
+
+fn checked_nullable_int64_subtract(value: ValueRef<'_>, literal: i64) -> Result<Value> {
+    match value {
+        ValueRef::Null(DataType::Int64) => Ok(Value::Null(DataType::Int64)),
+        ValueRef::Int64(value) => Ok(Value::Int64(checked_int64_subtract(value, literal)?)),
+        ValueRef::Null(_) | ValueRef::Float64(_) | ValueRef::Bool(_) | ValueRef::String(_) => {
+            unreachable!("Int64 subtraction input type is resolved")
+        }
+    }
 }
 
 fn sort_and_limit(

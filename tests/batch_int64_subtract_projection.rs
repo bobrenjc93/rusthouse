@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use rusthouse::batch::engine::{
     Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
 };
@@ -104,6 +106,100 @@ fn subtracts_negative_literals_and_integer_extremes_with_aliases() {
         )
         .rows,
         [vec![Value::Int64(-2)], vec![Value::Int64(12)]]
+    );
+}
+
+#[test]
+fn nullable_subtraction_propagates_nulls_and_preserves_projection_and_pagination() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (reading Nullable(Int64)); \
+             INSERT INTO samples VALUES \
+             (NULL), (9223372036854775807), (-7), (NULL), (7), \
+             (-9223372036854775808); \
+             CREATE TABLE all_missing (reading Nullable(Int64)); \
+             INSERT INTO all_missing VALUES (NULL), (NULL);",
+        )
+        .expect("setup");
+
+    let paged = query(
+        &mut database,
+        "SELECT reading - 0 AS adjusted, reading - -1 AS shifted \
+         FROM samples ORDER BY reading - 0 LIMIT 4 OFFSET 1",
+    );
+    assert_eq!(
+        paged.columns,
+        [
+            ResultColumn {
+                name: "adjusted".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "shifted".to_owned(),
+                data_type: DataType::Int64,
+            },
+        ]
+    );
+    assert_eq!(
+        paged.rows,
+        [
+            vec![Value::Null(DataType::Int64), Value::Null(DataType::Int64)],
+            vec![Value::Int64(i64::MIN), Value::Int64(i64::MIN + 1)],
+            vec![Value::Int64(-7), Value::Int64(-6)],
+            vec![Value::Int64(7), Value::Int64(8)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT reading - 0 AS adjusted FROM samples \
+             ORDER BY adjusted DESC LIMIT 5",
+        )
+        .rows,
+        [
+            vec![Value::Int64(i64::MAX)],
+            vec![Value::Int64(7)],
+            vec![Value::Int64(-7)],
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Null(DataType::Int64)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT reading - -9223372036854775808 AS adjusted \
+             FROM all_missing ORDER BY adjusted LIMIT 1 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Null(DataType::Int64)]]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT reading - -9223372036854775808 FROM samples \
+             WHERE reading = -9223372036854775808",
+        )
+        .rows,
+        [vec![Value::Int64(0)]]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT reading - 9223372036854775807 FROM samples \
+             WHERE reading = 9223372036854775807",
+        )
+        .rows,
+        [vec![Value::Int64(0)]]
+    );
+    assert_eq!(
+        database.execute(
+            "SELECT reading - -1 FROM samples \
+             WHERE reading = 9223372036854775807",
+        ),
+        Err(Error::NumericOverflow("Int64 subtraction".to_owned()))
     );
 }
 
@@ -300,6 +396,41 @@ fn subtraction_projection_obeys_result_caps() {
             ..
         })
     ));
+
+    let result_name = "adjusted";
+    let exact_bytes = size_of::<ResultColumn>()
+        + result_name.len()
+        + 2 * size_of::<Vec<Value>>()
+        + 2 * size_of::<Value>();
+    let setup = "CREATE TABLE samples (reading Nullable(Int64)); \
+                 INSERT INTO samples VALUES (NULL), (8);";
+    let sql = "SELECT reading - 1 AS adjusted FROM samples";
+    let exact_limits = QueryResultLimits {
+        max_rows: 2,
+        max_values: 2,
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    };
+    let mut exact = Database::with_query_result_limits(exact_limits);
+    exact.execute(setup).expect("setup");
+    assert_eq!(
+        query(&mut exact, sql).rows,
+        [vec![Value::Null(DataType::Int64)], vec![Value::Int64(7)],]
+    );
+
+    let mut one_byte_short = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes - 1,
+        ..exact_limits
+    });
+    one_byte_short.execute(setup).expect("setup");
+    assert_eq!(
+        one_byte_short.execute(sql),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        })
+    );
 }
 
 #[test]
