@@ -234,6 +234,67 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
 }
 
 #[test]
+fn nullable_null_update_is_wal_first_and_recovers() {
+    let directory = TestDirectory::new();
+    let path = directory.join("nullable-null-update.wal");
+    let limits = Int64WriteAheadLogLimits::default();
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Readings (Measurement Nullable(Int64)); \
+             INSERT INTO Readings VALUES (7), (-2), (7), (NULL);",
+        )
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+    database
+        .execute("ALTER TABLE Readings UPDATE Measurement = NULL WHERE Measurement = 7;")
+        .unwrap();
+    assert_eq!(
+        nullable_int64_values(&database, "readings"),
+        [None, Some(-2), None, None]
+    );
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert_eq!(
+        nullable_int64_values(&recovered, "readings"),
+        [None, Some(-2), None, None]
+    );
+
+    let failed_path = directory.join("nullable-null-update-failed.wal");
+    let one_record = Int64WriteAheadLogLimits::new(64 * 1024, 16 * 1024, 1);
+    let mut failed = Database::new();
+    failed
+        .execute(
+            "CREATE TABLE Readings (Measurement Nullable(Int64)); \
+             INSERT INTO Readings VALUES (1), (2);",
+        )
+        .unwrap();
+    failed
+        .enable_int64_write_ahead_log("readings", &failed_path, one_record)
+        .unwrap();
+    assert!(matches!(
+        failed.execute("ALTER TABLE Readings UPDATE Measurement = NULL WHERE Measurement = 2;"),
+        Err(Error::WriteAheadLog(Int64WriteAheadLogCommitError::Limit(
+            Int64WriteAheadLogLimitError::Records {
+                records: 2,
+                max_records: 1,
+            }
+        )))
+    ));
+    assert_eq!(
+        nullable_int64_values(&failed, "readings"),
+        [Some(1), Some(2)]
+    );
+    let recovered_failed =
+        Database::recover_int64_write_ahead_log(&failed_path, one_record).unwrap();
+    assert_eq!(
+        nullable_int64_values(&recovered_failed, "readings"),
+        [Some(1), Some(2)]
+    );
+}
+
+#[test]
 fn nullable_csv_appends_recover_from_wal_for_named_and_headerless_inputs() {
     let directory = TestDirectory::new();
     let path = directory.join("nullable-csv.wal");

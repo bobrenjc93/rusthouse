@@ -1,7 +1,7 @@
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{AlterUpdateLiteral, AlterUpdateValue, Statement, parse};
-use rusthouse::batch::storage::Column;
+use rusthouse::batch::storage::{Column, Int64MinMaxBlockMetadata, Int64MinMaxIndexLimits};
 use rusthouse::batch::value::{DataType, Value};
 use rusthouse::{SharedDatabase, SharedDatabaseError};
 
@@ -37,6 +37,15 @@ fn string_column(database: &Database, table: &str, column: &str) -> Vec<String> 
     let index = table.column_index(column).expect("column exists");
     let Column::String(values) = &table.columns()[index] else {
         panic!("column is String");
+    };
+    values.clone()
+}
+
+fn nullable_int64_column(database: &Database, table: &str, column: &str) -> Vec<Option<i64>> {
+    let table = database.catalog().table(table).expect("table exists");
+    let index = table.column_index(column).expect("column exists");
+    let Column::NullableInt64(values) = &table.columns()[index] else {
+        panic!("column is Nullable(Int64)");
     };
     values.clone()
 }
@@ -146,6 +155,131 @@ fn parses_empty_unicode_and_doubled_quote_string_literals() {
             predicate_column: "Category".to_owned(),
             predicate_value: AlterUpdateValue::String(String::new()),
         }])
+    );
+}
+
+#[test]
+fn parses_null_only_in_the_alter_update_assignment() {
+    assert_eq!(
+        parse("ALTER TABLE Readings UPDATE Measurement = nUlL WHERE Measurement = -2"),
+        Ok(vec![Statement::AlterUpdateOwned {
+            table: "Readings".to_owned(),
+            target_column: "Measurement".to_owned(),
+            value: AlterUpdateValue::Null,
+            predicate_column: "Measurement".to_owned(),
+            predicate_value: AlterUpdateLiteral::Int64(-2).into(),
+        }])
+    );
+    assert!(parse("ALTER TABLE Readings UPDATE Measurement = 0 WHERE Measurement = NULL").is_err());
+}
+
+#[test]
+fn sql_created_nullable_target_accepts_null_and_refreshes_its_index() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Readings (Measurement Nullable(Int64)); \
+             INSERT INTO Readings VALUES (7), (2), (7), (NULL);",
+        )
+        .expect("setup succeeds");
+    database
+        .create_int64_min_max_index(
+            "readings",
+            "measurement",
+            Int64MinMaxIndexLimits::new(2, 2, usize::MAX),
+        )
+        .expect("nullable index is admitted");
+
+    assert_eq!(
+        database.execute("ALTER TABLE READINGS UPDATE MEASUREMENT = NULL WHERE measurement = 7;"),
+        Ok(vec![StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 2,
+        }])
+    );
+    assert_eq!(
+        nullable_int64_column(&database, "readings", "measurement"),
+        [None, Some(2), None, None]
+    );
+    assert_eq!(
+        database
+            .catalog()
+            .table("readings")
+            .unwrap()
+            .int64_min_max_index_blocks()
+            .unwrap(),
+        [
+            Int64MinMaxBlockMetadata {
+                first_row: 0,
+                row_count: 2,
+                min: Some(2),
+                max: Some(2),
+                null_count: 1,
+            },
+            Int64MinMaxBlockMetadata {
+                first_row: 2,
+                row_count: 2,
+                min: None,
+                max: None,
+                null_count: 2,
+            },
+        ]
+    );
+
+    assert_eq!(
+        database.execute("ALTER TABLE readings UPDATE measurement = NULL WHERE measurement = 99;"),
+        Ok(vec![StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 0,
+        }])
+    );
+    assert_eq!(
+        nullable_int64_column(&database, "readings", "measurement"),
+        [None, Some(2), None, None]
+    );
+}
+
+#[test]
+fn null_assignment_rejects_non_nullable_targets_and_honors_scan_limits_atomically() {
+    let mut non_nullable = Database::new();
+    non_nullable
+        .execute("CREATE TABLE Readings (Measurement Int64); INSERT INTO Readings VALUES (1), (2);")
+        .unwrap();
+    assert_eq!(
+        non_nullable
+            .execute("ALTER TABLE Readings UPDATE Measurement = NULL WHERE Measurement = 2;"),
+        Err(Error::TypeMismatch {
+            context: "ALTER TABLE UPDATE target column 'Readings.Measurement'".to_owned(),
+            expected: "Int64".to_owned(),
+            actual: "NULL".to_owned(),
+        })
+    );
+    assert_eq!(
+        int64_column(&non_nullable, "readings", "measurement"),
+        [1, 2]
+    );
+
+    let mut bounded = Database::with_query_result_limits(QueryResultLimits {
+        max_scan_rows: 2,
+        ..QueryResultLimits::default()
+    });
+    bounded
+        .execute(
+            "CREATE TABLE Readings (Measurement Nullable(Int64)); \
+             INSERT INTO Readings VALUES (1), (2), (3);",
+        )
+        .unwrap();
+    assert_eq!(
+        bounded.execute("ALTER TABLE Readings UPDATE Measurement = NULL WHERE Measurement = 99;"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "ALTER TABLE UPDATE scanned rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+    assert_eq!(
+        nullable_int64_column(&bounded, "readings", "measurement"),
+        [Some(1), Some(2), Some(3)]
     );
 }
 

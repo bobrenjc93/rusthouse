@@ -3140,6 +3140,23 @@ impl Database {
             let target = self.catalog.table(&table)?;
             let target_index = target.column_index(&target_column)?;
             let predicate_index = target.column_index(&predicate_column)?;
+            if matches!(&predicate_value, AlterUpdateValue::Null) {
+                return Err(Error::InvalidQuery(
+                    "ALTER TABLE UPDATE WHERE comparison does not accept NULL".to_owned(),
+                ));
+            }
+            if matches!(&value, AlterUpdateValue::Null)
+                && !target.column_is_nullable_int64(target_index)
+            {
+                return Err(Error::TypeMismatch {
+                    context: format!(
+                        "ALTER TABLE UPDATE target column '{}.{target_column}'",
+                        target.name()
+                    ),
+                    expected: target.schema()[target_index].data_type.to_string(),
+                    actual: "NULL".to_owned(),
+                });
+            }
             for (column, index, literal, role) in [
                 (&target_column, target_index, &value, "target"),
                 (
