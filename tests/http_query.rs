@@ -6409,11 +6409,45 @@ fn http_insert_and_query_round_trip_sql_created_nullable_int64_values() {
     assert_response(
         &exchange(
             &database,
+            &request_for_target(
+                "/query",
+                b"SELECT measurement FROM readings WHERE measurement iS nUlL;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"measurement","type":"Int64"}],"rows":[[null]]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target(
+                "/query",
+                b"SELECT measurement FROM readings \
+                  WHERE measurement IS NOT NULL ORDER BY measurement;",
+            ),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"measurement","type":"Int64"}],"rows":[[-2],[7]]}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
             &request_for_target("/query", b"SHOW CREATE TABLE readings;"),
         ),
         "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"statement","type":"String"}],"rows":[["CREATE TABLE Readings (measurement Nullable(Int64))"]]}"#,
     );
+
+    let malformed = exchange(
+        &database,
+        &request_for_target(
+            "/query",
+            b"SELECT measurement FROM readings WHERE measurement IS NOT;",
+        ),
+    );
+    let malformed = std::str::from_utf8(&malformed).expect("HTTP response is UTF-8");
+    assert!(malformed.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(malformed.contains("expected keyword NULL"));
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{Cursor, ErrorKind};
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,7 +23,10 @@ use rusthouse::batch::wal::{
     Int64WriteAheadLogCorruption, Int64WriteAheadLogError, Int64WriteAheadLogLimitError,
     Int64WriteAheadLogLimits,
 };
-use rusthouse::{DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError, TableLimits};
+use rusthouse::{
+    DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError, SharedDatabase, TableLimits,
+    handle_http_query,
+};
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -221,6 +224,19 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
         nullable_int64_sum(&mut recovered, "readings"),
         Value::Int64(5)
     );
+    let missing = recovered
+        .execute("SELECT Measurement FROM readings WHERE Measurement IS NULL")
+        .unwrap();
+    let [StatementResult::Query(missing)] = missing.as_slice() else {
+        panic!("expected recovered nullness query result")
+    };
+    assert_eq!(
+        missing.rows,
+        [
+            vec![Value::Null(rusthouse::batch::value::DataType::Int64)],
+            vec![Value::Null(rusthouse::batch::value::DataType::Int64)],
+        ]
+    );
     let results = recovered.execute("SHOW CREATE TABLE READINGS").unwrap();
     let [StatementResult::Query(result)] = results.as_slice() else {
         panic!("expected recovered SHOW CREATE result")
@@ -230,6 +246,24 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
         [vec![Value::String(
             "CREATE TABLE Readings (Measurement Nullable(Int64))".to_owned()
         )]]
+    );
+
+    let database = SharedDatabase::new(recovered);
+    let sql =
+        b"SELECT Measurement FROM readings WHERE Measurement IS NOT NULL ORDER BY Measurement";
+    let request = format!(
+        "POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        sql.len()
+    );
+    let mut request = request.into_bytes();
+    request.extend_from_slice(sql);
+    let mut response = Vec::new();
+    handle_http_query(&database, Cursor::new(request), &mut response).unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(
+        response
+            .ends_with(r#"{"columns":[{"name":"Measurement","type":"Int64"}],"rows":[[-2],[7]]}"#)
     );
 }
 
