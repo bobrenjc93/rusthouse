@@ -167,6 +167,89 @@ fn ordered_row_number_supports_both_directions_stable_ties_filtering_and_limit()
 }
 
 #[test]
+fn ordered_row_number_accepts_sql_created_nullable_keys_with_ordinary_null_placement() {
+    let filtered_rows = 6;
+    let filtered_state_bytes = filtered_rows * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES;
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: filtered_state_bytes,
+        ..QueryResultLimits::default()
+    });
+    let results = database
+        .execute(
+            "CREATE TABLE events (rank_key Nullable(Int64)); \
+             ALTER TABLE events ADD COLUMN id Int64; \
+             INSERT INTO events VALUES \
+                 (NULL, 10), (2, 20), (1, 30), (2, 40), \
+                 (NULL, 50), (1, 60), (9, 70); \
+             CREATE TABLE all_null (rank_key Nullable(Int64)); \
+             ALTER TABLE all_null ADD COLUMN id Int64; \
+             INSERT INTO all_null VALUES (NULL, 3), (NULL, 1), (NULL, 2); \
+             SELECT id, rank_key, \
+                    ROW_NUMBER() OVER (ORDER BY rank_key ASC) AS n \
+             FROM events WHERE id <= 60 LIMIT 5; \
+             SELECT id, rank_key, \
+                    ROW_NUMBER() OVER (ORDER BY rank_key DESC) AS n \
+             FROM events WHERE id <= 60 LIMIT 5; \
+             SELECT id, ROW_NUMBER() OVER (ORDER BY rank_key ASC) AS n \
+             FROM all_null LIMIT 2; \
+             SELECT id, ROW_NUMBER() OVER (ORDER BY rank_key DESC) AS n \
+             FROM all_null LIMIT 2;",
+        )
+        .expect("nullable ordered ROW_NUMBER queries succeed");
+
+    assert_eq!(
+        query(&results[6]).rows,
+        [
+            vec![
+                Value::Int64(10),
+                Value::Null(DataType::Int64),
+                Value::Int64(1)
+            ],
+            vec![
+                Value::Int64(50),
+                Value::Null(DataType::Int64),
+                Value::Int64(2)
+            ],
+            vec![Value::Int64(30), Value::Int64(1), Value::Int64(3)],
+            vec![Value::Int64(60), Value::Int64(1), Value::Int64(4)],
+            vec![Value::Int64(20), Value::Int64(2), Value::Int64(5)],
+        ]
+    );
+    assert_eq!(
+        query(&results[7]).rows,
+        [
+            vec![Value::Int64(20), Value::Int64(2), Value::Int64(1)],
+            vec![Value::Int64(40), Value::Int64(2), Value::Int64(2)],
+            vec![Value::Int64(30), Value::Int64(1), Value::Int64(3)],
+            vec![Value::Int64(60), Value::Int64(1), Value::Int64(4)],
+            vec![
+                Value::Int64(10),
+                Value::Null(DataType::Int64),
+                Value::Int64(5)
+            ],
+        ]
+    );
+    let stable_all_null = [
+        vec![Value::Int64(3), Value::Int64(1)],
+        vec![Value::Int64(1), Value::Int64(2)],
+    ];
+    assert_eq!(query(&results[8]).rows, stable_all_null);
+    assert_eq!(query(&results[9]).rows, stable_all_null);
+
+    assert_eq!(
+        database.execute(
+            "SELECT ROW_NUMBER() OVER (ORDER BY rank_key ASC) \
+             FROM events LIMIT 1"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT ordering state bytes",
+            actual: 7 * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES,
+            max: filtered_state_bytes,
+        })
+    );
+}
+
+#[test]
 fn ordered_row_number_preflights_exact_filtered_state_and_preserves_stable_ties() {
     let setup = "CREATE TABLE events (id Int64, rank_key Int64, keep Bool); \
                  INSERT INTO events VALUES \

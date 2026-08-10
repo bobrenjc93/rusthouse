@@ -4817,7 +4817,6 @@ fn resolve_row_number_ordering(
             actual: actual.to_string(),
         });
     }
-    reject_nullable_operation(table, source, "ROW_NUMBER ORDER BY")?;
 
     Ok(Some(ResolvedWindowOrder {
         source,
@@ -4842,8 +4841,7 @@ fn order_window_rows(
     limit: Option<usize>,
 ) {
     sort_and_limit(rows, limit, |left, right| {
-        let comparison =
-            int64_at(table, ordering.source, left).cmp(&int64_at(table, ordering.source, right));
+        let comparison = table.columns()[ordering.source].cmp_at(left, right);
         let comparison = if ordering.descending {
             comparison.reverse()
         } else {
