@@ -115,10 +115,12 @@ byte caps; a zero granularity, a full database index slot, or either exceeded
 cap is an admission rejection and leaves existing state unchanged. Each block
 records its first row, row count, non-null minimum/maximum, and null count;
 all-null blocks therefore have no extrema. Physical column vectors support
-`Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL DDL
-cannot currently declare nullable columns; `Nullable(Int64)` storage is instead
-created through library APIs or WAL recovery. The index metadata has explicit
-nullable-block semantics for both `Int64` storage forms.
+`Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL accepts
+the exact one-column `CREATE TABLE <name> (<column> Nullable(Int64))` shape
+case-insensitively; other nullable types and nullable multi-column declarations
+remain outside the bounded grammar. Library APIs and WAL recovery can also
+create this physical storage. The index metadata has explicit nullable-block
+semantics for both `Int64` storage forms.
 
 An admitted, current index can reject blocks only for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
@@ -371,9 +373,16 @@ integer conversions are checked before result storage is allocated. The query
 reads constant-time cached database measurements without scanning tables or
 values and is available through the normal `Database`, `SharedDatabase`, CLI,
 and HTTP paths in every supported format.
-`SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
-bounded `String`, preserving the stored table and column display names and
-schema order while normalizing type spellings.
+`SHOW CREATE TABLE <name>` returns canonical, replayable DDL as a bounded
+`String`, preserving the stored table and column display names and schema order
+while normalizing type spellings. Ordinary schemas and sole-column
+`Nullable(Int64)` tables use one `CREATE TABLE` statement. If non-nullable
+columns were subsequently appended to a nullable table, the result uses that
+one-column nullable `CREATE TABLE` followed by ordered `ALTER TABLE ... ADD
+COLUMN` statements so it remains inside the bounded grammar. Because the
+normal executor accepts at most 4,096 statements, nullable tables admit at
+most 4,096 columns even when a larger custom table-column limit is configured;
+the rejected addition leaves the table unchanged.
 `DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
 and `type` `String` columns, rendering physical nullable `Int64` storage as
 `Nullable(Int64)`. It uses case-insensitive table lookup and applies the normal
@@ -1498,10 +1507,10 @@ exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.m
 ## Int64 write-ahead logging
 
 On Unix, `Database::enable_int64_write_ahead_log` can opt one existing batch
-table with exactly one `Int64` or programmatic `Nullable(Int64)` column into a
-bounded WAL. A synchronized bootstrap captures its display names, current
-rows and nullability, table/database limits, query row and byte caps, and
-worker cap. `Database::create_nullable_int64_table`,
+table with exactly one `Int64` or SQL-created/programmatic `Nullable(Int64)`
+column into a bounded WAL. A synchronized bootstrap captures its display
+names, current rows and nullability, table/database limits, query row and byte
+caps, and worker cap. `Database::create_nullable_int64_table`,
 `append_nullable_int64_values`, and `replace_nullable_int64_values` provide
 the bounded nullable table and mutation paths.
 Successful SQL/CSV/TSV appends, `TRUNCATE TABLE`, and atomic `ALTER TABLE ...

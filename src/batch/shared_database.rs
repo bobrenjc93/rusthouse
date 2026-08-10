@@ -1047,7 +1047,10 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         | Statement::ShowCreateTable { .. }
         | Statement::DescribeTable { .. }
         | Statement::ExistsTable { .. }) => Ok(statement),
-        Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => {
+        Statement::CreateTable { .. }
+        | Statement::CreateTableIfNotExists { .. }
+        | Statement::CreateNullableInt64Table { .. }
+        | Statement::CreateNullableInt64TableIfNotExists { .. } => {
             Err(SharedDatabaseError::ReadOnlyStatementRequired {
                 statement: "CREATE TABLE",
             })

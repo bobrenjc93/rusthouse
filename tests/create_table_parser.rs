@@ -16,6 +16,12 @@ fn parses_whitespace_casing_and_nullability_table() {
             "event_2",
             false,
         ),
+        (
+            "cReAtE TABLE NullableReadings (Measurement nUlLaBlE(iNt64))",
+            "NullableReadings",
+            "Measurement",
+            true,
+        ),
     ];
 
     for (input, table_name, column_name, nullable) in cases {
@@ -230,6 +236,46 @@ fn rejects_malformed_statements_with_byte_offsets() {
             "{input:?}"
         );
     }
+}
+
+#[test]
+fn nullable_int64_wrapper_stays_inside_exact_parser_resource_and_shape_boundaries() {
+    for input in [
+        "CREATE TABLE t (c Nullable(Float64))",
+        "CREATE TABLE t (c Nullable())",
+        "CREATE TABLE t (c Nullable(Int64, Int64))",
+        "CREATE TABLE t (c Nullable((Int64)))",
+        "CREATE TABLE t (c Nullable Int64)",
+        "CREATE TABLE t (c Nullable(Int64) NULL)",
+        "CREATE TABLE t (c Nullable(Int64), d Int64)",
+    ] {
+        assert!(
+            parse_create_table(input, ParseLimits::default()).is_err(),
+            "out-of-shape nullable declaration was accepted: {input:?}"
+        );
+    }
+
+    let input = "CREATE TABLE table123 (column45 Nullable(Int64))";
+    let statement = parse_create_table(input, ParseLimits::new(input.len(), 8)).unwrap();
+    assert_eq!(statement.table_name().as_str(), "table123");
+    assert_eq!(statement.column().name().as_str(), "column45");
+    assert!(statement.column().is_nullable());
+
+    assert_eq!(
+        parse_create_table(input, ParseLimits::new(input.len() - 1, 8)),
+        Err(ParseError::StatementTooLong {
+            bytes: input.len(),
+            max_bytes: input.len() - 1,
+        })
+    );
+    assert_eq!(
+        parse_create_table(input, ParseLimits::new(input.len(), 7)),
+        Err(ParseError::IdentifierTooLong {
+            offset: 13,
+            bytes: 8,
+            max_bytes: 7,
+        })
+    );
 }
 
 #[test]

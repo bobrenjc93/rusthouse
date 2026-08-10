@@ -77,6 +77,16 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
     },
+    /// The deliberately bounded one-column `Nullable(Int64)` CREATE shape.
+    CreateNullableInt64Table {
+        name: String,
+        column: String,
+    },
+    /// Conditional form of the bounded one-column nullable CREATE shape.
+    CreateNullableInt64TableIfNotExists {
+        name: String,
+        column: String,
+    },
     DropTable {
         name: String,
     },
@@ -1622,6 +1632,7 @@ impl<'a> Parser<'a> {
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
+        let mut nullable_int64_column = None;
         loop {
             self.reserve_ast_list_item()?;
             let column_name = self.expect_identifier("column name")?;
@@ -1633,10 +1644,37 @@ impl<'a> Parser<'a> {
             }
             let position = self.position();
             let type_name = self.expect_identifier("column type")?;
+            if type_name.eq_ignore_ascii_case("Nullable") {
+                if !columns.is_empty() {
+                    return Err(Error::Sql {
+                        position,
+                        message: "Nullable(Int64) is supported only as the sole table column"
+                            .to_owned(),
+                    });
+                }
+                self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
+                let nested_position = self.position();
+                let nested_type = self.expect_identifier("type inside Nullable")?;
+                if !nested_type.eq_ignore_ascii_case("Int64") {
+                    return Err(Error::Sql {
+                        position: nested_position,
+                        message: format!(
+                            "unsupported nullable type '{nested_type}'; expected Int64"
+                        ),
+                    });
+                }
+                self.expect(&TokenKind::RightParen, "')' after Nullable(Int64)")?;
+                if self.at(&TokenKind::Comma) {
+                    return self
+                        .error("Nullable(Int64) is supported only as the sole table column");
+                }
+                nullable_int64_column = Some(column_name);
+                break;
+            }
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+                    "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(Int64)"
                 ),
             })?;
             columns.push(ColumnDef {
@@ -1661,6 +1699,13 @@ impl<'a> Parser<'a> {
         }
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error("unexpected trailing input after CREATE TABLE");
+        }
+        if let Some(column) = nullable_int64_column {
+            return if if_not_exists {
+                Ok(Statement::CreateNullableInt64TableIfNotExists { name, column })
+            } else {
+                Ok(Statement::CreateNullableInt64Table { name, column })
+            };
         }
         if if_not_exists {
             Ok(Statement::CreateTableIfNotExists { name, columns })

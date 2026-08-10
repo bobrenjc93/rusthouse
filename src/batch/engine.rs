@@ -2783,6 +2783,22 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::CreateNullableInt64Table { name, column } => {
+                self.create_nullable_int64_table(name, column, Vec::new())?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::CreateNullableInt64TableIfNotExists { name, column } => {
+                if !self.catalog.table_exists(&name) {
+                    self.create_nullable_int64_table(name, column, Vec::new())?;
+                }
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::DropTable { name } => {
                 self.reject_unlogged_wal_mutation(&name, "DROP TABLE")?;
                 let measurements = TableMeasurements::read(self.catalog.table(&name)?);
@@ -2831,6 +2847,18 @@ impl Database {
             }
             Statement::AddColumn { table, column } => {
                 self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
+                let existing = self.catalog.table(&table)?;
+                let show_create_statements = existing.schema().len().saturating_add(1);
+                if starts_with_nullable_int64(existing)
+                    && show_create_statements > sql::DEFAULT_MAX_BATCH_STATEMENTS
+                {
+                    existing.validate_add_column(&column)?;
+                    return Err(Error::ResourceLimitExceeded {
+                        resource: "nullable SHOW CREATE statements",
+                        actual: show_create_statements,
+                        max: sql::DEFAULT_MAX_BATCH_STATEMENTS,
+                    });
+                }
                 self.table_mut(&table)?.add_column(column)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",
@@ -3023,6 +3051,8 @@ impl Database {
             }
             Statement::CreateTable { .. }
             | Statement::CreateTableIfNotExists { .. }
+            | Statement::CreateNullableInt64Table { .. }
+            | Statement::CreateNullableInt64TableIfNotExists { .. }
             | Statement::DropTable { .. }
             | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
@@ -3769,15 +3799,37 @@ impl Database {
         ddl.push_str("CREATE TABLE ");
         ddl.push_str(table.name());
         ddl.push_str(" (");
-        for (index, field) in table.schema().iter().enumerate() {
+        let nullable_create = starts_with_nullable_int64(table);
+        let create_columns = if nullable_create {
+            1
+        } else {
+            table.schema().len()
+        };
+        for (index, (field, values)) in table
+            .schema()
+            .iter()
+            .zip(table.columns())
+            .take(create_columns)
+            .enumerate()
+        {
             if index != 0 {
                 ddl.push_str(", ");
             }
             ddl.push_str(&field.name);
             ddl.push(' ');
-            ddl.push_str(field.data_type.as_str());
+            ddl.push_str(values.metadata_type_name());
         }
         ddl.push(')');
+        if nullable_create {
+            for (field, values) in table.schema().iter().zip(table.columns()).skip(1) {
+                ddl.push_str("; ALTER TABLE ");
+                ddl.push_str(table.name());
+                ddl.push_str(" ADD COLUMN ");
+                ddl.push_str(&field.name);
+                ddl.push(' ');
+                ddl.push_str(values.metadata_type_name());
+            }
+        }
         debug_assert_eq!(ddl.len(), ddl_bytes);
 
         Ok(QueryResult {
@@ -4202,7 +4254,10 @@ fn enforce_alter_update_replacement_bytes(
 
 fn statement_name(statement: &Statement) -> &'static str {
     match statement {
-        Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => "CREATE TABLE",
+        Statement::CreateTable { .. }
+        | Statement::CreateTableIfNotExists { .. }
+        | Statement::CreateNullableInt64Table { .. }
+        | Statement::CreateNullableInt64TableIfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. }
@@ -4252,18 +4307,45 @@ fn delete_comparison_predicate(comparison: DeleteComparisonPredicate) -> Predica
 }
 
 fn create_table_ddl_len(table: &Table) -> usize {
+    let nullable_create = starts_with_nullable_int64(table);
+    let create_columns = if nullable_create {
+        1
+    } else {
+        table.schema().len()
+    };
     let fields_bytes = table
         .schema()
         .iter()
-        .map(|field| {
+        .zip(table.columns())
+        .take(create_columns)
+        .map(|(field, values)| {
             field
                 .name
                 .len()
                 .saturating_add(1)
-                .saturating_add(field.data_type.as_str().len())
+                .saturating_add(values.metadata_type_name().len())
         })
         .fold(0_usize, usize::saturating_add);
-    let delimiters = table.schema().len().saturating_sub(1).saturating_mul(2);
+    let delimiters = create_columns.saturating_sub(1).saturating_mul(2);
+    let alter_bytes = if nullable_create {
+        table
+            .schema()
+            .iter()
+            .zip(table.columns())
+            .skip(1)
+            .map(|(field, values)| {
+                "; ALTER TABLE "
+                    .len()
+                    .saturating_add(table.name().len())
+                    .saturating_add(" ADD COLUMN ".len())
+                    .saturating_add(field.name.len())
+                    .saturating_add(1)
+                    .saturating_add(values.metadata_type_name().len())
+            })
+            .fold(0_usize, usize::saturating_add)
+    } else {
+        0
+    };
 
     "CREATE TABLE "
         .len()
@@ -4272,6 +4354,20 @@ fn create_table_ddl_len(table: &Table) -> usize {
         .saturating_add(fields_bytes)
         .saturating_add(delimiters)
         .saturating_add(")".len())
+        .saturating_add(alter_bytes)
+}
+
+fn starts_with_nullable_int64(table: &Table) -> bool {
+    let starts_nullable = matches!(table.columns().first(), Some(Column::NullableInt64(_)));
+    debug_assert!(
+        table
+            .columns()
+            .iter()
+            .skip(1)
+            .all(|column| !matches!(column, Column::NullableInt64(_))),
+        "bounded nullable storage can only occupy the first column"
+    );
+    starts_nullable
 }
 
 fn literal_result_name_len(value: &Value) -> usize {

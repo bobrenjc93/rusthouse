@@ -540,7 +540,7 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
-/// Parses one `CREATE TABLE` statement with one `Int64` column.
+/// Parses one `CREATE TABLE` statement with one `Int64` or `Nullable(Int64)` column.
 ///
 /// Keywords are ASCII case-insensitive. Identifiers must match
 /// `[A-Za-z_][A-Za-z0-9_]*` and retain their original spelling. An omitted
@@ -548,7 +548,9 @@ impl Error for ParseError {}
 /// accepted grammar is:
 ///
 /// ```text
-/// CREATE TABLE [IF NOT EXISTS] identifier (identifier Int64 [NULL | NOT NULL]) [ENGINE = Memory]
+/// CREATE TABLE [IF NOT EXISTS] identifier (
+///     identifier (Int64 [NULL | NOT NULL] | Nullable(Int64))
+/// ) [ENGINE = Memory]
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted. Statement and
@@ -909,10 +911,20 @@ impl<'input> Parser<'input> {
         self.expect_byte(b'(', "'('")?;
         self.skip_whitespace();
         let column_name = self.parse_identifier()?;
-        self.require_whitespace("whitespace before Int64")?;
-        self.expect_keyword("Int64")?;
-
-        let nullable = self.parse_nullability()?;
+        self.require_whitespace("whitespace before Int64 or Nullable(Int64)")?;
+        let nullable = if self.keyword_at_position("Nullable") {
+            self.expect_keyword("Nullable")?;
+            self.skip_whitespace();
+            self.expect_byte(b'(', "'(' after Nullable")?;
+            self.skip_whitespace();
+            self.expect_keyword("Int64")?;
+            self.skip_whitespace();
+            self.expect_byte(b')', "')' after Nullable(Int64)")?;
+            true
+        } else {
+            self.expect_keyword("Int64")?;
+            self.parse_nullability()?
+        };
         self.skip_whitespace();
         self.expect_byte(b')', "')'")?;
         self.skip_whitespace();

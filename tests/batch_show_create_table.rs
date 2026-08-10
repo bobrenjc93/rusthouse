@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::mem::size_of;
 
 use rusthouse::SharedDatabase;
@@ -5,8 +6,8 @@ use rusthouse::batch::engine::{
     Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
 };
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{Statement, parse};
-use rusthouse::batch::storage::ColumnDef;
+use rusthouse::batch::sql::{DEFAULT_MAX_BATCH_STATEMENTS, Statement, parse};
+use rusthouse::batch::storage::{ColumnDef, TableLimits};
 use rusthouse::batch::value::{DataType, Value};
 
 const CREATE: &str =
@@ -147,6 +148,145 @@ fn accepts_exact_and_rejects_exceeded_result_limits() {
             bytes: exact_bytes,
             max_bytes: exact_bytes - 1,
         })
+    );
+}
+
+#[test]
+fn nullable_int64_ddl_obeys_the_exact_show_create_byte_boundary() {
+    const NULLABLE_DDL: &str = "CREATE TABLE Readings (Measurement Nullable(Int64))";
+    let exact_bytes = result_bytes(NULLABLE_DDL);
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    exact.execute(NULLABLE_DDL).expect("setup succeeds");
+    assert_eq!(
+        query(&mut exact, "SHOW CREATE TABLE readings").rows,
+        [vec![Value::String(NULLABLE_DDL.to_owned())]]
+    );
+
+    let mut one_short = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_short.execute(NULLABLE_DDL).expect("setup succeeds");
+    assert_eq!(
+        one_short.execute("SHOW CREATE TABLE readings"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SHOW CREATE TABLE result bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        })
+    );
+}
+
+#[test]
+fn mixed_nullable_schema_show_create_replays_create_and_alter_at_exact_byte_limit() {
+    const SETUP: &str = "CREATE TABLE Mixed (v Nullable(Int64)); \
+                         ALTER TABLE Mixed ADD COLUMN tag String; \
+                         ALTER TABLE Mixed ADD COLUMN active Bool;";
+    const REPLAYABLE_DDL: &str = "CREATE TABLE Mixed (v Nullable(Int64)); \
+                                  ALTER TABLE Mixed ADD COLUMN tag String; \
+                                  ALTER TABLE Mixed ADD COLUMN active Bool";
+    let exact_bytes = result_bytes(REPLAYABLE_DDL);
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    database.execute(SETUP).expect("setup succeeds");
+
+    let shown = query(&mut database, "SHOW CREATE TABLE mixed");
+    assert_eq!(shown.rows, [vec![Value::String(REPLAYABLE_DDL.to_owned())]]);
+    assert_eq!(parse(REPLAYABLE_DDL).unwrap().len(), 3);
+
+    let mut recreated = Database::new();
+    recreated
+        .execute(REPLAYABLE_DDL)
+        .expect("SHOW CREATE output is executable");
+    assert_eq!(query(&mut recreated, "SHOW CREATE TABLE MIXED"), shown);
+    recreated
+        .execute("INSERT INTO mixed VALUES (NULL, 'kept', true)")
+        .expect("recreated nullable storage accepts NULL");
+    assert_eq!(
+        query(&mut recreated, "DESCRIBE TABLE mixed").rows,
+        [
+            vec![
+                Value::String("v".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+            vec![
+                Value::String("tag".to_owned()),
+                Value::String("String".to_owned()),
+            ],
+            vec![
+                Value::String("active".to_owned()),
+                Value::String("Bool".to_owned()),
+            ],
+        ]
+    );
+
+    let mut one_short = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: exact_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_short.execute(SETUP).expect("setup succeeds");
+    assert_eq!(
+        one_short.execute("SHOW CREATE TABLE mixed"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SHOW CREATE TABLE result bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        })
+    );
+}
+
+#[test]
+fn nullable_show_create_replay_accepts_4096_and_rejects_4097_statements() {
+    let limits = TableLimits::new(0, DEFAULT_MAX_BATCH_STATEMENTS + 1, 0);
+    let mut database = Database::with_table_limits(limits);
+    let mut setup = String::from("CREATE TABLE Boundary (c0 Nullable(Int64));");
+    for index in 1..DEFAULT_MAX_BATCH_STATEMENTS {
+        write!(setup, "ALTER TABLE Boundary ADD COLUMN c{index} Int64;").unwrap();
+    }
+    database
+        .execute(&setup)
+        .expect("the exact replay statement limit is accepted");
+
+    let shown = query(&mut database, "SHOW CREATE TABLE boundary");
+    let [Value::String(ddl)] = shown.rows[0].as_slice() else {
+        panic!("SHOW CREATE returns one DDL string")
+    };
+    assert_eq!(parse(ddl).unwrap().len(), DEFAULT_MAX_BATCH_STATEMENTS);
+
+    let mut recreated = Database::with_table_limits(limits);
+    recreated
+        .execute(ddl)
+        .expect("the exact-limit SHOW CREATE output is replayable");
+    assert_eq!(
+        recreated
+            .catalog()
+            .table("boundary")
+            .unwrap()
+            .schema()
+            .len(),
+        DEFAULT_MAX_BATCH_STATEMENTS
+    );
+
+    assert_eq!(
+        database.execute(&format!(
+            "ALTER TABLE Boundary ADD COLUMN c{} Int64",
+            DEFAULT_MAX_BATCH_STATEMENTS
+        )),
+        Err(Error::ResourceLimitExceeded {
+            resource: "nullable SHOW CREATE statements",
+            actual: DEFAULT_MAX_BATCH_STATEMENTS + 1,
+            max: DEFAULT_MAX_BATCH_STATEMENTS,
+        })
+    );
+    assert_eq!(
+        database.catalog().table("boundary").unwrap().schema().len(),
+        DEFAULT_MAX_BATCH_STATEMENTS
     );
 }
 
