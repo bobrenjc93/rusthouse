@@ -584,6 +584,17 @@ impl PreparedInsertRows {
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
     }
+
+    /// Returns the preflighted values when the target is one physical Int64 column.
+    pub(crate) fn int64_values(&self) -> Option<Vec<i64>> {
+        self.rows
+            .iter()
+            .map(|row| match row.as_slice() {
+                [Value::Int64(value)] => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// A table stores one typed vector per schema field.
