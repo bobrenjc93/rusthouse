@@ -149,16 +149,16 @@ fn nullable_count_preserves_query_resource_bounds() {
 }
 
 #[test]
-fn nullable_count_and_minimum_coexist_while_other_aggregates_remain_rejected() {
+fn nullable_count_sum_and_minimum_coexist_while_other_aggregates_remain_rejected() {
     let mut database = Database::new();
     create_mixed(&mut database);
 
     assert_eq!(
-        query(&mut database, "SELECT COUNT(v), MIN(v) FROM mixed").rows,
-        [vec![Value::Int64(5), Value::Int64(-1)]]
+        query(&mut database, "SELECT COUNT(v), SUM(v), MIN(v) FROM mixed").rows,
+        [vec![Value::Int64(5), Value::Int64(13), Value::Int64(-1)]]
     );
 
-    for function in ["SUM", "MAX", "AVG"] {
+    for function in ["MAX", "AVG"] {
         assert_eq!(
             database
                 .execute(&format!("SELECT {function}(v) FROM mixed"))

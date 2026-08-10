@@ -5485,9 +5485,11 @@ fn resolve_select_items(
                 };
                 validate_aggregate(*function, input_type)?;
                 if let Some(argument) = argument_index {
-                    let supported_nullable_aggregate =
-                        matches!(function, AggregateFunction::Count | AggregateFunction::Min)
-                            && table.column_is_nullable_int64(argument);
+                    let supported_nullable_aggregate = matches!(
+                        function,
+                        AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Min
+                    ) && table
+                        .column_is_nullable_int64(argument);
                     if !supported_nullable_aggregate {
                         reject_nullable_operation(table, argument, function.name())?;
                     }
@@ -6241,7 +6243,10 @@ fn execute_grouped<'a>(
                 input_type: Some(DataType::Int64),
                 ..
             }]
-        );
+        )
+        && aggregate_specs
+            .first()
+            .is_some_and(|spec| aggregate_argument_is_non_nullable_int64(table, spec));
     let sole_global_avg_int = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -7545,16 +7550,19 @@ impl AggregateState {
                 }
             }
             Self::SumInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
-                else {
-                    unreachable!("SUM input type is resolved")
+                let value = match &table.columns()[spec.argument.expect("SUM argument")] {
+                    Column::Int64(values) => Some(values[row]),
+                    Column::NullableInt64(values) => values[row],
+                    _ => unreachable!("SUM input type is resolved"),
                 };
-                *sum = sum
-                    .checked_add(i128::from(values[row]))
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?;
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?;
+                if let Some(value) = value {
+                    *sum = sum
+                        .checked_add(i128::from(value))
+                        .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?;
+                    *count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?;
+                }
             }
             Self::SumFloat { sum, count } => {
                 let Column::Float64(values) =
@@ -9655,6 +9663,55 @@ mod tests {
             ),
         );
         assert_eq!(result.rows, [vec![Value::Int64(expected)]]);
+    }
+
+    #[test]
+    fn nullable_int64_sum_stays_on_the_sequential_aggregate_path() {
+        static OBSERVED_BUDGET: GlobalAggregateWorkerBudget =
+            GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let values = (0..row_count)
+            .map(|row| (row % 2 == 0).then_some(1))
+            .collect::<Vec<_>>();
+        let expected_sum = i64::try_from(row_count.div_ceil(2)).unwrap();
+        let mut database = Database::new();
+        database
+            .create_nullable_int64_table("nullable_values", "value", values)
+            .unwrap();
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(
+            database.global_aggregate_worker_cap(),
+            &OBSERVED_BUDGET,
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, "SELECT SUM(value) FROM nullable_values").rows,
+            [vec![Value::Int64(expected_sum)]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET.peak_helpers_in_use(),
+            0,
+            "nullable SUM remains on the bounded sequential state path"
+        );
+
+        OBSERVED_BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(*) AS rows, SUM(value) AS total FROM nullable_values"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(expected_sum),
+            ]]
+        );
+        assert_eq!(
+            OBSERVED_BUDGET.peak_helpers_in_use(),
+            0,
+            "nullable COUNT/SUM remains on the bounded sequential state path"
+        );
     }
 
     #[test]

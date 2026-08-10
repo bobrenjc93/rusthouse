@@ -90,7 +90,6 @@ fn create_two_table_registry(path: &Path) {
 
 fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
     for (expression, operation) in [
-        ("SUM(v)", "SUM"),
         ("MAX(v)", "MAX"),
         ("AVG(v)", "AVG"),
         ("v - 1", "Int64 subtraction"),
@@ -112,17 +111,13 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
         );
     }
 
-    let grouped = database
-        .execute(&format!("SELECT v, SUM(v) FROM {table} GROUP BY v"))
-        .unwrap_err();
-    assert_eq!(
-        grouped,
-        Error::UnsupportedNullableOperation {
-            table: "Alpha".to_owned(),
-            column: "v".to_owned(),
-            operation: "SUM",
-        }
-    );
+    let results = database
+        .execute(&format!("SELECT SUM(v) FROM {table}"))
+        .unwrap();
+    let [StatementResult::Query(sum)] = results.as_slice() else {
+        panic!("expected SUM query")
+    };
+    assert_eq!(sum.rows, [vec![Value::Int64(1)]]);
 
     let results = database
         .execute(&format!("SELECT COUNT(*), COUNT(v) FROM {table}"))
@@ -158,7 +153,7 @@ fn assert_nullable_aggregate_behavior(database: &mut Database, table: &str) {
 }
 
 #[test]
-fn nullable_created_and_recovered_tables_support_to_string_and_reject_other_operations() {
+fn nullable_created_and_recovered_tables_support_sum_and_to_string() {
     let directory = TestDirectory::new();
     let registry = directory.join("registry");
     let snapshot = directory.join("nullable.snapshot");
