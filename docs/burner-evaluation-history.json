@@ -3057,6 +3057,22 @@
         "eval_c88a7f3d": 90,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:786",
+      "recordedAt": "2026-08-11T08:54:42.742Z",
+      "label": "PR #786",
+      "kind": "leaf",
+      "prNumber": 786,
+      "title": "Parallelize paired COUNT and Nullable Int64 AVG",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 90,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
