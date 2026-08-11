@@ -80,6 +80,20 @@ fn nullable_database(row_cap: usize, rows_sql: &str) -> Database {
 }
 
 #[test]
+fn legacy_nullable_column_error_variant_remains_source_compatible() {
+    let error = DatabaseSnapshotSaveError::NullableColumn {
+        column: "Reading".to_owned(),
+    };
+
+    assert!(matches!(
+        error,
+        DatabaseSnapshotSaveError::NullableColumn { ref column } if column == "Reading"
+    ));
+    assert!(!error.destination_was_replaced());
+    assert!(std::error::Error::source(&error).is_none());
+}
+
+#[test]
 fn saves_and_decodes_an_empty_nullable_table_with_its_row_cap() {
     let directory = TestDirectory::new();
     let path = directory.join("empty.snapshot");

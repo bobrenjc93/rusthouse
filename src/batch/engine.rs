@@ -663,6 +663,14 @@ pub enum DatabaseSnapshotSaveError {
         /// The physical type found in the batch table.
         data_type: DataType,
     },
+    /// Legacy nullable-column rejection retained for source compatibility.
+    ///
+    /// Nullable `Int64` columns are now supported, so
+    /// [`Database::save_int64_table_to_file`] no longer returns this variant.
+    NullableColumn {
+        /// The stored display name of the nullable column.
+        column: String,
+    },
     /// Encoding or atomically replacing the snapshot failed.
     Snapshot(Int64TablePayloadFileSaveError),
 }
@@ -911,7 +919,8 @@ impl DatabaseSnapshotSaveError {
             Self::Snapshot(error) => error.destination_was_replaced(),
             Self::Table(_)
             | Self::UnsupportedColumnCount { .. }
-            | Self::UnsupportedColumnType { .. } => false,
+            | Self::UnsupportedColumnType { .. }
+            | Self::NullableColumn { .. } => false,
         }
     }
 }
@@ -931,6 +940,10 @@ impl fmt::Display for DatabaseSnapshotSaveError {
             Self::UnsupportedColumnType { column, data_type } => write!(
                 formatter,
                 "column '{column}' has type {data_type}; batch snapshot save requires exactly one Int64 column"
+            ),
+            Self::NullableColumn { column } => write!(
+                formatter,
+                "column '{column}' is nullable; batch snapshot save requires exactly one non-nullable Int64 column"
             ),
             Self::Snapshot(error) => write!(formatter, "could not save snapshot: {error}"),
         }
@@ -973,7 +986,9 @@ impl std::error::Error for DatabaseSnapshotSaveError {
         match self {
             Self::Table(error) => Some(error),
             Self::Snapshot(error) => Some(error),
-            Self::UnsupportedColumnCount { .. } | Self::UnsupportedColumnType { .. } => None,
+            Self::UnsupportedColumnCount { .. }
+            | Self::UnsupportedColumnType { .. }
+            | Self::NullableColumn { .. } => None,
         }
     }
 }
