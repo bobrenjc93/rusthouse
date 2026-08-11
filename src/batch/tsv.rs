@@ -10,7 +10,7 @@
 //! exact-case subset of schema names without duplicates; names may appear in
 //! any order. Each data field is parsed using its selected type, and omitted
 //! named columns use the same typed defaults as an explicit-column SQL
-//! `INSERT`.
+//! `INSERT`, including `NULL` for `Nullable(Int64)`.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;

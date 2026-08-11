@@ -1184,11 +1184,12 @@ impl Table {
     /// materializing omitted defaults. Positional rows retain schema order.
     ///
     /// Explicit names resolve case-insensitively. Unknown and duplicate names
-    /// are rejected. Omitted columns receive their type's non-null default:
-    /// `0`, `0.0`, `false`, or an empty String when the prepared rows are
-    /// committed. After column and row-width validation, `capacity_rows` is
-    /// checked before supplied values are type-checked in schema order. Atomic
-    /// callers pass the cumulative rows for this table.
+    /// are rejected. Omitted columns receive their physical default when the
+    /// prepared rows are committed: `NULL` for `Nullable(Int64)`, otherwise
+    /// `0`, `0.0`, `false`, or an empty String. After column and row-width
+    /// validation, `capacity_rows` is checked before supplied values are
+    /// type-checked in schema order. Atomic callers pass the cumulative rows
+    /// for this table.
     pub(crate) fn prepare_insert_rows(
         &self,
         insert_columns: Option<&[String]>,
@@ -1355,6 +1356,24 @@ impl Table {
             DataType::Bool => Column::Bool(vec![false; self.row_count]),
             DataType::String => Column::String(vec![String::new(); self.row_count]),
         };
+        self.publish_added_column(field, column);
+        Ok(())
+    }
+
+    /// Appends one physical `Nullable(Int64)` column, backfilling existing
+    /// rows with SQL `NULL`.
+    pub fn add_nullable_int64_column(&mut self, name: String) -> Result<()> {
+        let field = ColumnDef {
+            name,
+            data_type: DataType::Int64,
+        };
+        self.validate_add_column(&field)?;
+        let column = Column::NullableInt64(vec![None; self.row_count]);
+        self.publish_added_column(field, column);
+        Ok(())
+    }
+
+    fn publish_added_column(&mut self, field: ColumnDef, column: Column) {
         let added_value_bytes = column.retained_value_bytes_exact();
 
         debug_assert_eq!(self.schema.len(), self.columns.len());
@@ -1362,7 +1381,6 @@ impl Table {
         self.columns.push(column);
         self.retained_value_bytes = self.retained_value_bytes.saturating_add(added_value_bytes);
         self.mark_values_mutated();
-        Ok(())
     }
 
     pub(crate) fn validate_add_column(&self, field: &ColumnDef) -> Result<()> {

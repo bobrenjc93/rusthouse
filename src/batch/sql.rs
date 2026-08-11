@@ -107,6 +107,11 @@ pub enum Statement {
         table: String,
         column: ColumnDef,
     },
+    /// Exact `ALTER TABLE ... ADD COLUMN ... Nullable(Int64)` addition.
+    AddNullableInt64Column {
+        table: String,
+        column: String,
+    },
     DropColumn {
         table: String,
         column: String,
@@ -1768,10 +1773,31 @@ impl<'a> Parser<'a> {
             }
             let position = self.position();
             let type_name = self.expect_identifier("column type")?;
+            if type_name.eq_ignore_ascii_case("Nullable") {
+                self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
+                let nested_position = self.position();
+                let nested_type = self.expect_identifier("type inside Nullable")?;
+                if !nested_type.eq_ignore_ascii_case("Int64") {
+                    return Err(Error::Sql {
+                        position: nested_position,
+                        message: format!(
+                            "unsupported nullable type '{nested_type}'; expected Int64"
+                        ),
+                    });
+                }
+                self.expect(&TokenKind::RightParen, "')' after Nullable(Int64)")?;
+                if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                    return self.error("unexpected trailing input after ALTER TABLE ADD COLUMN");
+                }
+                return Ok(Statement::AddNullableInt64Column {
+                    table,
+                    column: name,
+                });
+            }
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+                    "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(Int64)"
                 ),
             })?;
             if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {

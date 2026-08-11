@@ -162,6 +162,34 @@ fn mixed_rows_round_trip_with_exact_null_positions_and_integer_boundaries() {
 }
 
 #[test]
+fn nullable_column_added_by_alter_round_trips_after_becoming_the_snapshot_column() {
+    let directory = TestDirectory::new();
+    let path = directory.join("alter-added.snapshot");
+    let rows = [None, Some(7)];
+    let mut database = Database::with_max_rows_per_table(3);
+    database
+        .execute(
+            "CREATE TABLE Metrics (Legacy Int64); \
+             INSERT INTO Metrics VALUES (1); \
+             ALTER TABLE Metrics ADD COLUMN Reading Nullable(Int64); \
+             INSERT INTO Metrics VALUES (2, 7); \
+             ALTER TABLE Metrics DROP COLUMN Legacy;",
+        )
+        .expect("schema evolution leaves one physical nullable snapshot column");
+    let (snapshot_codec, payload_codec) = exact_codecs("Reading", 3, &rows);
+
+    database
+        .save_int64_table_to_file("metrics", &path, snapshot_codec, payload_codec)
+        .expect("ALTER-added nullable storage is snapshot-compatible");
+
+    let restored =
+        restore_int64_table_payload_from_file(path, snapshot_codec, payload_codec).unwrap();
+    assert_eq!(restored.schema(), &Schema::int64("Reading", true));
+    assert_eq!(restored.row_cap(), 3);
+    assert_eq!(restored.values(), rows);
+}
+
+#[test]
 fn nullable_payload_limit_failure_is_typed_and_preserves_the_destination() {
     let directory = TestDirectory::new();
     let path = directory.join("preserved.snapshot");
