@@ -1521,7 +1521,9 @@ attempt before any source access and holds the guard while delegating the
 caller-supplied entry slice and inclusive entry-count bound to
 `Database::restore_int64_tables_from_files`. Busy and poisoned locks remain
 distinct from indexed count, name, file, schema, and table-limit failures; no
-failure changes catalog data or cached metrics.
+failure changes catalog data or cached metrics. Sets may mix `Int64` and
+`Nullable(Int64)` snapshots, with each table's nullability, NULL positions, row
+order, persisted row cap, and exact cached metrics preserved.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries
@@ -1571,7 +1573,8 @@ configured `TableLimits`, and registers the table plus its cached metrics only
 after all decoding and storage validation succeeds. Duplicate names resolve
 case-insensitively just like SQL table names and leave the existing catalog
 unchanged. The explicit-backup restore accepts the same two physical column
-shapes; replacement and set-restore retain their existing non-nullable boundary.
+shapes. Set restore also accepts both shapes in one atomic set; replacement
+alone retains its existing non-nullable boundary.
 `Database::replace_int64_table_from_file` applies the same bounded decoding and
 table validation to one existing caller-named table. Lookup is
 case-insensitive, but the catalog's stored table-name spelling is preserved;
@@ -1599,10 +1602,12 @@ distinct, and every failure preserves the target and cached metrics.
 inclusive entry-count limit and the complete case-insensitive destination-name
 set are checked before any source file is opened. Each entry has independent
 envelope and self-describing payload codec bounds; decoded tables remain staged
-until every file passes corruption, non-nullability, and configured table-limit
-checks. Success makes the complete subset queryable and updates cached metrics;
-failure reports the zero-based entry and caller table name while preserving all
-prior catalog data and gauges.
+until every file passes corruption, schema, and configured table-limit checks.
+The set may mix `Int64` and `Nullable(Int64)` columns, including all-NULL
+tables, while preserving input row order, nullability, NULL positions, and each
+persisted row cap. Success makes the complete subset queryable and updates
+cached metrics exactly; failure reports the zero-based entry and caller table
+name while preserving all prior catalog data and gauges.
 `Database::restore_int64_table_from_file_with_backup` adds explicit recovery:
 it tries the primary self-describing snapshot first, falls back to the supplied
 backup only when bounded snapshot decoding fails, and reports which file

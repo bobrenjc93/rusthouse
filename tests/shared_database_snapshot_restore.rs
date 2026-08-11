@@ -589,14 +589,14 @@ fn poisoning_is_distinct_and_precedes_source_access() {
 }
 
 #[test]
-fn restores_two_int64_snapshots_as_one_atomic_set() {
+fn restores_mixed_nullable_snapshot_set_at_the_exact_count_limit() {
     let directory = TestDirectory::new();
     let temperatures_path = directory.join("temperatures.snapshot");
     let pressures_path = directory.join("pressures.snapshot");
     let (temperatures_snapshot_codec, temperatures_payload_codec) =
         write_snapshot(&temperatures_path, "temperature", 2, &[Some(-4), Some(12)]);
     let (pressures_snapshot_codec, pressures_payload_codec) =
-        write_snapshot(&pressures_path, "pressure", 1, &[Some(1013)]);
+        write_snapshot_with_nullability(&pressures_path, "pressure", true, 2, &[None, Some(1013)]);
     let entries = [
         DatabaseSnapshotRestoreEntry::new(
             "Temperatures",
@@ -629,15 +629,15 @@ fn restores_two_int64_snapshots_as_one_atomic_set() {
             .query("SELECT pressure FROM PRESSURES;")
             .unwrap()
             .rows,
-        [[Value::Int64(1013)]]
+        [[Value::Null(DataType::Int64)], [Value::Int64(1013)],]
     );
     assert_eq!(
         database.metrics_snapshot(),
         Some(DatabaseMetrics {
             table_count: 2,
             column_count: 2,
-            retained_row_count: 3,
-            retained_value_bytes: 24,
+            retained_row_count: 4,
+            retained_value_bytes: 34,
         })
     );
 }
@@ -647,7 +647,8 @@ fn later_set_file_failure_rolls_back_catalog_data_and_cached_metrics() {
     let directory = TestDirectory::new();
     let valid_path = directory.join("valid.snapshot");
     let corrupt_path = directory.join("corrupt.snapshot");
-    let (snapshot_codec, payload_codec) = write_snapshot(&valid_path, "value", 2, &[Some(8)]);
+    let (snapshot_codec, payload_codec) =
+        write_snapshot_with_nullability(&valid_path, "value", true, 2, &[None, Some(8)]);
     let mut corrupt = fs::read(&valid_path).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     fs::write(&corrupt_path, corrupt).unwrap();

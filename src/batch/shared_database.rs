@@ -511,8 +511,8 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
-    /// Attempts to atomically restore a caller-bounded set of self-describing,
-    /// non-nullable `Int64` snapshots.
+    /// Attempts to atomically restore a caller-bounded set of self-describing
+    /// `Int64` or `Nullable(Int64)` snapshots.
     ///
     /// Exactly one nonblocking write-lock attempt occurs before any source path
     /// is accessed. An active reader or writer returns
@@ -520,8 +520,9 @@ impl SharedDatabase {
     /// a source, and a poisoned lock remains distinct. Once acquired, the guard
     /// is retained while [`Database::restore_int64_tables_from_files`] checks
     /// `max_entries`, validates all names, performs bounded file decoding, and
-    /// atomically registers the complete set. Every failure leaves catalog data
-    /// and cached metrics unchanged, and delegated failures retain their
+    /// atomically registers the complete set while preserving each table's
+    /// nullability, NULL positions, and row order. Every failure leaves catalog
+    /// data and cached metrics unchanged, and delegated failures retain their
     /// zero-based entry index and caller-supplied table name.
     pub fn try_restore_int64_tables_from_files(
         &self,
