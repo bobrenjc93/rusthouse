@@ -6820,7 +6820,10 @@ fn paired_global_count_aggregate(
     if nullable_int64
         && !matches!(
             function,
-            AggregateFunction::Sum | AggregateFunction::Avg | AggregateFunction::Min
+            AggregateFunction::Sum
+                | AggregateFunction::Avg
+                | AggregateFunction::Min
+                | AggregateFunction::Max
         )
     {
         return None;
@@ -12973,7 +12976,7 @@ mod tests {
     }
 
     #[test]
-    fn sole_nullable_int64_max_crosses_the_parallel_threshold_and_excludes_other_shapes() {
+    fn paired_nullable_int64_max_crosses_the_parallel_threshold_and_excludes_other_shapes() {
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
 
         let cap = NonZeroUsize::new(4).unwrap();
@@ -12986,15 +12989,22 @@ mod tests {
             .create_nullable_int64_table("readings", "v", values)
             .unwrap();
 
-        let boundary_sql = "SELECT MAX(v) FROM readings WHERE v IS NOT NULL";
+        let boundary_sql =
+            "SELECT COUNT(*) AS rows, MAX(v) AS maximum FROM readings WHERE v IS NOT NULL";
         assert_eq!(
             assert_global_aggregate_worker_differential(&mut database, boundary_sql).rows,
-            [vec![Value::Int64(i64::MAX)]]
+            [vec![
+                Value::Int64(i64::try_from(row_count - 1).unwrap()),
+                Value::Int64(i64::MAX),
+            ]]
         );
-        let above_threshold_sql = "SELECT MAX(v) FROM readings";
+        let above_threshold_sql = "SELECT MAX(v) AS maximum, COUNT() AS rows FROM readings";
         assert_eq!(
             assert_global_aggregate_worker_differential(&mut database, above_threshold_sql).rows,
-            [vec![Value::Int64(i64::MAX)]]
+            [vec![
+                Value::Int64(i64::MAX),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
         );
 
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
@@ -13002,7 +13012,10 @@ mod tests {
         BUDGET.reset_peak();
         assert_eq!(
             query(&mut database, boundary_sql).rows,
-            [vec![Value::Int64(i64::MAX)]]
+            [vec![
+                Value::Int64(i64::try_from(row_count - 1).unwrap()),
+                Value::Int64(i64::MAX),
+            ]]
         );
         assert_eq!(
             BUDGET.peak_helpers_in_use(),
@@ -13013,11 +13026,14 @@ mod tests {
         BUDGET.reset_peak();
         assert_eq!(
             query(&mut database, above_threshold_sql).rows,
-            [vec![Value::Int64(i64::MAX)]]
+            [vec![
+                Value::Int64(i64::MAX),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
         );
         assert!(
             BUDGET.peak_helpers_in_use() > 0,
-            "a sole nullable MAX above the threshold uses shared helpers"
+            "nullable MAX plus COUNT() above the threshold uses shared helpers"
         );
         assert_eq!(BUDGET.helpers_in_use(), 0);
 
@@ -13029,10 +13045,42 @@ mod tests {
                 Value::Int64(i64::MAX),
             ]]
         );
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "COUNT(*) plus nullable MAX uses the same shared helper budget"
+        );
+
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, "SELECT COUNT(v), MAX(v) FROM readings").rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count - 1).unwrap()),
+                Value::Int64(i64::MAX),
+            ]]
+        );
         assert_eq!(
             BUDGET.peak_helpers_in_use(),
             0,
-            "paired nullable MAX remains sequential"
+            "COUNT(column) plus nullable MAX remains sequential"
+        );
+
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(*), MAX(v), MIN(v) FROM readings"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(i64::MAX),
+                Value::Int64(-3),
+            ]]
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "other multi-aggregate nullable projections remain sequential"
         );
 
         BUDGET.reset_peak();
@@ -13056,16 +13104,19 @@ mod tests {
     }
 
     #[test]
-    fn sole_nullable_int64_max_forced_workers_match_null_distributions_and_clauses() {
+    fn paired_nullable_int64_max_forced_workers_match_null_distributions_and_clauses() {
         let mut empty = Database::new();
         empty
             .create_nullable_int64_table("empty_values", "value", Vec::new())
             .unwrap();
         let empty_result = assert_global_aggregate_worker_differential(
             &mut empty,
-            "SELECT MAX(value) FROM empty_values",
+            "SELECT COUNT(*) AS rows, MAX(value) AS maximum FROM empty_values",
         );
-        assert_eq!(empty_result.rows, [vec![Value::Null(DataType::Int64)]]);
+        assert_eq!(
+            empty_result.rows,
+            [vec![Value::Int64(0), Value::Null(DataType::Int64)]]
+        );
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
         let mut all_null = Database::new();
@@ -13074,10 +13125,16 @@ mod tests {
             .unwrap();
         let null_result = assert_global_aggregate_worker_differential(
             &mut all_null,
-            "SELECT MAX(value) AS maximum FROM all_null HAVING maximum IS NULL \
-             ORDER BY maximum LIMIT 1 OFFSET 0",
+            "SELECT MAX(value) AS maximum, COUNT() AS rows FROM all_null \
+             HAVING maximum IS NULL ORDER BY rows DESC LIMIT 1 OFFSET 0",
         );
-        assert_eq!(null_result.rows, [vec![Value::Null(DataType::Int64)]]);
+        assert_eq!(
+            null_result.rows,
+            [vec![
+                Value::Null(DataType::Int64),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
 
         let mut values = vec![None; row_count];
         values[0] = Some(i64::MIN);
@@ -13089,16 +13146,22 @@ mod tests {
             .unwrap();
         let mixed_result = assert_global_aggregate_worker_differential(
             &mut sparse,
-            "SELECT MAX(value) AS maximum FROM sparse \
+            "SELECT COUNT(*) AS rows, MAX(value) AS maximum FROM sparse \
              WHERE value IS NULL OR value IS NOT NULL \
              HAVING maximum = 9223372036854775807 \
-             ORDER BY maximum DESC LIMIT 1 OFFSET 0",
+             ORDER BY rows DESC LIMIT 1 OFFSET 0",
         );
-        assert_eq!(mixed_result.rows, [vec![Value::Int64(i64::MAX)]]);
+        assert_eq!(
+            mixed_result.rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(i64::MAX),
+            ]]
+        );
     }
 
     #[test]
-    fn sole_nullable_int64_max_exhausted_admission_falls_back_completely() {
+    fn paired_nullable_int64_max_exhausted_admission_falls_back_completely() {
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
 
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
@@ -13109,8 +13172,8 @@ mod tests {
         database
             .create_nullable_int64_table("nullable_values", "value", values)
             .unwrap();
-        let sql = "SELECT MAX(value) AS maximum FROM nullable_values \
-                   HAVING maximum = 9 ORDER BY maximum LIMIT 1";
+        let sql = "SELECT MAX(value) AS maximum, COUNT() AS rows FROM nullable_values \
+                   HAVING maximum = 9 ORDER BY rows DESC LIMIT 1";
         let sequential = force_global_aggregate_workers(&mut database, 1, sql);
         database.global_aggregate_parallelism =
             GlobalAggregateParallelism::budgeted(database.global_aggregate_worker_cap(), &BUDGET);
@@ -13121,16 +13184,22 @@ mod tests {
         let exhausted = query(&mut database, sql);
         assert_eq!(
             exhausted, sequential,
-            "exhausted admission repeats the complete nullable MAX locally"
+            "exhausted admission repeats the complete COUNT/nullable MAX pair locally"
         );
-        assert_eq!(exhausted.rows, [vec![Value::Int64(9)]]);
+        assert_eq!(
+            exhausted.rows,
+            [vec![
+                Value::Int64(9),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
         assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
         drop(held);
         assert_eq!(BUDGET.helpers_in_use(), 0);
     }
 
     #[test]
-    fn sole_nullable_int64_max_worker_failure_repeats_the_complete_input_locally() {
+    fn paired_nullable_int64_max_worker_failure_repeats_the_complete_pair_locally() {
         let values = [Some(-9), None, Some(i64::MAX)];
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut matching_rows = vec![0; row_count];
@@ -13160,19 +13229,24 @@ mod tests {
 
         assert_eq!(successful_parallel, Some(i64::MAX));
         assert_eq!(maximum, successful_parallel);
+        assert_eq!(
+            count_matched_rows(matching_rows.len()),
+            Ok(i64::try_from(row_count).unwrap())
+        );
     }
 
     #[test]
-    fn sole_nullable_int64_max_forced_workers_preserve_resource_limits() {
+    fn paired_nullable_int64_max_forced_workers_preserve_resource_limits() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let fixed_bytes =
-            std::mem::size_of::<AggregateState>() + std::mem::size_of::<Vec<AggregateState>>();
+        let fixed_bytes = 2_usize.saturating_mul(
+            std::mem::size_of::<AggregateState>() + std::mem::size_of::<Vec<AggregateState>>(),
+        );
         let exact_limits = QueryResultLimits {
             max_scan_rows: row_count,
             max_rows: 1,
-            max_values: 1,
+            max_values: 2,
             max_groups: 1,
-            max_aggregate_state_cells: 1,
+            max_aggregate_state_cells: 2,
             max_aggregate_state_bytes: fixed_bytes,
             ..QueryResultLimits::default()
         };
@@ -13186,19 +13260,18 @@ mod tests {
                     .collect(),
             )
             .unwrap();
+        let sql = "SELECT COUNT(*) AS rows, MAX(value) AS maximum FROM nullable_values";
 
-        let sequential = force_global_aggregate_workers(
-            &mut database,
-            1,
-            "SELECT MAX(value) FROM nullable_values",
-        );
-        let parallel = force_global_aggregate_workers(
-            &mut database,
-            4,
-            "SELECT MAX(value) FROM nullable_values",
-        );
+        let sequential = force_global_aggregate_workers(&mut database, 1, sql);
+        let parallel = force_global_aggregate_workers(&mut database, 4, sql);
         assert_eq!(parallel, sequential);
-        assert_eq!(parallel.rows, [vec![Value::Int64(5)]]);
+        assert_eq!(
+            parallel.rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(5),
+            ]]
+        );
 
         for (limits, expected) in [
             (
@@ -13214,6 +13287,17 @@ mod tests {
             ),
             (
                 QueryResultLimits {
+                    max_aggregate_state_cells: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state cells",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
                     max_aggregate_state_bytes: fixed_bytes - 1,
                     ..exact_limits
                 },
@@ -13221,6 +13305,17 @@ mod tests {
                     resource: "SELECT aggregate state bytes",
                     actual: fixed_bytes,
                     max: fixed_bytes - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_values: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result values",
+                    actual: 2,
+                    max: 1,
                 },
             ),
             (
@@ -13237,9 +13332,9 @@ mod tests {
         ] {
             database.query_result_limits = limits;
             database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
-            let sequential = database.execute("SELECT MAX(value) FROM nullable_values");
+            let sequential = database.execute(sql);
             database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
-            let parallel = database.execute("SELECT MAX(value) FROM nullable_values");
+            let parallel = database.execute(sql);
             assert_eq!(parallel, sequential);
             assert_eq!(parallel, Err(expected));
         }
