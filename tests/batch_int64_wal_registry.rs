@@ -96,16 +96,22 @@ fn create_two_table_registry(path: &Path) {
 }
 
 fn assert_nullable_query_behavior(database: &mut Database, table: &str) {
-    let error = database
-        .execute(&format!("SELECT CAST(v AS String) FROM {table}"))
-        .unwrap_err();
+    let results = database
+        .execute(&format!(
+            "SELECT CAST(v AS String) AS rendered FROM {table} \
+             ORDER BY CAST(v AS String)"
+        ))
+        .unwrap();
+    let [StatementResult::Query(cast)] = results.as_slice() else {
+        panic!("expected nullable String CAST query")
+    };
     assert_eq!(
-        error,
-        Error::UnsupportedNullableOperation {
-            table: "Alpha".to_owned(),
-            column: "v".to_owned(),
-            operation: "CAST",
-        }
+        cast.rows,
+        [
+            vec![Value::Null(rusthouse::batch::value::DataType::String)],
+            vec![Value::String(i64::MIN.to_string())],
+            vec![Value::String(i64::MAX.to_string())],
+        ]
     );
 
     let results = database
@@ -301,7 +307,7 @@ fn registry_recovered_mixed_and_all_null_keys_support_ordered_row_number() {
 }
 
 #[test]
-fn nullable_created_and_recovered_tables_support_subtraction_aggregates_and_to_string() {
+fn nullable_created_and_recovered_tables_support_scalars_aggregates_and_to_string() {
     let directory = TestDirectory::new();
     let registry = directory.join("registry");
     let snapshot = directory.join("nullable.snapshot");

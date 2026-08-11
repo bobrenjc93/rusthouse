@@ -922,19 +922,15 @@ fn nullable_int64_to_float64_propagates_typed_nulls_through_selection_and_orderi
         [vec![Value::Null(DataType::Float64)]]
     );
 
-    for target in ["Int64", "String"] {
-        assert_eq!(
-            database.execute(&format!(
-                "SELECT CAST(measurement AS {target}) FROM readings"
-            )),
-            Err(Error::UnsupportedNullableOperation {
-                table: "readings".to_owned(),
-                column: "measurement".to_owned(),
-                operation: "CAST",
-            }),
-            "nullable CAST AS {target} must remain unsupported",
-        );
-    }
+    assert_eq!(
+        database.execute("SELECT CAST(measurement AS Int64) FROM readings"),
+        Err(Error::UnsupportedNullableOperation {
+            table: "readings".to_owned(),
+            column: "measurement".to_owned(),
+            operation: "CAST",
+        }),
+        "nullable CAST AS Int64 must remain unsupported",
+    );
 }
 
 #[test]
@@ -1004,6 +1000,170 @@ fn nullable_int64_to_float64_cast_obeys_result_caps() {
             ..
         })
     ));
+}
+
+#[test]
+fn nullable_int64_to_string_formats_extrema_and_preserves_ordering_and_pagination() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (measurement Nullable(Int64)); \
+             INSERT INTO readings VALUES \
+             (NULL), (-9223372036854775808), (-1), (0), (2), (10), \
+             (9223372036854775807), (NULL); \
+             CREATE TABLE missing (measurement Nullable(Int64)); \
+             INSERT INTO missing VALUES (NULL), (NULL), (NULL);",
+        )
+        .expect("setup");
+
+    let all = query(
+        &mut database,
+        "SELECT CAST(measurement AS String) FROM readings",
+    );
+    assert_eq!(
+        all.columns,
+        [ResultColumn {
+            name: "CAST(measurement AS String)".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert_eq!(
+        all.rows,
+        [
+            vec![Value::Null(DataType::String)],
+            vec![Value::String(i64::MIN.to_string())],
+            vec![Value::String("-1".to_owned())],
+            vec![Value::String("0".to_owned())],
+            vec![Value::String("2".to_owned())],
+            vec![Value::String("10".to_owned())],
+            vec![Value::String(i64::MAX.to_string())],
+            vec![Value::Null(DataType::String)],
+        ]
+    );
+
+    let paged = query(
+        &mut database,
+        "SELECT CAST(measurement AS String) AS rendered FROM readings \
+         WHERE measurement IS NULL OR measurement >= 0 \
+         ORDER BY rendered LIMIT 5 OFFSET 1",
+    );
+    assert_eq!(
+        paged.columns,
+        [ResultColumn {
+            name: "rendered".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert_eq!(
+        paged.rows,
+        [
+            vec![Value::Null(DataType::String)],
+            vec![Value::String("0".to_owned())],
+            vec![Value::String("10".to_owned())],
+            vec![Value::String("2".to_owned())],
+            vec![Value::String(i64::MAX.to_string())],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(measurement AS String) FROM readings \
+             ORDER BY CAST(measurement AS String) DESC LIMIT 2 OFFSET 6",
+        )
+        .rows,
+        [
+            vec![Value::Null(DataType::String)],
+            vec![Value::Null(DataType::String)],
+        ],
+        "expression ordering must keep NULL last when descending",
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(measurement AS String) AS rendered FROM missing \
+             ORDER BY rendered LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [
+            vec![Value::Null(DataType::String)],
+            vec![Value::Null(DataType::String)],
+        ],
+        "an all-NULL source must return typed String NULLs",
+    );
+}
+
+#[test]
+fn nullable_int64_to_string_cast_charges_only_selected_generated_bytes_exactly() {
+    let result_name = "rendered";
+    let fixed_bytes = std::mem::size_of::<ResultColumn>()
+        + result_name.len()
+        + 4 * std::mem::size_of::<Vec<Value>>()
+        + 4 * std::mem::size_of::<Value>();
+    let exact_bytes = fixed_bytes + i64::MIN.to_string().len() + "7".len();
+    let values = vec![Some(i64::MIN), None, Some(7), None];
+    let sql = "SELECT CAST(value AS String) AS rendered FROM samples";
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 4,
+        max_values: 4,
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    exact
+        .create_nullable_int64_table("samples", "value", values.clone())
+        .expect("setup");
+    assert_eq!(
+        query(&mut exact, sql).rows,
+        [
+            vec![Value::String(i64::MIN.to_string())],
+            vec![Value::Null(DataType::String)],
+            vec![Value::String("7".to_owned())],
+            vec![Value::Null(DataType::String)],
+        ]
+    );
+
+    let mut one_byte_short = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 4,
+        max_values: 4,
+        max_bytes: exact_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    one_byte_short
+        .create_nullable_int64_table("samples", "value", values)
+        .expect("setup");
+    assert_eq!(
+        one_byte_short.execute(sql),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        })
+    );
+
+    let selected_fixed_bytes = std::mem::size_of::<ResultColumn>()
+        + result_name.len()
+        + std::mem::size_of::<Vec<Value>>()
+        + std::mem::size_of::<Value>();
+    let mut selected_only = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: selected_fixed_bytes + "7".len(),
+        ..QueryResultLimits::default()
+    });
+    selected_only
+        .create_nullable_int64_table(
+            "samples",
+            "value",
+            vec![Some(i64::MIN), None, Some(7), Some(i64::MAX)],
+        )
+        .expect("setup");
+    assert_eq!(
+        query(&mut selected_only, &format!("{sql} LIMIT 1 OFFSET 2"),).rows,
+        [vec![Value::String("7".to_owned())]],
+        "pagination must select rows before generated payload accounting and materialization",
+    );
 }
 
 #[test]

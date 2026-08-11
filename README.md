@@ -498,13 +498,16 @@ selected overflow or non-`Int64` argument is a typed error.
 `CAST(int64_column AS String)`, `CAST(float64_column AS String)`, and
 `CAST(bool_column AS String)`.
 For the narrow physical `Nullable(Int64)` case,
-`CAST(nullable_int64_column AS Float64)` and
-`CAST(nullable_int64_column AS Bool)` are supported. Present values use the
+`CAST(nullable_int64_column AS Float64)`,
+`CAST(nullable_int64_column AS Bool)`, and
+`CAST(nullable_int64_column AS String)` are supported. Present values use the
 normal conversion; for Bool, zero becomes `false` and every nonzero value
-becomes `true`. Absent values produce a typed `NULL` of the target type.
+becomes `true`, while String uses canonical base-10 integer text. Absent values
+produce a typed `NULL` of the target type and add no generated String payload
+bytes.
 Filtering, aliases, expression ordering, pagination, and result limits behave
 as for the non-nullable casts, with `NULL` first ascending and last descending.
-Other CAST targets for physical nullable columns remain unsupported.
+Casting a physical nullable column to `Int64` remains unsupported.
 Integer-to-String casts use canonical base-10
 text: zero is `0`, positive values have no leading plus sign or zeroes, and
 negative values have one leading minus sign. This includes exact
