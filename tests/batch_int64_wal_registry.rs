@@ -16,7 +16,7 @@ use rusthouse::batch::wal::{
 };
 use rusthouse::{
     DatabaseInt64WalRegistryEnableError, DatabaseInt64WalRegistryRecoveryError,
-    DatabaseSnapshotSaveError, Int64TablePayloadCodec, SnapshotCodec, TableLimits,
+    Int64TablePayloadCodec, SnapshotCodec, TableLimits,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -311,20 +311,15 @@ fn nullable_created_and_recovered_tables_support_subtraction_aggregates_and_to_s
         .unwrap();
 
     assert_nullable_query_behavior(&mut database, "alpha");
-    let snapshot_error = database
+    database
         .save_int64_table_to_file(
             "Alpha",
             &snapshot,
             SnapshotCodec::new(1024),
-            Int64TablePayloadCodec::new(1, 2, 1024),
+            Int64TablePayloadCodec::new(1, database.max_rows_per_table(), 1024),
         )
-        .unwrap_err();
-    assert!(matches!(
-        snapshot_error,
-        DatabaseSnapshotSaveError::NullableColumn { ref column } if column == "v"
-    ));
-    assert!(!snapshot_error.destination_was_replaced());
-    assert!(!snapshot.exists());
+        .unwrap();
+    assert!(snapshot.is_file());
 
     database
         .enable_int64_write_ahead_log_registry(&["Alpha"], &registry, limits())

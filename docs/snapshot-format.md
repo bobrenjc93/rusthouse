@@ -148,17 +148,17 @@ metrics.
 
 `Database::save_int64_table_to_file` adapts one named batch-engine table to the
 same self-describing payload and atomic replacement operation. The selected
-table must exist and have exactly one non-nullable physical `Int64` column.
-Table lookup and the complete column-count and type validation happen before
-filesystem access. The adapter retains the stored column name, row order, and
-row cap, but the format still does not include the batch table name or other
-catalog tables. The existing `restore_int64_table_payload_from_file` decoder
-reopens its output. Its save error distinguishes table lookup and shape
-validation from the existing payload and replacement failures, and reports
-whether a post-rename directory-sync failure occurred. Name, row-cap, row-count,
-and encoded-byte limits are checked directly against borrowed batch storage
-before allocating the payload; no intermediate `Int64Table` column clone is
-created.
+table must exist and have exactly one physical `Int64` or `Nullable(Int64)`
+column. Table lookup and the complete column-count and type validation happen
+before filesystem access. The adapter retains the stored column name,
+nullability, exact NULL positions, row order, and row cap, but the format still
+does not include the batch table name or other catalog tables. The existing
+`restore_int64_table_payload_from_file` decoder reopens its output. Its save
+error distinguishes table lookup and shape validation from the existing payload
+and replacement failures, and reports whether a post-rename directory-sync
+failure occurred. Name, row-cap, row-count, and encoded-byte limits are checked
+directly against borrowed batch storage before allocating the payload; no
+intermediate `Int64Table` column clone is created.
 
 `save_int64_table_to_file` is the Unix-only composed table save operation. It
 first encodes an existing `Int64Table` through `NullableI64PayloadCodec`, then

@@ -541,7 +541,8 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
-    /// Attempts to atomically save one non-nullable, one-column `Int64` table on Unix.
+    /// Attempts to atomically save one nullable or non-nullable, one-column
+    /// `Int64` table on Unix.
     ///
     /// Exactly one nonblocking read-lock attempt occurs. A concurrent writer
     /// returns [`SharedDatabaseSnapshotSaveError::DatabaseBusy`] without

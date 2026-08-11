@@ -1695,8 +1695,35 @@ impl Int64TablePayloadCodec {
     /// Encodes one table, including its one-column schema and row cap.
     pub fn encode(self, table: &Int64Table) -> Result<Vec<u8>, Int64TablePayloadError> {
         let column = table.schema().column();
-        let metadata = self.validate_metadata(column.name(), table.row_cap(), table.row_count())?;
-        let encoded_rows_len = table.values().iter().try_fold(0_usize, |length, value| {
+        self.encode_optional_values(
+            column.name(),
+            column.is_nullable(),
+            table.row_cap(),
+            table.values(),
+        )
+    }
+
+    /// Encodes one validated nullable `Int64` column without first cloning it
+    /// into an [`Int64Table`].
+    #[cfg(unix)]
+    pub(crate) fn encode_nullable_values(
+        self,
+        name: &str,
+        row_cap: usize,
+        values: &[Option<i64>],
+    ) -> Result<Vec<u8>, Int64TablePayloadError> {
+        self.encode_optional_values(name, true, row_cap, values)
+    }
+
+    fn encode_optional_values(
+        self,
+        name: &str,
+        nullable: bool,
+        row_cap: usize,
+        values: &[Option<i64>],
+    ) -> Result<Vec<u8>, Int64TablePayloadError> {
+        let metadata = self.validate_metadata(name, row_cap, values.len())?;
+        let encoded_rows_len = values.iter().try_fold(0_usize, |length, value| {
             let row_len = if value.is_some() {
                 std::mem::size_of::<u8>() + std::mem::size_of::<i64>()
             } else {
@@ -1704,13 +1731,8 @@ impl Int64TablePayloadCodec {
             };
             length.checked_add(row_len)
         });
-        let mut payload = self.encode_prefix(
-            column.name(),
-            column.is_nullable(),
-            metadata,
-            encoded_rows_len,
-        )?;
-        for value in table.values() {
+        let mut payload = self.encode_prefix(name, nullable, metadata, encoded_rows_len)?;
+        for value in values {
             match value {
                 None => payload.push(NULLABLE_I64_NULL_TAG),
                 Some(value) => {
