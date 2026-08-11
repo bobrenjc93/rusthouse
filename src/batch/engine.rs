@@ -30,8 +30,6 @@ use crate::batch::wal::{
     Int64WriteAheadLogError, Int64WriteAheadLogLimits, Int64WriteAheadLogRegistryError,
     Int64WriteAheadLogRegistryLimits,
 };
-#[cfg(unix)]
-use crate::snapshot::Int64TablePayloadFileSaveError;
 use crate::snapshot::{
     Int64TablePayloadCodec, Int64TablePayloadFileRecoveryError,
     Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError,
@@ -39,6 +37,8 @@ use crate::snapshot::{
     restore_int64_table_payload_from_file, restore_int64_table_payload_from_file_with_backup,
     restore_int64_table_rle_from_file,
 };
+#[cfg(unix)]
+use crate::snapshot::{Int64TablePayloadFileSaveError, Int64TableRleFileSaveError};
 use crate::storage::{Int64Table, Schema};
 
 pub use crate::batch::aggregate_scheduler::{
@@ -670,6 +670,32 @@ pub enum DatabaseSnapshotSaveError {
     Snapshot(Int64TablePayloadFileSaveError),
 }
 
+/// A failure while atomically saving one batch table as a row-only,
+/// RLE-compressed nullable or non-nullable `Int64` snapshot.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum DatabaseRleSnapshotSaveError {
+    /// The requested table was not present in the database.
+    Table(Error),
+    /// The selected table does not have exactly one physical column.
+    UnsupportedColumnCount {
+        /// The stored display name of the selected table.
+        table: String,
+        /// The number of physical columns in the selected table.
+        column_count: usize,
+    },
+    /// The selected table's only physical column is not `Int64` or
+    /// `Nullable(Int64)`.
+    UnsupportedColumnType {
+        /// The stored display name of the unsupported column.
+        column: String,
+        /// The physical type found in the batch table.
+        data_type: DataType,
+    },
+    /// RLE encoding or atomically replacing the snapshot failed.
+    Snapshot(Int64TableRleFileSaveError),
+}
+
 /// A failure while opting one existing one-column `Int64` table into a new WAL.
 #[cfg(unix)]
 #[derive(Debug)]
@@ -921,6 +947,23 @@ impl DatabaseSnapshotSaveError {
 }
 
 #[cfg(unix)]
+impl DatabaseRleSnapshotSaveError {
+    /// Returns whether the destination was replaced before this error occurred.
+    ///
+    /// Table validation, RLE encoding, and every replacement failure before
+    /// the rename return `false`. Only post-rename directory-sync uncertainty
+    /// returns `true`.
+    pub const fn destination_was_replaced(&self) -> bool {
+        match self {
+            Self::Snapshot(error) => error.destination_was_replaced(),
+            Self::Table(_)
+            | Self::UnsupportedColumnCount { .. }
+            | Self::UnsupportedColumnType { .. } => false,
+        }
+    }
+}
+
+#[cfg(unix)]
 impl fmt::Display for DatabaseSnapshotSaveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -941,6 +984,27 @@ impl fmt::Display for DatabaseSnapshotSaveError {
                 "column '{column}' is nullable; batch snapshot save requires exactly one non-nullable Int64 column"
             ),
             Self::Snapshot(error) => write!(formatter, "could not save snapshot: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for DatabaseRleSnapshotSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Table(error) => error.fmt(formatter),
+            Self::UnsupportedColumnCount {
+                table,
+                column_count,
+            } => write!(
+                formatter,
+                "table '{table}' has {column_count} columns; batch RLE snapshot save requires exactly one Int64 or Nullable(Int64) column"
+            ),
+            Self::UnsupportedColumnType { column, data_type } => write!(
+                formatter,
+                "column '{column}' has type {data_type}; batch RLE snapshot save requires Int64 or Nullable(Int64)"
+            ),
+            Self::Snapshot(error) => write!(formatter, "could not save RLE snapshot: {error}"),
         }
     }
 }
@@ -988,6 +1052,17 @@ impl std::error::Error for DatabaseSnapshotSaveError {
     }
 }
 
+#[cfg(unix)]
+impl std::error::Error for DatabaseRleSnapshotSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Table(error) => Some(error),
+            Self::Snapshot(error) => Some(error),
+            Self::UnsupportedColumnCount { .. } | Self::UnsupportedColumnType { .. } => None,
+        }
+    }
+}
+
 impl From<Int64TablePayloadFileRestoreError> for DatabaseSnapshotRestoreError {
     fn from(error: Int64TablePayloadFileRestoreError) -> Self {
         Self::Snapshot(error)
@@ -1028,6 +1103,20 @@ impl From<Error> for DatabaseSnapshotSaveError {
 #[cfg(unix)]
 impl From<Int64TablePayloadFileSaveError> for DatabaseSnapshotSaveError {
     fn from(error: Int64TablePayloadFileSaveError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<Error> for DatabaseRleSnapshotSaveError {
+    fn from(error: Error) -> Self {
+        Self::Table(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<Int64TableRleFileSaveError> for DatabaseRleSnapshotSaveError {
+    fn from(error: Int64TableRleFileSaveError) -> Self {
         Self::Snapshot(error)
     }
 }
@@ -2291,6 +2380,58 @@ impl Database {
         snapshot_codec
             .replace_file(path, &payload)
             .map_err(Int64TablePayloadFileSaveError::from)?;
+        Ok(())
+    }
+
+    /// Atomically saves one nullable or non-nullable, one-column `Int64` batch
+    /// table as a bounded, RLE-compressed snapshot on Unix.
+    ///
+    /// `table_name` uses the catalog's normal case-insensitive lookup. This is
+    /// deliberately a row-only format: it preserves exact values, NULL
+    /// positions, and row order, but does not store the column schema, table
+    /// row cap, batch table name, or any other catalog metadata. Reopening with
+    /// [`Self::restore_int64_table_rle_from_file`] therefore requires the
+    /// caller to supply the column schema and row cap.
+    ///
+    /// Table existence, exact column count, and physical type are checked
+    /// before any filesystem access. The existing
+    /// [`NullableI64RlePayloadCodec`] bounds rows, runs, and encoded bytes
+    /// before the checksummed envelope is atomically replaced. Every
+    /// validation, encoding, or pre-rename replacement failure preserves an
+    /// existing destination. Encoding borrows the physical batch column and
+    /// does not clone it into an intermediate [`Int64Table`].
+    #[cfg(unix)]
+    pub fn save_int64_table_rle_to_file(
+        &self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: NullableI64RlePayloadCodec,
+    ) -> std::result::Result<(), DatabaseRleSnapshotSaveError> {
+        let table = self.catalog.table(table_name)?;
+        if table.schema().len() != 1 {
+            return Err(DatabaseRleSnapshotSaveError::UnsupportedColumnCount {
+                table: table.name().to_owned(),
+                column_count: table.schema().len(),
+            });
+        }
+
+        let column = &table.schema()[0];
+        if column.data_type != DataType::Int64 {
+            return Err(DatabaseRleSnapshotSaveError::UnsupportedColumnType {
+                column: column.name.clone(),
+                data_type: column.data_type,
+            });
+        }
+        let payload = match &table.columns()[0] {
+            Column::Int64(values) => payload_codec.encode_non_nullable_values(values),
+            Column::NullableInt64(values) => payload_codec.encode(values),
+            _ => unreachable!("batch table storage must agree with its validated schema"),
+        };
+        let payload = payload.map_err(Int64TableRleFileSaveError::from)?;
+        snapshot_codec
+            .replace_file(path, &payload)
+            .map_err(Int64TableRleFileSaveError::from)?;
         Ok(())
     }
 

@@ -29,15 +29,15 @@ pub use engine::{
 pub use engine::{
     DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError,
     DatabaseInt64WalRegistryEnableError, DatabaseInt64WalRegistryRecoveryError,
-    DatabaseSnapshotSaveError,
+    DatabaseRleSnapshotSaveError, DatabaseSnapshotSaveError,
 };
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
-#[cfg(unix)]
-pub use shared_database::SharedDatabaseSnapshotSaveError;
 pub use shared_database::{
     DatabaseMetrics, SharedDatabase, SharedDatabaseError, SharedDatabaseSnapshotRestoreError,
     SharedDatabaseSnapshotSetRestoreError,
 };
+#[cfg(unix)]
+pub use shared_database::{SharedDatabaseRleSnapshotSaveError, SharedDatabaseSnapshotSaveError};
 pub use storage::TableLimits;
 #[cfg(unix)]
 pub use wal::{
