@@ -456,8 +456,8 @@ pub enum DatabaseSnapshotRestoreError {
     /// nullable `Int64` column.
     ///
     /// The primary [`Database::restore_int64_table_from_file`] path accepts
-    /// nullable columns; backup, replacement, and set restore keep returning
-    /// this variant for them.
+    /// nullable columns, as does its explicit-backup recovery counterpart;
+    /// replacement and set restore keep returning this variant for them.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
     /// limits were rejected by batch storage.
@@ -2160,8 +2160,8 @@ impl Database {
         Ok(())
     }
 
-    /// Reopens one self-describing, non-nullable `Int64` snapshot from a
-    /// primary or caller-supplied backup file as a named batch table.
+    /// Reopens one self-describing `Int64` or `Nullable(Int64)` snapshot from
+    /// a primary or caller-supplied backup file as a named batch table.
     ///
     /// The primary file is decoded first and takes precedence whenever it is
     /// valid. The backup is inspected only if bounded primary file, envelope,
@@ -2170,11 +2170,13 @@ impl Database {
     /// [`DatabaseSnapshotRestoreError::Recovery`] variant retains both typed
     /// failures.
     ///
-    /// Database validation is identical to [`Self::restore_int64_table_from_file`]:
-    /// the caller-provided table name must be unique, the snapshot column must
-    /// be non-nullable, and the persisted table must fit all configured
-    /// [`TableLimits`]. The catalog and its cached metrics change only after
-    /// decoding and every validation step succeed.
+    /// Database validation is identical to [`Self::restore_int64_table_from_file`].
+    /// The caller-provided table name must be unique, and the persisted table
+    /// must fit all configured [`TableLimits`]. Registration preserves the
+    /// decoded column name, nullability, exact NULL positions, row order, and
+    /// persisted row cap. The catalog and its cached metrics change only after
+    /// decoding and every validation step succeed; database validation does
+    /// not cause a fallback to the backup.
     pub fn restore_int64_table_from_file_with_backup(
         &mut self,
         table_name: &str,
@@ -2195,20 +2197,8 @@ impl Database {
             payload_codec,
         )?;
         let (restored, source) = recovered.into_parts();
-        self.register_restored_int64_table(table_name, restored)?;
+        self.register_reopened_int64_table(table_name, restored)?;
         Ok(source)
-    }
-
-    fn register_restored_int64_table(
-        &mut self,
-        table_name: &str,
-        restored: Int64Table,
-    ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
-        let table = self.prepare_restored_int64_table(table_name, restored)?;
-        let measurements = TableMeasurements::read(&table);
-        self.catalog.register_table(table)?;
-        self.measurements.add(measurements);
-        Ok(())
     }
 
     fn register_reopened_int64_table(

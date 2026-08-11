@@ -6,15 +6,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::batch::engine::{QueryResult, StatementResult};
 use rusthouse::batch::error::Error;
-#[cfg(unix)]
 use rusthouse::batch::storage::Column;
 use rusthouse::batch::value::Value;
 use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
-    Database, DatabaseMetrics, DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError,
-    DatabaseSnapshotSetRestoreError, Int64Table, Int64TablePayloadCodec, Int64TablePayloadError,
-    Int64TablePayloadFileRecoverySource, Int64TablePayloadFileRestoreError, Schema, SharedDatabase,
-    SnapshotCodec, SnapshotError, TableLimits,
+    BatchDataType, Database, DatabaseMetrics, DatabaseSnapshotRestoreEntry,
+    DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, Int64Table,
+    Int64TablePayloadCodec, Int64TablePayloadError, Int64TablePayloadFileRecoverySource,
+    Int64TablePayloadFileRestoreError, Schema, SharedDatabase, SnapshotCodec, SnapshotError,
+    TableLimits,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -194,6 +194,171 @@ fn backup_restore_prefers_a_valid_primary_without_inspecting_the_backup() {
         unreachable!("SELECT always returns one query result")
     };
     assert_eq!(result.rows, [[Value::Int64(11)]]);
+}
+
+#[test]
+fn nullable_backup_restore_prefers_primary_and_preserves_metadata_rows_and_metrics() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("nullable-primary.snapshot");
+    let rows = [Some(i64::MIN), None, Some(7), None];
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&primary_path, "Measurement", true, 5, &rows);
+    let limits = TableLimits::new(5, 1, 5);
+    let mut database = Database::with_table_limits(limits);
+
+    let source = database
+        .restore_int64_table_from_file_with_backup(
+            "Archive",
+            primary_path,
+            directory.join("missing-backup.snapshot"),
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+
+    assert_eq!(source, Int64TablePayloadFileRecoverySource::Primary);
+    let table = database.catalog().table("archive").unwrap();
+    assert_eq!(table.schema()[0].name, "Measurement");
+    assert_eq!(table.row_cap(), 5);
+    assert_eq!(table.limits(), limits);
+    let [Column::NullableInt64(restored_rows)] = table.columns() else {
+        panic!("recovered column must retain physical Nullable(Int64) storage");
+    };
+    assert_eq!(restored_rows, &rows);
+
+    let mut results = database.execute("SELECT Measurement FROM Archive").unwrap();
+    let StatementResult::Query(result) = results.pop().unwrap() else {
+        unreachable!("SELECT always returns one query result")
+    };
+    assert_eq!(
+        result.rows,
+        [
+            [Value::Int64(i64::MIN)],
+            [Value::Null(BatchDataType::Int64)],
+            [Value::Int64(7)],
+            [Value::Null(BatchDataType::Int64)],
+        ]
+    );
+    assert_eq!(
+        SharedDatabase::new(database).metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 1,
+            column_count: 1,
+            retained_row_count: rows.len(),
+            retained_value_bytes: rows.len() * 9,
+        })
+    );
+}
+
+#[test]
+fn nullable_backup_restore_recovers_an_all_null_backup_at_its_row_cap() {
+    let directory = TestDirectory::new();
+    let backup_path = directory.join("all-null-backup.snapshot");
+    let rows = [None, None, None];
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&backup_path, "reading", true, rows.len(), &rows);
+    let limits = TableLimits::new(rows.len(), 1, rows.len());
+    let mut database = Database::with_table_limits(limits);
+
+    let source = database
+        .restore_int64_table_from_file_with_backup(
+            "Readings",
+            directory.join("missing-primary.snapshot"),
+            backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+
+    assert_eq!(source, Int64TablePayloadFileRecoverySource::Backup);
+    let table = database.catalog().table("readings").unwrap();
+    assert_eq!(table.schema()[0].name, "reading");
+    assert_eq!(table.row_cap(), rows.len());
+    assert_eq!(table.limits(), limits);
+    let [Column::NullableInt64(restored_rows)] = table.columns() else {
+        panic!("recovered column must retain physical Nullable(Int64) storage");
+    };
+    assert_eq!(restored_rows, &rows);
+    assert_eq!(
+        SharedDatabase::new(database).metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 1,
+            column_count: 1,
+            retained_row_count: rows.len(),
+            retained_value_bytes: rows.len() * 9,
+        })
+    );
+}
+
+#[test]
+fn nullable_backup_restore_recovers_after_a_corrupt_primary() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("corrupt-nullable-primary.snapshot");
+    let backup_path = directory.join("nullable-backup.snapshot");
+    let rows = [None, Some(i64::MAX), Some(-9)];
+    let (snapshot_codec, payload_codec) = write_snapshot(&backup_path, "reading", true, 4, &rows);
+    let mut corrupt = fs::read(&backup_path).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&primary_path, corrupt).unwrap();
+    let mut database = Database::with_table_limits(TableLimits::new(4, 1, 4));
+
+    let source = database
+        .restore_int64_table_from_file_with_backup(
+            "Readings",
+            primary_path,
+            backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+
+    assert_eq!(source, Int64TablePayloadFileRecoverySource::Backup);
+    let table = database.catalog().table("readings").unwrap();
+    let [Column::NullableInt64(restored_rows)] = table.columns() else {
+        panic!("recovered column must retain physical Nullable(Int64) storage");
+    };
+    assert_eq!(restored_rows, &rows);
+}
+
+#[test]
+fn nullable_primary_validation_failure_does_not_fall_back_or_change_metrics() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("over-limit-primary.snapshot");
+    let backup_path = directory.join("valid-backup.snapshot");
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&primary_path, "reading", true, 3, &[Some(1), None]);
+    write_snapshot(&backup_path, "reading", true, 2, &[Some(99)]);
+
+    let mut database = Database::with_table_limits(TableLimits::new(2, 1, 2));
+    database
+        .execute("CREATE TABLE existing (id Int64); INSERT INTO existing VALUES (7);")
+        .unwrap();
+    let metrics_before = cached_metrics(&mut database);
+
+    let error = database
+        .restore_int64_table_from_file_with_backup(
+            "Readings",
+            primary_path,
+            backup_path,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        DatabaseSnapshotRestoreError::Table(Error::ResourceLimitExceeded {
+            resource: "table row cap",
+            actual: 3,
+            max: 2,
+        })
+    ));
+    assert!(matches!(
+        database.catalog().table("readings"),
+        Err(Error::TableNotFound(name)) if name == "readings"
+    ));
+    assert_eq!(database.catalog().table("existing").unwrap().row_count(), 1);
+    assert_eq!(cached_metrics(&mut database), metrics_before);
 }
 
 #[test]
