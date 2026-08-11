@@ -392,7 +392,9 @@ The exact case-insensitive query
 `rusthouse_retained_value_bytes`—followed by the cumulative
 `rusthouse_index_scanned_blocks` and `rusthouse_index_pruned_blocks` counters.
 All six are also exposed by `GET /metrics`; the database totals are Prometheus
-gauges and the sparse-index measurements are Prometheus counters.
+gauges and the sparse-index measurements are Prometheus counters. That endpoint
+additionally exposes the configured aggregate worker cap, which is not a
+`system.metrics` row.
 Rows remain in that order and contain a `String` metric name plus a checked
 `Int64` value. The totals track table,
 column, retained-row, and retained scalar payload-byte lifecycle changes; the
@@ -1106,7 +1108,11 @@ accepts no body and returns four unlabeled gauges: `rusthouse_tables`,
 `rusthouse_columns`, `rusthouse_retained_rows`, and
 `rusthouse_retained_value_bytes`. They report the registered table count, the
 schema-column count across all tables, the row count retained across all tables,
-and retained scalar payload bytes. The same response includes the unlabeled
+and retained scalar payload bytes. These are followed by the unlabeled
+`rusthouse_global_aggregate_worker_cap` gauge, which reports the database's
+current configured computation-lane cap for supported aggregate queries. A
+request-local `max_threads` value can only tighten one query and never changes
+this gauge. The same response then includes the unlabeled
 `rusthouse_index_scanned_blocks` and `rusthouse_index_pruned_blocks` counters
 reported by `system.metrics`. They count blocks passed to the exact predicate
 evaluator and blocks rejected from metadata, respectively, across indexed query
@@ -1122,19 +1128,19 @@ catalog. A scrape that cannot fit all current-table samples within the
 configured complete-response cap fails with the existing bounded response-limit
 error instead of returning a partial metric family. An allocation-free catalog
 pass accounts for the table count, both copies of every display name, decimal
-total and counter values, and the complete HTTP envelope before any name is
-cloned or sorted. The byte gauges count each `Int64` and `Float64` value as 8
-bytes, each `Bool` as 1 byte, and each `String` by its UTF-8 payload length; they
-exclude container capacity, schema text, and allocation metadata and saturate
-at the platform's maximum `usize`. The response uses Prometheus text format
-version 0.0.4. Table and database totals are maintained during mutations, so a
-scrape reads cached measurements instead of scanning retained values. When the
-preflight succeeds, capturing the per-table samples copies and sorts the current
-catalog names, row counts, and cached byte counts under the same database
-read-lock attempt that snapshots the totals and index counters, then releases
-the lock before formatting or writing the response. It never waits for a
-writer; lock contention and poisoning return the same deterministic `503
-Service Unavailable` response as `/ready`.
+total, worker-cap, and counter values, and the complete HTTP envelope before any
+name is cloned or sorted. The byte gauges count each `Int64` and `Float64` value
+as 8 bytes, each `Bool` as 1 byte, and each `String` by its UTF-8 payload length;
+they exclude container capacity, schema text, and allocation metadata and
+saturate at the platform's maximum `usize`. The response uses Prometheus text
+format version 0.0.4. Table and database totals are maintained during mutations,
+so a scrape reads cached measurements instead of scanning retained values. When
+the preflight succeeds, capturing the per-table samples copies and sorts the
+current catalog names, row counts, and cached byte counts under the same
+database read-lock attempt that snapshots the totals, aggregate worker cap, and
+index counters, then releases the lock before formatting or writing the
+response. It never waits for a writer; lock contention and poisoning return the
+same deterministic `503 Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a
 POST body or decoded GET SQL, and 16 MiB for the complete response including
