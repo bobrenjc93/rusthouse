@@ -79,12 +79,13 @@ two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
 `MAX(Float64)`, as well as `COUNT(nullable_int64_column)` plus
 `AVG(the_same_column)`, use
 deterministic contiguous chunks when more than 262,144 rows match. A grouped
-query also uses those chunks when it has exactly one non-nullable `Bool`
-grouping column and exactly one `COUNT(*)` or `COUNT()` aggregate. Ordered
-partition reduction preserves first-seen Bool grouping before the normal
-grouped ordering and pagination stages. The paired
-shapes preserve either projection order. Row-count pairs derive `COUNT` with a
-checked conversion of the filtered cardinality; a same-column nullable
+query also uses those chunks when it has exactly one physical, non-nullable
+`Bool` grouping column and exactly one aggregate: either `COUNT(*)`/`COUNT()`
+or `COUNT` of a physical `Nullable(Int64)` column. Ordered partition reduction
+preserves first-seen Bool grouping, including groups whose nullable count is
+zero, before the normal grouped HAVING, ordering, and pagination stages. The
+paired shapes preserve either projection order. Row-count pairs derive `COUNT`
+with a checked conversion of the filtered cardinality; a same-column nullable
 `COUNT`/`AVG` pair derives its NULL-ignoring count from the AVG partitions'
 checked present-value count. The existing checked sum-and-count lanes target
 about 131,072 rows each. Release-mode crossover
@@ -95,7 +96,9 @@ Nullable SUM/AVG partitions ignore absent values and reduce checked i128 sum
 and present-count partials in chunk order; nullable MIN/MAX partitions ignore
 absent values and reduce optional extrema in chunk order. Sole nullable COUNT
 partitions likewise ignore absent values and reduce checked count partials in
-chunk order.
+chunk order. Bool-grouped nullable COUNT partitions track key presence
+separately from present-value counts so all-NULL groups remain in the result
+with a zero count.
 Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
@@ -117,8 +120,10 @@ reduced directly without
 allocating a partial-results collection. Ordered reduction preserves the first
 occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
-or below the threshold, other grouped shapes (including `COUNT(column)`, more
-than one grouping column, non-Bool keys, or multiple aggregates), and
+or below the threshold, other grouped shapes (including `COUNT(column)` unless
+it is the sole aggregate over a physical `Nullable(Int64)` column grouped by
+one physical Bool key, more than one grouping column, non-Bool keys, or
+multiple aggregates), and
 multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
 row-count/`MAX(Float64)` pairs or the same-column nullable `COUNT`/`AVG` pair
@@ -152,8 +157,9 @@ present-value counts; nullable SUM/AVG chunks and their
 ordered reduction use a checked `i128` sum and checked present-value count;
 nullable MIN/MAX chunks ignore absent values and reduce optional extrema in chunk
 order. At or below the threshold, without worker admission, or after a worker
-failure, the complete computation runs sequentially. Grouped nullable shapes
-remain sequential. Paired nullable shapes remain sequential except for the
+failure, the complete computation runs sequentially. Grouped nullable `SUM`,
+`MIN`, `MAX`, and `AVG`, nullable COUNT with any other grouping shape, and
+paired nullable shapes remain sequential except for the
 exact ungrouped `COUNT(*)`/`COUNT()` plus nullable `SUM`, `MIN`, `MAX`, or `AVG` pair and
 `COUNT(nullable_column)` plus `AVG(the_same_column)` pair.
 These nullable shapes compose with filters, grouping, HAVING, ordering,
@@ -801,7 +807,7 @@ all unselected cells and table metadata.
 constructor configure the scan and output limits.
 `Database::with_global_aggregate_worker_cap` and the matching `SharedDatabase`
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
-parallel global aggregates and the narrow Bool-grouped `COUNT` shape. The
+parallel global aggregates and the narrow Bool-grouped `COUNT` shapes. The
 configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
