@@ -119,6 +119,21 @@ fn assert_response(response: &[u8], status: &str, expected_body: &str) {
     );
 }
 
+fn aggregate_state_bytes_required(response: &[u8], limit: usize) -> usize {
+    let response = std::str::from_utf8(response).expect("response is UTF-8");
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .expect("response has an empty header line");
+    assert_eq!(headers.lines().next(), Some("HTTP/1.1 400 Bad Request"));
+    let prefix = r#"{"error":"SELECT aggregate state bytes requires at least "#;
+    let suffix = format!(r#", exceeding the limit of {limit}"}}"#);
+    body.strip_prefix(prefix)
+        .and_then(|body| body.strip_suffix(&suffix))
+        .expect("response reports the aggregate-state byte requirement")
+        .parse()
+        .expect("aggregate-state byte requirement is decimal")
+}
+
 fn assert_response_with_content_type(
     response: &[u8],
     status: &str,
@@ -2034,6 +2049,217 @@ fn concurrent_parameterized_max_ordering_state_requests_are_isolated() {
                 };
                 let request = format!(
                     "GET /?max_ordering_state_bytes={requested_max}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                );
+                started.wait();
+                (request_index % 4, exchange(&database, request.as_bytes()))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let (case, response) = handle.join().unwrap();
+        if case == 1 {
+            assert_eq!(response, expected_failure);
+        } else {
+            assert_eq!(response, expected_success);
+        }
+    }
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_aggregate_state_bytes_enforces_fixed_and_dynamic_boundaries() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE samples (g Int64, value String); \
+             INSERT INTO samples VALUES (1, 'abcd'), (2, 'wxyz');",
+        )
+        .unwrap();
+    let fixed_query = "SELECT+g%2C+COUNT%28%2A%29+AS+n+FROM+samples+GROUP+BY+g%3B";
+    let dynamic_query =
+        "SELECT+g%2C+MIN%28value%29+AS+first%2C+MAX%28value%29+AS+last+FROM+samples+GROUP+BY+g%3B";
+    let fixed_probe = b"GET /?query=SELECT+g%2C+COUNT%28%2A%29+AS+n+FROM+samples+GROUP+BY+g%3B&max_aggregate_state_bytes=1 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let fixed_bytes = aggregate_state_bytes_required(&exchange(&database, fixed_probe), 1);
+    let dynamic_probe = b"GET /?max_aggregate_state_bytes=1&query=SELECT+g%2C+MIN%28value%29+AS+first%2C+MAX%28value%29+AS+last+FROM+samples+GROUP+BY+g%3B HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let dynamic_fixed_bytes =
+        aggregate_state_bytes_required(&exchange(&database, dynamic_probe), 1);
+    let dynamic_bytes = dynamic_fixed_bytes + 16;
+
+    for method in ["GET", "POST"] {
+        let fixed_exact = format!(
+            "{method} /?max_aggregate_state_bytes={fixed_bytes}&query={fixed_query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, fixed_exact.as_bytes()),
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"g","type":"Int64"},{"name":"n","type":"Int64"}],"rows":[[1,1],[2,1]]}"#,
+        );
+
+        let fixed_short = fixed_bytes - 1;
+        let fixed_exceeded = format!(
+            "{method} /?query={fixed_query}&max_aggregate_state_bytes={fixed_short} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, fixed_exceeded.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            &format!(
+                r#"{{"error":"SELECT aggregate state bytes requires at least {fixed_bytes}, exceeding the limit of {fixed_short}"}}"#
+            ),
+        );
+
+        let dynamic_exact = format!(
+            "{method} /?query={dynamic_query}&max_aggregate_state_bytes={dynamic_bytes} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, dynamic_exact.as_bytes()),
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"g","type":"Int64"},{"name":"first","type":"String"},{"name":"last","type":"String"}],"rows":[[1,"abcd","abcd"],[2,"wxyz","wxyz"]]}"#,
+        );
+
+        let dynamic_short = dynamic_bytes - 1;
+        let dynamic_exceeded = format!(
+            "{method} /?max_aggregate_state_bytes={dynamic_short}&query={dynamic_query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, dynamic_exceeded.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            &format!(
+                r#"{{"error":"SELECT aggregate state bytes requires at least {dynamic_bytes}, exceeding the limit of {dynamic_short}"}}"#
+            ),
+        );
+    }
+
+    let configured_limits = QueryResultLimits {
+        max_aggregate_state_bytes: dynamic_bytes - 1,
+        ..QueryResultLimits::default()
+    };
+    let configured = SharedDatabase::with_query_result_limits(configured_limits);
+    configured
+        .execute(
+            "CREATE TABLE samples (g Int64, value String); \
+             INSERT INTO samples VALUES (1, 'abcd'), (2, 'wxyz');",
+        )
+        .unwrap();
+    for (method, requested_max) in [
+        ("GET", "0".to_owned()),
+        ("POST", dynamic_bytes.to_string()),
+        ("GET", usize::MAX.to_string()),
+    ] {
+        let request = format!(
+            "{method} /?query={dynamic_query}&max_aggregate_state_bytes={requested_max} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&configured, request.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            &format!(
+                r#"{{"error":"SELECT aggregate state bytes requires at least {dynamic_bytes}, exceeding the limit of {}"}}"#,
+                dynamic_bytes - 1,
+            ),
+        );
+    }
+    assert_eq!(configured.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_aggregate_state_bytes_rejects_invalid_values() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_aggregate_state_bytes= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_aggregate_state_bytes=1&query=SELECT+1%3B&max%5Faggregate%5Fstate%5Fbytes=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_aggregate_state_bytes parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_aggregate_state_bytes=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_aggregate_state_bytes parameter must be a decimal integer"}"#
+                    .to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_aggregate_state_bytes={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_aggregate_state_bytes parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_parameterized_max_aggregate_state_requests_are_isolated() {
+    use std::sync::Barrier;
+
+    let probe = SharedDatabase::default();
+    probe
+        .execute(
+            "CREATE TABLE samples (g Int64, value String); \
+             INSERT INTO samples VALUES (1, 'abcd'), (2, 'wxyz');",
+        )
+        .unwrap();
+    let query =
+        "SELECT+g%2C+MIN%28value%29+AS+first%2C+MAX%28value%29+AS+last+FROM+samples+GROUP+BY+g%3B";
+    let probe_request = format!(
+        "GET /?query={query}&max_aggregate_state_bytes=1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    let exact_bytes =
+        aggregate_state_bytes_required(&exchange(&probe, probe_request.as_bytes()), 1) + 16;
+
+    let configured_limits = QueryResultLimits {
+        max_aggregate_state_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE samples (g Int64, value String); \
+             INSERT INTO samples VALUES (1, 'abcd'), (2, 'wxyz');",
+        )
+        .unwrap();
+    let success_request = format!(
+        "GET /?query={query}&max_aggregate_state_bytes={exact_bytes} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    let failure_request = format!(
+        "GET /?max_aggregate_state_bytes={}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        exact_bytes - 1,
+    );
+    let expected_success = exchange(&database, success_request.as_bytes());
+    let expected_failure = exchange(&database, failure_request.as_bytes());
+
+    let request_count = 12;
+    let started = Arc::new(Barrier::new(request_count));
+    let handles = (0..request_count)
+        .map(|request_index| {
+            let database = database.clone();
+            let started = Arc::clone(&started);
+            thread::spawn(move || {
+                let requested_max = match request_index % 4 {
+                    0 => exact_bytes.to_string(),
+                    1 => (exact_bytes - 1).to_string(),
+                    2 => "0".to_owned(),
+                    _ => usize::MAX.to_string(),
+                };
+                let request = format!(
+                    "GET /?max_aggregate_state_bytes={requested_max}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
                 );
                 started.wait();
                 (request_index % 4, exchange(&database, request.as_bytes()))

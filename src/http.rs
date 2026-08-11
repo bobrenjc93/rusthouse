@@ -826,13 +826,14 @@ fn serve_http_connections(
 /// `max_result_values` parameter, one decimal `max_result_bytes` parameter, one
 /// decimal `max_rows_to_read` parameter, one decimal `max_rows_to_group_by`
 /// parameter, one decimal `max_ordering_state_bytes` parameter, one decimal
-/// `max_threads` parameter, one decimal `readonly` parameter, and one
-/// `default_format` parameter in any order. `readonly=1`
+/// `max_aggregate_state_bytes` parameter, one decimal `max_threads` parameter,
+/// one decimal `readonly` parameter, and one `default_format` parameter in any
+/// order. `readonly=1`
 /// tightens the request to read-only,
 /// while `readonly=0` retains the handler's configured access and never grants
 /// insertion access to a read-only handler. Nonzero result, scan, group,
-/// ordering-state, and worker limits can tighten but never relax the database's
-/// configured query limits;
+/// ordering-state, aggregate-state, and worker limits can tighten but never
+/// relax the database's configured query limits;
 /// `max_result_bytes` also cannot relax the default retained-result byte limit.
 /// Zero disables the corresponding request-level limit while retaining the
 /// configured defaults. `default_format`
@@ -1807,6 +1808,7 @@ fn handle_http_query_exchange(
         max_rows_to_read,
         max_rows_to_group_by,
         max_ordering_state_bytes,
+        max_aggregate_state_bytes,
         max_threads,
     } = workload_limits;
     let query_result = match (
@@ -1816,9 +1818,10 @@ fn handle_http_query_exchange(
         max_rows_to_read,
         max_rows_to_group_by,
         max_ordering_state_bytes,
+        max_aggregate_state_bytes,
         max_threads,
     ) {
-        (None, None, None, None, None, None, None) => database.try_query(&sql),
+        (None, None, None, None, None, None, None, None) => database.try_query(&sql),
         (
             max_result_bytes,
             max_result_rows,
@@ -1826,6 +1829,7 @@ fn handle_http_query_exchange(
             max_rows_to_read,
             max_rows_to_group_by,
             max_ordering_state_bytes,
+            max_aggregate_state_bytes,
             max_threads,
         ) => database.try_query_with_parameterized_workload_limits(
             &sql,
@@ -1836,6 +1840,7 @@ fn handle_http_query_exchange(
                 max_scan_rows: max_rows_to_read.unwrap_or(0),
                 max_groups: max_rows_to_group_by.unwrap_or(0),
                 max_ordering_state_bytes: max_ordering_state_bytes.unwrap_or(0),
+                max_aggregate_state_bytes: max_aggregate_state_bytes.unwrap_or(0),
                 max_threads: max_threads.unwrap_or(0),
             },
         ),
@@ -2511,6 +2516,7 @@ struct ParameterizedWorkloadLimits {
     max_rows_to_read: Option<usize>,
     max_rows_to_group_by: Option<usize>,
     max_ordering_state_bytes: Option<usize>,
+    max_aggregate_state_bytes: Option<usize>,
     max_threads: Option<usize>,
 }
 
@@ -3056,6 +3062,7 @@ fn parse_request_line(
                 || target.starts_with(b"/?max_rows_to_read=")
                 || target.starts_with(b"/?max_rows_to_group_by=")
                 || target.starts_with(b"/?max_ordering_state_bytes=")
+                || target.starts_with(b"/?max_aggregate_state_bytes=")
                 || target.starts_with(b"/?max_threads=")
                 || target.starts_with(b"/?readonly=")
                 || target.starts_with(b"/?default_format=") =>
@@ -3138,6 +3145,7 @@ fn decode_query_parameters(
     let mut max_rows_to_read = None;
     let mut max_rows_to_group_by = None;
     let mut max_ordering_state_bytes = None;
+    let mut max_aggregate_state_bytes = None;
     let mut max_threads = None;
     let mut readonly = None;
 
@@ -3276,6 +3284,17 @@ fn decode_query_parameters(
                 let value = decode_form_component(encoded_value, None)?;
                 max_ordering_state_bytes = Some(parse_decimal_max_ordering_state_bytes(&value)?);
             }
+            b"max_aggregate_state_bytes" => {
+                if max_aggregate_state_bytes.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate max_aggregate_state_bytes parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                max_aggregate_state_bytes = Some(parse_decimal_max_aggregate_state_bytes(&value)?);
+            }
             b"max_threads" => {
                 if max_threads.is_some() {
                     return Err(RequestFailure::new(
@@ -3324,6 +3343,7 @@ fn decode_query_parameters(
             max_rows_to_read,
             max_rows_to_group_by,
             max_ordering_state_bytes,
+            max_aggregate_state_bytes,
             max_threads,
         },
         readonly,
@@ -3389,6 +3409,14 @@ fn parse_decimal_max_ordering_state_bytes(value: &[u8]) -> Result<usize, Request
         value,
         "max_ordering_state_bytes parameter must be a decimal integer",
         "max_ordering_state_bytes parameter is out of range",
+    )
+}
+
+fn parse_decimal_max_aggregate_state_bytes(value: &[u8]) -> Result<usize, RequestReadError> {
+    parse_decimal_parameter(
+        value,
+        "max_aggregate_state_bytes parameter must be a decimal integer",
+        "max_aggregate_state_bytes parameter is out of range",
     )
 }
 
