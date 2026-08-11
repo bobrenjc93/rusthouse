@@ -1064,6 +1064,18 @@ impl Table {
         })
     }
 
+    pub(crate) fn int64_min_max_between_index_scan(
+        &self,
+        column: usize,
+        lower: i64,
+        upper: i64,
+        source_rows: Range<usize>,
+    ) -> Option<Int64MinMaxIndexScan> {
+        self.int64_min_max_index_scan_with(column, source_rows, |block| {
+            block_may_match_between(block, lower, upper)
+        })
+    }
+
     pub(crate) fn int64_min_max_nullness_index_scan(
         &self,
         column: usize,
@@ -1747,6 +1759,16 @@ fn block_may_match(block: Int64MinMaxBlockMetadata, filter: Int64Filter) -> bool
     }
 }
 
+fn block_may_match_between(block: Int64MinMaxBlockMetadata, lower: i64, upper: i64) -> bool {
+    if lower > upper {
+        return false;
+    }
+    let (Some(min), Some(max)) = (block.min, block.max) else {
+        return false;
+    };
+    lower <= max && min <= upper
+}
+
 fn block_may_match_nullness(block: Int64MinMaxBlockMetadata, is_null: bool) -> bool {
     if is_null {
         block.null_count != 0
@@ -1938,6 +1960,21 @@ mod tests {
             summarize_nullable_int64_block(0, [None, None]),
             Int64Filter::Equal(0),
         ));
+        assert!(!block_may_match_between(
+            summarize_nullable_int64_block(0, [None, None]),
+            i64::MIN,
+            i64::MAX,
+        ));
+        assert!(block_may_match_between(
+            summarize_nullable_int64_block(0, [Some(1), Some(5)]),
+            5,
+            5,
+        ));
+        assert!(!block_may_match_between(
+            summarize_nullable_int64_block(0, [Some(i64::MIN), Some(i64::MAX)]),
+            1,
+            0,
+        ));
         assert!(!block_may_match_nullness(
             summarize_nullable_int64_block(0, [Some(1), Some(2)]),
             true,
@@ -1984,6 +2021,11 @@ mod tests {
                 .int64_min_max_nullness_index_scan(0, true, 0..table.row_count())
                 .is_some()
         );
+        assert!(
+            table
+                .int64_min_max_between_index_scan(0, 1, 2, 0..table.row_count())
+                .is_some()
+        );
 
         table.mutation_generation = table.mutation_generation.wrapping_add(1);
         assert!(
@@ -1996,11 +2038,21 @@ mod tests {
                 .int64_min_max_nullness_index_scan(0, true, 0..table.row_count())
                 .is_none()
         );
+        assert!(
+            table
+                .int64_min_max_between_index_scan(0, 1, 2, 0..table.row_count())
+                .is_none()
+        );
         table.mutation_generation = table.mutation_generation.wrapping_sub(1);
         table.int64_min_max_index.as_mut().unwrap().blocks[1].first_row = 0;
         assert!(
             table
                 .int64_min_max_index_scan(0, Int64Filter::Equal(2), 0..table.row_count())
+                .is_none()
+        );
+        assert!(
+            table
+                .int64_min_max_between_index_scan(0, 1, 2, 0..table.row_count())
                 .is_none()
         );
     }

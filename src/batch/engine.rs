@@ -4245,6 +4245,9 @@ impl Database {
         // the scan limit. A sparse index can then narrow physical candidates,
         // but does not reduce that charge for an ordinary table.
         let int64_filter = predicate.as_ref().and_then(CompiledPredicate::int64_filter);
+        let int64_between = predicate
+            .as_ref()
+            .and_then(CompiledPredicate::int64_between);
         let int64_nullness = predicate
             .as_ref()
             .and_then(CompiledPredicate::int64_nullness);
@@ -4255,6 +4258,16 @@ impl Database {
         let indexed_scan = int64_filter
             .and_then(|(column, filter)| {
                 table.int64_min_max_index_scan(column, filter, source_rows.clone())
+            })
+            .or_else(|| {
+                int64_between.and_then(|(column, lower, upper)| {
+                    table.int64_min_max_between_index_scan(
+                        column,
+                        lower,
+                        upper,
+                        source_rows.clone(),
+                    )
+                })
             })
             .or_else(|| {
                 int64_nullness.and_then(|(column, is_null)| {
@@ -9426,6 +9439,37 @@ impl CompiledPredicate {
             ComparisonOperator::NotEqual => return None,
         };
         Some((column, filter))
+    }
+
+    fn int64_between(&self) -> Option<(usize, i64, i64)> {
+        let Self::And(lower, upper) = self else {
+            return None;
+        };
+        let Self::Comparison {
+            left:
+                CompiledOperand::Column {
+                    index: lower_column,
+                    data_type: DataType::Int64,
+                },
+            operator: ComparisonOperator::GreaterOrEqual,
+            right: CompiledOperand::Literal(Value::Int64(lower)),
+        } = lower.as_ref()
+        else {
+            return None;
+        };
+        let Self::Comparison {
+            left:
+                CompiledOperand::Column {
+                    index: upper_column,
+                    data_type: DataType::Int64,
+                },
+            operator: ComparisonOperator::LessOrEqual,
+            right: CompiledOperand::Literal(Value::Int64(upper)),
+        } = upper.as_ref()
+        else {
+            return None;
+        };
+        (*lower_column == *upper_column).then_some((*lower_column, *lower, *upper))
     }
 
     fn int64_nullness(&self) -> Option<(usize, bool)> {

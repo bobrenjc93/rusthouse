@@ -2,6 +2,7 @@ use std::mem::size_of;
 
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
+use rusthouse::batch::value::Value;
 use rusthouse::{
     Int64MinMaxBlockMetadata, Int64MinMaxIndexAdmission, Int64MinMaxIndexLimits,
     Int64MinMaxIndexRejection,
@@ -96,6 +97,171 @@ fn indexed_and_unindexed_results_match_at_boundaries_order_pagination_and_having
 }
 
 #[test]
+fn between_prunes_disjoint_blocks_and_rechecks_overlaps_in_source_order() {
+    let mut indexed = test_database(true);
+    let mut unindexed = test_database(false);
+    let cases = [
+        (
+            "SELECT id FROM events WHERE key BETWEEN 4 AND 99",
+            Vec::new(),
+            0,
+            3,
+        ),
+        (
+            "SELECT id FROM events WHERE key BETWEEN -8 AND 1",
+            vec![
+                vec![Value::Int64(2)],
+                vec![Value::Int64(3)],
+                vec![Value::Int64(4)],
+                vec![Value::Int64(5)],
+            ],
+            2,
+            1,
+        ),
+        (
+            "SELECT id FROM events WHERE key BETWEEN 3 AND 3",
+            vec![vec![Value::Int64(7)]],
+            1,
+            2,
+        ),
+        (
+            "SELECT id FROM events WHERE key BETWEEN 100 AND 0",
+            Vec::new(),
+            0,
+            3,
+        ),
+        (
+            "SELECT id FROM events WHERE key BETWEEN -9223372036854775808 AND 9223372036854775807",
+            (0..12).map(|id| vec![Value::Int64(id)]).collect(),
+            3,
+            0,
+        ),
+    ];
+
+    for (sql, expected_rows, expected_scanned, expected_pruned) in cases {
+        let before = indexed.index_pruning_metrics();
+        let indexed_result = query(&mut indexed, sql);
+        assert_eq!(indexed_result, query(&mut unindexed, sql), "{sql}");
+        let StatementResult::Query(result) = indexed_result else {
+            panic!("expected query result")
+        };
+        assert_eq!(result.rows, expected_rows, "{sql}");
+
+        let after = indexed.index_pruning_metrics();
+        assert_eq!(
+            after.scanned_blocks - before.scanned_blocks,
+            expected_scanned,
+            "{sql}"
+        );
+        assert_eq!(
+            after.pruned_blocks - before.pruned_blocks,
+            expected_pruned,
+            "{sql}"
+        );
+    }
+    assert_eq!(unindexed.index_pruning_metrics().scanned_blocks, 0);
+    assert_eq!(unindexed.index_pruning_metrics().pruned_blocks, 0);
+}
+
+#[test]
+fn nullable_between_prunes_all_null_blocks_without_matching_nulls() {
+    const NULLABLE_SETUP: &str = "\
+        CREATE TABLE samples (key Nullable(Int64)); \
+        INSERT INTO samples VALUES \
+          (NULL), (NULL), (1), (NULL), (5), (7), (NULL), (10);";
+
+    let mut indexed = Database::new();
+    indexed.execute(NULLABLE_SETUP).unwrap();
+    indexed
+        .create_int64_min_max_index(
+            "samples",
+            "key",
+            Int64MinMaxIndexLimits::new(2, 4, usize::MAX),
+        )
+        .unwrap();
+    let mut unindexed = Database::new();
+    unindexed.execute(NULLABLE_SETUP).unwrap();
+
+    let sql = "SELECT key FROM samples WHERE key BETWEEN 5 AND 7";
+    let result = query(&mut indexed, sql);
+    assert_eq!(result, query(&mut unindexed, sql));
+    let StatementResult::Query(result) = result else {
+        panic!("expected query result")
+    };
+    assert_eq!(result.rows, [vec![Value::Int64(5)], vec![Value::Int64(7)]]);
+    assert_eq!(indexed.index_pruning_metrics().scanned_blocks, 1);
+    assert_eq!(indexed.index_pruning_metrics().pruned_blocks, 3);
+
+    let sql =
+        "SELECT key FROM samples WHERE key BETWEEN -9223372036854775808 AND 9223372036854775807";
+    let result = query(&mut indexed, sql);
+    assert_eq!(result, query(&mut unindexed, sql));
+    let StatementResult::Query(result) = result else {
+        panic!("expected query result")
+    };
+    assert_eq!(
+        result.rows,
+        [
+            vec![Value::Int64(1)],
+            vec![Value::Int64(5)],
+            vec![Value::Int64(7)],
+            vec![Value::Int64(10)],
+        ]
+    );
+    assert_eq!(indexed.index_pruning_metrics().scanned_blocks, 4);
+    assert_eq!(indexed.index_pruning_metrics().pruned_blocks, 4);
+}
+
+#[test]
+fn all_null_between_prunes_every_block() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (key Nullable(Int64)); \
+             INSERT INTO samples VALUES (NULL), (NULL), (NULL);",
+        )
+        .unwrap();
+    database
+        .create_int64_min_max_index(
+            "samples",
+            "key",
+            Int64MinMaxIndexLimits::new(2, 2, usize::MAX),
+        )
+        .unwrap();
+
+    let StatementResult::Query(result) = query(
+        &mut database,
+        "SELECT key FROM samples WHERE key BETWEEN -9223372036854775808 AND 9223372036854775807",
+    ) else {
+        panic!("expected query result")
+    };
+    assert!(result.rows.is_empty());
+    assert_eq!(database.index_pruning_metrics().scanned_blocks, 0);
+    assert_eq!(database.index_pruning_metrics().pruned_blocks, 2);
+}
+
+#[test]
+fn unsupported_between_shapes_keep_the_full_scan_fallback() {
+    let mut indexed = test_database(true);
+    let mut unindexed = test_database(false);
+
+    for sql in [
+        "SELECT id FROM events WHERE key NOT BETWEEN 0 AND 100",
+        "SELECT id FROM events WHERE key BETWEEN 0.0 AND 100.0",
+        "SELECT id FROM events WHERE key BETWEEN 0 AND 100 AND selected = true",
+        "SELECT id FROM events WHERE selected BETWEEN false AND true",
+    ] {
+        assert_eq!(
+            query(&mut indexed, sql),
+            query(&mut unindexed, sql),
+            "{sql}"
+        );
+    }
+    assert_eq!(indexed.index_pruning_metrics().scanned_blocks, 0);
+    assert_eq!(indexed.index_pruning_metrics().pruned_blocks, 0);
+}
+
+#[test]
 fn scan_row_limit_still_charges_the_complete_source_before_pruning() {
     let mut database = Database::with_query_result_limits(QueryResultLimits {
         max_scan_rows: 11,
@@ -111,7 +277,10 @@ fn scan_row_limit_still_charges_the_complete_source_before_pruning() {
         .expect("valid index request");
 
     assert_eq!(
-        database.execute("SELECT id FROM events WHERE key = 9223372036854775807"),
+        database.execute(
+            "SELECT id FROM events \
+             WHERE key BETWEEN 9223372036854775807 AND 9223372036854775807",
+        ),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 12,
@@ -229,7 +398,10 @@ fn mutations_refresh_the_index_and_over_budget_or_schema_changes_invalidate_it()
         .expect("index remains admitted");
     assert_eq!(info.indexed_rows, 12);
     assert_eq!(
-        query(&mut database, "SELECT id FROM events WHERE key = 999"),
+        query(
+            &mut database,
+            "SELECT id FROM events WHERE key BETWEEN 999 AND 999",
+        ),
         query(
             &mut {
                 let mut unindexed = test_database(false);
@@ -242,7 +414,7 @@ fn mutations_refresh_the_index_and_over_budget_or_schema_changes_invalidate_it()
                     .unwrap();
                 unindexed
             },
-            "SELECT id FROM events WHERE key = 999",
+            "SELECT id FROM events WHERE key BETWEEN 999 AND 999",
         )
     );
 
@@ -299,7 +471,10 @@ fn mutations_refresh_the_index_and_over_budget_or_schema_changes_invalidate_it()
             .is_none()
     );
     assert_eq!(
-        query(&mut capped, "SELECT value FROM t WHERE value = 5"),
+        query(
+            &mut capped,
+            "SELECT value FROM t WHERE value BETWEEN 5 AND 5",
+        ),
         query(
             &mut {
                 let mut expected = Database::new();
@@ -311,7 +486,9 @@ fn mutations_refresh_the_index_and_over_budget_or_schema_changes_invalidate_it()
                     .unwrap();
                 expected
             },
-            "SELECT value FROM t WHERE value = 5",
+            "SELECT value FROM t WHERE value BETWEEN 5 AND 5",
         )
     );
+    assert_eq!(capped.index_pruning_metrics().scanned_blocks, 0);
+    assert_eq!(capped.index_pruning_metrics().pruned_blocks, 0);
 }

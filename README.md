@@ -160,16 +160,18 @@ These nullable shapes compose with filters, grouping, HAVING, ordering,
 pagination, and other supported aggregate projections. Other operations retain
 their documented nullable restrictions.
 
-An admitted, current index can reject blocks only for a simple `Int64`
+An admitted, current index can reject blocks for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
-order). Every row in a surviving block still follows the normal exact
-predicate evaluator. Compound and `!=` predicates, missing or stale indexes,
-and failed admissions use the unchanged full-scan path. Candidate blocks and
-rows retain source order, so first-row, ordering, pagination, grouping, and
-`HAVING` behavior is identical. The full source row count still pays the query
-scan-row limit. Inserts, deletes, updates, truncation, and added columns rebuild
-the index within the table mutation; if its original cap is exceeded it is
-invalidated. Dropping a column or replacing/restoring the table invalidates it.
+order), or for an exact positive `column BETWEEN lower AND upper` with `Int64`
+bounds on `Int64` or `Nullable(Int64)` storage. Every row in a surviving block
+still follows the normal exact predicate evaluator. Other compound and `!=`
+predicates, missing or stale indexes, and failed admissions use the unchanged
+full-scan path. Candidate blocks and rows retain source order, so first-row,
+ordering, pagination, grouping, and `HAVING` behavior is identical. The full
+source row count still pays the query scan-row limit. Inserts, deletes, updates,
+truncation, and added columns rebuild the index within the table mutation; if
+its original cap is exceeded it is invalidated. Dropping a column or
+replacing/restoring the table invalidates it.
 `Database::index_pruning_metrics` exposes cumulative surviving
 `scanned_blocks` and metadata-rejected `pruned_blocks` whenever sparse-index
 pruning runs. This work remains counted if later query processing fails;
