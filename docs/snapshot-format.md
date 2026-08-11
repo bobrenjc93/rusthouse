@@ -84,11 +84,14 @@ destination was already replaced. The matching bounded reopen operation is
 or row cap.
 
 The batch `Database::restore_int64_table_from_file` API registers one decoded
-self-describing payload under a caller-supplied table name. It currently
-accepts only a non-nullable column and validates the database's row, column, and
-cell limits before changing the catalog or metrics. The payload is strictly a
-single-table format: it contains one column and no database name, batch table
-name, additional tables, or catalog metadata.
+self-describing payload under a caller-supplied table name. It accepts one
+`Int64` or `Nullable(Int64)` column, preserving its name, nullability, exact
+NULL positions, row order, and persisted row cap. It validates the database's
+row, column, and cell limits before changing the catalog or cached metrics. The
+payload is strictly a single-table format: it contains one column and no
+database name, batch table name, additional tables, or catalog metadata. The
+backup, replacement, and set-restore APIs retain their existing non-nullable
+boundary.
 
 `Database::replace_int64_table_from_file` instead requires that the
 case-insensitively resolved target already exist. It checks that requirement
@@ -134,8 +137,9 @@ supported platform. It makes one nonblocking write-lock attempt before opening
 or reading the source, then holds that guard while delegating to
 `Database::restore_int64_table_from_file`. Active readers and writers report
 database contention without source access; poisoned locks and the existing
-typed snapshot failures remain distinguishable. The delegated database restore
-keeps catalog entries and cached metrics unchanged on every failure.
+typed snapshot failures remain distinguishable. Nullable and non-nullable
+snapshots follow the same delegated path, which keeps catalog entries and
+cached metrics unchanged on every failure.
 
 `SharedDatabase::try_restore_int64_tables_from_files` provides the same
 nonblocking synchronization for an atomic snapshot set. It makes exactly one

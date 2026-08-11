@@ -436,7 +436,8 @@ impl SharedDatabase {
         Ok(self.read()?.index_pruning_metrics())
     }
 
-    /// Attempts to restore one self-describing, non-nullable `Int64` snapshot.
+    /// Attempts to restore one self-describing `Int64` or `Nullable(Int64)`
+    /// snapshot.
     ///
     /// Exactly one nonblocking write-lock attempt occurs before the source path
     /// is accessed. An active reader or writer returns

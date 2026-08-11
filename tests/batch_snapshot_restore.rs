@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::batch::engine::{QueryResult, StatementResult};
 use rusthouse::batch::error::Error;
+#[cfg(unix)]
+use rusthouse::batch::storage::Column;
 use rusthouse::batch::value::Value;
 use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
@@ -83,6 +85,85 @@ fn cached_metrics(database: &mut Database) -> QueryResult {
         StatementResult::Query(result) => result,
         StatementResult::Command { .. } => {
             unreachable!("system.metrics always returns one query result")
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn nullable_save_to_fresh_database_round_trips_all_shapes_at_exact_codec_limits() {
+    let directory = TestDirectory::new();
+    let cases = [
+        ("empty", 3, vec![]),
+        ("all-null", 4, vec![None, None, None]),
+        (
+            "mixed-extreme",
+            5,
+            vec![Some(i64::MIN), None, Some(0), Some(i64::MAX)],
+        ),
+        (
+            "exact-limit",
+            4,
+            vec![None, Some(i64::MIN), Some(i64::MAX), None],
+        ),
+    ];
+
+    for (case, row_cap, rows) in cases {
+        let path = directory.join(&format!("{case}.snapshot"));
+        let limits = TableLimits::new(row_cap, 1, row_cap);
+        let mut source = Database::with_table_limits(limits);
+        source
+            .create_nullable_int64_table("Source", "Measurement", rows.clone())
+            .unwrap();
+
+        let payload_len = INT64_TABLE_PAYLOAD_FIXED_LEN
+            + "Measurement".len()
+            + rows
+                .iter()
+                .map(|value| 1 + usize::from(value.is_some()) * size_of::<i64>())
+                .sum::<usize>();
+        let snapshot_codec = SnapshotCodec::new(payload_len);
+        let payload_codec = Int64TablePayloadCodec::new("Measurement".len(), row_cap, payload_len);
+        source
+            .save_int64_table_to_file("source", &path, snapshot_codec, payload_codec)
+            .unwrap();
+
+        let mut reopened = Database::with_table_limits(limits);
+        reopened
+            .restore_int64_table_from_file("Archive", path, snapshot_codec, payload_codec)
+            .unwrap();
+
+        let table = reopened.catalog().table("archive").unwrap();
+        assert_eq!(table.schema()[0].name, "Measurement", "case {case}");
+        assert_eq!(table.row_cap(), row_cap, "case {case}");
+        assert_eq!(table.limits(), limits, "case {case}");
+        let [Column::NullableInt64(reopened_rows)] = table.columns() else {
+            panic!("case {case} must reopen physical Nullable(Int64) storage");
+        };
+        assert_eq!(reopened_rows, &rows, "case {case}");
+
+        let shared = SharedDatabase::new(reopened);
+        assert_eq!(
+            shared.metrics_snapshot(),
+            Some(DatabaseMetrics {
+                table_count: 1,
+                column_count: 1,
+                retained_row_count: rows.len(),
+                retained_value_bytes: rows.len() * 9,
+            }),
+            "case {case}"
+        );
+        if case == "exact-limit" {
+            assert!(matches!(
+                shared.execute("INSERT INTO archive VALUES (1);"),
+                Err(rusthouse::SharedDatabaseError::Sql(
+                    Error::ResourceLimitExceeded {
+                        resource: "table rows",
+                        actual: 5,
+                        max: 4,
+                    }
+                ))
+            ));
         }
     }
 }
@@ -273,7 +354,7 @@ fn reopens_to_select_and_metrics_at_exact_snapshot_and_table_limits() {
 }
 
 #[test]
-fn corruption_nullability_and_duplicate_names_leave_existing_state_unchanged() {
+fn corruption_and_duplicate_names_leave_existing_state_unchanged() {
     let directory = TestDirectory::new();
     let valid_path = directory.join("valid.snapshot");
     let (snapshot_codec, payload_codec) =
@@ -292,20 +373,6 @@ fn corruption_nullability_and_duplicate_names_leave_existing_state_unchanged() {
         DatabaseSnapshotRestoreError::Snapshot(Int64TablePayloadFileRestoreError::Envelope(
             SnapshotError::ChecksumMismatch { .. }
         ))
-    ));
-    assert_empty(&database);
-
-    let nullable_path = directory.join("nullable.snapshot");
-    let (nullable_snapshot_codec, nullable_payload_codec) =
-        write_snapshot(&nullable_path, "value", true, 2, &[Some(9)]);
-    assert!(matches!(
-        database.restore_int64_table_from_file(
-            "nullable",
-            nullable_path,
-            nullable_snapshot_codec,
-            nullable_payload_codec,
-        ),
-        Err(DatabaseSnapshotRestoreError::NullableColumn { ref column }) if column == "value"
     ));
     assert_empty(&database);
 
