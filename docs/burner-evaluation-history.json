@@ -3265,6 +3265,22 @@
         "eval_c88a7f3d": 95,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:807",
+      "recordedAt": "2026-08-11T19:38:08.341Z",
+      "label": "PR #807",
+      "kind": "composite",
+      "prNumber": 807,
+      "title": "YOLO generation 127: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 95,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
