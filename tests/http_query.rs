@@ -5,7 +5,11 @@ use std::thread;
 use std::time::Duration;
 
 use rusthouse::batch::csv::CsvIngestLimits;
-use rusthouse::batch::engine::{Database, QueryResultLimits, ResultColumn};
+use rusthouse::batch::engine::{
+    Database, LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES, QueryResultLimits,
+    ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES, ResultColumn,
+    STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES,
+};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::tsv::TsvIngestLimits;
 use rusthouse::batch::value::Value;
@@ -1850,6 +1854,202 @@ fn concurrent_parameterized_max_threads_requests_are_isolated_and_preserve_setti
         settings_before
     );
     assert_eq!(database.global_aggregate_worker_cap().unwrap().get(), 4);
+}
+
+#[test]
+fn parameterized_max_ordering_state_bytes_enforces_every_exact_cache_boundary() {
+    let configured_max = 3 * STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES;
+    let configured_limits = QueryResultLimits {
+        max_ordering_state_bytes: configured_max,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, rank_key Int64, keep Bool); \
+             INSERT INTO events VALUES \
+                 (1, 2, true), (2, 1, true), (3, 2, true), (4, 0, false); \
+             CREATE TABLE labels (label String, keep Bool); \
+             INSERT INTO labels VALUES \
+                 ('é', true), ('Z', true), ('東京', true), ('discarded', false); \
+             CREATE TABLE readings (id Int64, reading String, keep Bool); \
+             INSERT INTO readings VALUES \
+                 (1, '2', true), (2, '-0', true), (3, '2.00', true), \
+                 (4, 'invalid', false);",
+        )
+        .unwrap();
+
+    let cases = [
+        (
+            "SELECT+id%2C+ROW_NUMBER%28%29+OVER+%28ORDER+BY+rank_key+ASC%29+AS+n+FROM+events+WHERE+keep+%3D+true+LIMIT+3%3B",
+            3 * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES,
+            r#"{"columns":[{"name":"id","type":"Int64"},{"name":"n","type":"Int64"}],"rows":[[2,1],[1,2],[3,3]]}"#,
+        ),
+        (
+            "SELECT+label%2C+lengthUTF8%28label%29+AS+scalars+FROM+labels+WHERE+keep+%3D+true+ORDER+BY+scalars+ASC+LIMIT+3%3B",
+            3 * LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES,
+            r#"{"columns":[{"name":"label","type":"String"},{"name":"scalars","type":"Int64"}],"rows":[["é",1],["Z",1],["東京",2]]}"#,
+        ),
+        (
+            "SELECT+id%2C+CAST%28reading+AS+Float64%29+AS+converted+FROM+readings+WHERE+keep+%3D+true+ORDER+BY+converted+ASC+LIMIT+3%3B",
+            3 * STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES,
+            r#"{"columns":[{"name":"id","type":"Int64"},{"name":"converted","type":"Float64"}],"rows":[[2,-0.0],[1,2.0],[3,2.0]]}"#,
+        ),
+    ];
+
+    for method in ["GET", "POST"] {
+        for (query, exact_bytes, expected_body) in cases {
+            assert!(exact_bytes <= configured_max);
+            let exact = format!(
+                "{method} /?max_ordering_state_bytes={exact_bytes}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, exact.as_bytes()),
+                "HTTP/1.1 200 OK",
+                expected_body,
+            );
+
+            let one_byte_short = exact_bytes - 1;
+            let exceeded = format!(
+                "{method} /?query={query}&max_ordering_state_bytes={one_byte_short} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, exceeded.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &format!(
+                    r#"{{"error":"SELECT ordering state bytes requires at least {exact_bytes}, exceeding the limit of {one_byte_short}"}}"#
+                ),
+            );
+        }
+    }
+
+    let zero_retains_configured_limit = format!(
+        "POST /?query={}&max_ordering_state_bytes=0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        cases[2].0,
+    );
+    assert_response(
+        &exchange(&database, zero_retains_configured_limit.as_bytes()),
+        "HTTP/1.1 200 OK",
+        cases[2].2,
+    );
+
+    let unfiltered_bytes = 4 * STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES;
+    let cannot_relax_configured_limit = format!(
+        "GET /?max_ordering_state_bytes={}&query=SELECT+CAST%28reading+AS+Float64%29+AS+converted+FROM+readings+ORDER+BY+converted+LIMIT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        usize::MAX,
+    );
+    assert_response(
+        &exchange(&database, cannot_relax_configured_limit.as_bytes()),
+        "HTTP/1.1 400 Bad Request",
+        &format!(
+            r#"{{"error":"SELECT ordering state bytes requires at least {unfiltered_bytes}, exceeding the limit of {configured_max}"}}"#
+        ),
+    );
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_ordering_state_bytes_rejects_invalid_values() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_ordering_state_bytes= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_ordering_state_bytes=1&query=SELECT+1%3B&max%5Fordering%5Fstate%5Fbytes=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_ordering_state_bytes parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_ordering_state_bytes=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_ordering_state_bytes parameter must be a decimal integer"}"#
+                    .to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_ordering_state_bytes={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_ordering_state_bytes parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_parameterized_max_ordering_state_requests_are_isolated() {
+    use std::sync::Barrier;
+
+    let exact_bytes = 3 * LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES;
+    let configured_limits = QueryResultLimits {
+        max_ordering_state_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE labels (label String); \
+             INSERT INTO labels VALUES ('é'), ('Z'), ('東京');",
+        )
+        .unwrap();
+    let query = "SELECT+label%2C+lengthUTF8%28label%29+AS+scalars+FROM+labels+ORDER+BY+scalars%3B";
+    let success_request = format!(
+        "GET /?query={query}&max_ordering_state_bytes={exact_bytes} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    let failure_request = format!(
+        "GET /?query={query}&max_ordering_state_bytes={} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        exact_bytes - 1,
+    );
+    let expected_success = exchange(&database, success_request.as_bytes());
+    let expected_failure = exchange(&database, failure_request.as_bytes());
+
+    let request_count = 12;
+    let started = Arc::new(Barrier::new(request_count));
+    let handles = (0..request_count)
+        .map(|request_index| {
+            let database = database.clone();
+            let started = Arc::clone(&started);
+            thread::spawn(move || {
+                let requested_max = match request_index % 4 {
+                    0 => exact_bytes.to_string(),
+                    1 => (exact_bytes - 1).to_string(),
+                    2 => "0".to_owned(),
+                    _ => usize::MAX.to_string(),
+                };
+                let request = format!(
+                    "GET /?max_ordering_state_bytes={requested_max}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                );
+                started.wait();
+                (request_index % 4, exchange(&database, request.as_bytes()))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let (case, response) = handle.join().unwrap();
+        if case == 1 {
+            assert_eq!(response, expected_failure);
+        } else {
+            assert_eq!(response, expected_success);
+        }
+    }
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
 }
 
 #[test]
