@@ -1479,12 +1479,13 @@ atomically replaces a checksummed envelope. Its typed error separates payload
 encoding from replacement failures, preserves an existing destination on every
 pre-rename failure, and identifies post-rename directory-sync uncertainty.
 `Database::save_int64_table_to_file` connects that operation to one named batch
-table. It accepts exactly one non-nullable `Int64` column, preserves the stored
-column name, row order, and table row cap, and intentionally omits the batch
-table name and every other catalog table. Missing tables, multi-column tables,
-and other physical column types are rejected before filesystem access. Files it
-writes remain compatible with `restore_int64_table_payload_from_file`; payload
-encoding and atomic-replacement errors retain their existing typed causes and
+table. It accepts exactly one physical `Int64` or `Nullable(Int64)` column and
+preserves the stored column name, nullability, exact NULL positions, row order,
+and table row cap while intentionally omitting the batch table name and every
+other catalog table. Missing tables, multi-column tables, and other physical
+column types are rejected before filesystem access. Files it writes remain
+compatible with `restore_int64_table_payload_from_file`; payload encoding and
+atomic-replacement errors retain their existing typed causes and
 destination-preservation reporting. Codec bounds are checked against borrowed
 batch storage before payload allocation; the adapter does not clone the column
 into a second table representation.
