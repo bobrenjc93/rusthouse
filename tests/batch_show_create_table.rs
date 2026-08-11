@@ -245,9 +245,18 @@ fn mixed_nullable_schema_show_create_replays_create_and_alter_at_exact_byte_limi
 fn nullable_show_create_replay_accepts_4096_and_rejects_4097_statements() {
     let limits = TableLimits::new(0, DEFAULT_MAX_BATCH_STATEMENTS + 1, 0);
     let mut database = Database::with_table_limits(limits);
-    let mut setup = String::from("CREATE TABLE Boundary (c0 Nullable(Int64));");
+    let mut setup = String::from("CREATE TABLE Boundary (c0 Int64);");
     for index in 1..DEFAULT_MAX_BATCH_STATEMENTS {
-        write!(setup, "ALTER TABLE Boundary ADD COLUMN c{index} Int64;").unwrap();
+        let data_type = if index == 1 {
+            "Nullable(Int64)"
+        } else {
+            "Int64"
+        };
+        write!(
+            setup,
+            "ALTER TABLE Boundary ADD COLUMN c{index} {data_type};"
+        )
+        .unwrap();
     }
     database
         .execute(&setup)
@@ -275,7 +284,7 @@ fn nullable_show_create_replay_accepts_4096_and_rejects_4097_statements() {
 
     assert_eq!(
         database.execute(&format!(
-            "ALTER TABLE Boundary ADD COLUMN c{} Int64",
+            "ALTER TABLE Boundary ADD COLUMN c{} Nullable(Int64)",
             DEFAULT_MAX_BATCH_STATEMENTS
         )),
         Err(Error::ResourceLimitExceeded {

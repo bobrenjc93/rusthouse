@@ -217,6 +217,11 @@ impl Catalog {
         self.table_mut(table)?.add_column(column)
     }
 
+    /// Adds one nullable Int64 column using case-insensitive table resolution.
+    pub fn add_nullable_int64_column(&mut self, table: &str, column: String) -> Result<()> {
+        self.table_mut(table)?.add_nullable_int64_column(column)
+    }
+
     /// Drops one column using case-insensitive table and column resolution.
     pub fn drop_column(&mut self, table: &str, column: &str) -> Result<()> {
         self.table_mut(table)?.drop_column(column)

@@ -233,15 +233,16 @@ already absent, it returns the normal successful zero-row command result;
 plain `DROP TABLE` continues to report a missing-table error.
 
 `ALTER TABLE <table> ADD COLUMN <name> <type>` appends an `Int64`, `Float64`,
-`Bool`, or `String` field to the end of the schema and creates its matching
-physical column. Existing rows are backfilled with the ClickHouse-style
-non-null default for that type: `0`, `0.0`, `false`, or an empty String.
+`Bool`, `String`, or exact `Nullable(Int64)` field to the end of the schema and
+creates its matching physical column. Existing rows are backfilled with the
+ClickHouse-style default for that type: `0`, `0.0`, `false`, an empty String,
+or `NULL`, respectively.
 Table and collision lookup are case-insensitive; the stored column spelling is
 preserved. Invalid, reserved, or already-used names and missing tables fail
 before mutation, leaving schema, data, row count, and row cap unchanged. A
 positional insert or complete explicit list must include the new field, while
-an explicit subset may omit it and receive its typed default. Default
-expressions, `Nullable(...)` column additions, placement clauses, and
+an explicit subset may omit it and receive its typed default. Nullable types
+other than `Nullable(Int64)`, default expressions, placement clauses, and
 `IF NOT EXISTS` are not supported by this statement. Each addition is
 preflighted against the table's persistent column and physical-cell caps before
 its default vector is allocated. A trailing
@@ -413,14 +414,15 @@ values and is available through the normal `Database`, `SharedDatabase`, CLI,
 and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns canonical, replayable DDL as a bounded
 `String`, preserving the stored table and column display names and schema order
-while normalizing type spellings. Ordinary schemas and sole-column
-`Nullable(Int64)` tables use one `CREATE TABLE` statement. If non-nullable
-columns were subsequently appended to a nullable table, the result uses that
-one-column nullable `CREATE TABLE` followed by ordered `ALTER TABLE ... ADD
-COLUMN` statements so it remains inside the bounded grammar. Because the
-normal executor accepts at most 4,096 statements, nullable tables admit at
-most 4,096 columns even when a larger custom table-column limit is configured;
-the rejected addition leaves the table unchanged.
+while normalizing type spellings. Schemas with no nullable columns and
+sole-column `Nullable(Int64)` tables use one `CREATE TABLE` statement. For a
+mixed schema, the result creates the non-nullable prefix before the first
+nullable column (or creates a first nullable column by itself), then emits
+ordered `ALTER TABLE ... ADD COLUMN` statements for the remainder so it stays
+inside the bounded grammar. Because the normal executor accepts at most 4,096
+statements, additions that would require a 4,097th replay statement are
+rejected without changing the table, even when a larger custom column limit is
+configured.
 `DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
 and `type` `String` columns, rendering physical nullable `Int64` storage as
 `Nullable(Int64)`. It uses case-insensitive table lookup and applies the normal
@@ -1039,7 +1041,8 @@ TSV in physical schema order and treats every physical line as data.
 `TabSeparatedWithNames` selects named TSV. Named CSV and TSV bodies start with a
 matching-case column-name header. Their headers may contain any nonempty
 target-column subset without duplicates and in any order; omitted columns
-receive `0`, `0.0`, `false`, or an empty string according to their schema type.
+receive `NULL` for `Nullable(Int64)`, or `0`, `0.0`, `false`, or an empty string
+according to their non-nullable schema type.
 Duplicate, differently cased, and other format values return `400 Bad Request`.
 The route calls the corresponding nonblocking `SharedDatabase::try_ingest_*`
 method, so typed input, schema, capacity, and format-specific limit failures
@@ -1397,9 +1400,10 @@ failures remain distinct, and every failure leaves existing rows unchanged.
 The header must contain a nonempty, duplicate-free subset of schema columns
 with matching case, and may list those names in any order. Each data field
 parses as the table type selected by its header. Omitted fields use the same
-typed defaults as an explicit-column SQL `INSERT`: `0` for `Int64`, `0.0` for
-`Float64`, `false` for `Bool`, and an empty `String`. Supported input types are
-`Int64`, finite `Float64`, `Bool`, and `String`, and callers provide
+typed defaults as an explicit-column SQL `INSERT`: `NULL` for
+`Nullable(Int64)`, `0` for `Int64`, `0.0` for `Float64`, `false` for `Bool`,
+and an empty `String`. Supported input types are `Int64`, finite `Float64`,
+`Bool`, and `String`, and callers provide
 complete-input byte, row, and total supplied-value limits. Full physical rows
 remain subject to the table's row and cell capacity limits.
 As in headerless CSV, only the exact unquoted `NULL` field maps to SQL `NULL`,

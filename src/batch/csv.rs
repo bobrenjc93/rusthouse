@@ -6,9 +6,10 @@
 //! every physical schema column in order. `CSVWithNames` headers must contain a
 //! nonempty, exact-case subset of schema names without duplicates; names may
 //! appear in any order and must remain unquoted. Omitted named columns use the
-//! same typed defaults as an explicit-column SQL `INSERT`. The exact unquoted
-//! token `NULL` stores SQL `NULL` only in a physical `Nullable(Int64)` column;
-//! quoted tokens and all other spellings continue through normal typed parsing.
+//! same typed defaults as an explicit-column SQL `INSERT`, including `NULL` for
+//! `Nullable(Int64)`. The exact unquoted token `NULL` stores SQL `NULL` only in
+//! a physical `Nullable(Int64)` column; quoted tokens and all other spellings
+//! continue through normal typed parsing.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;

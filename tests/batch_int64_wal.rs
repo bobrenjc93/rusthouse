@@ -296,6 +296,39 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
 }
 
 #[test]
+fn active_wal_rejects_nullable_add_column_without_mutating_the_table() {
+    let directory = TestDirectory::new();
+    let path = directory.join("reject-nullable-add.wal");
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (Measurement Int64); INSERT INTO Readings VALUES (7)")
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, Int64WriteAheadLogLimits::default())
+        .unwrap();
+
+    assert_eq!(
+        database.execute("ALTER TABLE READINGS ADD COLUMN missing Nullable(Int64)"),
+        Err(Error::InvalidQuery(
+            "ALTER TABLE ADD COLUMN is not supported while table 'READINGS' has an active Int64 WAL"
+                .to_owned()
+        ))
+    );
+    let table = database.catalog().table("readings").unwrap();
+    assert_eq!(table.schema().len(), 1);
+    assert_eq!(int64_values(&database, "readings"), [7]);
+
+    assert!(database.disable_int64_write_ahead_log());
+    database
+        .execute("ALTER TABLE Readings ADD COLUMN missing Nullable(Int64)")
+        .expect("the schema change succeeds after detaching the WAL");
+    assert!(matches!(
+        &database.catalog().table("readings").unwrap().columns()[1],
+        Column::NullableInt64(values) if values == &[None]
+    ));
+}
+
+#[test]
 fn recovered_all_null_wal_casts_to_typed_float64_nulls() {
     let directory = TestDirectory::new();
     let path = directory.join("all-null-cast.wal");

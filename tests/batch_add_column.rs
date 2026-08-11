@@ -60,6 +60,56 @@ fn parses_exact_alter_table_add_column_syntax_for_every_type() {
 }
 
 #[test]
+fn parses_exact_case_insensitive_nullable_int64_add_column_syntax() {
+    for (sql, table, column) in [
+        (
+            "ALTER TABLE events ADD COLUMN measurement Nullable(Int64)",
+            "events",
+            "measurement",
+        ),
+        (
+            "alter table Events add column Measurement nullable(int64);",
+            "Events",
+            "Measurement",
+        ),
+    ] {
+        assert_eq!(
+            parse(sql).expect("valid nullable ALTER TABLE ADD COLUMN"),
+            [Statement::AddNullableInt64Column {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            }]
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_and_unsupported_nullable_add_column_types() {
+    for sql in [
+        "ALTER TABLE events ADD COLUMN value Nullable",
+        "ALTER TABLE events ADD COLUMN value Nullable()",
+        "ALTER TABLE events ADD COLUMN value Nullable(String)",
+        "ALTER TABLE events ADD COLUMN value Nullable(Nullable(Int64))",
+        "ALTER TABLE events ADD COLUMN value Nullable(Int64",
+        "ALTER TABLE events ADD COLUMN value Nullable(Int64))",
+        "ALTER TABLE events ADD COLUMN value Nullable(Int64, String)",
+        "ALTER TABLE events ADD COLUMN value Nullable(Int64) NULL",
+        "ALTER TABLE events ADD COLUMN value NullableInt64",
+    ] {
+        assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
+    }
+
+    let unsupported = "ALTER TABLE events ADD COLUMN value Nullable(Float64)";
+    assert_eq!(
+        parse(unsupported),
+        Err(Error::Sql {
+            position: unsupported.find("Float64").unwrap(),
+            message: "unsupported nullable type 'Float64'; expected Int64".to_owned(),
+        })
+    );
+}
+
+#[test]
 fn rejects_every_other_alter_table_add_column_shape() {
     for sql in [
         "ALTER events ADD COLUMN payload String",
@@ -369,6 +419,171 @@ fn populated_table_backfills_every_physical_type_and_exposes_metadata() {
             Value::String("new".to_owned()),
         ]]
     );
+}
+
+#[test]
+fn nullable_add_backfills_empty_and_populated_tables_and_defaults_omitted_inserts() {
+    let mut empty = Database::new();
+    empty
+        .execute(
+            "CREATE TABLE Empty (id Int64); \
+             ALTER TABLE Empty ADD COLUMN measurement Nullable(Int64);",
+        )
+        .expect("nullable column can be added to an empty table");
+    assert!(matches!(
+        &empty.catalog().table("empty").unwrap().columns()[1],
+        Column::NullableInt64(values) if values.is_empty()
+    ));
+    empty
+        .execute(
+            "INSERT INTO Empty (id) VALUES (1); \
+             INSERT INTO Empty VALUES (2, 7);",
+        )
+        .expect("omitted nullable values default to NULL");
+    assert_eq!(
+        query(&mut empty, "SELECT id, measurement FROM Empty ORDER BY id",).rows,
+        [
+            vec![Value::Int64(1), Value::Null(DataType::Int64)],
+            vec![Value::Int64(2), Value::Int64(7)],
+        ]
+    );
+
+    let mut populated = Database::new();
+    populated
+        .execute(
+            "CREATE TABLE Events (id Int64, label String); \
+             INSERT INTO Events VALUES (2, 'two'), (1, 'one'); \
+             ALTER TABLE Events ADD COLUMN measurement Nullable(Int64); \
+             ALTER TABLE Events ADD COLUMN previous Nullable(Int64); \
+             ALTER TABLE Events ADD COLUMN active Bool;",
+        )
+        .expect("nullable columns backfill populated rows");
+    let table = populated.catalog().table("events").unwrap();
+    assert!(matches!(
+        &table.columns()[2],
+        Column::NullableInt64(values) if values == &[None, None]
+    ));
+    assert!(matches!(
+        &table.columns()[3],
+        Column::NullableInt64(values) if values == &[None, None]
+    ));
+    assert_eq!(table.retained_value_bytes(), 60);
+
+    populated
+        .execute(
+            "INSERT INTO Events (id, label, measurement) VALUES (3, 'three', 30); \
+             INSERT INTO Events (id, label) VALUES (4, 'four');",
+        )
+        .expect("each omitted nullable column defaults to NULL");
+    assert_eq!(
+        query(
+            &mut populated,
+            "SELECT id, measurement, previous FROM Events ORDER BY id",
+        )
+        .rows,
+        [
+            vec![
+                Value::Int64(1),
+                Value::Null(DataType::Int64),
+                Value::Null(DataType::Int64),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Null(DataType::Int64),
+                Value::Null(DataType::Int64),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Int64(30),
+                Value::Null(DataType::Int64),
+            ],
+            vec![
+                Value::Int64(4),
+                Value::Null(DataType::Int64),
+                Value::Null(DataType::Int64),
+            ],
+        ]
+    );
+
+    let ddl = "CREATE TABLE Events (id Int64, label String); \
+               ALTER TABLE Events ADD COLUMN measurement Nullable(Int64); \
+               ALTER TABLE Events ADD COLUMN previous Nullable(Int64); \
+               ALTER TABLE Events ADD COLUMN active Bool";
+    assert_eq!(
+        query(&mut populated, "SHOW CREATE TABLE events").rows,
+        [vec![Value::String(ddl.to_owned())]]
+    );
+    assert_eq!(
+        query(&mut populated, "DESCRIBE TABLE events").rows[2..4],
+        [
+            vec![
+                Value::String("measurement".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+            vec![
+                Value::String("previous".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+        ]
+    );
+
+    let mut replayed = Database::new();
+    replayed
+        .execute(ddl)
+        .expect("SHOW CREATE output recreates every nullable column");
+    assert_eq!(
+        query(&mut replayed, "SHOW CREATE TABLE Events").rows,
+        [vec![Value::String(ddl.to_owned())]]
+    );
+}
+
+#[test]
+fn nullable_add_accepts_exact_table_limits_and_rejects_atomically() {
+    let limits = TableLimits::new(2, 3, 4);
+    let mut database = Database::with_table_limits(limits);
+    database
+        .execute(
+            "CREATE TABLE Events (id Int64); \
+             INSERT INTO Events VALUES (1), (2); \
+             ALTER TABLE Events ADD COLUMN measurement Nullable(Int64);",
+        )
+        .expect("two rows by two columns exactly fits four cells");
+    let table = database.catalog().table("events").unwrap();
+    assert_eq!(table.retained_cell_count(), limits.max_cells);
+    assert!(matches!(
+        &table.columns()[1],
+        Column::NullableInt64(values) if values == &[None, None]
+    ));
+
+    assert_eq!(
+        database.execute("ALTER TABLE Events ADD COLUMN overflow Nullable(Int64)"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table cells",
+            actual: 6,
+            max: 4,
+        })
+    );
+    let table = database.catalog().table("events").unwrap();
+    assert_eq!(table.schema().len(), 2);
+    assert_eq!(table.columns().len(), 2);
+    assert_eq!(table.retained_cell_count(), 4);
+
+    let mut columns = Database::with_table_limits(TableLimits::new(0, 2, 0));
+    columns
+        .execute(
+            "CREATE TABLE Empty (id Int64); \
+             ALTER TABLE Empty ADD COLUMN measurement Nullable(Int64);",
+        )
+        .expect("the exact column cap is accepted");
+    assert_eq!(
+        columns.execute("ALTER TABLE Empty ADD COLUMN overflow Nullable(Int64)"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table columns",
+            actual: 3,
+            max: 2,
+        })
+    );
+    assert_eq!(columns.catalog().table("empty").unwrap().schema().len(), 2);
 }
 
 #[test]

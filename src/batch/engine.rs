@@ -19,8 +19,8 @@ use crate::batch::sql::{
     SelectItem, Statement, VersionSelect,
 };
 use crate::batch::storage::{
-    Column, Int64Filter, Int64MinMaxIndexScan, PreparedInsertRows, Table, validate_row_selection,
-    validate_table_name,
+    Column, ColumnDef, Int64Filter, Int64MinMaxIndexScan, PreparedInsertRows, Table,
+    validate_row_selection, validate_table_name,
 };
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -2399,7 +2399,8 @@ impl Database {
     /// duplicates, using exact case, but may place those names in any order.
     /// Each data field is parsed using the `Int64`, finite `Float64`, `Bool`, or
     /// `String` type selected by its header. Omitted columns receive the same
-    /// typed defaults as SQL `INSERT`: `0`, `0.0`, `false`, or an empty string.
+    /// typed defaults as SQL `INSERT`: `NULL` for `Nullable(Int64)`, otherwise
+    /// `0`, `0.0`, `false`, or an empty string.
     /// Data fields may be double-quoted, allowing commas, LF or CRLF line
     /// endings, and doubled (`""`) quote escapes; decoded contents use the same
     /// type rules. The exact unquoted token `NULL` stores SQL `NULL` only in a
@@ -2496,8 +2497,9 @@ impl Database {
     ///
     /// The decoded header must contain a nonempty, duplicate-free subset of
     /// target schema columns in any order, with matching case. Omitted columns
-    /// receive their typed defaults. Fields use the TSV writer's ClickHouse-style
-    /// escapes: `\\`, `\t`, `\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Values are
+    /// receive their typed defaults, including `NULL` for `Nullable(Int64)`.
+    /// Fields use the TSV writer's ClickHouse-style escapes: `\\`, `\t`, `\r`,
+    /// `\n`, `\0`, `\b`, `\f`, and `\'`. Values are
     /// parsed as `Int64`, finite `Float64`, `Bool`, or `String`; the exact raw
     /// `\N` field is NULL only for a selected physical `Nullable(Int64)` column,
     /// while escaped `\\N` remains String data. Records may use LF or CRLF.
@@ -2929,18 +2931,22 @@ impl Database {
             Statement::AddColumn { table, column } => {
                 self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
                 let existing = self.catalog.table(&table)?;
-                let show_create_statements = existing.schema().len().saturating_add(1);
-                if starts_with_nullable_int64(existing)
-                    && show_create_statements > sql::DEFAULT_MAX_BATCH_STATEMENTS
-                {
-                    existing.validate_add_column(&column)?;
-                    return Err(Error::ResourceLimitExceeded {
-                        resource: "nullable SHOW CREATE statements",
-                        actual: show_create_statements,
-                        max: sql::DEFAULT_MAX_BATCH_STATEMENTS,
-                    });
-                }
+                validate_show_create_addition(existing, &column, false)?;
                 self.table_mut(&table)?.add_column(column)?;
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::AddNullableInt64Column { table, column } => {
+                self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
+                let field = ColumnDef {
+                    name: column.clone(),
+                    data_type: DataType::Int64,
+                };
+                let existing = self.catalog.table(&table)?;
+                validate_show_create_addition(existing, &field, true)?;
+                self.table_mut(&table)?.add_nullable_int64_column(column)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",
                     affected_rows: 0,
@@ -3139,6 +3145,7 @@ impl Database {
             | Statement::RenameTable { .. }
             | Statement::RenameColumn { .. }
             | Statement::AddColumn { .. }
+            | Statement::AddNullableInt64Column { .. }
             | Statement::DropColumn { .. }
             | Statement::AlterUpdate { .. }
             | Statement::AlterUpdateTyped { .. }
@@ -3897,12 +3904,7 @@ impl Database {
         ddl.push_str("CREATE TABLE ");
         ddl.push_str(table.name());
         ddl.push_str(" (");
-        let nullable_create = starts_with_nullable_int64(table);
-        let create_columns = if nullable_create {
-            1
-        } else {
-            table.schema().len()
-        };
+        let create_columns = show_create_column_count(table);
         for (index, (field, values)) in table
             .schema()
             .iter()
@@ -3918,8 +3920,13 @@ impl Database {
             ddl.push_str(values.metadata_type_name());
         }
         ddl.push(')');
-        if nullable_create {
-            for (field, values) in table.schema().iter().zip(table.columns()).skip(1) {
+        if create_columns != table.schema().len() {
+            for (field, values) in table
+                .schema()
+                .iter()
+                .zip(table.columns())
+                .skip(create_columns)
+            {
                 ddl.push_str("; ALTER TABLE ");
                 ddl.push_str(table.name());
                 ddl.push_str(" ADD COLUMN ");
@@ -4369,6 +4376,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. }
         | Statement::AddColumn { .. }
+        | Statement::AddNullableInt64Column { .. }
         | Statement::DropColumn { .. }
         | Statement::AlterUpdate { .. }
         | Statement::AlterUpdateTyped { .. }
@@ -4414,12 +4422,7 @@ fn delete_comparison_predicate(comparison: DeleteComparisonPredicate) -> Predica
 }
 
 fn create_table_ddl_len(table: &Table) -> usize {
-    let nullable_create = starts_with_nullable_int64(table);
-    let create_columns = if nullable_create {
-        1
-    } else {
-        table.schema().len()
-    };
+    let create_columns = show_create_column_count(table);
     let fields_bytes = table
         .schema()
         .iter()
@@ -4434,12 +4437,12 @@ fn create_table_ddl_len(table: &Table) -> usize {
         })
         .fold(0_usize, usize::saturating_add);
     let delimiters = create_columns.saturating_sub(1).saturating_mul(2);
-    let alter_bytes = if nullable_create {
+    let alter_bytes = if create_columns != table.schema().len() {
         table
             .schema()
             .iter()
             .zip(table.columns())
-            .skip(1)
+            .skip(create_columns)
             .map(|(field, values)| {
                 "; ALTER TABLE "
                     .len()
@@ -4464,17 +4467,43 @@ fn create_table_ddl_len(table: &Table) -> usize {
         .saturating_add(alter_bytes)
 }
 
-fn starts_with_nullable_int64(table: &Table) -> bool {
-    let starts_nullable = matches!(table.columns().first(), Some(Column::NullableInt64(_)));
-    debug_assert!(
-        table
-            .columns()
-            .iter()
-            .skip(1)
-            .all(|column| !matches!(column, Column::NullableInt64(_))),
-        "bounded nullable storage can only occupy the first column"
-    );
-    starts_nullable
+fn show_create_column_count(table: &Table) -> usize {
+    table
+        .columns()
+        .iter()
+        .position(|column| matches!(column, Column::NullableInt64(_)))
+        .map_or(table.schema().len(), |index| index.max(1))
+}
+
+fn show_create_statement_count_after_addition(table: &Table, added_nullable: bool) -> usize {
+    match table
+        .columns()
+        .iter()
+        .position(|column| matches!(column, Column::NullableInt64(_)))
+    {
+        Some(index) => 1_usize
+            .saturating_add(table.schema().len().saturating_add(1))
+            .saturating_sub(index.max(1)),
+        None if added_nullable => 2,
+        None => 1,
+    }
+}
+
+fn validate_show_create_addition(
+    table: &Table,
+    field: &ColumnDef,
+    added_nullable: bool,
+) -> Result<()> {
+    let statements = show_create_statement_count_after_addition(table, added_nullable);
+    if statements <= sql::DEFAULT_MAX_BATCH_STATEMENTS {
+        return Ok(());
+    }
+    table.validate_add_column(field)?;
+    Err(Error::ResourceLimitExceeded {
+        resource: "nullable SHOW CREATE statements",
+        actual: statements,
+        max: sql::DEFAULT_MAX_BATCH_STATEMENTS,
+    })
 }
 
 fn literal_result_name_len(value: &Value) -> usize {
