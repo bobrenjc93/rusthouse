@@ -5294,7 +5294,10 @@ fn resolve_select_items(
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
                 if actual == DataType::Int64
-                    && !matches!(target_type, DataType::Float64 | DataType::Bool)
+                    && !matches!(
+                        target_type,
+                        DataType::Float64 | DataType::Bool | DataType::String
+                    )
                 {
                     reject_nullable_operation(table, source, "CAST")?;
                 }
