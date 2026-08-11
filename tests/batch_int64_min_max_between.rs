@@ -45,7 +45,7 @@ fn rows(values: &[i64]) -> Vec<Vec<Value>> {
         .collect()
 }
 
-fn assert_indexed_between(
+fn assert_indexed_range(
     indexed: &mut Database,
     unindexed: &mut Database,
     sql: &str,
@@ -149,7 +149,29 @@ fn int64_between_prunes_disjoint_blocks_and_rechecks_overlaps_in_source_order() 
             },
         ),
     ] {
-        assert_indexed_between(&mut indexed, &mut unindexed, sql, &expected, expected_delta);
+        assert_indexed_range(&mut indexed, &mut unindexed, sql, &expected, expected_delta);
+    }
+}
+
+#[test]
+fn equivalent_positive_range_conjunctions_use_the_documented_index_path() {
+    let mut indexed = int64_database(true);
+    let mut unindexed = int64_database(false);
+
+    for sql in [
+        "SELECT id FROM events WHERE key >= -8 AND key <= 1",
+        "SELECT id FROM events WHERE NOT (key < -8 OR key > 1)",
+    ] {
+        assert_indexed_range(
+            &mut indexed,
+            &mut unindexed,
+            sql,
+            &[2, 3, 4, 5],
+            IndexPruningMetrics {
+                scanned_blocks: 2,
+                pruned_blocks: 1,
+            },
+        );
     }
 }
 
@@ -174,7 +196,7 @@ fn nullable_between_prunes_all_null_blocks_and_preserves_null_semantics() {
         )
         .expect("valid nullable index");
 
-    assert_indexed_between(
+    assert_indexed_range(
         &mut indexed,
         &mut unindexed,
         "SELECT value FROM readings WHERE value BETWEEN -1 AND 6",
@@ -184,7 +206,7 @@ fn nullable_between_prunes_all_null_blocks_and_preserves_null_semantics() {
             pruned_blocks: 2,
         },
     );
-    assert_indexed_between(
+    assert_indexed_range(
         &mut indexed,
         &mut unindexed,
         "SELECT value FROM readings WHERE value BETWEEN -9223372036854775808 AND 9223372036854775807",

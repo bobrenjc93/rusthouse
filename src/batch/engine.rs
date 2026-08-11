@@ -9435,13 +9435,15 @@ impl CompiledPredicate {
     }
 
     /// Returns the shapes that an `Int64` min/max index can reject safely.
-    /// `BETWEEN` is lowered by the parser to the exact positive conjunction
-    /// recognized here; every surviving row is still evaluated by `self`.
+    /// This includes any exact positive inclusive-range conjunction after
+    /// predicate normalization. Every surviving row is still evaluated by
+    /// `self`.
     fn int64_index_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_filter().or_else(|| self.int64_between_filter())
+        self.int64_filter()
+            .or_else(|| self.int64_inclusive_range_filter())
     }
 
-    fn int64_between_filter(&self) -> Option<(usize, Int64Filter)> {
+    fn int64_inclusive_range_filter(&self) -> Option<(usize, Int64Filter)> {
         let Self::And(lower, upper) = self else {
             return None;
         };
@@ -9454,7 +9456,7 @@ impl CompiledPredicate {
         if lower_column != upper_column {
             return None;
         }
-        Some((lower_column, Int64Filter::Between { lower, upper }))
+        Some((lower_column, Int64Filter::InclusiveRange { lower, upper }))
     }
 
     fn int64_nullness(&self) -> Option<(usize, bool)> {

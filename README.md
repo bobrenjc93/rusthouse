@@ -162,17 +162,20 @@ their documented nullable restrictions.
 
 An admitted, current index can reject blocks for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
-order), and for the exact positive `column BETWEEN lower AND upper` shape with
-`Int64` literal bounds. Both `Int64` and physical `Nullable(Int64)` index
-columns are supported; all-null blocks cannot satisfy either shape. Every row
-in a surviving block still follows the normal exact predicate evaluator.
-Other compound shapes, `NOT BETWEEN`, `!=`, missing or stale indexes, and
-failed admissions use the unchanged full-scan path. Candidate blocks and rows
-retain source order, so first-row, ordering, pagination, grouping, and `HAVING`
-behavior is identical. The full source row count still pays the query scan-row
-limit. Inserts, deletes, updates, truncation, and added columns rebuild the
-index within the table mutation; if its original cap is exceeded it is
-invalidated. Dropping a column or replacing/restoring the table invalidates it.
+order), and for an exact positive inclusive range on one column with `Int64`
+literal bounds. `column BETWEEN lower AND upper`, the equivalent `column >=
+lower AND column <= upper`, and forms normalized to that conjunction such as
+`NOT (column < lower OR column > upper)` share this indexed range path. Both
+`Int64` and physical `Nullable(Int64)` index columns are supported; all-null
+blocks cannot satisfy these shapes. Every row in a surviving block still
+follows the normal exact predicate evaluator. Other compound shapes, `NOT
+BETWEEN`, `!=`, missing or stale indexes, and failed admissions use the
+unchanged full-scan path. Candidate blocks and rows retain source order, so
+first-row, ordering, pagination, grouping, and `HAVING` behavior is identical.
+The full source row count still pays the query scan-row limit. Inserts, deletes,
+updates, truncation, and added columns rebuild the index within the table
+mutation; if its original cap is exceeded it is invalidated. Dropping a column
+or replacing/restoring the table invalidates it.
 `Database::index_pruning_metrics` exposes cumulative surviving
 `scanned_blocks` and metadata-rejected `pruned_blocks` whenever sparse-index
 pruning runs. This work remains counted if later query processing fails;

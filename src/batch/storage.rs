@@ -183,7 +183,7 @@ pub(crate) enum Int64Filter {
     LessOrEqual(i64),
     Greater(i64),
     GreaterOrEqual(i64),
-    Between { lower: i64, upper: i64 },
+    InclusiveRange { lower: i64, upper: i64 },
 }
 
 #[derive(Debug)]
@@ -924,7 +924,7 @@ impl Table {
             Int64Filter::LessOrEqual(value) => partition.lower_bound <= value,
             Int64Filter::Greater(value) => partition.upper_bound > value,
             Int64Filter::GreaterOrEqual(value) => partition.upper_bound >= value,
-            Int64Filter::Between { lower, upper } => {
+            Int64Filter::InclusiveRange { lower, upper } => {
                 lower <= upper && partition.upper_bound >= lower && partition.lower_bound <= upper
             }
         });
@@ -1748,7 +1748,9 @@ fn block_may_match(block: Int64MinMaxBlockMetadata, filter: Int64Filter) -> bool
         Int64Filter::LessOrEqual(value) => min <= value,
         Int64Filter::Greater(value) => max > value,
         Int64Filter::GreaterOrEqual(value) => max >= value,
-        Int64Filter::Between { lower, upper } => lower <= upper && max >= lower && min <= upper,
+        Int64Filter::InclusiveRange { lower, upper } => {
+            lower <= upper && max >= lower && min <= upper
+        }
     }
 }
 
