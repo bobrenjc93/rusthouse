@@ -72,6 +72,11 @@ fn parses_exact_case_insensitive_nullable_int64_add_column_syntax() {
             "Events",
             "Measurement",
         ),
+        (
+            "ALTER TABLE events ADD COLUMN IF Nullable(Int64)",
+            "events",
+            "IF",
+        ),
     ] {
         assert_eq!(
             parse(sql).expect("valid nullable ALTER TABLE ADD COLUMN"),

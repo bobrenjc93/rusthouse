@@ -1770,10 +1770,18 @@ impl<'a> Parser<'a> {
         let table = self.expect_identifier("table name")?;
         if self.eat_keyword("ADD") {
             self.expect_keyword("COLUMN")?;
-            let if_not_exists = if self.eat_keyword("IF") {
-                self.expect_keyword("NOT")?;
-                self.expect_keyword("EXISTS")?;
-                true
+            let if_not_exists = if self.at_keyword("IF") {
+                let lexer = self.lexer;
+                let current = self.current.clone();
+                self.advance();
+                if self.eat_keyword("NOT") {
+                    self.expect_keyword("EXISTS")?;
+                    true
+                } else {
+                    self.lexer = lexer;
+                    self.current = current;
+                    false
+                }
             } else {
                 false
             };
