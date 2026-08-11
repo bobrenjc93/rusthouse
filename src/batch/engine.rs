@@ -143,6 +143,7 @@ pub(crate) struct ParameterizedQueryLimits {
     pub(crate) max_result_values: usize,
     pub(crate) max_scan_rows: usize,
     pub(crate) max_groups: usize,
+    pub(crate) max_group_key_cells: usize,
     pub(crate) max_ordering_state_bytes: usize,
     pub(crate) max_aggregate_state_cells: usize,
     pub(crate) max_aggregate_state_bytes: usize,
@@ -1146,7 +1147,8 @@ impl Database {
 
     /// Creates an empty database with an explicit nonzero computation-lane cap
     /// for supported parallel aggregates, including sole nullable `Int64`
-    /// `COUNT` and Bool-grouped `COUNT`.
+    /// `COUNT`, Bool-grouped row count, and Bool-grouped nullable `Int64`
+    /// `COUNT`.
     ///
     /// A cap of one keeps those aggregates sequential. Higher caps remain
     /// subject to the process-wide worker budget, available hardware, and the
@@ -2800,6 +2802,7 @@ impl Database {
                 max_result_values: 0,
                 max_scan_rows: 0,
                 max_groups: 0,
+                max_group_key_cells: 0,
                 max_ordering_state_bytes: 0,
                 max_aggregate_state_cells: 0,
                 max_aggregate_state_bytes: 0,
@@ -2811,8 +2814,8 @@ impl Database {
     /// Executes one already-parsed read-only query with caller-supplied limits.
     ///
     /// Caller limits may only tighten the database's configured result-byte,
-    /// result-row, result-value, scan-row, group-count, ordering-state,
-    /// aggregate-state cell, aggregate-state byte, and supported
+    /// result-row, result-value, scan-row, group-count, group-key cell,
+    /// ordering-state, aggregate-state cell, aggregate-state byte, and supported
     /// global-aggregate worker limits. Zero leaves the corresponding configured
     /// limit in place.
     /// Result-shape validation applies the effective row, value, and byte
@@ -2829,6 +2832,7 @@ impl Database {
             max_result_values,
             max_scan_rows,
             max_groups,
+            max_group_key_cells,
             max_ordering_state_bytes,
             max_aggregate_state_cells,
             max_aggregate_state_bytes,
@@ -2854,6 +2858,13 @@ impl Database {
             self.query_result_limits.max_groups
         } else {
             self.query_result_limits.max_groups.min(max_groups)
+        };
+        let max_group_key_cells = if max_group_key_cells == 0 {
+            self.query_result_limits.max_group_key_cells
+        } else {
+            self.query_result_limits
+                .max_group_key_cells
+                .min(max_group_key_cells)
         };
         let max_ordering_state_bytes = if max_ordering_state_bytes == 0 {
             self.query_result_limits.max_ordering_state_bytes
@@ -2881,6 +2892,7 @@ impl Database {
             max_rows,
             max_values,
             max_groups,
+            max_group_key_cells,
             max_ordering_state_bytes,
             max_aggregate_state_cells,
             max_aggregate_state_bytes,
@@ -6835,10 +6847,9 @@ fn execute_grouped_bool_count<'a>(
         return Ok(None);
     };
     let [
-        AggregateSpec {
+        spec @ AggregateSpec {
             function: AggregateFunction::Count,
-            argument: None,
-            input_type: None,
+            ..
         },
     ] = aggregate_specs
     else {
@@ -6848,9 +6859,22 @@ fn execute_grouped_bool_count<'a>(
         return Ok(None);
     };
 
-    let partial =
-        reduce_grouped_bool_count(values, matching_rows, parallelism, grouped_bool_count_chunk)?;
-    let group_count = usize::from(partial.false_count > 0) + usize::from(partial.true_count > 0);
+    let partial = match (spec.argument, spec.input_type) {
+        (None, None) => {
+            reduce_grouped_bool_count(values, matching_rows, parallelism, grouped_bool_count_chunk)?
+        }
+        (Some(argument), Some(DataType::Int64)) if table.column_is_nullable_int64(argument) => {
+            let Column::NullableInt64(count_values) = &table.columns()[argument] else {
+                unreachable!("grouped nullable Int64 COUNT shape is resolved")
+            };
+            reduce_grouped_bool_count(values, matching_rows, parallelism, |values, rows| {
+                grouped_bool_nullable_int64_count_chunk(values, count_values, rows)
+            })?
+        }
+        _ => return Ok(None),
+    };
+    let group_count =
+        usize::from(partial.row_count(false) > 0) + usize::from(partial.row_count(true) > 0);
     enforce_resource_limit("SELECT groups", group_count, limits.max_groups)?;
     enforce_resource_limit(
         "SELECT group key cells",
@@ -6869,7 +6893,7 @@ fn execute_grouped_bool_count<'a>(
         keys.push(GroupKey::One(ValueRef::Bool(first)));
         counts.push(Value::Int64(partial.count(first)));
         let second = !first;
-        if partial.count(second) > 0 {
+        if partial.row_count(second) > 0 {
             keys.push(GroupKey::One(ValueRef::Bool(second)));
             counts.push(Value::Int64(partial.count(second)));
         }
@@ -6884,18 +6908,51 @@ fn execute_grouped_bool_count<'a>(
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct GroupedBoolCountPartial {
+    false_rows: i64,
+    true_rows: i64,
     false_count: i64,
     true_count: i64,
     first_seen: Option<bool>,
 }
 
 impl GroupedBoolCountPartial {
+    fn row_count(&self, value: bool) -> i64 {
+        if value {
+            self.true_rows
+        } else {
+            self.false_rows
+        }
+    }
+
     fn count(&self, value: bool) -> i64 {
         if value {
             self.true_count
         } else {
             self.false_count
         }
+    }
+
+    fn observe(&mut self, value: bool, counted: bool) -> Result<()> {
+        self.first_seen.get_or_insert(value);
+        let rows = if value {
+            &mut self.true_rows
+        } else {
+            &mut self.false_rows
+        };
+        *rows = rows
+            .checked_add(1)
+            .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+        if counted {
+            let count = if value {
+                &mut self.true_count
+            } else {
+                &mut self.false_count
+            };
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+        }
+        Ok(())
     }
 }
 
@@ -6981,15 +7038,19 @@ fn grouped_bool_count_chunk(
     let mut partial = GroupedBoolCountPartial::default();
     for row in matching_rows {
         let value = values[*row];
-        partial.first_seen.get_or_insert(value);
-        let count = if value {
-            &mut partial.true_count
-        } else {
-            &mut partial.false_count
-        };
-        *count = count
-            .checked_add(1)
-            .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+        partial.observe(value, true)?;
+    }
+    Ok(partial)
+}
+
+fn grouped_bool_nullable_int64_count_chunk(
+    group_values: &[bool],
+    count_values: &[Option<i64>],
+    matching_rows: &[usize],
+) -> Result<GroupedBoolCountPartial> {
+    let mut partial = GroupedBoolCountPartial::default();
+    for row in matching_rows {
+        partial.observe(group_values[*row], count_values[*row].is_some())?;
     }
     Ok(partial)
 }
@@ -7003,6 +7064,14 @@ fn reduce_grouped_bool_count_partials(
             if total.first_seen.is_none() {
                 total.first_seen = partial.first_seen;
             }
+            total.false_rows = total
+                .false_rows
+                .checked_add(partial.false_rows)
+                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+            total.true_rows = total
+                .true_rows
+                .checked_add(partial.true_rows)
+                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             total.false_count = total
                 .false_count
                 .checked_add(partial.false_count)
@@ -9725,6 +9794,7 @@ mod tests {
                     max_result_values: 0,
                     max_scan_rows: 0,
                     max_groups: 0,
+                    max_group_key_cells: 0,
                     max_ordering_state_bytes: 0,
                     max_aggregate_state_cells: 0,
                     max_aggregate_state_bytes: 0,
@@ -9780,6 +9850,39 @@ mod tests {
                 database
                     .execute(&format!("INSERT INTO bool_events VALUES {rows}"))
                     .expect("grouped Bool COUNT differential rows");
+            }
+        }
+        database
+    }
+
+    fn grouped_bool_nullable_count_database(
+        row_count: usize,
+        row_values: impl Fn(usize) -> (bool, Option<i64>),
+    ) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE bool_nullable_events (id Int64, active Bool); \
+                 ALTER TABLE bool_nullable_events ADD COLUMN measurement Nullable(Int64);",
+            )
+            .expect("grouped Bool nullable COUNT differential setup");
+        if row_count > 0 {
+            for first_id in (1..=row_count).step_by(50_000) {
+                let last_id = first_id.saturating_add(49_999).min(row_count);
+                let rows = (first_id..=last_id)
+                    .map(|id| {
+                        let (active, measurement) = row_values(id);
+                        let measurement = measurement.map_or_else(
+                            || "NULL".to_owned(),
+                            |measurement| measurement.to_string(),
+                        );
+                        format!("({id}, {active}, {measurement})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                database
+                    .execute(&format!("INSERT INTO bool_nullable_events VALUES {rows}"))
+                    .expect("grouped Bool nullable COUNT differential rows");
             }
         }
         database
@@ -10049,7 +10152,7 @@ mod tests {
         assert_eq!(
             BUDGET.peak_helpers_in_use(),
             0,
-            "grouped nullable COUNT remains sequential"
+            "nullable-key grouped COUNT remains sequential"
         );
     }
 
@@ -10281,6 +10384,300 @@ mod tests {
     }
 
     #[test]
+    fn grouped_bool_nullable_count_threshold_filters_all_null_groups_and_admission_fallback() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
+        let mut database = grouped_bool_nullable_count_database(row_count, |id| {
+            let active = id % 2 == 1;
+            let measurement = (!active && id % 6 != 0)
+                .then(|| i64::try_from(id).expect("test row id fits Int64"));
+            (active, measurement)
+        });
+        let present_through = |last_id: usize| {
+            i64::try_from(
+                (1..=last_id)
+                    .filter(|id| id % 2 == 0 && id % 6 != 0)
+                    .count(),
+            )
+            .unwrap()
+        };
+
+        let boundary_sql = format!(
+            "SELECT active, COUNT(measurement) AS n FROM bool_nullable_events \
+             WHERE id <= {} GROUP BY active HAVING n >= 0",
+            GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+        );
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, &boundary_sql).rows,
+            [
+                vec![
+                    Value::Bool(false),
+                    Value::Int64(present_through(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD)),
+                ],
+                vec![Value::Bool(true), Value::Int64(0)],
+            ],
+            "an all-NULL group is retained with a zero count"
+        );
+
+        let above_threshold = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let above_threshold_sql = format!(
+            "SELECT active, COUNT(measurement) AS n FROM bool_nullable_events \
+             WHERE id <= {above_threshold} GROUP BY active HAVING n >= 0"
+        );
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, &above_threshold_sql).rows,
+            [
+                vec![
+                    Value::Bool(false),
+                    Value::Int64(present_through(above_threshold)),
+                ],
+                vec![Value::Bool(true), Value::Int64(0)],
+            ],
+            "parallel reduction preserves the established grouped key tie-break"
+        );
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database.global_aggregate_worker_cap(), &BUDGET);
+        BUDGET.reset_peak();
+        query(&mut database, &boundary_sql);
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "the exact threshold stays sequential"
+        );
+        BUDGET.reset_peak();
+        query(&mut database, &above_threshold_sql);
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "the sole supported shape above the threshold uses shared helpers"
+        );
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        let filtered_sql = "SELECT active AS enabled, COUNT(measurement) AS n \
+                            FROM bool_nullable_events WHERE id > 1 GROUP BY active \
+                            HAVING n >= 0 ORDER BY n DESC, enabled DESC";
+        let expected_filtered = [
+            vec![Value::Bool(false), Value::Int64(present_through(row_count))],
+            vec![Value::Bool(true), Value::Int64(0)],
+        ];
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, filtered_sql).rows,
+            expected_filtered,
+            "filtered NULL-ignoring counts retain normal HAVING and ordering"
+        );
+
+        let sequential = force_global_aggregate_workers(&mut database, 1, filtered_sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database.global_aggregate_worker_cap(), &BUDGET);
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts aggregate helper admission");
+        let exhausted = query(&mut database, filtered_sql);
+        assert_eq!(exhausted, sequential);
+        assert_eq!(exhausted.rows, expected_filtered);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        for unsupported_sql in [
+            "SELECT active, COUNT(active) FROM bool_nullable_events GROUP BY active",
+            "SELECT active, COUNT(measurement), COUNT(*) \
+             FROM bool_nullable_events GROUP BY active",
+        ] {
+            BUDGET.reset_peak();
+            query(&mut database, unsupported_sql);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use(),
+                0,
+                "unsupported grouped shape stays sequential: {unsupported_sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_bool_nullable_count_worker_failure_repeats_complete_input_locally() {
+        let group_values = [true, false, false];
+        let count_values = [None, Some(17), None];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_grouped_bool_count(
+            &group_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            |group_values, rows| {
+                grouped_bool_nullable_int64_count_chunk(group_values, &count_values, rows)
+            },
+        )
+        .expect("deterministic parallel grouped nullable COUNT succeeds");
+        let failed_parallel = reduce_grouped_bool_count(
+            &group_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            |group_values, rows| {
+                if std::thread::current().name() == Some("rusthouse-group-bool-count-1") {
+                    panic!("injected grouped nullable COUNT worker failure");
+                }
+                grouped_bool_nullable_int64_count_chunk(group_values, &count_values, rows)
+            },
+        )
+        .expect("worker failure falls back to a complete local grouped nullable COUNT");
+
+        let expected = GroupedBoolCountPartial {
+            false_rows: 2,
+            true_rows: i64::try_from(row_count - 2).unwrap(),
+            false_count: 1,
+            true_count: 0,
+            first_seen: Some(true),
+        };
+        assert_eq!(successful_parallel, expected);
+        assert_eq!(failed_parallel, expected);
+    }
+
+    #[test]
+    fn grouped_bool_nullable_count_forced_workers_preserve_resource_boundaries() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database = grouped_bool_nullable_count_database(row_count, |id| {
+            (id == 1, (id % 2 == 0).then_some(9))
+        });
+        let aggregate_state_bytes = 2_usize
+            .saturating_mul(std::mem::size_of::<AggregateState>())
+            .saturating_add(std::mem::size_of::<Vec<AggregateState>>());
+        let group_key_bytes = 2_usize.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES);
+        let exact_limits = QueryResultLimits {
+            max_scan_rows: row_count,
+            max_rows: 2,
+            max_values: 4,
+            max_groups: 2,
+            max_group_key_cells: 2,
+            max_group_key_bytes: group_key_bytes,
+            max_aggregate_state_cells: 2,
+            max_aggregate_state_bytes: aggregate_state_bytes,
+            ..QueryResultLimits::default()
+        };
+        database.query_result_limits = exact_limits;
+        let sql = "SELECT active, COUNT(measurement) \
+                   FROM bool_nullable_events GROUP BY active";
+
+        let sequential = force_global_aggregate_workers(&mut database, 1, sql);
+        let parallel = force_global_aggregate_workers(&mut database, 4, sql);
+        assert_eq!(parallel, sequential);
+        assert_eq!(
+            parallel.rows,
+            [
+                vec![
+                    Value::Bool(false),
+                    Value::Int64(i64::try_from(row_count / 2).unwrap()),
+                ],
+                vec![Value::Bool(true), Value::Int64(0)],
+            ]
+        );
+
+        for (limits, expected_error) in [
+            (
+                QueryResultLimits {
+                    max_scan_rows: row_count - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT scanned rows",
+                    actual: row_count,
+                    max: row_count - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_groups: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT groups",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_group_key_cells: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT group key cells",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_group_key_bytes: group_key_bytes - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT group key bytes",
+                    actual: group_key_bytes,
+                    max: group_key_bytes - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_aggregate_state_cells: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state cells",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_aggregate_state_bytes: aggregate_state_bytes - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state bytes",
+                    actual: aggregate_state_bytes,
+                    max: aggregate_state_bytes - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_rows: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result rows",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_values: 3,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result values",
+                    actual: 4,
+                    max: 3,
+                },
+            ),
+        ] {
+            database.query_result_limits = limits;
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+            let sequential = database.execute(sql);
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
+            let parallel = database.execute(sql);
+            assert_eq!(parallel, sequential);
+            assert_eq!(parallel, Err(expected_error));
+        }
+    }
+
+    #[test]
     fn grouped_bool_count_empty_one_and_two_group_worker_differentials_preserve_query_semantics() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 2;
         let mut database = grouped_bool_count_database(row_count);
@@ -10482,6 +10879,8 @@ mod tests {
         assert_eq!(
             partial,
             GroupedBoolCountPartial {
+                false_rows: i64::try_from(row_count - 1).unwrap(),
+                true_rows: 1,
                 false_count: i64::try_from(row_count - 1).unwrap(),
                 true_count: 1,
                 first_seen: Some(false),
@@ -14332,6 +14731,7 @@ mod tests {
                                 max_result_values: 0,
                                 max_scan_rows: 0,
                                 max_groups: 0,
+                                max_group_key_cells: 0,
                                 max_ordering_state_bytes: 0,
                                 max_aggregate_state_cells: 0,
                                 max_aggregate_state_bytes: 0,

@@ -917,7 +917,8 @@ fn serve_http_connections(
 /// parameter, one decimal `max_result_rows` parameter, one decimal
 /// `max_result_values` parameter, one decimal `max_result_bytes` parameter, one
 /// decimal `max_rows_to_read` parameter, one decimal `max_rows_to_group_by`
-/// parameter, one decimal `max_ordering_state_bytes` parameter, one decimal
+/// parameter, one decimal `max_group_key_cells` parameter, one decimal
+/// `max_ordering_state_bytes` parameter, one decimal
 /// `max_aggregate_state_cells` parameter, one decimal
 /// `max_aggregate_state_bytes` parameter, one decimal `max_threads` parameter,
 /// one decimal `readonly` parameter, and one `default_format` parameter in any
@@ -925,8 +926,8 @@ fn serve_http_connections(
 /// tightens the request to read-only,
 /// while `readonly=0` retains the handler's configured access and never grants
 /// insertion access to a read-only handler. Nonzero result, scan, group,
-/// ordering-state, aggregate-state, and worker limits can tighten but never
-/// relax the database's configured query limits;
+/// group-key, ordering-state, aggregate-state, and worker limits can tighten
+/// but never relax the database's configured query limits;
 /// `max_result_bytes` also cannot relax the default retained-result byte limit.
 /// Zero disables the corresponding request-level limit while retaining the
 /// configured defaults. `default_format`
@@ -1900,6 +1901,7 @@ fn handle_http_query_exchange(
         max_result_values,
         max_rows_to_read,
         max_rows_to_group_by,
+        max_group_key_cells,
         max_ordering_state_bytes,
         max_aggregate_state_cells,
         max_aggregate_state_bytes,
@@ -1911,18 +1913,20 @@ fn handle_http_query_exchange(
         max_result_values,
         max_rows_to_read,
         max_rows_to_group_by,
+        max_group_key_cells,
         max_ordering_state_bytes,
         max_aggregate_state_cells,
         max_aggregate_state_bytes,
         max_threads,
     ) {
-        (None, None, None, None, None, None, None, None, None) => database.try_query(&sql),
+        (None, None, None, None, None, None, None, None, None, None) => database.try_query(&sql),
         (
             max_result_bytes,
             max_result_rows,
             max_result_values,
             max_rows_to_read,
             max_rows_to_group_by,
+            max_group_key_cells,
             max_ordering_state_bytes,
             max_aggregate_state_cells,
             max_aggregate_state_bytes,
@@ -1935,6 +1939,7 @@ fn handle_http_query_exchange(
                 max_result_values: max_result_values.unwrap_or(0),
                 max_scan_rows: max_rows_to_read.unwrap_or(0),
                 max_groups: max_rows_to_group_by.unwrap_or(0),
+                max_group_key_cells: max_group_key_cells.unwrap_or(0),
                 max_ordering_state_bytes: max_ordering_state_bytes.unwrap_or(0),
                 max_aggregate_state_cells: max_aggregate_state_cells.unwrap_or(0),
                 max_aggregate_state_bytes: max_aggregate_state_bytes.unwrap_or(0),
@@ -2612,6 +2617,7 @@ struct ParameterizedWorkloadLimits {
     max_result_values: Option<usize>,
     max_rows_to_read: Option<usize>,
     max_rows_to_group_by: Option<usize>,
+    max_group_key_cells: Option<usize>,
     max_ordering_state_bytes: Option<usize>,
     max_aggregate_state_cells: Option<usize>,
     max_aggregate_state_bytes: Option<usize>,
@@ -3159,6 +3165,7 @@ fn parse_request_line(
                 || target.starts_with(b"/?max_result_values=")
                 || target.starts_with(b"/?max_rows_to_read=")
                 || target.starts_with(b"/?max_rows_to_group_by=")
+                || target.starts_with(b"/?max_group_key_cells=")
                 || target.starts_with(b"/?max_ordering_state_bytes=")
                 || target.starts_with(b"/?max_aggregate_state_cells=")
                 || target.starts_with(b"/?max_aggregate_state_bytes=")
@@ -3243,6 +3250,7 @@ fn decode_query_parameters(
     let mut max_result_values = None;
     let mut max_rows_to_read = None;
     let mut max_rows_to_group_by = None;
+    let mut max_group_key_cells = None;
     let mut max_ordering_state_bytes = None;
     let mut max_aggregate_state_cells = None;
     let mut max_aggregate_state_bytes = None;
@@ -3373,6 +3381,17 @@ fn decode_query_parameters(
                 let value = decode_form_component(encoded_value, None)?;
                 max_rows_to_group_by = Some(parse_decimal_max_rows_to_group_by(&value)?);
             }
+            b"max_group_key_cells" => {
+                if max_group_key_cells.is_some() {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "duplicate max_group_key_cells parameter",
+                    )
+                    .into());
+                }
+                let value = decode_form_component(encoded_value, None)?;
+                max_group_key_cells = Some(parse_decimal_max_group_key_cells(&value)?);
+            }
             b"max_ordering_state_bytes" => {
                 if max_ordering_state_bytes.is_some() {
                     return Err(RequestFailure::new(
@@ -3453,6 +3472,7 @@ fn decode_query_parameters(
             max_result_values,
             max_rows_to_read,
             max_rows_to_group_by,
+            max_group_key_cells,
             max_ordering_state_bytes,
             max_aggregate_state_cells,
             max_aggregate_state_bytes,
@@ -3513,6 +3533,14 @@ fn parse_decimal_max_rows_to_group_by(value: &[u8]) -> Result<usize, RequestRead
         value,
         "max_rows_to_group_by parameter must be a decimal integer",
         "max_rows_to_group_by parameter is out of range",
+    )
+}
+
+fn parse_decimal_max_group_key_cells(value: &[u8]) -> Result<usize, RequestReadError> {
+    parse_decimal_parameter(
+        value,
+        "max_group_key_cells parameter must be a decimal integer",
+        "max_group_key_cells parameter is out of range",
     )
 }
 

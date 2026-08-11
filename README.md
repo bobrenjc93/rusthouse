@@ -80,9 +80,12 @@ two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
 `AVG(the_same_column)`, use
 deterministic contiguous chunks when more than 262,144 rows match. A grouped
 query also uses those chunks when it has exactly one non-nullable `Bool`
-grouping column and exactly one `COUNT(*)` or `COUNT()` aggregate. Ordered
-partition reduction preserves first-seen Bool grouping before the normal
-grouped ordering and pagination stages. The paired
+grouping column and exactly one `COUNT(*)`, `COUNT()`, or
+`COUNT(physical_nullable_int64_column)` aggregate. Nullable grouped COUNT
+partials track group row presence separately from present values, so all-NULL
+groups remain visible with a zero count. Ordered partition reduction preserves
+first-seen Bool grouping before the normal grouped ordering and pagination
+stages. The paired
 shapes preserve either projection order. Row-count pairs derive `COUNT` with a
 checked conversion of the filtered cardinality; a same-column nullable
 `COUNT`/`AVG` pair derives its NULL-ignoring count from the AVG partitions'
@@ -117,8 +120,9 @@ reduced directly without
 allocating a partial-results collection. Ordered reduction preserves the first
 occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
-or below the threshold, other grouped shapes (including `COUNT(column)`, more
-than one grouping column, non-Bool keys, or multiple aggregates), and
+or below the threshold, other grouped shapes (including `COUNT` of a
+non-nullable column, more than one grouping column, non-Bool keys, or multiple
+aggregates), and
 multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
 row-count/`MAX(Float64)` pairs or the same-column nullable `COUNT`/`AVG` pair
@@ -153,9 +157,11 @@ ordered reduction use a checked `i128` sum and checked present-value count;
 nullable MIN/MAX chunks ignore absent values and reduce optional extrema in chunk
 order. At or below the threshold, without worker admission, or after a worker
 failure, the complete computation runs sequentially. Grouped nullable shapes
-remain sequential. Paired nullable shapes remain sequential except for the
-exact ungrouped `COUNT(*)`/`COUNT()` plus nullable `SUM`, `MIN`, `MAX`, or `AVG` pair and
-`COUNT(nullable_column)` plus `AVG(the_same_column)` pair.
+remain sequential except for a sole nullable integer `COUNT` grouped by one
+physical non-nullable `Bool` column. Paired nullable shapes remain sequential
+except for the exact ungrouped `COUNT(*)`/`COUNT()` plus nullable `SUM`, `MIN`,
+`MAX`, or `AVG` pair and `COUNT(nullable_column)` plus
+`AVG(the_same_column)` pair.
 These nullable shapes compose with filters, grouping, HAVING, ordering,
 pagination, and other supported aggregate projections. Other operations retain
 their documented nullable restrictions.
@@ -807,7 +813,8 @@ all unselected cells and table metadata.
 constructor configure the scan and output limits.
 `Database::with_global_aggregate_worker_cap` and the matching `SharedDatabase`
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
-parallel global aggregates and the narrow Bool-grouped `COUNT` shape. The
+parallel global aggregates and the narrow Bool-grouped row or nullable integer
+`COUNT` shapes. The
 configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
@@ -935,7 +942,8 @@ optional `database=default` parameter, one optional decimal `max_result_rows`
 parameter, one optional decimal `max_result_values` parameter, one optional
 decimal `max_result_bytes` parameter, one optional decimal `max_rows_to_read`
 parameter, one optional decimal `max_rows_to_group_by` parameter, one optional
-decimal `max_ordering_state_bytes` parameter, one optional decimal
+decimal `max_group_key_cells` parameter, one optional decimal
+`max_ordering_state_bytes` parameter, one optional decimal
 `max_aggregate_state_cells` parameter, one optional decimal
 `max_aggregate_state_bytes` parameter, one optional decimal `max_threads`
 parameter, one optional decimal `readonly` parameter, and one optional
@@ -973,6 +981,12 @@ tightens the database's configured group-count limit for that request, while
 zero retains the configured limit. A larger value never relaxes the configured
 limit. `GROUP BY` and `DISTINCT` charge every distinct working group before
 `HAVING` and `LIMIT`, so those result clauses cannot hide excess groups.
+`max_group_key_cells` has the same decimal syntax and zero behavior. A nonzero
+value tightens the configured group-key cell limit only for that request, while
+a larger value never relaxes the configured limit. The effective cap is checked
+before retaining each new key for `GROUP BY`, `DISTINCT`, and `UNION DISTINCT`,
+including temporary probe cells used by wide composite keys. It does not change
+`SHOW SETTINGS`, `system.settings`, or the persistent database configuration.
 `max_ordering_state_bytes` has the same decimal syntax and zero behavior. A
 nonzero value tightens the configured ordering-state byte limit only for that
 request, while a larger value never relaxes the configured limit. The effective
@@ -1010,7 +1024,7 @@ same SQL byte limit as a POST body; the database, workload-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
 duplicate `query`, `database`, `max_result_rows`, `max_result_values`,
 `max_result_bytes`, `max_rows_to_read`, `max_rows_to_group_by`,
-`max_ordering_state_bytes`, `max_aggregate_state_cells`,
+`max_group_key_cells`, `max_ordering_state_bytes`, `max_aggregate_state_cells`,
 `max_aggregate_state_bytes`, `max_threads`, `readonly`, or `default_format`
 parameters, malformed or overflowing workload limits, malformed or
 out-of-range `readonly` values, unknown parameters, malformed escapes,
