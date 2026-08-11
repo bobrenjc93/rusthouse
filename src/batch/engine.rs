@@ -5266,7 +5266,9 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
-                if actual == DataType::Int64 && *target_type != DataType::Float64 {
+                if actual == DataType::Int64
+                    && !matches!(target_type, DataType::Float64 | DataType::Bool)
+                {
                     reject_nullable_operation(table, source, "CAST")?;
                 }
                 let resolved = match (actual, *target_type) {
@@ -5807,7 +5809,7 @@ fn execute_projection(
                             Value::Int64(checked_string_to_int64(string_at(table, *source, *row))?)
                         }
                         ResolvedItem::CastInt64ToBool { source } => {
-                            Value::Bool(int64_at(table, *source, *row) != 0)
+                            int64_to_bool_at(table, *source, *row).to_owned()
                         }
                         ResolvedItem::CastFloat64ToBool { source } => {
                             Value::Bool(float64_at(table, *source, *row) != 0.0)
@@ -8232,7 +8234,9 @@ fn order_source_rows(
                     string_at(table, source, right),
                 ),
                 ResolvedItem::CastInt64ToBool { source } => {
-                    (int64_at(table, source, left) != 0).cmp(&(int64_at(table, source, right) != 0))
+                    let left = int64_to_bool_at(table, source, left);
+                    let right = int64_to_bool_at(table, source, right);
+                    left.cmp(&right)
                 }
                 ResolvedItem::CastFloat64ToBool { source } => (float64_at(table, source, left)
                     != 0.0)
@@ -8526,17 +8530,18 @@ fn order_grouped_rows(
     });
 }
 
-fn int64_at(table: &Table, source: usize, row: usize) -> i64 {
-    let Column::Int64(values) = &table.columns()[source] else {
-        unreachable!("CAST input type is resolved")
-    };
-    values[row]
-}
-
 fn int64_to_float64_at(table: &Table, source: usize, row: usize) -> ValueRef<'_> {
     match table.columns()[source].value_ref(row) {
         ValueRef::Int64(value) => ValueRef::Float64(value as f64),
         ValueRef::Null(DataType::Int64) => ValueRef::Null(DataType::Float64),
+        _ => unreachable!("CAST input type is resolved"),
+    }
+}
+
+fn int64_to_bool_at(table: &Table, source: usize, row: usize) -> ValueRef<'_> {
+    match table.columns()[source].value_ref(row) {
+        ValueRef::Int64(value) => ValueRef::Bool(value != 0),
+        ValueRef::Null(DataType::Int64) => ValueRef::Null(DataType::Bool),
         _ => unreachable!("CAST input type is resolved"),
     }
 }
