@@ -1090,7 +1090,8 @@ impl Database {
     }
 
     /// Creates an empty database with an explicit nonzero computation-lane cap
-    /// for supported parallel aggregates, including Bool-grouped `COUNT`.
+    /// for supported parallel aggregates, including sole nullable `Int64`
+    /// `COUNT` and Bool-grouped `COUNT`.
     ///
     /// A cap of one keeps those aggregates sequential. Higher caps remain
     /// subject to the process-wide worker budget, available hardware, and the
@@ -6424,6 +6425,21 @@ fn execute_grouped<'a>(
         && aggregate_specs
             .first()
             .is_some_and(|spec| aggregate_argument_is_physical_int64(table, spec));
+    let sole_global_nullable_int64_count = group_columns.is_empty()
+        && matches!(
+            aggregate_specs,
+            [AggregateSpec {
+                function: AggregateFunction::Count,
+                argument: Some(_),
+                input_type: Some(DataType::Int64),
+            }]
+        )
+        && aggregate_specs.first().is_some_and(|spec| {
+            table.column_is_nullable_int64(
+                spec.argument
+                    .expect("nullable Int64 COUNT has a column argument"),
+            )
+        });
     let sole_global_min_int = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -6529,7 +6545,14 @@ fn execute_grouped<'a>(
             aggregate_states[aggregate_state][0] = aggregate;
         } else {
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
-                if spec.function == AggregateFunction::CountIf {
+                if sole_global_nullable_int64_count {
+                    states[0] = AggregateState::Count(count_global_nullable_int64(
+                        table,
+                        matching_rows,
+                        spec,
+                        parallelism,
+                    )?);
+                } else if spec.function == AggregateFunction::CountIf {
                     states[0] = AggregateState::Count(count_global_count_if(
                         table,
                         matching_rows,
@@ -6586,6 +6609,7 @@ fn execute_grouped<'a>(
             debug_assert_eq!(states.len(), group_count);
             if group_columns.is_empty()
                 && (spec.function == AggregateFunction::CountIf
+                    || sole_global_nullable_int64_count
                     || sole_global_sum_int
                     || sole_global_avg_int
                     || sole_global_min_int
@@ -6906,6 +6930,126 @@ fn count_matched_rows(matched_rows: usize) -> Result<i64> {
 
 fn count_present_values(present_count: u64) -> Result<i64> {
     i64::try_from(present_count).map_err(|_| Error::NumericOverflow("COUNT".to_owned()))
+}
+
+fn count_global_nullable_int64(
+    table: &Table,
+    matching_rows: &[usize],
+    spec: &AggregateSpec,
+    parallelism: GlobalAggregateParallelism,
+) -> Result<i64> {
+    debug_assert_eq!(spec.function, AggregateFunction::Count);
+    debug_assert_eq!(spec.input_type, Some(DataType::Int64));
+    let Column::NullableInt64(values) =
+        &table.columns()[spec.argument.expect("nullable Int64 COUNT argument")]
+    else {
+        unreachable!("sole nullable Int64 COUNT shape is resolved")
+    };
+    reduce_global_nullable_int64_count(
+        values,
+        matching_rows,
+        parallelism,
+        nullable_int64_count_chunk,
+    )
+}
+
+fn reduce_global_nullable_int64_count<C>(
+    values: &[Option<i64>],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    chunk: C,
+) -> Result<i64>
+where
+    C: Fn(&[Option<i64>], &[usize]) -> Result<i64> + Sync,
+{
+    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
+        return chunk(values, matching_rows);
+    };
+
+    // Each lane receives one deterministic contiguous slice of the filtered
+    // row indices, and checked partials are reduced in partition order. A
+    // spawn failure or panic discards every partial and repeats the complete
+    // NULL-aware count locally after releasing shared admission.
+    let parallel_result = try_parallel_nullable_int64_count(
+        values,
+        matching_rows,
+        admission.helper_threads(),
+        &chunk,
+    );
+    drop(admission);
+    parallel_result.unwrap_or_else(|| chunk(values, matching_rows))
+}
+
+fn try_parallel_nullable_int64_count<C>(
+    values: &[Option<i64>],
+    matching_rows: &[usize],
+    helper_threads: usize,
+    chunk: &C,
+) -> Option<Result<i64>>
+where
+    C: Fn(&[Option<i64>], &[usize]) -> Result<i64> + Sync,
+{
+    debug_assert!(helper_threads > 0);
+    let worker_count = helper_threads.saturating_add(1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(helper_threads);
+        let mut worker_failed = false;
+        for chunk_index in 1..worker_count {
+            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
+            let spawn = std::thread::Builder::new()
+                .name(format!("rusthouse-count-nullable-int64-{chunk_index}"))
+                .spawn_scoped(scope, move || chunk(values, rows));
+            match spawn {
+                Ok(handle) => handles.push(handle),
+                Err(_) => {
+                    worker_failed = true;
+                    break;
+                }
+            }
+        }
+
+        let mut partial_results = Vec::with_capacity(worker_count);
+        partial_results.push(chunk(
+            values,
+            parallel_aggregate_partition(matching_rows, worker_count, 0),
+        ));
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => partial_results.push(result),
+                Err(_) => worker_failed = true,
+            }
+        }
+        if worker_failed {
+            return None;
+        }
+
+        Some(
+            partial_results
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .and_then(reduce_nullable_int64_count_partials),
+        )
+    })
+}
+
+fn nullable_int64_count_chunk(values: &[Option<i64>], matching_rows: &[usize]) -> Result<i64> {
+    matching_rows.iter().try_fold(0_i64, |count, row| {
+        if values[*row].is_some() {
+            count
+                .checked_add(1)
+                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))
+        } else {
+            Ok(count)
+        }
+    })
+}
+
+fn reduce_nullable_int64_count_partials(partial_counts: Vec<i64>) -> Result<i64> {
+    partial_counts.into_iter().try_fold(0_i64, |total, count| {
+        total
+            .checked_add(count)
+            .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))
+    })
 }
 
 fn count_global_count_if(
@@ -9583,6 +9727,318 @@ mod tests {
         let multi_worker = force_global_aggregate_workers(database, 4, sql);
         assert_eq!(single_worker, multi_worker, "worker differential for {sql}");
         multi_worker
+    }
+
+    #[test]
+    fn sole_nullable_int64_count_crosses_threshold_and_excludes_other_shapes() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut values = vec![Some(7); row_count];
+        values[row_count - 1] = None;
+        let mut database = Database::new();
+        database
+            .create_nullable_int64_table("nullable_values", "value", values)
+            .unwrap();
+
+        let boundary_sql = "SELECT COUNT(value) AS present FROM nullable_values \
+                            WHERE value IS NOT NULL";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, boundary_sql).rows,
+            [vec![Value::Int64(
+                i64::try_from(GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD).unwrap()
+            )]]
+        );
+        let above_threshold_sql = "SELECT COUNT(value) AS present FROM nullable_values";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, above_threshold_sql).rows,
+            [vec![Value::Int64(i64::try_from(row_count - 1).unwrap())]]
+        );
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database.global_aggregate_worker_cap(), &BUDGET);
+
+        BUDGET.reset_peak();
+        query(&mut database, boundary_sql);
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "the threshold itself stays sequential"
+        );
+
+        BUDGET.reset_peak();
+        query(&mut database, above_threshold_sql);
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "a sole nullable COUNT above the threshold uses shared helpers"
+        );
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(value), COUNT(*) FROM nullable_values"
+            )
+            .rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count - 1).unwrap()),
+                Value::Int64(i64::try_from(row_count).unwrap()),
+            ]]
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "multi-aggregate nullable COUNT remains sequential"
+        );
+
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT value, COUNT(value) FROM nullable_values GROUP BY value"
+            )
+            .rows,
+            [
+                vec![Value::Null(DataType::Int64), Value::Int64(0)],
+                vec![
+                    Value::Int64(7),
+                    Value::Int64(i64::try_from(row_count - 1).unwrap()),
+                ],
+            ]
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "grouped nullable COUNT remains sequential"
+        );
+    }
+
+    #[test]
+    fn sole_nullable_int64_count_forced_workers_match_null_distributions_and_filters() {
+        let mut empty = Database::new();
+        empty
+            .create_nullable_int64_table("empty_values", "value", Vec::new())
+            .unwrap();
+        assert_eq!(
+            assert_global_aggregate_worker_differential(
+                &mut empty,
+                "SELECT COUNT(value) AS present FROM empty_values"
+            )
+            .rows,
+            [vec![Value::Int64(0)]]
+        );
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 5;
+        let mut all_null = Database::new();
+        all_null
+            .create_nullable_int64_table("all_null", "value", vec![None; row_count])
+            .unwrap();
+        assert_eq!(
+            assert_global_aggregate_worker_differential(
+                &mut all_null,
+                "SELECT COUNT(value) AS present FROM all_null \
+                 HAVING present = 0 ORDER BY present LIMIT 1 OFFSET 0"
+            )
+            .rows,
+            [vec![Value::Int64(0)]]
+        );
+
+        let mut values = vec![Some(4); row_count];
+        values[0] = Some(-1);
+        values[row_count / 2] = None;
+        values[row_count - 1] = Some(i64::MAX);
+        let mut mixed = Database::new();
+        mixed
+            .create_nullable_int64_table("mixed", "value", values)
+            .unwrap();
+        let expected = i64::try_from(row_count - 2).unwrap();
+        assert_eq!(
+            assert_global_aggregate_worker_differential(
+                &mut mixed,
+                &format!(
+                    "SELECT COUNT(value) AS present FROM mixed WHERE value >= 0 \
+                     HAVING present = {expected} ORDER BY present DESC LIMIT 1"
+                ),
+            )
+            .rows,
+            [vec![Value::Int64(expected)]]
+        );
+    }
+
+    #[test]
+    fn sole_nullable_int64_count_exhausted_admission_falls_back_completely() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let values = (0..row_count)
+            .map(|row| (row % 3 != 0).then_some(11))
+            .collect::<Vec<_>>();
+        let expected = i64::try_from(values.iter().flatten().count()).unwrap();
+        let mut database = Database::new();
+        database
+            .create_nullable_int64_table("nullable_values", "value", values)
+            .unwrap();
+        let sql = &format!(
+            "SELECT COUNT(value) AS present FROM nullable_values \
+             HAVING present = {expected} ORDER BY present LIMIT 1"
+        );
+        let sequential = force_global_aggregate_workers(&mut database, 1, sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database.global_aggregate_worker_cap(), &BUDGET);
+
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts aggregate helper admission");
+        let exhausted = query(&mut database, sql);
+        assert_eq!(exhausted, sequential);
+        assert_eq!(exhausted.rows, [vec![Value::Int64(expected)]]);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+    }
+
+    #[test]
+    fn sole_nullable_int64_count_worker_failure_repeats_complete_input_locally() {
+        let values = [Some(1), None, Some(17)];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_global_nullable_int64_count(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            nullable_int64_count_chunk,
+        )
+        .expect("deterministic parallel nullable COUNT succeeds");
+        let failed_parallel = reduce_global_nullable_int64_count(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            |values, rows| {
+                if std::thread::current().name() == Some("rusthouse-count-nullable-int64-1") {
+                    panic!("injected nullable COUNT worker failure");
+                }
+                nullable_int64_count_chunk(values, rows)
+            },
+        )
+        .expect("worker failure falls back to a complete local nullable COUNT");
+
+        assert_eq!(failed_parallel, successful_parallel);
+        assert_eq!(failed_parallel, i64::try_from(row_count - 1).unwrap());
+        assert_eq!(
+            reduce_nullable_int64_count_partials(vec![i64::MAX, 1]),
+            Err(Error::NumericOverflow("COUNT".to_owned()))
+        );
+    }
+
+    #[test]
+    fn sole_nullable_int64_count_forced_workers_preserve_resource_limits() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let fixed_state_bytes = std::mem::size_of::<AggregateState>()
+            .saturating_add(std::mem::size_of::<Vec<AggregateState>>());
+        let exact_limits = QueryResultLimits {
+            max_scan_rows: row_count,
+            max_rows: 1,
+            max_values: 1,
+            max_groups: 1,
+            max_aggregate_state_cells: 1,
+            max_aggregate_state_bytes: fixed_state_bytes,
+            ..QueryResultLimits::default()
+        };
+        let mut database = Database::with_query_result_limits(exact_limits);
+        database
+            .create_nullable_int64_table(
+                "nullable_values",
+                "value",
+                (0..row_count)
+                    .map(|row| (row % 2 == 0).then_some(5))
+                    .collect(),
+            )
+            .unwrap();
+        let expected = i64::try_from(row_count.div_ceil(2)).unwrap();
+
+        let sequential = force_global_aggregate_workers(
+            &mut database,
+            1,
+            "SELECT COUNT(value) FROM nullable_values",
+        );
+        let parallel = force_global_aggregate_workers(
+            &mut database,
+            4,
+            "SELECT COUNT(value) FROM nullable_values",
+        );
+        assert_eq!(parallel, sequential);
+        assert_eq!(parallel.rows, [vec![Value::Int64(expected)]]);
+
+        for (limits, expected_error) in [
+            (
+                QueryResultLimits {
+                    max_scan_rows: row_count - 1,
+                    ..QueryResultLimits::default()
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT scanned rows",
+                    actual: row_count,
+                    max: row_count - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_aggregate_state_cells: 0,
+                    ..QueryResultLimits::default()
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state cells",
+                    actual: 1,
+                    max: 0,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_aggregate_state_bytes: fixed_state_bytes - 1,
+                    ..QueryResultLimits::default()
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state bytes",
+                    actual: fixed_state_bytes,
+                    max: fixed_state_bytes - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_values: 0,
+                    ..QueryResultLimits::default()
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result values",
+                    actual: 1,
+                    max: 0,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_rows: 0,
+                    ..QueryResultLimits::default()
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result rows",
+                    actual: 1,
+                    max: 0,
+                },
+            ),
+        ] {
+            database.query_result_limits = limits;
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+            let sequential = database.execute("SELECT COUNT(value) FROM nullable_values");
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
+            let parallel = database.execute("SELECT COUNT(value) FROM nullable_values");
+            assert_eq!(parallel, sequential);
+            assert_eq!(parallel, Err(expected_error));
+        }
     }
 
     #[test]
@@ -13402,10 +13858,14 @@ mod tests {
         let two = NonZeroUsize::new(2).unwrap();
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = count_if_database_with_worker_cap(row_count, initial);
+        database
+            .create_nullable_int64_table("nullable_values", "value", vec![Some(1); row_count])
+            .unwrap();
         database.global_aggregate_parallelism =
             GlobalAggregateParallelism::budgeted(initial, &BUDGET);
 
         for (query_index, sql) in [
+            "SELECT COUNT(value) FROM nullable_values",
             "SELECT SUM(id) FROM events",
             "SELECT AVG(id) FROM events",
             "SELECT MIN(id) FROM events",
@@ -13454,10 +13914,14 @@ mod tests {
         let database_cap = NonZeroUsize::new(4).unwrap();
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database = count_if_database_with_worker_cap(row_count, database_cap);
+        database
+            .create_nullable_int64_table("nullable_values", "value", vec![Some(1); row_count])
+            .unwrap();
         database.global_aggregate_parallelism =
             GlobalAggregateParallelism::budgeted(database_cap, &BUDGET);
 
         for sql in [
+            "SELECT COUNT(value) FROM nullable_values",
             "SELECT SUM(id) FROM events",
             "SELECT AVG(id) FROM events",
             "SELECT MIN(id) FROM events",
