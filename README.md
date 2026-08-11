@@ -246,11 +246,14 @@ preserved. Invalid, reserved, or already-used names and missing tables fail
 before mutation, leaving schema, data, row count, and row cap unchanged. A
 positional insert or complete explicit list must include the new field, while
 an explicit subset may omit it and receive its typed default. Nullable types
-other than `Nullable(Int64)`, default expressions, placement clauses, and
-`IF NOT EXISTS` are not supported by this statement. Each addition is
-preflighted against the table's persistent column and physical-cell caps before
-its default vector is allocated. A trailing
-semicolon is optional.
+other than `Nullable(Int64)`, default expressions, placement clauses, and the
+conditional modifier on non-nullable additions are not supported. The exact
+`ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <name> Nullable(Int64)` form adds
+and `NULL`-backfills the column when absent. An existing case-insensitive column
+name is a successful no-op regardless of its physical type; the table itself
+must still exist. Each actual addition is preflighted against the table's
+persistent column and physical-cell caps before its default vector is
+allocated. A trailing semicolon is optional.
 
 `ALTER TABLE <table> RENAME COLUMN <source> TO <destination>` changes only the
 stored column display name. Table, source-column, destination-collision, and

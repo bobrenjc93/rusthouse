@@ -2952,6 +2952,31 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::AddNullableInt64ColumnIfNotExists { table, column } => {
+                let existing = self.catalog.table(&table)?;
+                if existing
+                    .schema()
+                    .iter()
+                    .any(|field| field.name.eq_ignore_ascii_case(&column))
+                {
+                    return Ok(StatementResult::Command {
+                        tag: "ALTER TABLE",
+                        affected_rows: 0,
+                    });
+                }
+
+                self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
+                let field = ColumnDef {
+                    name: column.clone(),
+                    data_type: DataType::Int64,
+                };
+                validate_show_create_addition(existing, &field, true)?;
+                self.table_mut(&table)?.add_nullable_int64_column(column)?;
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::DropColumn { table, column } => {
                 self.reject_unlogged_wal_mutation(&table, "ALTER TABLE DROP COLUMN")?;
                 self.table_mut(&table)?.drop_column(&column)?;
@@ -3146,6 +3171,7 @@ impl Database {
             | Statement::RenameColumn { .. }
             | Statement::AddColumn { .. }
             | Statement::AddNullableInt64Column { .. }
+            | Statement::AddNullableInt64ColumnIfNotExists { .. }
             | Statement::DropColumn { .. }
             | Statement::AlterUpdate { .. }
             | Statement::AlterUpdateTyped { .. }
@@ -4377,6 +4403,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::RenameColumn { .. }
         | Statement::AddColumn { .. }
         | Statement::AddNullableInt64Column { .. }
+        | Statement::AddNullableInt64ColumnIfNotExists { .. }
         | Statement::DropColumn { .. }
         | Statement::AlterUpdate { .. }
         | Statement::AlterUpdateTyped { .. }

@@ -84,6 +84,39 @@ fn parses_exact_case_insensitive_nullable_int64_add_column_syntax() {
 }
 
 #[test]
+fn parses_exact_nullable_int64_add_column_if_not_exists_syntax() {
+    for (sql, table, column) in [
+        (
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS measurement Nullable(Int64)",
+            "events",
+            "measurement",
+        ),
+        (
+            "alter table Events add column if not exists Measurement nullable(int64);",
+            "Events",
+            "Measurement",
+        ),
+    ] {
+        assert_eq!(
+            parse(sql).expect("valid conditional nullable ALTER TABLE ADD COLUMN"),
+            [Statement::AddNullableInt64ColumnIfNotExists {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            }]
+        );
+    }
+
+    for sql in [
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS value Int64",
+        "ALTER TABLE events ADD COLUMN value Nullable(Int64) IF NOT EXISTS",
+        "ALTER TABLE events ADD COLUMN IF EXISTS value Nullable(Int64)",
+        "ALTER TABLE events ADD COLUMN IF NOT value Nullable(Int64)",
+    ] {
+        assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
+    }
+}
+
+#[test]
 fn rejects_malformed_and_unsupported_nullable_add_column_types() {
     for sql in [
         "ALTER TABLE events ADD COLUMN value Nullable",
@@ -538,6 +571,85 @@ fn nullable_add_backfills_empty_and_populated_tables_and_defaults_omitted_insert
 }
 
 #[test]
+fn conditional_nullable_add_is_case_insensitive_idempotent_and_show_create_is_executable() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Events (id Int64); \
+             INSERT INTO Events VALUES (1), (2); \
+             ALTER TABLE Events ADD COLUMN existing Nullable(Int64); \
+             INSERT INTO Events VALUES (3, 30);",
+        )
+        .expect("populated table setup succeeds");
+
+    for sql in [
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS ID Nullable(Int64)",
+        "ALTER TABLE EVENTS ADD COLUMN IF NOT EXISTS ExIsTiNg Nullable(Int64);",
+        "ALTER TABLE eVeNtS ADD COLUMN IF NOT EXISTS measurement Nullable(Int64)",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Ok(vec![StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 0,
+            }])
+        );
+    }
+
+    let table = database.catalog().table("events").unwrap();
+    assert_eq!(table.schema().len(), 3);
+    assert!(matches!(&table.columns()[0], Column::Int64(values) if values == &[1, 2, 3]));
+    assert!(matches!(
+        &table.columns()[1],
+        Column::NullableInt64(values) if values == &[None, None, Some(30)]
+    ));
+    assert!(matches!(
+        &table.columns()[2],
+        Column::NullableInt64(values) if values == &[None, None, None]
+    ));
+    assert_eq!(table.retained_cell_count(), 9);
+
+    assert_eq!(
+        query(&mut database, "DESCRIBE TABLE EVENTS").rows,
+        [
+            vec![
+                Value::String("id".to_owned()),
+                Value::String("Int64".to_owned()),
+            ],
+            vec![
+                Value::String("existing".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+            vec![
+                Value::String("measurement".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+        ]
+    );
+
+    let shown = query(&mut database, "SHOW CREATE TABLE events");
+    assert_eq!(
+        shown.rows,
+        [vec![Value::String(
+            "CREATE TABLE Events (id Int64); ALTER TABLE Events ADD COLUMN existing Nullable(Int64); ALTER TABLE Events ADD COLUMN measurement Nullable(Int64)".to_owned()
+        )]]
+    );
+    let [Value::String(ddl)] = shown.rows[0].as_slice() else {
+        panic!("SHOW CREATE returns one DDL string");
+    };
+    let mut recreated = Database::new();
+    recreated
+        .execute(ddl)
+        .expect("SHOW CREATE output remains directly executable");
+    assert_eq!(query(&mut recreated, "SHOW CREATE TABLE EVENTS"), shown);
+
+    assert_eq!(
+        database.execute("ALTER TABLE missing ADD COLUMN IF NOT EXISTS value Nullable(Int64)"),
+        Err(Error::TableNotFound("missing".to_owned()))
+    );
+}
+
+#[test]
 fn nullable_add_accepts_exact_table_limits_and_rejects_atomically() {
     let limits = TableLimits::new(2, 3, 4);
     let mut database = Database::with_table_limits(limits);
@@ -545,7 +657,7 @@ fn nullable_add_accepts_exact_table_limits_and_rejects_atomically() {
         .execute(
             "CREATE TABLE Events (id Int64); \
              INSERT INTO Events VALUES (1), (2); \
-             ALTER TABLE Events ADD COLUMN measurement Nullable(Int64);",
+             ALTER TABLE Events ADD COLUMN IF NOT EXISTS measurement Nullable(Int64);",
         )
         .expect("two rows by two columns exactly fits four cells");
     let table = database.catalog().table("events").unwrap();
@@ -555,8 +667,11 @@ fn nullable_add_accepts_exact_table_limits_and_rejects_atomically() {
         Column::NullableInt64(values) if values == &[None, None]
     ));
 
+    database
+        .execute("ALTER TABLE Events ADD COLUMN IF NOT EXISTS MEASUREMENT Nullable(Int64)")
+        .expect("an existing column remains a no-op at the exact cell limit");
     assert_eq!(
-        database.execute("ALTER TABLE Events ADD COLUMN overflow Nullable(Int64)"),
+        database.execute("ALTER TABLE Events ADD COLUMN IF NOT EXISTS overflow Nullable(Int64)"),
         Err(Error::ResourceLimitExceeded {
             resource: "table cells",
             actual: 6,
@@ -572,11 +687,11 @@ fn nullable_add_accepts_exact_table_limits_and_rejects_atomically() {
     columns
         .execute(
             "CREATE TABLE Empty (id Int64); \
-             ALTER TABLE Empty ADD COLUMN measurement Nullable(Int64);",
+             ALTER TABLE Empty ADD COLUMN IF NOT EXISTS measurement Nullable(Int64);",
         )
         .expect("the exact column cap is accepted");
     assert_eq!(
-        columns.execute("ALTER TABLE Empty ADD COLUMN overflow Nullable(Int64)"),
+        columns.execute("ALTER TABLE Empty ADD COLUMN IF NOT EXISTS overflow Nullable(Int64)"),
         Err(Error::ResourceLimitExceeded {
             resource: "table columns",
             actual: 3,
