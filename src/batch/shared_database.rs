@@ -467,8 +467,9 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
-    /// Attempts to replace one existing table from a primary `Int64` snapshot
-    /// or an explicit backup without waiting for the database lock.
+    /// Attempts to replace one existing table from a primary `Int64` or
+    /// `Nullable(Int64)` snapshot, or an explicit backup, without waiting for
+    /// the database lock.
     ///
     /// Exactly one nonblocking write-lock attempt occurs before either source
     /// path is accessed. An active reader or writer returns
@@ -477,8 +478,9 @@ impl SharedDatabase {
     /// without opening either file. Once acquired, the guard is retained while
     /// [`Database::replace_int64_table_from_file_with_backup`] checks the target,
     /// performs bounded primary-or-backup recovery, validates the replacement,
-    /// and atomically swaps the table. Success reports which source supplied
-    /// the replacement.
+    /// and atomically swaps the table while preserving the decoded column
+    /// metadata, nullability, NULL positions, row order, and row cap. Success
+    /// reports which source supplied the replacement.
     ///
     /// The primary takes precedence whenever it decodes successfully. If both
     /// sources fail, the typed recovery error retains both failures. Every
