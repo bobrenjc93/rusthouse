@@ -5032,6 +5032,10 @@ enum ResolvedItem {
         source: usize,
         literal: i64,
     },
+    IfNullInt64 {
+        source: usize,
+        fallback: i64,
+    },
     CastNullableInt64ToInt64 {
         source: usize,
     },
@@ -5271,6 +5275,36 @@ fn resolve_select_items(
                 result_columns.push(ResultColumn {
                     name: alias.clone().unwrap_or_else(|| {
                         sql::int64_subtraction_name(&table.schema()[source].name, *literal)
+                    }),
+                    data_type: DataType::Int64,
+                });
+            }
+            SelectItem::IfNullInt64 {
+                name,
+                fallback,
+                alias,
+            } => {
+                let source = table.column_index(name)?;
+                if !table.column_is_nullable_int64(source) {
+                    return Err(Error::TypeMismatch {
+                        context: format!("ifNull first argument '{name}'"),
+                        expected: "Nullable(Int64)".to_owned(),
+                        actual: table.columns()[source].metadata_type_name().to_owned(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "ifNull projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::IfNullInt64 {
+                    source,
+                    fallback: *fallback,
+                });
+                result_columns.push(ResultColumn {
+                    name: alias.clone().unwrap_or_else(|| {
+                        sql::if_null_int64_name(&table.schema()[source].name, *fallback)
                     }),
                     data_type: DataType::Int64,
                 });
@@ -5802,6 +5836,9 @@ fn execute_projection(
                                 *literal,
                             )?
                         }
+                        ResolvedItem::IfNullInt64 { source, fallback } => {
+                            Value::Int64(if_null_int64_at(table, *source, *row, *fallback))
+                        }
                         ResolvedItem::CastNullableInt64ToInt64 { source } => {
                             table.columns()[*source].value(*row)
                         }
@@ -6003,6 +6040,7 @@ fn validate_projection_result_limits(
                     input_type: DataType::String,
                 } => Some(*source),
                 ResolvedItem::Int64Subtract { .. }
+                | ResolvedItem::IfNullInt64 { .. }
                 | ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
@@ -6090,6 +6128,9 @@ fn validate_grouped_result_limits(
                     unreachable!(
                         "Int64 subtraction projections are restricted to ungrouped queries"
                     )
+                }
+                ResolvedItem::IfNullInt64 { .. } => {
+                    unreachable!("ifNull projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
@@ -7825,6 +7866,9 @@ impl GroupedData<'_> {
                                 "Int64 subtraction projections are restricted to ungrouped queries"
                             )
                         }
+                        ResolvedItem::IfNullInt64 { .. } => {
+                            unreachable!("ifNull projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::CastNullableInt64ToInt64 { .. }
                         | ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastBoolToFloat64 { .. }
@@ -8219,6 +8263,9 @@ fn resolved_expression_name(
         ResolvedItem::Int64Subtract { source, literal } => {
             sql::int64_subtraction_name(&table.schema()[*source].name, *literal)
         }
+        ResolvedItem::IfNullInt64 { source, fallback } => {
+            sql::if_null_int64_name(&table.schema()[*source].name, *fallback)
+        }
         ResolvedItem::CastNullableInt64ToInt64 { source } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
@@ -8375,6 +8422,10 @@ fn order_source_rows(
                 // is checked only after ordering and pagination select rows.
                 ResolvedItem::Int64Subtract { source, .. } => {
                     table.columns()[source].cmp_at(left, right)
+                }
+                ResolvedItem::IfNullInt64 { source, fallback } => {
+                    if_null_int64_at(table, source, left, fallback)
+                        .cmp(&if_null_int64_at(table, source, right, fallback))
                 }
                 ResolvedItem::CastNullableInt64ToInt64 { source } => {
                     table.columns()[source].cmp_at(left, right)
@@ -8634,6 +8685,9 @@ fn order_grouped_rows(
                     unreachable!(
                         "Int64 subtraction projections are restricted to ungrouped queries"
                     )
+                }
+                ResolvedItem::IfNullInt64 { .. } => {
+                    unreachable!("ifNull projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
@@ -9126,6 +9180,16 @@ fn checked_nullable_int64_subtract(value: ValueRef<'_>, literal: i64) -> Result<
         ValueRef::Int64(value) => Ok(Value::Int64(checked_int64_subtract(value, literal)?)),
         ValueRef::Null(_) | ValueRef::Float64(_) | ValueRef::Bool(_) | ValueRef::String(_) => {
             unreachable!("Int64 subtraction input type is resolved")
+        }
+    }
+}
+
+fn if_null_int64_at(table: &Table, source: usize, row: usize, fallback: i64) -> i64 {
+    match table.columns()[source].value_ref(row) {
+        ValueRef::Null(DataType::Int64) => fallback,
+        ValueRef::Int64(value) => value,
+        ValueRef::Null(_) | ValueRef::Float64(_) | ValueRef::Bool(_) | ValueRef::String(_) => {
+            unreachable!("ifNull first argument is resolved as Nullable(Int64)")
         }
     }
 }
