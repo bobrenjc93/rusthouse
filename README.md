@@ -935,7 +935,8 @@ optional `database=default` parameter, one optional decimal `max_result_rows`
 parameter, one optional decimal `max_result_values` parameter, one optional
 decimal `max_result_bytes` parameter, one optional decimal `max_rows_to_read`
 parameter, one optional decimal `max_rows_to_group_by` parameter, one optional
-decimal `max_ordering_state_bytes` parameter, one optional decimal
+decimal `max_group_key_bytes` parameter, one optional decimal
+`max_ordering_state_bytes` parameter, one optional decimal
 `max_aggregate_state_cells` parameter, one optional decimal
 `max_aggregate_state_bytes` parameter, one optional decimal `max_threads`
 parameter, one optional decimal `readonly` parameter, and one optional
@@ -973,6 +974,12 @@ tightens the database's configured group-count limit for that request, while
 zero retains the configured limit. A larger value never relaxes the configured
 limit. `GROUP BY` and `DISTINCT` charge every distinct working group before
 `HAVING` and `LIMIT`, so those result clauses cannot hide excess groups.
+`max_group_key_bytes` has the same decimal syntax and zero behavior. A nonzero
+value tightens the database's configured estimated grouped-key value-reference
+byte limit only for that request, while a larger value never relaxes the
+configured limit. `GROUP BY` and `DISTINCT` charge their existing key-byte
+preflight before `HAVING` and `LIMIT`. It does not change `SHOW SETTINGS`,
+`system.settings`, or the persistent database configuration.
 `max_ordering_state_bytes` has the same decimal syntax and zero behavior. A
 nonzero value tightens the configured ordering-state byte limit only for that
 request, while a larger value never relaxes the configured limit. The effective
@@ -1010,6 +1017,7 @@ same SQL byte limit as a POST body; the database, workload-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
 duplicate `query`, `database`, `max_result_rows`, `max_result_values`,
 `max_result_bytes`, `max_rows_to_read`, `max_rows_to_group_by`,
+`max_group_key_bytes`,
 `max_ordering_state_bytes`, `max_aggregate_state_cells`,
 `max_aggregate_state_bytes`, `max_threads`, `readonly`, or `default_format`
 parameters, malformed or overflowing workload limits, malformed or

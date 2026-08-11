@@ -143,6 +143,7 @@ pub(crate) struct ParameterizedQueryLimits {
     pub(crate) max_result_values: usize,
     pub(crate) max_scan_rows: usize,
     pub(crate) max_groups: usize,
+    pub(crate) max_group_key_bytes: usize,
     pub(crate) max_ordering_state_bytes: usize,
     pub(crate) max_aggregate_state_cells: usize,
     pub(crate) max_aggregate_state_bytes: usize,
@@ -2800,6 +2801,7 @@ impl Database {
                 max_result_values: 0,
                 max_scan_rows: 0,
                 max_groups: 0,
+                max_group_key_bytes: 0,
                 max_ordering_state_bytes: 0,
                 max_aggregate_state_cells: 0,
                 max_aggregate_state_bytes: 0,
@@ -2811,8 +2813,8 @@ impl Database {
     /// Executes one already-parsed read-only query with caller-supplied limits.
     ///
     /// Caller limits may only tighten the database's configured result-byte,
-    /// result-row, result-value, scan-row, group-count, ordering-state,
-    /// aggregate-state cell, aggregate-state byte, and supported
+    /// result-row, result-value, scan-row, group-count, group-key byte,
+    /// ordering-state, aggregate-state cell, aggregate-state byte, and supported
     /// global-aggregate worker limits. Zero leaves the corresponding configured
     /// limit in place.
     /// Result-shape validation applies the effective row, value, and byte
@@ -2829,6 +2831,7 @@ impl Database {
             max_result_values,
             max_scan_rows,
             max_groups,
+            max_group_key_bytes,
             max_ordering_state_bytes,
             max_aggregate_state_cells,
             max_aggregate_state_bytes,
@@ -2854,6 +2857,13 @@ impl Database {
             self.query_result_limits.max_groups
         } else {
             self.query_result_limits.max_groups.min(max_groups)
+        };
+        let max_group_key_bytes = if max_group_key_bytes == 0 {
+            self.query_result_limits.max_group_key_bytes
+        } else {
+            self.query_result_limits
+                .max_group_key_bytes
+                .min(max_group_key_bytes)
         };
         let max_ordering_state_bytes = if max_ordering_state_bytes == 0 {
             self.query_result_limits.max_ordering_state_bytes
@@ -2881,6 +2891,7 @@ impl Database {
             max_rows,
             max_values,
             max_groups,
+            max_group_key_bytes,
             max_ordering_state_bytes,
             max_aggregate_state_cells,
             max_aggregate_state_bytes,
@@ -9725,6 +9736,7 @@ mod tests {
                     max_result_values: 0,
                     max_scan_rows: 0,
                     max_groups: 0,
+                    max_group_key_bytes: 0,
                     max_ordering_state_bytes: 0,
                     max_aggregate_state_cells: 0,
                     max_aggregate_state_bytes: 0,
@@ -14332,6 +14344,7 @@ mod tests {
                                 max_result_values: 0,
                                 max_scan_rows: 0,
                                 max_groups: 0,
+                                max_group_key_bytes: 0,
                                 max_ordering_state_bytes: 0,
                                 max_aggregate_state_cells: 0,
                                 max_aggregate_state_bytes: 0,
