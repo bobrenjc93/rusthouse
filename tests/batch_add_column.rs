@@ -60,6 +60,21 @@ fn parses_exact_alter_table_add_column_syntax_for_every_type() {
 }
 
 #[test]
+fn parses_contextual_if_as_an_add_column_name_without_the_complete_modifier() {
+    assert_eq!(
+        parse("ALTER TABLE events ADD COLUMN IF Int64")
+            .expect("IF remains a contextual column identifier"),
+        [Statement::AddColumn {
+            table: "events".to_owned(),
+            column: ColumnDef {
+                name: "IF".to_owned(),
+                data_type: DataType::Int64,
+            },
+        }]
+    );
+}
+
+#[test]
 fn parses_exact_case_insensitive_nullable_int64_add_column_syntax() {
     for (sql, table, column) in [
         (
