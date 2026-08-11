@@ -84,6 +84,30 @@ fn parses_exact_case_insensitive_nullable_int64_add_column_syntax() {
 }
 
 #[test]
+fn parses_exact_case_insensitive_conditional_nullable_int64_add_column_syntax() {
+    for (sql, table, column) in [
+        (
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS measurement Nullable(Int64)",
+            "events",
+            "measurement",
+        ),
+        (
+            "alter table Events add column if not exists Measurement nullable(int64);",
+            "Events",
+            "Measurement",
+        ),
+    ] {
+        assert_eq!(
+            parse(sql).expect("valid conditional nullable ALTER TABLE ADD COLUMN"),
+            [Statement::AddNullableInt64ColumnIfNotExists {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            }]
+        );
+    }
+}
+
+#[test]
 fn rejects_malformed_and_unsupported_nullable_add_column_types() {
     for sql in [
         "ALTER TABLE events ADD COLUMN value Nullable",
@@ -117,6 +141,8 @@ fn rejects_every_other_alter_table_add_column_shape() {
         "ALTER TABLE events ADD COLUMN",
         "ALTER TABLE events ADD COLUMN payload",
         "ALTER TABLE events ADD COLUMN payload UInt64",
+        "ALTER TABLE events ADD COLUMN IF EXISTS payload Nullable(Int64)",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS payload Int64",
     ] {
         assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
     }
@@ -538,6 +564,76 @@ fn nullable_add_backfills_empty_and_populated_tables_and_defaults_omitted_insert
 }
 
 #[test]
+fn conditional_nullable_add_is_idempotent_for_both_int64_physical_types() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Plain (measurement Int64); \
+             INSERT INTO Plain VALUES (7), (9); \
+             CREATE TABLE Maybe (measurement Nullable(Int64)); \
+             INSERT INTO Maybe VALUES (3), (NULL);",
+        )
+        .expect("setup succeeds");
+
+    for sql in [
+        "ALTER TABLE plain ADD COLUMN IF NOT EXISTS Measurement Nullable(Int64)",
+        "ALTER TABLE MAYBE ADD COLUMN IF NOT EXISTS MEASUREMENT Nullable(Int64)",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Ok(vec![StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 0,
+            }])
+        );
+    }
+
+    let plain = database.catalog().table("Plain").unwrap();
+    assert_eq!(plain.schema().len(), 1);
+    assert!(matches!(&plain.columns()[0], Column::Int64(values) if values == &[7, 9]));
+    let nullable = database.catalog().table("Maybe").unwrap();
+    assert_eq!(nullable.schema().len(), 1);
+    assert!(matches!(
+        &nullable.columns()[0],
+        Column::NullableInt64(values) if values == &[Some(3), None]
+    ));
+}
+
+#[test]
+fn conditional_nullable_add_backfills_populated_rows_and_show_create_replays() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Events (id Int64); \
+             INSERT INTO Events VALUES (2), (1); \
+             ALTER TABLE events ADD COLUMN IF NOT EXISTS measurement Nullable(Int64);",
+        )
+        .expect("the absent nullable column is added");
+
+    let table = database.catalog().table("EVENTS").unwrap();
+    assert_eq!(table.schema().len(), 2);
+    assert!(matches!(
+        &table.columns()[1],
+        Column::NullableInt64(values) if values == &[None, None]
+    ));
+
+    let ddl = "CREATE TABLE Events (id Int64); \
+               ALTER TABLE Events ADD COLUMN measurement Nullable(Int64)";
+    assert_eq!(
+        query(&mut database, "SHOW CREATE TABLE Events").rows,
+        [vec![Value::String(ddl.to_owned())]]
+    );
+    let mut replayed = Database::new();
+    replayed
+        .execute(ddl)
+        .expect("SHOW CREATE output remains executable");
+    assert_eq!(
+        query(&mut replayed, "SHOW CREATE TABLE events").rows,
+        [vec![Value::String(ddl.to_owned())]]
+    );
+}
+
+#[test]
 fn nullable_add_accepts_exact_table_limits_and_rejects_atomically() {
     let limits = TableLimits::new(2, 3, 4);
     let mut database = Database::with_table_limits(limits);
@@ -545,7 +641,7 @@ fn nullable_add_accepts_exact_table_limits_and_rejects_atomically() {
         .execute(
             "CREATE TABLE Events (id Int64); \
              INSERT INTO Events VALUES (1), (2); \
-             ALTER TABLE Events ADD COLUMN measurement Nullable(Int64);",
+             ALTER TABLE Events ADD COLUMN IF NOT EXISTS measurement Nullable(Int64);",
         )
         .expect("two rows by two columns exactly fits four cells");
     let table = database.catalog().table("events").unwrap();
@@ -556,7 +652,7 @@ fn nullable_add_accepts_exact_table_limits_and_rejects_atomically() {
     ));
 
     assert_eq!(
-        database.execute("ALTER TABLE Events ADD COLUMN overflow Nullable(Int64)"),
+        database.execute("ALTER TABLE Events ADD COLUMN IF NOT EXISTS overflow Nullable(Int64)"),
         Err(Error::ResourceLimitExceeded {
             resource: "table cells",
             actual: 6,
@@ -598,6 +694,10 @@ fn every_failed_add_leaves_schema_physical_columns_rows_and_capacity_unchanged()
 
     assert_eq!(
         database.execute("ALTER TABLE missing ADD COLUMN score Float64;"),
+        Err(Error::TableNotFound("missing".to_owned()))
+    );
+    assert_eq!(
+        database.execute("ALTER TABLE missing ADD COLUMN IF NOT EXISTS score Nullable(Int64);"),
         Err(Error::TableNotFound("missing".to_owned()))
     );
     assert_eq!(

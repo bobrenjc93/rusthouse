@@ -308,7 +308,17 @@ fn active_wal_rejects_nullable_add_column_without_mutating_the_table() {
         .unwrap();
 
     assert_eq!(
-        database.execute("ALTER TABLE READINGS ADD COLUMN missing Nullable(Int64)"),
+        database
+            .execute("ALTER TABLE READINGS ADD COLUMN IF NOT EXISTS measurement Nullable(Int64)"),
+        Ok(vec![StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 0,
+        }])
+    );
+    assert_eq!(
+        database.execute(
+            "ALTER TABLE READINGS ADD COLUMN IF NOT EXISTS missing Nullable(Int64)"
+        ),
         Err(Error::InvalidQuery(
             "ALTER TABLE ADD COLUMN is not supported while table 'READINGS' has an active Int64 WAL"
                 .to_owned()

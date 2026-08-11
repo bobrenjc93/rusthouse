@@ -2939,18 +2939,23 @@ impl Database {
                 })
             }
             Statement::AddNullableInt64Column { table, column } => {
-                self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
-                let field = ColumnDef {
-                    name: column.clone(),
-                    data_type: DataType::Int64,
-                };
-                let existing = self.catalog.table(&table)?;
-                validate_show_create_addition(existing, &field, true)?;
-                self.table_mut(&table)?.add_nullable_int64_column(column)?;
-                Ok(StatementResult::Command {
-                    tag: "ALTER TABLE",
-                    affected_rows: 0,
-                })
+                self.execute_add_nullable_int64_column_statement(table, column)
+            }
+            Statement::AddNullableInt64ColumnIfNotExists { table, column } => {
+                let column_exists = self
+                    .catalog
+                    .table(&table)?
+                    .schema()
+                    .iter()
+                    .any(|field| field.name.eq_ignore_ascii_case(&column));
+                if column_exists {
+                    Ok(StatementResult::Command {
+                        tag: "ALTER TABLE",
+                        affected_rows: 0,
+                    })
+                } else {
+                    self.execute_add_nullable_int64_column_statement(table, column)
+                }
             }
             Statement::DropColumn { table, column } => {
                 self.reject_unlogged_wal_mutation(&table, "ALTER TABLE DROP COLUMN")?;
@@ -3146,6 +3151,7 @@ impl Database {
             | Statement::RenameColumn { .. }
             | Statement::AddColumn { .. }
             | Statement::AddNullableInt64Column { .. }
+            | Statement::AddNullableInt64ColumnIfNotExists { .. }
             | Statement::DropColumn { .. }
             | Statement::AlterUpdate { .. }
             | Statement::AlterUpdateTyped { .. }
@@ -3160,6 +3166,25 @@ impl Database {
                     .to_owned(),
             )),
         }
+    }
+
+    fn execute_add_nullable_int64_column_statement(
+        &mut self,
+        table: String,
+        column: String,
+    ) -> Result<StatementResult> {
+        self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
+        let field = ColumnDef {
+            name: column.clone(),
+            data_type: DataType::Int64,
+        };
+        let existing = self.catalog.table(&table)?;
+        validate_show_create_addition(existing, &field, true)?;
+        self.table_mut(&table)?.add_nullable_int64_column(column)?;
+        Ok(StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 0,
+        })
     }
 
     fn execute_insert_statement(
@@ -4377,6 +4402,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::RenameColumn { .. }
         | Statement::AddColumn { .. }
         | Statement::AddNullableInt64Column { .. }
+        | Statement::AddNullableInt64ColumnIfNotExists { .. }
         | Statement::DropColumn { .. }
         | Statement::AlterUpdate { .. }
         | Statement::AlterUpdateTyped { .. }

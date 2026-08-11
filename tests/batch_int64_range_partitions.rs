@@ -226,7 +226,7 @@ fn nullable_add_column_invalidates_range_metadata_and_backfills_partitioned_rows
         .expect("sparse index is valid");
 
     database
-        .execute("ALTER TABLE Events ADD COLUMN measurement Nullable(Int64)")
+        .execute("ALTER TABLE Events ADD COLUMN IF NOT EXISTS measurement Nullable(Int64)")
         .expect("nullable schema evolution succeeds");
 
     let table = database.catalog().table("events").unwrap();
