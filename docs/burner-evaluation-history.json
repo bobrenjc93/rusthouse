@@ -2881,6 +2881,22 @@
         "eval_c88a7f3d": 90,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:774",
+      "recordedAt": "2026-08-11T00:37:40.029Z",
+      "label": "PR #774",
+      "kind": "leaf",
+      "prNumber": 774,
+      "title": "Expose the aggregate worker cap on Prometheus metrics",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 90,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
