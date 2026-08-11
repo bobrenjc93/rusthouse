@@ -597,11 +597,14 @@ the unaliased expression or alias, and `LIMIT`/`OFFSET`; non-`String` arguments
 and grouped query shapes are rejected. Its owned `String` results are charged
 exactly against the result-byte cap before materialization.
 `ABS(numeric_column)` is an ungrouped scalar projection that returns an
-absolute value with the input column's type. `Int64` evaluation is checked;
-filtering and limiting select rows before output evaluation, so an excluded
+absolute value with the input column's type. Physical `Nullable(Int64)` inputs
+propagate each absent value as a typed `Int64` `NULL` without evaluating the
+operation. Present `Int64` evaluation is checked; filtering, expression
+ordering, and pagination select rows before output evaluation, so an excluded
 `i64::MIN` does not fail the query, while a selected `i64::MIN` reports a typed
-numeric-overflow error. Finite `Float64` inputs retain their magnitude, and
-either signed zero produces positive zero. It supports an optional `AS alias`,
+numeric-overflow error. Expression ordering places `NULL` first ascending and
+last descending. Finite `Float64` inputs retain their magnitude, and either
+signed zero produces positive zero. `ABS` supports an optional `AS alias`,
 ordering by the unaliased expression or alias, `WHERE`, and `LIMIT`/`OFFSET`;
 non-numeric arguments are rejected with a typed error.
 `ROUND(float64_column)` is an ungrouped scalar projection that returns a

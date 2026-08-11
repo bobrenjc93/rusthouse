@@ -430,6 +430,77 @@ fn nullable_csv_appends_recover_from_wal_for_named_and_headerless_inputs() {
 }
 
 #[test]
+fn recovered_mixed_and_all_null_wal_rows_support_nullable_abs() {
+    let directory = TestDirectory::new();
+    let path = directory.join("nullable-abs.wal");
+    let limits = Int64WriteAheadLogLimits::default();
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (measurement Nullable(Int64)); \
+             INSERT INTO readings VALUES (-7), (NULL);",
+        )
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO readings VALUES \
+             (2), (NULL), (-9223372036854775808);",
+        )
+        .unwrap();
+
+    let mut recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    let results = recovered
+        .execute(
+            "SELECT ABS(measurement) AS magnitude FROM readings \
+             ORDER BY magnitude LIMIT 4",
+        )
+        .unwrap();
+    let [StatementResult::Query(mixed)] = results.as_slice() else {
+        panic!("expected recovered nullable ABS query")
+    };
+    assert_eq!(
+        mixed.rows,
+        [
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(7)],
+        ]
+    );
+    assert_eq!(
+        recovered.execute(
+            "SELECT ABS(measurement) AS magnitude FROM readings \
+             ORDER BY magnitude DESC LIMIT 1"
+        ),
+        Err(Error::NumericOverflow("ABS(Int64)".to_owned()))
+    );
+
+    database
+        .replace_nullable_int64_values("readings", &[(0, None), (2, None), (4, None)])
+        .unwrap();
+    let mut all_null = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    let results = all_null
+        .execute(
+            "SELECT ABS(measurement) AS magnitude FROM readings \
+             ORDER BY magnitude DESC LIMIT 2 OFFSET 2",
+        )
+        .unwrap();
+    let [StatementResult::Query(all_null)] = results.as_slice() else {
+        panic!("expected recovered all-NULL ABS query")
+    };
+    assert_eq!(
+        all_null.rows,
+        [
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Null(DataType::Int64)],
+        ]
+    );
+}
+
+#[test]
 fn sql_null_append_replays_for_nullable_int64_wal() {
     let directory = TestDirectory::new();
     let path = directory.join("nullable-sql.wal");
