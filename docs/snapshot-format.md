@@ -90,28 +90,28 @@ NULL positions, row order, and persisted row cap. It validates the database's
 row, column, and cell limits before changing the catalog or cached metrics. The
 payload is strictly a single-table format: it contains one column and no
 database name, batch table name, additional tables, or catalog metadata. The
-explicit-backup restore accepts the same two physical column shapes;
-set restore accepts both shapes in one atomic set, while replacement retains
-its existing non-nullable boundary.
+explicit-backup restore, atomic set restore, and replacement APIs accept the
+same two physical column shapes.
 
 `Database::replace_int64_table_from_file` instead requires that the
 case-insensitively resolved target already exist. It checks that requirement
 before opening the snapshot, preserves the target's stored display name, and
-stages the decoded column schema, rows, and persisted row cap through the same
-non-nullability, identifier, and configured table-limit validation. Only then
-does it swap the catalog entry once and replace the cached measurements. A
-missing target, corrupt snapshot, nullable or invalid column, or limit failure
-leaves the prior table and metrics unchanged.
+stages the decoded column schema, nullability, exact NULL positions, row order,
+and persisted row cap through identifier and configured table-limit
+validation. Only then does it swap the catalog entry once and replace the
+cached measurements. A missing target, corrupt snapshot, invalid column, or
+limit failure leaves the prior table and metrics unchanged.
 
 `Database::replace_int64_table_from_file_with_backup` composes the same atomic
 replacement with the bounded primary-or-backup decoder. A decoded primary
 takes precedence without inspecting the backup. Any typed primary file,
 envelope, or table-payload decoding failure causes one attempt against the
 explicit backup with the same codecs; success identifies the source, and a
-dual failure preserves both typed causes. Non-nullability, identifier, and
-table-limit validation happens after recovery chooses a source and does not
-trigger another attempt. Dual recovery, validation, and limit failures leave
-the target's display name, rows, schema, and cached metrics unchanged.
+dual failure preserves both typed causes. Schema, identifier, and table-limit
+validation happens after recovery chooses a source and does not trigger
+another attempt. A recovered nullable source preserves every NULL position.
+Dual recovery, validation, and limit failures leave the target's display name,
+rows, schema, and cached metrics unchanged.
 
 `SharedDatabase::try_replace_int64_table_from_file_with_backup` exposes that
 replacement to concurrent users without blocking. It makes exactly one
@@ -119,7 +119,9 @@ write-lock attempt before opening either source, retains the guard through the
 delegated primary-or-backup replacement, and returns the successful recovery
 source. Reader or writer contention, a poisoned lock, and typed snapshot or
 database validation failures remain distinct. Every failure preserves the
-target table and cached metrics.
+target table and cached metrics. Nullable replacements preserve the same
+column metadata, NULL positions, row order, and persisted row cap as the
+direct database APIs.
 
 `Database::restore_int64_tables_from_files` transactionally composes those
 single-table payloads into a caller-bounded catalog subset. Each

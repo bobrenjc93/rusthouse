@@ -453,12 +453,10 @@ pub enum DatabaseSnapshotRestoreError {
     Snapshot(Int64TablePayloadFileRestoreError),
     /// Both the primary and explicit backup snapshots failed bounded restore.
     Recovery(Int64TablePayloadFileRecoveryError),
-    /// Snapshot replacement rejected a nullable `Int64` column.
+    /// Legacy nullable-column rejection retained for source compatibility.
     ///
-    /// The primary [`Database::restore_int64_table_from_file`] path accepts
-    /// nullable columns, as does its explicit-backup recovery counterpart;
-    /// atomic set restore accepts them too. Replacement retains its existing
-    /// non-nullable boundary and returns this variant.
+    /// Self-describing snapshot restore and replacement APIs now accept
+    /// nullable `Int64` columns, so they no longer return this variant.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
     /// limits were rejected by batch storage.
@@ -604,10 +602,9 @@ impl fmt::Display for DatabaseSnapshotRestoreError {
         match self {
             Self::Snapshot(error) => write!(formatter, "could not restore snapshot: {error}"),
             Self::Recovery(error) => write!(formatter, "could not recover snapshot: {error}"),
-            Self::NullableColumn { column } => write!(
-                formatter,
-                "snapshot column '{column}' is nullable; batch snapshot replacement requires a non-nullable Int64 column"
-            ),
+            Self::NullableColumn { column } => {
+                write!(formatter, "snapshot column '{column}' is nullable")
+            }
             Self::Table(error) => error.fmt(formatter),
         }
     }
@@ -2008,8 +2005,8 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically replaces one existing table from a self-describing,
-    /// non-nullable `Int64` snapshot.
+    /// Atomically replaces one existing table from a self-describing `Int64`
+    /// or `Nullable(Int64)` snapshot.
     ///
     /// `table_name` uses the catalog's case-insensitive lookup, while the
     /// replacement retains the target's stored display name. The snapshot
@@ -2017,11 +2014,12 @@ impl Database {
     /// and payload codecs bound all file and decoding work.
     ///
     /// Target existence is checked before the source is opened. The snapshot
-    /// is then fully decoded and staged as a batch table, including
-    /// non-nullability, SQL identifier, row-cap, column, and cell validation,
-    /// before one catalog swap. Every failure preserves the old table and its
-    /// cached metrics; success replaces those metrics with the staged table's
-    /// exact measurements.
+    /// is then fully decoded and staged as a batch table, including its column
+    /// metadata, nullability, exact NULL positions, row order, and row cap.
+    /// SQL identifier, row-cap, column, and cell validation completes before
+    /// one catalog swap. Every failure preserves the old table and its cached
+    /// metrics; success replaces those metrics with the staged table's exact
+    /// measurements.
     pub fn replace_int64_table_from_file(
         &mut self,
         table_name: &str,
@@ -2036,7 +2034,7 @@ impl Database {
     }
 
     /// Atomically replaces one existing table from a primary self-describing
-    /// `Int64` snapshot or an explicit backup.
+    /// `Int64` or `Nullable(Int64)` snapshot, or an explicit backup.
     ///
     /// `table_name` uses the catalog's case-insensitive lookup, while a
     /// successful replacement retains the target's stored display name. The
@@ -2048,11 +2046,11 @@ impl Database {
     /// failures.
     ///
     /// Target existence is checked before either source is opened. After one
-    /// source is decoded, the same non-nullability, SQL identifier, row-cap,
-    /// column, and cell validation as [`Self::replace_int64_table_from_file`]
-    /// runs before one catalog swap. Database validation does not cause a
-    /// fallback. Dual recovery, validation, and resource-limit failures all
-    /// preserve the old table and its cached metrics.
+    /// source is decoded, the same schema, SQL identifier, row-cap, column,
+    /// and cell validation as [`Self::replace_int64_table_from_file`] runs
+    /// before one catalog swap. Database validation does not cause a fallback.
+    /// Dual recovery, validation, and resource-limit failures all preserve the
+    /// old table and its cached metrics.
     pub fn replace_int64_table_from_file_with_backup(
         &mut self,
         table_name: &str,
@@ -2225,22 +2223,15 @@ impl Database {
         display_name: &str,
         restored: Int64Table,
     ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
-        let replacement = self.prepare_restored_int64_table(display_name, restored)?;
+        let replacement = self
+            .prepare_decoded_int64_table(display_name, restored)
+            .map_err(DatabaseSnapshotRestoreError::Table)?;
         let replacement_measurements = TableMeasurements::read(&replacement);
 
         let previous = self.catalog.replace_table(table_name, replacement)?;
         self.measurements
             .replace(TableMeasurements::read(&previous), replacement_measurements);
         Ok(())
-    }
-
-    fn prepare_restored_int64_table(
-        &self,
-        table_name: &str,
-        restored: Int64Table,
-    ) -> std::result::Result<Table, DatabaseSnapshotRestoreError> {
-        self.prepare_restored_int64_table_inner(table_name, restored)
-            .map_err(Into::into)
     }
 
     fn prepare_restored_int64_table_inner(

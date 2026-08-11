@@ -94,7 +94,7 @@ fn write_snapshot_with_nullability(
 fn populated_database() -> Database {
     let mut database = Database::new();
     database
-        .execute("CREATE TABLE existing (id Int64); INSERT INTO existing VALUES (7);")
+        .execute("CREATE TABLE Existing (id Int64); INSERT INTO existing VALUES (7);")
         .unwrap();
     database
 }
@@ -182,11 +182,12 @@ fn restores_nullable_snapshot_with_name_null_order_cap_and_cached_metrics() {
 }
 
 #[test]
-fn recovery_replacement_prefers_the_primary_snapshot() {
+fn recovery_replacement_prefers_nullable_primary_and_preserves_its_shape() {
     let directory = TestDirectory::new();
     let primary_path = directory.join("primary.snapshot");
     let backup_path = directory.join("backup.snapshot");
-    let (snapshot_codec, payload_codec) = write_snapshot(&primary_path, "reading", 2, &[Some(11)]);
+    let (snapshot_codec, payload_codec) =
+        write_snapshot_with_nullability(&primary_path, "Reading", true, 3, &[Some(11), None]);
     write_snapshot(&backup_path, "reading", 2, &[Some(22)]);
     let database = SharedDatabase::new(populated_database());
 
@@ -201,31 +202,48 @@ fn recovery_replacement_prefers_the_primary_snapshot() {
         .unwrap();
 
     assert_eq!(source, Int64TablePayloadFileRecoverySource::Primary);
+    let query = database.query("SELECT Reading FROM existing;").unwrap();
+    assert_eq!(query.columns[0].name, "Reading");
     assert_eq!(
-        database
-            .query("SELECT reading FROM existing;")
-            .unwrap()
-            .rows,
-        [[Value::Int64(11)]]
+        query.rows,
+        [[Value::Int64(11)], [Value::Null(DataType::Int64)],]
+    );
+    assert_eq!(
+        database.query("SHOW TABLES;").unwrap().rows,
+        [[Value::String("Existing".to_owned())]]
     );
     assert_eq!(
         database.metrics_snapshot(),
         Some(DatabaseMetrics {
             table_count: 1,
             column_count: 1,
-            retained_row_count: 1,
-            retained_value_bytes: 8,
+            retained_row_count: 2,
+            retained_value_bytes: 18,
         })
     );
+    database
+        .execute("INSERT INTO existing VALUES (NULL);")
+        .unwrap();
+    assert!(matches!(
+        database.execute("INSERT INTO existing VALUES (1);"),
+        Err(rusthouse::SharedDatabaseError::Sql(
+            Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 4,
+                max: 3,
+            }
+        ))
+    ));
 }
 
 #[test]
-fn recovery_replacement_uses_the_backup_after_primary_corruption() {
+fn recovery_replacement_uses_all_null_backup_after_primary_corruption() {
     let directory = TestDirectory::new();
     let primary_path = directory.join("primary.snapshot");
     let backup_path = directory.join("backup.snapshot");
-    let (snapshot_codec, payload_codec) = write_snapshot(&primary_path, "reading", 2, &[Some(11)]);
-    write_snapshot(&backup_path, "reading", 2, &[Some(22)]);
+    let (snapshot_codec, payload_codec) =
+        write_snapshot_with_nullability(&primary_path, "reading", true, 3, &[Some(11), None]);
+    write_snapshot_with_nullability(&backup_path, "reading", true, 3, &[None, None]);
     let mut corrupt = fs::read(&primary_path).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     fs::write(&primary_path, corrupt).unwrap();
@@ -247,7 +265,19 @@ fn recovery_replacement_uses_the_backup_after_primary_corruption() {
             .query("SELECT reading FROM existing;")
             .unwrap()
             .rows,
-        [[Value::Int64(22)]]
+        [
+            [Value::Null(DataType::Int64)],
+            [Value::Null(DataType::Int64)],
+        ]
+    );
+    assert_eq!(
+        database.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 1,
+            column_count: 1,
+            retained_row_count: 2,
+            retained_value_bytes: 18,
+        })
     );
 }
 

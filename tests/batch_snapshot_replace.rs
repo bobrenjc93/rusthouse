@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::batch::engine::StatementResult;
 use rusthouse::batch::error::Error;
+use rusthouse::batch::storage::Column;
 use rusthouse::batch::value::{DataType, Value};
 use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
@@ -87,11 +88,11 @@ fn assert_original_table(database: &mut Database) {
 }
 
 #[test]
-fn replacement_is_queryable_and_transfers_schema_and_row_cap_without_renaming() {
+fn nullable_replacement_preserves_metadata_nulls_row_order_cap_and_display_name() {
     let directory = TestDirectory::new();
     let path = directory.join("replacement.snapshot");
-    let (snapshot_codec, payload_codec) =
-        write_snapshot(&path, "restored_value", false, 3, &[Some(9), Some(-4)]);
+    let rows = [Some(9), None, Some(-4)];
+    let (snapshot_codec, payload_codec) = write_snapshot(&path, "restored_value", true, 4, &rows);
     let mut database = Database::with_table_limits(TableLimits::new(5, 2, 10));
     database
         .execute(
@@ -109,24 +110,29 @@ fn replacement_is_queryable_and_transfers_schema_and_row_cap_without_renaming() 
     assert_eq!(table.schema().len(), 1);
     assert_eq!(table.schema()[0].name, "restored_value");
     assert_eq!(table.schema()[0].data_type, DataType::Int64);
-    assert_eq!(table.limits(), TableLimits::new(3, 2, 10));
+    assert!(matches!(
+        &table.columns()[0],
+        Column::NullableInt64(values) if values == &rows
+    ));
+    assert_eq!(table.limits(), TableLimits::new(4, 2, 10));
     assert_eq!(
-        query_rows(
-            &mut database,
-            "SELECT restored_value FROM readings ORDER BY restored_value;",
-        ),
-        vec![vec![Value::Int64(-4)], vec![Value::Int64(9)]]
+        query_rows(&mut database, "SELECT restored_value FROM readings;"),
+        vec![
+            vec![Value::Int64(9)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Int64(-4)],
+        ]
     );
 
     database
-        .execute("INSERT INTO readings VALUES (11);")
+        .execute("INSERT INTO readings VALUES (NULL);")
         .unwrap();
     assert!(matches!(
         database.execute("INSERT INTO readings VALUES (12);"),
         Err(Error::ResourceLimitExceeded {
             resource: "table rows",
-            actual: 4,
-            max: 3,
+            actual: 5,
+            max: 4,
         })
     ));
 }
@@ -135,13 +141,8 @@ fn replacement_is_queryable_and_transfers_schema_and_row_cap_without_renaming() 
 fn successful_replacement_updates_cached_metrics_by_the_exact_table_delta() {
     let directory = TestDirectory::new();
     let path = directory.join("metrics.snapshot");
-    let (snapshot_codec, payload_codec) = write_snapshot(
-        &path,
-        "replacement",
-        false,
-        3,
-        &[Some(10), Some(20), Some(30)],
-    );
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&path, "replacement", true, 3, &[Some(10), None, Some(30)]);
     let mut database = Database::new();
     database
         .execute(
@@ -163,7 +164,7 @@ fn successful_replacement_updates_cached_metrics_by_the_exact_table_delta() {
             table_count: 2,
             column_count: 2,
             retained_row_count: 4,
-            retained_value_bytes: 32,
+            retained_value_bytes: 35,
         })
     );
 }
@@ -208,7 +209,7 @@ fn recovery_replacement_uses_the_backup_for_missing_and_corrupt_primaries() {
     let directory = TestDirectory::new();
     let backup_path = directory.join("backup.snapshot");
     let (snapshot_codec, payload_codec) =
-        write_snapshot(&backup_path, "recovered", false, 2, &[Some(22)]);
+        write_snapshot(&backup_path, "recovered", true, 3, &[None, None]);
     let corrupt_primary_path = directory.join("corrupt-primary.snapshot");
     let mut corrupt_primary = fs::read(&backup_path).unwrap();
     *corrupt_primary.last_mut().unwrap() ^= 1;
@@ -240,8 +241,22 @@ fn recovery_replacement_uses_the_backup_for_missing_and_corrupt_primaries() {
         );
         assert_eq!(
             query_rows(&mut database, "SELECT recovered FROM readings;"),
-            vec![vec![Value::Int64(22)]]
+            vec![
+                vec![Value::Null(DataType::Int64)],
+                vec![Value::Null(DataType::Int64)],
+            ]
         );
+        database
+            .execute("INSERT INTO readings VALUES (7);")
+            .unwrap();
+        assert!(matches!(
+            database.execute("INSERT INTO readings VALUES (8);"),
+            Err(Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 4,
+                max: 3,
+            })
+        ));
     }
 }
 
@@ -293,16 +308,8 @@ fn dual_recovery_failure_preserves_the_table_and_cached_metrics() {
 }
 
 #[test]
-fn recovery_validation_and_limit_failures_preserve_the_table_and_cached_metrics() {
+fn recovery_limit_failure_preserves_the_table_and_cached_metrics() {
     let directory = TestDirectory::new();
-    let nullable_primary_path = directory.join("nullable-primary.snapshot");
-    let (nullable_snapshot_codec, nullable_payload_codec) = write_snapshot(
-        &nullable_primary_path,
-        "nullable_value",
-        true,
-        3,
-        &[Some(9)],
-    );
     let limited_backup_path = directory.join("limited-backup.snapshot");
     let (limited_snapshot_codec, limited_payload_codec) =
         write_snapshot(&limited_backup_path, "replacement", false, 4, &[Some(10)]);
@@ -314,23 +321,6 @@ fn recovery_validation_and_limit_failures_preserve_the_table_and_cached_metrics(
         )
         .unwrap();
     let metrics_before = query_rows(&mut database, "SELECT metric, value FROM system.metrics;");
-
-    assert!(matches!(
-        database.replace_int64_table_from_file_with_backup(
-            "readings",
-            nullable_primary_path,
-            directory.join("missing-validation-backup.snapshot"),
-            nullable_snapshot_codec,
-            nullable_payload_codec,
-        ),
-        Err(DatabaseSnapshotRestoreError::NullableColumn { ref column })
-            if column == "nullable_value"
-    ));
-    assert_original_table(&mut database);
-    assert_eq!(
-        query_rows(&mut database, "SELECT metric, value FROM system.metrics;"),
-        metrics_before
-    );
 
     assert!(matches!(
         database.replace_int64_table_from_file_with_backup(
@@ -380,7 +370,7 @@ fn missing_target_is_rejected_before_the_snapshot_is_opened() {
 }
 
 #[test]
-fn corruption_nullability_and_invalid_schema_leave_the_old_table_and_metrics_unchanged() {
+fn corruption_and_invalid_schema_leave_the_old_table_and_metrics_unchanged() {
     let directory = TestDirectory::new();
     let valid_path = directory.join("valid.snapshot");
     let (snapshot_codec, payload_codec) =
@@ -389,9 +379,6 @@ fn corruption_nullability_and_invalid_schema_leave_the_old_table_and_metrics_unc
     let mut corrupt = fs::read(&valid_path).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     fs::write(&corrupt_path, corrupt).unwrap();
-    let nullable_path = directory.join("nullable.snapshot");
-    let (nullable_snapshot_codec, nullable_payload_codec) =
-        write_snapshot(&nullable_path, "nullable_value", true, 2, &[Some(9)]);
     let invalid_path = directory.join("invalid-name.snapshot");
     let (invalid_snapshot_codec, invalid_payload_codec) =
         write_snapshot(&invalid_path, "invalid-name", false, 2, &[Some(10)]);
@@ -415,18 +402,6 @@ fn corruption_nullability_and_invalid_schema_leave_the_old_table_and_metrics_unc
         Err(DatabaseSnapshotRestoreError::Snapshot(
             Int64TablePayloadFileRestoreError::Envelope(SnapshotError::ChecksumMismatch { .. })
         ))
-    ));
-    assert_original_table(&mut database);
-
-    assert!(matches!(
-        database.replace_int64_table_from_file(
-            "readings",
-            nullable_path,
-            nullable_snapshot_codec,
-            nullable_payload_codec,
-        ),
-        Err(DatabaseSnapshotRestoreError::NullableColumn { ref column })
-            if column == "nullable_value"
     ));
     assert_original_table(&mut database);
 
