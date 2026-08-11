@@ -318,6 +318,24 @@ fn nullable_backup_restore_recovers_after_a_corrupt_primary() {
         panic!("recovered column must retain physical Nullable(Int64) storage");
     };
     assert_eq!(restored_rows, &rows);
+
+    let mut results = database
+        .execute(
+            "SELECT CAST(reading AS Int64) AS recovered FROM Readings \
+             ORDER BY recovered",
+        )
+        .unwrap();
+    let StatementResult::Query(result) = results.pop().unwrap() else {
+        unreachable!("SELECT always returns one query result")
+    };
+    assert_eq!(
+        result.rows,
+        [
+            [Value::Null(BatchDataType::Int64)],
+            [Value::Int64(-9)],
+            [Value::Int64(i64::MAX)],
+        ]
+    );
 }
 
 #[test]
