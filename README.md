@@ -75,15 +75,18 @@ Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `SUM(Nullable(Int64))`,
 two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
 `SUM(Int64)` or `AVG(Int64)` (including a physical `Nullable(Int64)` argument),
 or a physically non-nullable `MIN(Int64)`, `MIN(Float64)`, `MAX(Int64)`, or
-`MAX(Float64)`, use
+`MAX(Float64)`, as well as `COUNT(nullable_int64_column)` plus
+`AVG(the_same_column)`, use
 deterministic contiguous chunks when more than 262,144 rows match. A grouped
 query also uses those chunks when it has exactly one non-nullable `Bool`
 grouping column and exactly one `COUNT(*)` or `COUNT()` aggregate. Ordered
 partition reduction preserves first-seen Bool grouping before the normal
 grouped ordering and pagination stages. The paired
-shape preserves either projection order and derives its row count with a
-checked conversion of the filtered cardinality while the existing checked
-sum-and-count lanes target about 131,072 rows each. Release-mode crossover
+shapes preserve either projection order. Row-count pairs derive `COUNT` with a
+checked conversion of the filtered cardinality; a same-column nullable
+`COUNT`/`AVG` pair derives its NULL-ignoring count from the AVG partitions'
+checked present-value count. The existing checked sum-and-count lanes target
+about 131,072 rows each. Release-mode crossover
 measurements kept smaller inputs sequential. Paired `SUM(Int64)` and
 `AVG(Int64)`, and sole `SUM`, `AVG`, `MIN`, and `MAX` admit physical
 `Nullable(Int64)` arguments;
@@ -105,7 +108,8 @@ share the process-wide budget. Parameterized HTTP queries may additionally set
 `max_threads` for one request without changing either settings result; zero
 retains the database cap, while a nonzero value can only tighten it. Checked count
 partials and checked i128 SUM/AVG sum-and-count partials are reduced in chunk
-order; the paired row count is checked independently from matched rows. Optional
+order; paired row counts are checked independently from matched rows, while a
+same-column nullable `COUNT` reuses and checks the AVG present count. Optional
 Int64 and Float64 extrema partials, including nullable Int64 MIN/MAX partials, are
 reduced directly without
 allocating a partial-results collection. Ordered reduction preserves the first
@@ -115,8 +119,8 @@ or below the threshold, other grouped shapes (including `COUNT(column)`, more
 than one grouping column, non-Bool keys, or multiple aggregates), and
 multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
-row-count/`MAX(Float64)` pairs (including
-`COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema, `AVG(Float64)`,
+row-count/`MAX(Float64)` pairs or the same-column nullable `COUNT`/`AVG` pair
+(including all other `COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema, `AVG(Float64)`,
 grouped nullable SUM, MIN, MAX, or AVG, paired nullable MIN or MAX, and
 other aggregate functions remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
@@ -147,7 +151,8 @@ nullable MIN/MAX chunks ignore absent values and reduce optional extrema in chun
 order. At or below the threshold, without worker admission, or after a worker
 failure, the complete computation runs sequentially. Grouped and paired
 nullable shapes remain sequential except for the exact ungrouped
-`COUNT(*)`/`COUNT()` plus nullable `SUM` or `AVG` pair.
+`COUNT(*)`/`COUNT()` plus nullable `SUM` or `AVG` pair and
+`COUNT(nullable_column)` plus `AVG(the_same_column)` pair.
 These nullable shapes compose with filters, grouping, HAVING, ordering,
 pagination, and other supported aggregate projections. Other operations retain
 their documented nullable restrictions.
