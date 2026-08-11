@@ -190,6 +190,24 @@ the envelope and RLE codecs. The existing `restore_int64_table_from_file`
 helper is not format-detecting and continues to expect
 `NullableI64PayloadCodec` bytes.
 
+`Database::save_int64_table_rle_to_file` adapts one named batch table to this
+row-only RLE format. It accepts exactly one physical `Int64` or
+`Nullable(Int64)` column, resolves the table case-insensitively, and completes
+table lookup and shape validation before accessing the destination. Row, run,
+payload-byte, and envelope-byte bounds retain their typed codec errors; atomic
+replacement retains its typed stage error and destination-replacement status.
+The encoder borrows either physical column representation directly. The file
+stores only maximal RLE runs and therefore does not store the batch table name,
+column name, nullability, or row cap. Those values must be supplied when
+reopening it.
+
+`SharedDatabase::try_save_int64_table_rle_to_file` is the nonblocking shared
+counterpart. It makes one read-lock attempt before validation or destination
+access, holds the guard through encoding and atomic replacement, and remains
+compatible with other readers. Writer contention and lock poisoning are
+distinct from the delegated table, RLE, and replacement failures, and all
+pre-rename failures report that the destination was preserved.
+
 `Database::restore_int64_table_rle_from_file` registers one such restored table
 under a caller-supplied batch table name. It rejects a case-insensitive catalog
 duplicate before opening the file, then stages the bounded RLE restore and all

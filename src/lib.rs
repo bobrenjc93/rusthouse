@@ -85,10 +85,11 @@ pub use batch::{
 pub use batch::{
     DatabaseInt64WalEnableError, DatabaseInt64WalRecoveryError,
     DatabaseInt64WalRegistryEnableError, DatabaseInt64WalRegistryRecoveryError,
-    DatabaseSnapshotSaveError, Int64WriteAheadLogCommitError, Int64WriteAheadLogCorruption,
-    Int64WriteAheadLogError, Int64WriteAheadLogLimitError, Int64WriteAheadLogLimits,
-    Int64WriteAheadLogRegistryCorruption, Int64WriteAheadLogRegistryError,
-    Int64WriteAheadLogRegistryLimitError, Int64WriteAheadLogRegistryLimits,
+    DatabaseRleSnapshotSaveError, DatabaseSnapshotSaveError, Int64WriteAheadLogCommitError,
+    Int64WriteAheadLogCorruption, Int64WriteAheadLogError, Int64WriteAheadLogLimitError,
+    Int64WriteAheadLogLimits, Int64WriteAheadLogRegistryCorruption,
+    Int64WriteAheadLogRegistryError, Int64WriteAheadLogRegistryLimitError,
+    Int64WriteAheadLogRegistryLimits, SharedDatabaseRleSnapshotSaveError,
     SharedDatabaseSnapshotSaveError,
 };
 pub use catalog::{

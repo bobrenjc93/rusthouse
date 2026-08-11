@@ -1575,6 +1575,15 @@ replacement failures, and every pre-rename failure preserves the destination.
 `save_int64_table_rle_to_file` is the opt-in compressed counterpart. It uses
 `NullableI64RlePayloadCodec` with the same atomic replacement guarantees and
 keeps RLE encoding and replacement failures typed separately.
+`Database::save_int64_table_rle_to_file` exposes that bounded row-only format
+for a named one-column batch table. It accepts physical `Int64` and
+`Nullable(Int64)`, validates table existence and shape before destination
+access, and preserves exact row order and NULL positions without persisting
+the table name, column name, nullability, or row cap. Its matching
+`SharedDatabase::try_save_int64_table_rle_to_file` makes one nonblocking read
+lock attempt and holds the guard through validation, encoding, and atomic
+replacement. Writer contention, poisoning, validation, RLE bounds, replacement
+stages, and whether the destination was already replaced remain typed.
 `restore_int64_table_rle_from_file` is its bounded reopen path: it accepts the
 row-only format's caller-supplied schema and row cap, rejects non-regular and
 oversized files before decoding, and keeps filesystem, envelope, RLE payload,

@@ -1416,6 +1416,23 @@ impl NullableI64RlePayloadCodec {
 
     /// Encodes rows as deterministic maximal runs in input order.
     pub fn encode(self, rows: &[Option<i64>]) -> Result<Vec<u8>, NullableI64RlePayloadError> {
+        self.encode_rows(rows.iter().copied())
+    }
+
+    /// Encodes one validated batch-engine `Int64` column without cloning it
+    /// into nullable storage first.
+    #[cfg(unix)]
+    pub(crate) fn encode_non_nullable_values(
+        self,
+        values: &[i64],
+    ) -> Result<Vec<u8>, NullableI64RlePayloadError> {
+        self.encode_rows(values.iter().copied().map(Some))
+    }
+
+    fn encode_rows<I>(self, rows: I) -> Result<Vec<u8>, NullableI64RlePayloadError>
+    where
+        I: Clone + ExactSizeIterator<Item = Option<i64>>,
+    {
         let row_count = u64::try_from(rows.len()).map_err(|_| {
             NullableI64RlePayloadError::RowLimitExceeded {
                 row_count: u64::MAX,
@@ -1429,15 +1446,19 @@ impl NullableI64RlePayloadCodec {
             });
         }
 
-        let mut run_count = usize::from(!rows.is_empty());
-        let mut value_run_count = usize::from(rows.first().is_some_and(Option::is_some));
-        for pair in rows.windows(2) {
-            if pair[0] != pair[1] {
+        let mut inspected_rows = rows.clone();
+        let first = inspected_rows.next();
+        let mut run_count = usize::from(first.is_some());
+        let mut value_run_count = usize::from(first.is_some_and(|value| value.is_some()));
+        let mut previous = first;
+        for value in inspected_rows {
+            if Some(value) != previous {
                 run_count += 1;
-                if pair[1].is_some() {
+                if value.is_some() {
                     value_run_count += 1;
                 }
             }
+            previous = Some(value);
         }
         let declared_runs =
             u64::try_from(run_count).map_err(|_| NullableI64RlePayloadError::RunLimitExceeded {
@@ -1478,29 +1499,19 @@ impl NullableI64RlePayloadCodec {
         payload.extend_from_slice(&row_count.to_le_bytes());
         payload.extend_from_slice(&declared_runs.to_le_bytes());
 
-        let mut run_start = 0;
-        while run_start < rows.len() {
-            let value = rows[run_start];
-            let mut run_end = run_start + 1;
-            while run_end < rows.len() && rows[run_end] == value {
-                run_end += 1;
-            }
-            let run_length = u64::try_from(run_end - run_start).map_err(|_| {
-                NullableI64RlePayloadError::RowLimitExceeded {
-                    row_count: u64::MAX,
-                    max_rows: self.max_rows,
+        let mut encoded_rows = rows;
+        if let Some(mut value) = encoded_rows.next() {
+            let mut run_length = 1_usize;
+            for next in encoded_rows {
+                if next == value {
+                    run_length += 1;
+                } else {
+                    append_nullable_i64_rle_run(&mut payload, value, run_length, self.max_rows)?;
+                    value = next;
+                    run_length = 1;
                 }
-            })?;
-
-            match value {
-                None => payload.push(NULLABLE_I64_RLE_NULL_RUN_TAG),
-                Some(_) => payload.push(NULLABLE_I64_RLE_VALUE_RUN_TAG),
             }
-            payload.extend_from_slice(&run_length.to_le_bytes());
-            if let Some(value) = value {
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
-            run_start = run_end;
+            append_nullable_i64_rle_run(&mut payload, value, run_length, self.max_rows)?;
         }
 
         Ok(payload)
@@ -1630,6 +1641,28 @@ impl NullableI64RlePayloadCodec {
 
         Ok(rows)
     }
+}
+
+fn append_nullable_i64_rle_run(
+    payload: &mut Vec<u8>,
+    value: Option<i64>,
+    run_length: usize,
+    max_rows: usize,
+) -> Result<(), NullableI64RlePayloadError> {
+    let run_length =
+        u64::try_from(run_length).map_err(|_| NullableI64RlePayloadError::RowLimitExceeded {
+            row_count: u64::MAX,
+            max_rows,
+        })?;
+    match value {
+        None => payload.push(NULLABLE_I64_RLE_NULL_RUN_TAG),
+        Some(_) => payload.push(NULLABLE_I64_RLE_VALUE_RUN_TAG),
+    }
+    payload.extend_from_slice(&run_length.to_le_bytes());
+    if let Some(value) = value {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// Encodes and decodes one bounded, self-describing [`Int64Table`].

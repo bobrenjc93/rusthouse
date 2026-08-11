@@ -7,17 +7,19 @@ use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use super::csv::{CsvIngestError, CsvIngestLimits};
-#[cfg(unix)]
-use super::engine::DatabaseSnapshotSaveError;
 use super::engine::{
     DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, DatabaseSnapshotRestoreEntry,
     DatabaseSnapshotRestoreError, DatabaseSnapshotSetRestoreError, IndexPruningMetrics,
     Int64MinMaxIndexAdmission, Int64MinMaxIndexLimits, ParameterizedQueryLimits, QueryResult,
     QueryResultLimits, StatementResult, TableLimits,
 };
+#[cfg(unix)]
+use super::engine::{DatabaseRleSnapshotSaveError, DatabaseSnapshotSaveError};
 use super::error::Error;
 use super::sql::{self, Statement};
 use super::tsv::{TsvIngestError, TsvIngestLimits};
+#[cfg(unix)]
+use crate::snapshot::NullableI64RlePayloadCodec;
 use crate::snapshot::{Int64TablePayloadCodec, Int64TablePayloadFileRecoverySource, SnapshotCodec};
 
 /// An instantaneous measurement of data retained by a [`SharedDatabase`].
@@ -259,6 +261,64 @@ impl From<DatabaseSnapshotSaveError> for SharedDatabaseSnapshotSaveError {
     }
 }
 
+/// A failure while nonblockingly saving a [`SharedDatabase`] table as a
+/// row-only RLE snapshot.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum SharedDatabaseRleSnapshotSaveError {
+    /// A writer prevented immediate acquisition of the database read lock.
+    DatabaseBusy,
+    /// A thread panicked while it held the database write lock.
+    LockPoisoned,
+    /// Table validation, RLE encoding, or atomic replacement failed.
+    Snapshot(DatabaseRleSnapshotSaveError),
+}
+
+#[cfg(unix)]
+impl SharedDatabaseRleSnapshotSaveError {
+    /// Returns whether the destination was replaced before this error occurred.
+    ///
+    /// Lock-acquisition failures never access the destination. Snapshot errors
+    /// preserve the more precise replacement status reported by
+    /// [`DatabaseRleSnapshotSaveError::destination_was_replaced`].
+    pub const fn destination_was_replaced(&self) -> bool {
+        match self {
+            Self::Snapshot(error) => error.destination_was_replaced(),
+            Self::DatabaseBusy | Self::LockPoisoned => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for SharedDatabaseRleSnapshotSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseBusy => write!(formatter, "shared database is busy"),
+            Self::LockPoisoned => write!(formatter, "shared database lock is poisoned"),
+            Self::Snapshot(error) => {
+                write!(formatter, "shared database RLE snapshot failed: {error}")
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl StdError for SharedDatabaseRleSnapshotSaveError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::DatabaseBusy | Self::LockPoisoned => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<DatabaseRleSnapshotSaveError> for SharedDatabaseRleSnapshotSaveError {
+    fn from(error: DatabaseRleSnapshotSaveError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 /// A clonable, synchronized handle to an in-memory typed [`Database`].
 ///
 /// Each SQL batch is completely parsed before the database lock is acquired.
@@ -281,7 +341,11 @@ impl From<DatabaseSnapshotSaveError> for SharedDatabaseSnapshotSaveError {
     unix,
     doc = "On Unix, [`Self::try_save_int64_table_to_file`] attempts one read lock and"
 )]
-#[cfg_attr(unix, doc = "saves a supported table without copying its column.")]
+#[cfg_attr(
+    unix,
+    doc = "[`Self::try_save_int64_table_rle_to_file`] provides the compressed row-only equivalent;"
+)]
+#[cfg_attr(unix, doc = "both save without copying the selected column.")]
 /// [`Self::try_execute_insert_batch`] similarly attempts
 /// one nonblocking write lock for an atomic `INSERT`-only batch, and
 /// [`Self::try_ingest_csv`], [`Self::try_ingest_csv_with_names`],
@@ -575,6 +639,40 @@ impl SharedDatabase {
         };
         database
             .save_int64_table_to_file(table_name, path, snapshot_codec, payload_codec)
+            .map_err(Into::into)
+    }
+
+    /// Attempts to atomically save one nullable or non-nullable, one-column
+    /// `Int64` table as a bounded, row-only RLE snapshot on Unix.
+    ///
+    /// Exactly one nonblocking read-lock attempt occurs. A concurrent writer
+    /// returns [`SharedDatabaseRleSnapshotSaveError::DatabaseBusy`] without
+    /// validating the table or accessing the destination, while an existing
+    /// reader is compatible. The acquired guard is retained through typed
+    /// table validation, RLE encoding, and atomic replacement, so the saved
+    /// rows form one consistent database version. This delegates directly to
+    /// [`Database::save_int64_table_rle_to_file`] without cloning the selected
+    /// column. Reopening this row-only format requires caller-supplied schema
+    /// and row-cap metadata.
+    #[cfg(unix)]
+    pub fn try_save_int64_table_rle_to_file(
+        &self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: NullableI64RlePayloadCodec,
+    ) -> Result<(), SharedDatabaseRleSnapshotSaveError> {
+        let database = match self.inner.try_read() {
+            Ok(database) => database,
+            Err(TryLockError::WouldBlock) => {
+                return Err(SharedDatabaseRleSnapshotSaveError::DatabaseBusy);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(SharedDatabaseRleSnapshotSaveError::LockPoisoned);
+            }
+        };
+        database
+            .save_int64_table_rle_to_file(table_name, path, snapshot_codec, payload_codec)
             .map_err(Into::into)
     }
 
