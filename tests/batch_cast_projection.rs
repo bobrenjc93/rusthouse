@@ -922,7 +922,7 @@ fn nullable_int64_to_float64_propagates_typed_nulls_through_selection_and_orderi
         [vec![Value::Null(DataType::Float64)]]
     );
 
-    for target in ["Int64", "Bool", "String"] {
+    for target in ["Int64", "String"] {
         assert_eq!(
             database.execute(&format!(
                 "SELECT CAST(measurement AS {target}) FROM readings"
@@ -998,6 +998,176 @@ fn nullable_int64_to_float64_cast_obeys_result_caps() {
         .expect("setup");
     assert!(matches!(
         byte_limited.execute("SELECT CAST(reading AS Float64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            max: 0,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn nullable_int64_to_bool_propagates_typed_nulls_and_maps_boundary_values() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (reading Nullable(Int64)); \
+             INSERT INTO samples VALUES \
+             (NULL), (-9223372036854775808), (-1), (0), (1), \
+             (9223372036854775807), (NULL);",
+        )
+        .expect("setup");
+
+    let all = query(&mut database, "SELECT CAST(reading AS Bool) FROM samples");
+    assert_eq!(
+        all.columns,
+        [ResultColumn {
+            name: "CAST(reading AS Bool)".to_owned(),
+            data_type: DataType::Bool,
+        }]
+    );
+    assert_eq!(
+        all.rows,
+        [
+            vec![Value::Null(DataType::Bool)],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(false)],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(true)],
+            vec![Value::Null(DataType::Bool)],
+        ]
+    );
+
+    let selected = query(
+        &mut database,
+        "SELECT CAST(reading AS Bool) AS truthy FROM samples \
+         WHERE reading IS NULL OR reading >= 0 \
+         ORDER BY truthy LIMIT 3 OFFSET 1",
+    );
+    assert_eq!(
+        selected.columns,
+        [ResultColumn {
+            name: "truthy".to_owned(),
+            data_type: DataType::Bool,
+        }]
+    );
+    assert_eq!(
+        selected.rows,
+        [
+            vec![Value::Null(DataType::Bool)],
+            vec![Value::Bool(false)],
+            vec![Value::Bool(true)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(reading AS Bool) FROM samples \
+             ORDER BY CAST(reading AS Bool) DESC",
+        )
+        .rows,
+        [
+            vec![Value::Bool(true)],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(true)],
+            vec![Value::Bool(false)],
+            vec![Value::Null(DataType::Bool)],
+            vec![Value::Null(DataType::Bool)],
+        ]
+    );
+}
+
+#[test]
+fn nullable_int64_to_bool_returns_typed_nulls_for_an_all_null_input() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE missing (reading Nullable(Int64)); \
+             INSERT INTO missing VALUES (NULL), (NULL), (NULL);",
+        )
+        .expect("setup");
+
+    let result = query(
+        &mut database,
+        "SELECT CAST(reading AS Bool) AS truthy FROM missing \
+         ORDER BY truthy LIMIT 2 OFFSET 1",
+    );
+    assert_eq!(
+        result.columns,
+        [ResultColumn {
+            name: "truthy".to_owned(),
+            data_type: DataType::Bool,
+        }]
+    );
+    assert_eq!(
+        result.rows,
+        [
+            vec![Value::Null(DataType::Bool)],
+            vec![Value::Null(DataType::Bool)],
+        ]
+    );
+}
+
+#[test]
+fn nullable_int64_to_bool_cast_obeys_result_caps() {
+    let setup = "CREATE TABLE samples (reading Nullable(Int64)); \
+                 INSERT INTO samples VALUES (NULL), (0), (1);";
+    let mut row_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 2,
+        max_values: 2,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    row_limited.execute(setup).expect("setup");
+    assert_eq!(
+        query(
+            &mut row_limited,
+            "SELECT CAST(reading AS Bool) FROM samples LIMIT 2",
+        )
+        .rows,
+        [vec![Value::Null(DataType::Bool)], vec![Value::Bool(false)],]
+    );
+    assert_eq!(
+        row_limited.execute("SELECT CAST(reading AS Bool) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+
+    let mut value_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 3,
+        max_values: 5,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    value_limited.execute(setup).expect("setup");
+    assert_eq!(
+        value_limited.execute("SELECT CAST(reading AS Bool), CAST(reading AS Bool) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result values",
+            actual: 6,
+            max: 5,
+        })
+    );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    byte_limited
+        .execute(
+            "CREATE TABLE samples (reading Nullable(Int64)); INSERT INTO samples VALUES (NULL);",
+        )
+        .expect("setup");
+    assert!(matches!(
+        byte_limited.execute("SELECT CAST(reading AS Bool) FROM samples"),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT result bytes",
             max: 0,
