@@ -296,7 +296,7 @@ fn sql_created_nullable_int64_table_opts_into_and_recovers_from_wal() {
 }
 
 #[test]
-fn active_wal_rejects_nullable_add_column_without_mutating_the_table() {
+fn active_wal_allows_add_column_no_ops_but_rejects_real_additions() {
     let directory = TestDirectory::new();
     let path = directory.join("reject-nullable-add.wal");
     let mut database = Database::new();
@@ -306,35 +306,45 @@ fn active_wal_rejects_nullable_add_column_without_mutating_the_table() {
     database
         .enable_int64_write_ahead_log("readings", &path, Int64WriteAheadLogLimits::default())
         .unwrap();
+    let wal_before = fs::read(&path).unwrap();
 
-    assert_eq!(
-        database
-            .execute("ALTER TABLE READINGS ADD COLUMN IF NOT EXISTS measurement Nullable(Int64)"),
-        Ok(vec![StatementResult::Command {
-            tag: "ALTER TABLE",
-            affected_rows: 0,
-        }])
-    );
-    assert_eq!(
-        database.execute(
-            "ALTER TABLE READINGS ADD COLUMN IF NOT EXISTS missing Nullable(Int64)"
-        ),
-        Err(Error::InvalidQuery(
-            "ALTER TABLE ADD COLUMN is not supported while table 'READINGS' has an active Int64 WAL"
-                .to_owned()
-        ))
-    );
+    for sql in [
+        "ALTER TABLE READINGS ADD COLUMN IF NOT EXISTS measurement Nullable(Int64)",
+        "ALTER TABLE READINGS ADD COLUMN IF NOT EXISTS MEASUREMENT String",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Ok(vec![StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 0,
+            }])
+        );
+        assert_eq!(fs::read(&path).unwrap(), wal_before, "{sql}");
+    }
+    for sql in [
+        "ALTER TABLE READINGS ADD COLUMN IF NOT EXISTS missing Float64",
+        "ALTER TABLE READINGS ADD COLUMN IF NOT EXISTS nullable_missing Nullable(Int64)",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::InvalidQuery(
+                "ALTER TABLE ADD COLUMN is not supported while table 'READINGS' has an active Int64 WAL"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(fs::read(&path).unwrap(), wal_before, "{sql}");
+    }
     let table = database.catalog().table("readings").unwrap();
     assert_eq!(table.schema().len(), 1);
     assert_eq!(int64_values(&database, "readings"), [7]);
 
     assert!(database.disable_int64_write_ahead_log());
     database
-        .execute("ALTER TABLE Readings ADD COLUMN missing Nullable(Int64)")
+        .execute("ALTER TABLE Readings ADD COLUMN IF NOT EXISTS missing Float64")
         .expect("the schema change succeeds after detaching the WAL");
     assert!(matches!(
         &database.catalog().table("readings").unwrap().columns()[1],
-        Column::NullableInt64(values) if values == &[None]
+        Column::Float64(values) if values == &[0.0]
     ));
 }
 

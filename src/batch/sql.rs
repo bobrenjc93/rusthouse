@@ -107,6 +107,12 @@ pub enum Statement {
         table: String,
         column: ColumnDef,
     },
+    /// Conditional non-nullable addition; an existing case-insensitive
+    /// column name is a no-op regardless of its physical type.
+    AddColumnIfNotExists {
+        table: String,
+        column: ColumnDef,
+    },
     /// Exact `ALTER TABLE ... ADD COLUMN ... Nullable(Int64)` addition.
     AddNullableInt64Column {
         table: String,
@@ -1828,20 +1834,15 @@ impl<'a> Parser<'a> {
                     "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(Int64)"
                 ),
             })?;
-            if if_not_exists {
-                return Err(Error::Sql {
-                    position,
-                    message: "ADD COLUMN IF NOT EXISTS is supported only for Nullable(Int64)"
-                        .to_owned(),
-                });
-            }
             if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("unexpected trailing input after ALTER TABLE ADD COLUMN");
             }
-            return Ok(Statement::AddColumn {
-                table,
-                column: ColumnDef { name, data_type },
-            });
+            let column = ColumnDef { name, data_type };
+            return if if_not_exists {
+                Ok(Statement::AddColumnIfNotExists { table, column })
+            } else {
+                Ok(Statement::AddColumn { table, column })
+            };
         }
 
         if self.eat_keyword("RENAME") {
