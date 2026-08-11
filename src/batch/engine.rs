@@ -455,9 +455,9 @@ pub enum DatabaseSnapshotRestoreError {
     /// A snapshot API that retains the non-nullable boundary rejected a
     /// nullable `Int64` column.
     ///
-    /// The primary [`Database::restore_int64_table_from_file`] path accepts
-    /// nullable columns; backup, replacement, and set restore keep returning
-    /// this variant for them.
+    /// The primary [`Database::restore_int64_table_from_file`] and snapshot-set
+    /// restore paths accept nullable columns; backup and replacement keep
+    /// returning this variant for them.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
     /// limits were rejected by batch storage.
@@ -2072,8 +2072,8 @@ impl Database {
         Ok(source)
     }
 
-    /// Atomically reopens a caller-bounded set of named, self-describing,
-    /// non-nullable `Int64` snapshots.
+    /// Atomically reopens a caller-bounded set of named, self-describing
+    /// `Int64` or `Nullable(Int64)` snapshots.
     ///
     /// `max_entries` is an inclusive bound on the number of source files. The
     /// count is checked before name validation or file access. All destination
@@ -2085,9 +2085,9 @@ impl Database {
     /// Files are decoded and converted into fully validated batch tables in
     /// input order, but remain staged outside the catalog until every entry
     /// succeeds. Excess counts, invalid or colliding names, file corruption,
-    /// nullable columns, and configured [`TableLimits`] therefore leave all
-    /// catalog data and cached metrics unchanged. Every error identifies the
-    /// zero-based input entry and its caller-supplied table name.
+    /// invalid decoded schemas, and configured [`TableLimits`] therefore leave
+    /// all catalog data and cached metrics unchanged. Every error identifies
+    /// the zero-based input entry and its caller-supplied table name.
     pub fn restore_int64_tables_from_files(
         &mut self,
         entries: &[DatabaseSnapshotRestoreEntry<'_>],
@@ -2137,11 +2137,11 @@ impl Database {
                 error: error.into(),
             })?;
             let table = self
-                .prepare_restored_int64_table(entry.table_name, restored)
+                .prepare_decoded_int64_table(entry.table_name, restored)
                 .map_err(|error| DatabaseSnapshotSetRestoreError::Entry {
                     entry_index,
                     table_name: entry.table_name.to_owned(),
-                    error,
+                    error: error.into(),
                 })?;
             staged_measurements.add(TableMeasurements::read(&table));
             staged.push(table);

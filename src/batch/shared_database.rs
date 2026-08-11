@@ -511,8 +511,8 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
-    /// Attempts to atomically restore a caller-bounded set of self-describing,
-    /// non-nullable `Int64` snapshots.
+    /// Attempts to atomically restore a caller-bounded set of self-describing
+    /// `Int64` or `Nullable(Int64)` snapshots.
     ///
     /// Exactly one nonblocking write-lock attempt occurs before any source path
     /// is accessed. An active reader or writer returns

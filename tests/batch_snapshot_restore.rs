@@ -8,7 +8,7 @@ use rusthouse::batch::engine::{QueryResult, StatementResult};
 use rusthouse::batch::error::Error;
 #[cfg(unix)]
 use rusthouse::batch::storage::Column;
-use rusthouse::batch::value::Value;
+use rusthouse::batch::value::{DataType, Value};
 use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
     Database, DatabaseMetrics, DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError,
@@ -461,10 +461,11 @@ fn row_cap_column_and_cell_limit_failures_are_atomic() {
 }
 
 #[test]
-fn bounded_snapshot_set_reopens_two_tables_at_the_exact_count_limit() {
+fn bounded_snapshot_set_reopens_mixed_tables_in_input_order_at_exact_limits() {
     let directory = TestDirectory::new();
     let temperatures_path = directory.join("temperatures.snapshot");
-    let pressures_path = directory.join("pressures.snapshot");
+    let readings_path = directory.join("readings.snapshot");
+    let missing_path = directory.join("missing.snapshot");
     let (temperatures_snapshot_codec, temperatures_payload_codec) = write_snapshot(
         &temperatures_path,
         "temperature",
@@ -472,8 +473,15 @@ fn bounded_snapshot_set_reopens_two_tables_at_the_exact_count_limit() {
         2,
         &[Some(-4), Some(12)],
     );
-    let (pressures_snapshot_codec, pressures_payload_codec) =
-        write_snapshot(&pressures_path, "pressure", false, 1, &[Some(1013)]);
+    let (readings_snapshot_codec, readings_payload_codec) = write_snapshot(
+        &readings_path,
+        "reading",
+        true,
+        3,
+        &[Some(9), None, Some(-2)],
+    );
+    let (missing_snapshot_codec, missing_payload_codec) =
+        write_snapshot(&missing_path, "missing", true, 2, &[None, None]);
     let entries = [
         DatabaseSnapshotRestoreEntry::new(
             "Temperatures",
@@ -482,13 +490,19 @@ fn bounded_snapshot_set_reopens_two_tables_at_the_exact_count_limit() {
             temperatures_payload_codec,
         ),
         DatabaseSnapshotRestoreEntry::new(
-            "Pressures",
-            &pressures_path,
-            pressures_snapshot_codec,
-            pressures_payload_codec,
+            "Readings",
+            &readings_path,
+            readings_snapshot_codec,
+            readings_payload_codec,
+        ),
+        DatabaseSnapshotRestoreEntry::new(
+            "Missing",
+            &missing_path,
+            missing_snapshot_codec,
+            missing_payload_codec,
         ),
     ];
-    let mut database = Database::with_table_limits(TableLimits::new(2, 1, 2));
+    let mut database = Database::with_table_limits(TableLimits::new(3, 1, 3));
 
     database
         .restore_int64_tables_from_files(&entries, entries.len())
@@ -496,28 +510,50 @@ fn bounded_snapshot_set_reopens_two_tables_at_the_exact_count_limit() {
 
     let results = database
         .execute(
-            "SELECT temperature FROM temperatures ORDER BY temperature; \
-             SELECT pressure FROM PRESSURES;",
+            "SELECT temperature FROM temperatures; \
+             SELECT reading FROM READINGS; \
+             SELECT missing FROM missing;",
         )
         .unwrap();
     let [
         StatementResult::Query(temperatures),
-        StatementResult::Query(pressures),
+        StatementResult::Query(readings),
+        StatementResult::Query(missing),
     ] = results.as_slice()
     else {
-        panic!("both restored tables must be queryable")
+        panic!("all restored tables must be queryable in caller order")
     };
     assert_eq!(temperatures.rows, [[Value::Int64(-4)], [Value::Int64(12)]]);
-    assert_eq!(pressures.rows, [[Value::Int64(1013)]]);
+    assert_eq!(
+        readings.rows,
+        [
+            [Value::Int64(9)],
+            [Value::Null(DataType::Int64)],
+            [Value::Int64(-2)],
+        ]
+    );
+    assert_eq!(
+        missing.rows,
+        [
+            [Value::Null(DataType::Int64)],
+            [Value::Null(DataType::Int64)],
+        ]
+    );
+    assert_eq!(
+        database.catalog().table("temperatures").unwrap().row_cap(),
+        2
+    );
+    assert_eq!(database.catalog().table("readings").unwrap().row_cap(), 3);
+    assert_eq!(database.catalog().table("missing").unwrap().row_cap(), 2);
 
     let shared = SharedDatabase::new(database);
     assert_eq!(
         shared.metrics_snapshot(),
         Some(DatabaseMetrics {
-            table_count: 2,
-            column_count: 2,
-            retained_row_count: 3,
-            retained_value_bytes: 24,
+            table_count: 3,
+            column_count: 3,
+            retained_row_count: 7,
+            retained_value_bytes: 61,
         })
     );
 }
@@ -561,7 +597,7 @@ fn later_corrupt_snapshot_rolls_back_staged_tables_and_cached_metrics() {
     let valid_path = directory.join("valid.snapshot");
     let corrupt_path = directory.join("corrupt.snapshot");
     let (snapshot_codec, payload_codec) =
-        write_snapshot(&valid_path, "value", false, 2, &[Some(8)]);
+        write_snapshot(&valid_path, "value", true, 2, &[None, None]);
     let mut corrupt = fs::read(&valid_path).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     fs::write(&corrupt_path, corrupt).unwrap();
@@ -635,52 +671,21 @@ fn snapshot_set_rejects_case_insensitive_collisions_before_file_access() {
 }
 
 #[test]
-fn later_nullability_and_table_limit_failures_roll_back_the_snapshot_set() {
+fn later_table_limit_failure_rolls_back_a_staged_nullable_snapshot() {
     let directory = TestDirectory::new();
-    let valid_path = directory.join("valid.snapshot");
     let nullable_path = directory.join("nullable.snapshot");
     let limited_path = directory.join("limited.snapshot");
-    let (valid_snapshot_codec, valid_payload_codec) =
-        write_snapshot(&valid_path, "value", false, 2, &[Some(1)]);
     let (nullable_snapshot_codec, nullable_payload_codec) =
-        write_snapshot(&nullable_path, "value", true, 2, &[None]);
+        write_snapshot(&nullable_path, "value", true, 2, &[None, None]);
     let (limited_snapshot_codec, limited_payload_codec) =
         write_snapshot(&limited_path, "value", false, 3, &[Some(2)]);
 
-    let nullable_entries = [
-        DatabaseSnapshotRestoreEntry::new(
-            "valid",
-            &valid_path,
-            valid_snapshot_codec,
-            valid_payload_codec,
-        ),
+    let limited_entries = [
         DatabaseSnapshotRestoreEntry::new(
             "nullable",
             &nullable_path,
             nullable_snapshot_codec,
             nullable_payload_codec,
-        ),
-    ];
-    let mut nullable_database = Database::with_table_limits(TableLimits::new(2, 1, 2));
-    let nullable_error = nullable_database
-        .restore_int64_tables_from_files(&nullable_entries, 2)
-        .unwrap_err();
-    assert!(matches!(
-        nullable_error,
-        DatabaseSnapshotSetRestoreError::Entry {
-            entry_index: 1,
-            ref table_name,
-            error: DatabaseSnapshotRestoreError::NullableColumn { ref column },
-        } if table_name == "nullable" && column == "value"
-    ));
-    assert_empty(&nullable_database);
-
-    let limited_entries = [
-        DatabaseSnapshotRestoreEntry::new(
-            "valid",
-            &valid_path,
-            valid_snapshot_codec,
-            valid_payload_codec,
         ),
         DatabaseSnapshotRestoreEntry::new(
             "limited",
