@@ -6329,7 +6329,7 @@ fn execute_grouped<'a>(
         )
         && aggregate_specs
             .first()
-            .is_some_and(|spec| aggregate_argument_is_non_nullable_int64(table, spec));
+            .is_some_and(|spec| aggregate_argument_is_physical_int64(table, spec));
     let sole_global_min_float = group_columns.is_empty()
         && matches!(
             aggregate_specs,
@@ -7093,16 +7093,20 @@ fn min_global_int64(
 ) -> AggregateState {
     debug_assert_eq!(spec.function, AggregateFunction::Min);
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
-    let Column::Int64(values) = &table.columns()[spec.argument.expect("MIN argument")] else {
-        unreachable!("MIN input type is resolved")
+    let minimum = match &table.columns()[spec.argument.expect("MIN argument")] {
+        Column::Int64(values) => {
+            reduce_global_int64_extremum(values, matching_rows, parallelism, "min", i64::min)
+        }
+        Column::NullableInt64(values) => reduce_global_nullable_int64_extremum(
+            values,
+            matching_rows,
+            parallelism,
+            "min",
+            i64::min,
+        ),
+        _ => unreachable!("MIN input type is resolved"),
     };
-    min_int64_state(reduce_global_int64_extremum(
-        values,
-        matching_rows,
-        parallelism,
-        "min",
-        i64::min,
-    ))
+    min_int64_state(minimum)
 }
 
 fn reduce_global_int64_extremum<C>(
@@ -7121,24 +7125,49 @@ where
         parallelism,
         worker_label,
         "int64",
+        |value| Some(*value),
         compare,
     )
 }
 
-fn reduce_global_scalar_extremum<T, C>(
+fn reduce_global_nullable_int64_extremum<C>(
+    values: &[Option<i64>],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    worker_label: &'static str,
+    compare: C,
+) -> Option<i64>
+where
+    C: Fn(i64, i64) -> i64 + Sync,
+{
+    reduce_global_scalar_extremum(
+        values,
+        matching_rows,
+        parallelism,
+        worker_label,
+        "nullable-int64",
+        |value| *value,
+        compare,
+    )
+}
+
+fn reduce_global_scalar_extremum<T, E, M, C>(
     values: &[T],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
     worker_label: &'static str,
     worker_type_label: &'static str,
+    map: M,
     compare: C,
-) -> Option<T>
+) -> Option<E>
 where
-    T: Copy + Send + Sync,
-    C: Fn(T, T) -> T + Sync,
+    T: Sync,
+    E: Copy + Send,
+    M: Fn(&T) -> Option<E> + Sync,
+    C: Fn(E, E) -> E + Sync,
 {
     let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return scalar_extremum_chunk(values, matching_rows, &compare);
+        return scalar_extremum_chunk(values, matching_rows, &map, &compare);
     };
 
     // Each lane receives the same deterministic contiguous partition used by
@@ -7149,6 +7178,7 @@ where
     let helper_threads = admission.helper_threads();
     debug_assert!(helper_threads > 0);
     let worker_count = helper_threads.saturating_add(1);
+    let map = &map;
     let compare = &compare;
     let parallel_result = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(helper_threads);
@@ -7159,7 +7189,9 @@ where
                 .name(format!(
                     "rusthouse-{worker_label}-{worker_type_label}-{chunk_index}"
                 ))
-                .spawn_scoped(scope, move || scalar_extremum_chunk(values, rows, compare));
+                .spawn_scoped(scope, move || {
+                    scalar_extremum_chunk(values, rows, map, compare)
+                });
             match spawn {
                 Ok(handle) => handles.push(handle),
                 Err(_) => {
@@ -7172,6 +7204,7 @@ where
         let mut extremum = scalar_extremum_chunk(
             values,
             parallel_aggregate_partition(matching_rows, worker_count, 0),
+            map,
             compare,
         );
         for handle in handles {
@@ -7185,15 +7218,23 @@ where
         (!worker_failed).then_some(extremum)
     });
     drop(admission);
-    parallel_result.unwrap_or_else(|| scalar_extremum_chunk(values, matching_rows, compare))
+    parallel_result.unwrap_or_else(|| scalar_extremum_chunk(values, matching_rows, map, compare))
 }
 
-fn scalar_extremum_chunk<T, C>(values: &[T], matching_rows: &[usize], compare: &C) -> Option<T>
+fn scalar_extremum_chunk<T, E, M, C>(
+    values: &[T],
+    matching_rows: &[usize],
+    map: &M,
+    compare: &C,
+) -> Option<E>
 where
-    T: Copy,
-    C: Fn(T, T) -> T,
+    M: Fn(&T) -> Option<E>,
+    C: Fn(E, E) -> E,
 {
-    matching_rows.iter().map(|row| values[*row]).reduce(compare)
+    matching_rows
+        .iter()
+        .filter_map(|row| map(&values[*row]))
+        .reduce(compare)
 }
 
 fn reduce_scalar_extremum_partials<T, C>(
@@ -7254,6 +7295,7 @@ where
         parallelism,
         worker_label,
         "float64",
+        |value| Some(*value),
         compare,
     )
 }
@@ -12010,46 +12052,204 @@ mod tests {
     }
 
     #[test]
-    fn nullable_int64_extrema_stay_sequential_above_the_parallel_threshold() {
-        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(8);
+    fn sole_nullable_int64_min_crosses_the_parallel_threshold_and_excludes_other_shapes() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
 
-        let cap = NonZeroUsize::new(2).unwrap();
+        let cap = NonZeroUsize::new(4).unwrap();
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut values = vec![None; row_count];
-        values[0] = Some(i64::MAX);
-        values[row_count - 1] = Some(i64::MIN);
+        let mut values = vec![Some(3); row_count];
+        values[0] = Some(i64::MIN);
+        values[row_count - 1] = None;
         let mut database = Database::with_global_aggregate_worker_cap(cap);
         database
             .create_nullable_int64_table("readings", "v", values)
             .unwrap();
+
+        let boundary_sql = "SELECT MIN(v) FROM readings WHERE v IS NOT NULL";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, boundary_sql).rows,
+            [vec![Value::Int64(i64::MIN)]]
+        );
+        let above_threshold_sql = "SELECT MIN(v) FROM readings";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, above_threshold_sql).rows,
+            [vec![Value::Int64(i64::MIN)]]
+        );
+
         database.global_aggregate_parallelism = GlobalAggregateParallelism::budgeted(cap, &BUDGET);
 
-        for (sql, expected) in [
-            ("SELECT MIN(v) FROM readings", vec![Value::Int64(i64::MIN)]),
-            (
-                "SELECT COUNT(*), MIN(v) FROM readings",
-                vec![
-                    Value::Int64(i64::try_from(row_count).unwrap()),
-                    Value::Int64(i64::MIN),
-                ],
-            ),
-            ("SELECT MAX(v) FROM readings", vec![Value::Int64(i64::MAX)]),
-            (
-                "SELECT COUNT(*), MAX(v) FROM readings",
-                vec![
-                    Value::Int64(i64::try_from(row_count).unwrap()),
-                    Value::Int64(i64::MAX),
-                ],
-            ),
-        ] {
-            BUDGET.reset_peak();
-            assert_eq!(query(&mut database, sql).rows, [expected]);
-            assert_eq!(
-                BUDGET.peak_helpers_in_use(),
-                0,
-                "nullable extrema must not request parallel aggregate helpers"
-            );
-        }
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, boundary_sql).rows,
+            [vec![Value::Int64(i64::MIN)]]
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "matching rows at the threshold stay sequential"
+        );
+
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, above_threshold_sql).rows,
+            [vec![Value::Int64(i64::MIN)]]
+        );
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "a sole nullable MIN above the threshold uses shared helpers"
+        );
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, "SELECT COUNT(*), MIN(v) FROM readings").rows,
+            [vec![
+                Value::Int64(i64::try_from(row_count).unwrap()),
+                Value::Int64(i64::MIN),
+            ]]
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "paired nullable MIN remains sequential"
+        );
+
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT v, MIN(v) FROM readings GROUP BY v ORDER BY v"
+            )
+            .rows,
+            [
+                vec![Value::Null(DataType::Int64), Value::Null(DataType::Int64)],
+                vec![Value::Int64(i64::MIN), Value::Int64(i64::MIN)],
+                vec![Value::Int64(3), Value::Int64(3)],
+            ]
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "grouped nullable MIN remains sequential"
+        );
+
+        BUDGET.reset_peak();
+        assert_eq!(
+            query(&mut database, "SELECT MAX(v) FROM readings").rows,
+            [vec![Value::Int64(3)]]
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "sole nullable MAX remains sequential"
+        );
+    }
+
+    #[test]
+    fn sole_nullable_int64_min_forced_workers_match_null_distributions_and_clauses() {
+        let mut empty = Database::new();
+        empty
+            .create_nullable_int64_table("empty_values", "value", Vec::new())
+            .unwrap();
+        let empty_result = assert_global_aggregate_worker_differential(
+            &mut empty,
+            "SELECT MIN(value) FROM empty_values",
+        );
+        assert_eq!(empty_result.rows, [vec![Value::Null(DataType::Int64)]]);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 3;
+        let mut all_null = Database::new();
+        all_null
+            .create_nullable_int64_table("all_null", "value", vec![None; row_count])
+            .unwrap();
+        let null_result = assert_global_aggregate_worker_differential(
+            &mut all_null,
+            "SELECT MIN(value) AS minimum FROM all_null HAVING minimum IS NULL \
+             ORDER BY minimum LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(null_result.rows, [vec![Value::Null(DataType::Int64)]]);
+
+        let mut values = vec![None; row_count];
+        values[0] = Some(i64::MAX);
+        values[row_count / 3] = Some(4);
+        values[row_count - 1] = Some(i64::MIN);
+        let mut sparse = Database::new();
+        sparse
+            .create_nullable_int64_table("sparse", "value", values)
+            .unwrap();
+        let mixed_result = assert_global_aggregate_worker_differential(
+            &mut sparse,
+            "SELECT MIN(value) AS minimum FROM sparse \
+             WHERE value IS NULL OR value IS NOT NULL \
+             HAVING minimum = -9223372036854775808 \
+             ORDER BY minimum DESC LIMIT 1 OFFSET 0",
+        );
+        assert_eq!(mixed_result.rows, [vec![Value::Int64(i64::MIN)]]);
+    }
+
+    #[test]
+    fn sole_nullable_int64_min_exhausted_admission_falls_back_completely() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let values = (0..row_count)
+            .map(|row| (row % 5 != 0).then_some(-9))
+            .collect::<Vec<_>>();
+        let mut database = Database::new();
+        database
+            .create_nullable_int64_table("nullable_values", "value", values)
+            .unwrap();
+        let sql = "SELECT MIN(value) AS minimum FROM nullable_values \
+                   HAVING minimum = -9 ORDER BY minimum LIMIT 1";
+        let sequential = force_global_aggregate_workers(&mut database, 1, sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(database.global_aggregate_worker_cap(), &BUDGET);
+
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts aggregate helper admission");
+        let exhausted = query(&mut database, sql);
+        assert_eq!(
+            exhausted, sequential,
+            "exhausted admission repeats the complete nullable MIN locally"
+        );
+        assert_eq!(exhausted.rows, [vec![Value::Int64(-9)]]);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+    }
+
+    #[test]
+    fn sole_nullable_int64_min_worker_failure_repeats_the_complete_input_locally() {
+        let values = [Some(9), None, Some(i64::MIN)];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_global_nullable_int64_extremum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            "min",
+            i64::min,
+        );
+        let minimum = reduce_global_nullable_int64_extremum(
+            &values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            "min",
+            |left, right| {
+                if std::thread::current().name() == Some("rusthouse-min-nullable-int64-1") {
+                    panic!("injected nullable MIN worker failure");
+                }
+                left.min(right)
+            },
+        );
+
+        assert_eq!(successful_parallel, Some(i64::MIN));
+        assert_eq!(minimum, successful_parallel);
     }
 
     #[test]
