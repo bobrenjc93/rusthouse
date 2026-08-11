@@ -1070,9 +1070,9 @@ impl SharedDatabase {
     /// Parsing and read-only validation finish before the single nonblocking
     /// read-lock attempt. Nonzero supplied limits can tighten, but cannot
     /// relax, the database's configured result-byte, result-row, result-value,
-    /// scan-row, group-count, ordering-state, aggregate-state cell,
-    /// aggregate-state byte, and supported global-aggregate worker limits or
-    /// the default retained-result byte limit. Zero retains the corresponding
+    /// scan-row, group-count, group-key cell, ordering-state, aggregate-state
+    /// cell, aggregate-state byte, and supported global-aggregate worker limits
+    /// or the default retained-result byte limit. Zero retains the corresponding
     /// defaults.
     pub(crate) fn try_query_with_parameterized_workload_limits(
         &self,

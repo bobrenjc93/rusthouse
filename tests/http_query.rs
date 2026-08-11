@@ -3034,6 +3034,187 @@ fn parameterized_max_rows_to_group_by_rejects_invalid_values_for_get_and_post() 
 }
 
 #[test]
+fn parameterized_max_group_key_cells_enforces_group_by_distinct_and_union_boundaries() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             CREATE TABLE left_rows (value Int64); \
+             CREATE TABLE right_rows (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (1), (3); \
+             INSERT INTO left_rows VALUES (1), (2); \
+             INSERT INTO right_rows VALUES (2), (3);",
+        )
+        .unwrap();
+    let cases = [
+        (
+            "SELECT+value%2C+COUNT%28%2A%29+AS+n+FROM+samples+GROUP+BY+value+ORDER+BY+value%3B",
+            r#"{"columns":[{"name":"value","type":"Int64"},{"name":"n","type":"Int64"}],"rows":[[1,2],[2,1],[3,1]]}"#,
+        ),
+        (
+            "SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value%3B",
+            r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[1],[2],[3]]}"#,
+        ),
+        (
+            "SELECT+value+FROM+left_rows+UNION+DISTINCT+SELECT+value+FROM+right_rows%3B",
+            r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[1],[2],[3]]}"#,
+        ),
+    ];
+
+    for method in ["GET", "POST"] {
+        for (query, expected_body) in cases {
+            let exact = format!(
+                "{method} /?max%5Fgroup%5Fkey%5Fcells=%33&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, exact.as_bytes()),
+                "HTTP/1.1 200 OK",
+                expected_body,
+            );
+
+            let one_cell_short = format!(
+                "{method} /?query={query}&max_group_key_cells=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, one_cell_short.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                r#"{"error":"SELECT group key cells requires at least 3, exceeding the limit of 2"}"#,
+            );
+        }
+    }
+}
+
+#[test]
+fn parameterized_max_group_key_cells_zero_and_larger_values_never_relax_defaults() {
+    let configured_limits = QueryResultLimits {
+        max_group_key_cells: 2,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+
+    for (method, requested_max) in [
+        ("GET", "0".to_owned()),
+        ("POST", "3".to_owned()),
+        ("GET", usize::MAX.to_string()),
+    ] {
+        let request = format!(
+            "{method} /?query=SELECT+DISTINCT+value+FROM+samples%3B&max_group_key_cells={requested_max} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, request.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"SELECT group key cells requires at least 3, exceeding the limit of 2"}"#,
+        );
+    }
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_group_key_cells_rejects_invalid_values_for_get_and_post() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_group_key_cells= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_group_key_cells=1&query=SELECT+1%3B&max%5Fgroup%5Fkey%5Fcells=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_group_key_cells parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_group_key_cells=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_group_key_cells parameter must be a decimal integer"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_group_key_cells={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_group_key_cells parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_parameterized_max_group_key_cell_requests_are_isolated() {
+    use std::sync::Barrier;
+
+    let configured_limits = QueryResultLimits {
+        max_group_key_cells: 3,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+    let query = "SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value%3B";
+    let success_request =
+        format!("GET /?query={query}&max_group_key_cells=3 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let failure_request =
+        format!("GET /?max_group_key_cells=2&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let expected_success = exchange(&database, success_request.as_bytes());
+    let expected_failure = exchange(&database, failure_request.as_bytes());
+
+    let request_count = 12;
+    let started = Arc::new(Barrier::new(request_count));
+    let handles = (0..request_count)
+        .map(|request_index| {
+            let database = database.clone();
+            let started = Arc::clone(&started);
+            thread::spawn(move || {
+                let requested_max = match request_index % 4 {
+                    0 => "3".to_owned(),
+                    1 => "2".to_owned(),
+                    2 => "0".to_owned(),
+                    _ => usize::MAX.to_string(),
+                };
+                let request = format!(
+                    "GET /?max_group_key_cells={requested_max}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                );
+                started.wait();
+                (request_index % 4, exchange(&database, request.as_bytes()))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let (case, response) = handle.join().unwrap();
+        if case == 1 {
+            assert_eq!(response, expected_failure);
+        } else {
+            assert_eq!(response, expected_success);
+        }
+    }
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
 fn max_rows_to_group_by_validation_follows_authentication_and_precedes_lock_admission() {
     let poisoned_inner = Arc::new(RwLock::new(Database::new()));
     let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
