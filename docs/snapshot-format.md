@@ -90,8 +90,8 @@ NULL positions, row order, and persisted row cap. It validates the database's
 row, column, and cell limits before changing the catalog or cached metrics. The
 payload is strictly a single-table format: it contains one column and no
 database name, batch table name, additional tables, or catalog metadata. The
-backup, replacement, and set-restore APIs retain their existing non-nullable
-boundary.
+explicit-backup restore accepts the same two physical column shapes;
+replacement and set-restore retain their existing non-nullable boundary.
 
 `Database::replace_int64_table_from_file` instead requires that the
 case-insensitively resolved target already exist. It checks that requirement

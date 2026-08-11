@@ -1570,8 +1570,8 @@ NULL positions, row order, and the persisted row cap, enforces the database's
 configured `TableLimits`, and registers the table plus its cached metrics only
 after all decoding and storage validation succeeds. Duplicate names resolve
 case-insensitively just like SQL table names and leave the existing catalog
-unchanged. The backup, replacement, and set-restore APIs retain their existing
-non-nullable boundary.
+unchanged. The explicit-backup restore accepts the same two physical column
+shapes; replacement and set-restore retain their existing non-nullable boundary.
 `Database::replace_int64_table_from_file` applies the same bounded decoding and
 table validation to one existing caller-named table. Lookup is
 case-insensitive, but the catalog's stored table-name spelling is preserved;
@@ -1607,8 +1607,11 @@ prior catalog data and gauges.
 it tries the primary self-describing snapshot first, falls back to the supplied
 backup only when bounded snapshot decoding fails, and reports which file
 succeeded. If neither file is valid, its typed recovery error retains both
-failures. Database table validation remains atomic and applies unchanged to the
-recovered snapshot.
+failures. It accepts the same `Int64` and `Nullable(Int64)` columns as the
+single-file reopen, preserving the decoded column name, nullability, exact NULL
+positions, row order, and persisted row cap. Database table validation remains
+atomic, applies unchanged to the recovered snapshot, and does not trigger
+fallback.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary
