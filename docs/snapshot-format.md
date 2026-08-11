@@ -91,7 +91,8 @@ row, column, and cell limits before changing the catalog or cached metrics. The
 payload is strictly a single-table format: it contains one column and no
 database name, batch table name, additional tables, or catalog metadata. The
 explicit-backup restore accepts the same two physical column shapes;
-replacement and set-restore retain their existing non-nullable boundary.
+set restore accepts both shapes in one atomic set, while replacement retains
+its existing non-nullable boundary.
 
 `Database::replace_int64_table_from_file` instead requires that the
 case-insensitively resolved target already exist. It checks that requirement
@@ -127,10 +128,12 @@ envelope and payload codec bounds; the separate inclusive `max_entries`
 argument is checked before name validation or file access. The complete name
 set is validated case-insensitively against itself and the current catalog
 before file access. Every decoded table then remains staged outside the catalog
-until all entries pass corruption, nullability, row-cap, column, and cell validation.
-Only the complete set is registered and charged to cached metrics. An excessive
-count or entry failure reports the zero-based entry index and caller name, and
-leaves the existing catalog and metrics unchanged.
+until all entries pass corruption, schema, row-cap, column, and cell validation.
+A set may mix `Int64` and `Nullable(Int64)` snapshots, including all-NULL
+tables; nullability, NULL positions, input row order, and persisted row caps are
+preserved. Only the complete set is registered and charged exactly to cached
+metrics. An excessive count or entry failure reports the zero-based entry index
+and caller name, and leaves the existing catalog and metrics unchanged.
 
 `SharedDatabase::try_restore_int64_table_from_file` is available on every
 supported platform. It makes one nonblocking write-lock attempt before opening
@@ -147,7 +150,8 @@ write-lock attempt before any source file access and, while holding that guard,
 delegates the caller's entry slice and inclusive `max_entries` bound to
 `Database::restore_int64_tables_from_files`. Contention, lock poisoning, and
 indexed set-restore failures are distinct. Count and name validation still
-precede file access, and every failure preserves both catalog data and cached
+precede file access, mixed nullable and non-nullable tables retain the database
+restore guarantees, and every failure preserves both catalog data and cached
 metrics.
 
 `Database::save_int64_table_to_file` adapts one named batch-engine table to the

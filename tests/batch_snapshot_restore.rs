@@ -626,7 +626,7 @@ fn row_cap_column_and_cell_limit_failures_are_atomic() {
 }
 
 #[test]
-fn bounded_snapshot_set_reopens_two_tables_at_the_exact_count_limit() {
+fn bounded_snapshot_set_reopens_mixed_tables_in_order_with_exact_metrics() {
     let directory = TestDirectory::new();
     let temperatures_path = directory.join("temperatures.snapshot");
     let pressures_path = directory.join("pressures.snapshot");
@@ -638,7 +638,7 @@ fn bounded_snapshot_set_reopens_two_tables_at_the_exact_count_limit() {
         &[Some(-4), Some(12)],
     );
     let (pressures_snapshot_codec, pressures_payload_codec) =
-        write_snapshot(&pressures_path, "pressure", false, 1, &[Some(1013)]);
+        write_snapshot(&pressures_path, "pressure", true, 2, &[None, Some(1013)]);
     let entries = [
         DatabaseSnapshotRestoreEntry::new(
             "Temperatures",
@@ -673,7 +673,10 @@ fn bounded_snapshot_set_reopens_two_tables_at_the_exact_count_limit() {
         panic!("both restored tables must be queryable")
     };
     assert_eq!(temperatures.rows, [[Value::Int64(-4)], [Value::Int64(12)]]);
-    assert_eq!(pressures.rows, [[Value::Int64(1013)]]);
+    assert_eq!(
+        pressures.rows,
+        [[Value::Null(BatchDataType::Int64)], [Value::Int64(1013)],]
+    );
 
     let shared = SharedDatabase::new(database);
     assert_eq!(
@@ -681,8 +684,54 @@ fn bounded_snapshot_set_reopens_two_tables_at_the_exact_count_limit() {
         Some(DatabaseMetrics {
             table_count: 2,
             column_count: 2,
+            retained_row_count: 4,
+            retained_value_bytes: 34,
+        })
+    );
+}
+
+#[test]
+fn snapshot_set_restores_all_null_table_at_exact_resource_limits() {
+    let directory = TestDirectory::new();
+    let path = directory.join("all-null.snapshot");
+    let rows = [None, None, None];
+    let (snapshot_codec, payload_codec) =
+        write_snapshot(&path, "measurement", true, rows.len(), &rows);
+    let entries = [DatabaseSnapshotRestoreEntry::new(
+        "Readings",
+        &path,
+        snapshot_codec,
+        payload_codec,
+    )];
+    let mut database = Database::with_table_limits(TableLimits::new(3, 1, 3));
+
+    database
+        .restore_int64_tables_from_files(&entries, entries.len())
+        .unwrap();
+
+    let table = database.catalog().table("readings").unwrap();
+    assert_eq!(table.row_cap(), 3);
+    let [Column::NullableInt64(restored)] = table.columns() else {
+        panic!("snapshot set must preserve physical Nullable(Int64) storage");
+    };
+    assert_eq!(restored, &rows);
+    assert!(matches!(
+        database.execute("INSERT INTO readings VALUES (1);"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table rows",
+            actual: 4,
+            max: 3,
+        })
+    ));
+
+    let shared = SharedDatabase::new(database);
+    assert_eq!(
+        shared.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 1,
+            column_count: 1,
             retained_row_count: 3,
-            retained_value_bytes: 24,
+            retained_value_bytes: 27,
         })
     );
 }
@@ -800,52 +849,20 @@ fn snapshot_set_rejects_case_insensitive_collisions_before_file_access() {
 }
 
 #[test]
-fn later_nullability_and_table_limit_failures_roll_back_the_snapshot_set() {
+fn later_table_limit_failure_rolls_back_a_staged_nullable_table_and_metrics() {
     let directory = TestDirectory::new();
-    let valid_path = directory.join("valid.snapshot");
     let nullable_path = directory.join("nullable.snapshot");
     let limited_path = directory.join("limited.snapshot");
-    let (valid_snapshot_codec, valid_payload_codec) =
-        write_snapshot(&valid_path, "value", false, 2, &[Some(1)]);
     let (nullable_snapshot_codec, nullable_payload_codec) =
-        write_snapshot(&nullable_path, "value", true, 2, &[None]);
+        write_snapshot(&nullable_path, "value", true, 2, &[None, Some(1)]);
     let (limited_snapshot_codec, limited_payload_codec) =
         write_snapshot(&limited_path, "value", false, 3, &[Some(2)]);
-
-    let nullable_entries = [
-        DatabaseSnapshotRestoreEntry::new(
-            "valid",
-            &valid_path,
-            valid_snapshot_codec,
-            valid_payload_codec,
-        ),
+    let limited_entries = [
         DatabaseSnapshotRestoreEntry::new(
             "nullable",
             &nullable_path,
             nullable_snapshot_codec,
             nullable_payload_codec,
-        ),
-    ];
-    let mut nullable_database = Database::with_table_limits(TableLimits::new(2, 1, 2));
-    let nullable_error = nullable_database
-        .restore_int64_tables_from_files(&nullable_entries, 2)
-        .unwrap_err();
-    assert!(matches!(
-        nullable_error,
-        DatabaseSnapshotSetRestoreError::Entry {
-            entry_index: 1,
-            ref table_name,
-            error: DatabaseSnapshotRestoreError::NullableColumn { ref column },
-        } if table_name == "nullable" && column == "value"
-    ));
-    assert_empty(&nullable_database);
-
-    let limited_entries = [
-        DatabaseSnapshotRestoreEntry::new(
-            "valid",
-            &valid_path,
-            valid_snapshot_codec,
-            valid_payload_codec,
         ),
         DatabaseSnapshotRestoreEntry::new(
             "limited",
@@ -855,6 +872,10 @@ fn later_nullability_and_table_limit_failures_roll_back_the_snapshot_set() {
         ),
     ];
     let mut limited_database = Database::with_table_limits(TableLimits::new(2, 1, 2));
+    limited_database
+        .execute("CREATE TABLE existing (id Int64); INSERT INTO existing VALUES (7);")
+        .unwrap();
+    let metrics_before = cached_metrics(&mut limited_database);
     let limited_error = limited_database
         .restore_int64_tables_from_files(&limited_entries, 2)
         .unwrap_err();
@@ -870,5 +891,9 @@ fn later_nullability_and_table_limit_failures_roll_back_the_snapshot_set() {
             }),
         } if table_name == "limited"
     ));
-    assert_empty(&limited_database);
+    assert_eq!(limited_database.catalog().table_count(), 1);
+    assert!(limited_database.catalog().table_exists("existing"));
+    assert!(!limited_database.catalog().table_exists("nullable"));
+    assert!(!limited_database.catalog().table_exists("limited"));
+    assert_eq!(cached_metrics(&mut limited_database), metrics_before);
 }
