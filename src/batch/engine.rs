@@ -472,7 +472,11 @@ pub enum DatabaseRleSnapshotRestoreError {
     /// Opening or decoding the bounded RLE snapshot failed, or its rows did
     /// not satisfy the caller-supplied schema and row cap.
     Snapshot(Int64TableRleFileRestoreError),
-    /// This `Database` adapter accepts only a non-nullable `Int64` column.
+    /// Legacy nullable-column rejection retained for source compatibility.
+    ///
+    /// Nullable `Int64` schemas are now supported, so
+    /// [`Database::restore_int64_table_rle_from_file`] no longer returns this
+    /// variant.
     NullableColumn { column: String },
     /// The caller name, schema, duplicate name, or configured table limits
     /// were rejected by batch storage.
@@ -1032,17 +1036,6 @@ impl From<Error> for DatabaseRleSnapshotRestoreError {
 }
 
 impl From<RestoredInt64TableValidationError> for DatabaseSnapshotRestoreError {
-    fn from(error: RestoredInt64TableValidationError) -> Self {
-        match error {
-            RestoredInt64TableValidationError::NullableColumn { column } => {
-                Self::NullableColumn { column }
-            }
-            RestoredInt64TableValidationError::Table(error) => Self::Table(error),
-        }
-    }
-}
-
-impl From<RestoredInt64TableValidationError> for DatabaseRleSnapshotRestoreError {
     fn from(error: RestoredInt64TableValidationError) -> Self {
         match error {
             RestoredInt64TableValidationError::NullableColumn { column } => {
@@ -1977,10 +1970,11 @@ impl Database {
     /// Existing names are resolved case-insensitively and rejected before the
     /// source path is opened. The complete file is restored through
     /// [`crate::restore_int64_table_rle_from_file`] and converted into a fully
-    /// validated non-nullable batch table before registration. Corruption,
-    /// nullability, invalid identifiers, caller row-cap failures, and the
-    /// database's configured [`TableLimits`] leave catalog data and cached
-    /// metrics unchanged.
+    /// validated `Int64` or `Nullable(Int64)` batch table before registration.
+    /// The caller's nullability choice and exact NULL positions are preserved.
+    /// Corruption, schema mismatch, invalid identifiers, caller row-cap
+    /// failures, and the database's configured [`TableLimits`] leave catalog
+    /// data and cached metrics unchanged.
     pub fn restore_int64_table_rle_from_file(
         &mut self,
         table_name: &str,
@@ -2001,7 +1995,7 @@ impl Database {
             snapshot_codec,
             payload_codec,
         )?;
-        let table = self.prepare_restored_int64_table_inner(table_name, restored)?;
+        let table = self.prepare_decoded_int64_table(table_name, restored)?;
         let measurements = TableMeasurements::read(&table);
         self.catalog.register_table(table)?;
         self.measurements.add(measurements);

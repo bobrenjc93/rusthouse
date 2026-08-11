@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::batch::engine::{QueryResult, StatementResult};
 use rusthouse::batch::error::Error;
-use rusthouse::batch::value::Value;
+use rusthouse::batch::storage::Column;
+use rusthouse::batch::value::{DataType, Value};
 use rusthouse::snapshot::{NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN, SNAPSHOT_HEADER_LEN};
 use rusthouse::{
     Database, DatabaseRleSnapshotRestoreError, InsertError, Int64Table,
@@ -59,6 +60,20 @@ fn cached_metrics(database: &mut Database) -> QueryResult {
         panic!("system.metrics must return one query result")
     };
     result.clone()
+}
+
+#[test]
+fn legacy_nullable_column_error_variant_remains_source_compatible() {
+    let error = DatabaseRleSnapshotRestoreError::NullableColumn {
+        column: "reading".to_owned(),
+    };
+
+    assert!(matches!(
+        error,
+        DatabaseRleSnapshotRestoreError::NullableColumn { ref column }
+            if column == "reading"
+    ));
+    assert!(std::error::Error::source(&error).is_none());
 }
 
 #[test]
@@ -144,7 +159,186 @@ fn existing_rle_saver_imports_to_select_at_every_exact_limit() {
 }
 
 #[test]
-fn corruption_and_nullability_failures_preserve_catalog_and_cached_metrics() {
+fn nullable_rle_imports_preserve_empty_and_all_null_storage_and_row_caps() {
+    let directory = TestDirectory::new();
+    let empty_path = directory.join("empty.snapshot");
+    let empty_payload_len = NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN;
+    let empty_payload_codec = NullableI64RlePayloadCodec::new(0, 0, empty_payload_len);
+    let empty_snapshot_codec = SnapshotCodec::new(empty_payload_len);
+    save_int64_table_rle_to_file(
+        &empty_path,
+        &table(Schema::int64("reading", true), 2, &[]),
+        empty_snapshot_codec,
+        empty_payload_codec,
+    )
+    .unwrap();
+
+    let all_null_path = directory.join("all-null.snapshot");
+    let all_null_rows = [None, None, None];
+    let all_null_payload_len = NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN + 9;
+    let all_null_payload_codec =
+        NullableI64RlePayloadCodec::new(all_null_rows.len(), 1, all_null_payload_len);
+    let all_null_snapshot_codec = SnapshotCodec::new(all_null_payload_len);
+    save_int64_table_rle_to_file(
+        &all_null_path,
+        &table(
+            Schema::int64("reading", true),
+            all_null_rows.len() + 1,
+            &all_null_rows,
+        ),
+        all_null_snapshot_codec,
+        all_null_payload_codec,
+    )
+    .unwrap();
+
+    let mut database = Database::with_table_limits(TableLimits::new(4, 1, 4));
+    database
+        .restore_int64_table_rle_from_file(
+            "empty_readings",
+            empty_path,
+            Schema::int64("reading", true),
+            2,
+            empty_snapshot_codec,
+            empty_payload_codec,
+        )
+        .unwrap();
+    database
+        .restore_int64_table_rle_from_file(
+            "all_null_readings",
+            all_null_path,
+            Schema::int64("reading", true),
+            all_null_rows.len() + 1,
+            all_null_snapshot_codec,
+            all_null_payload_codec,
+        )
+        .unwrap();
+
+    let empty = database.catalog().table("empty_readings").unwrap();
+    assert_eq!(empty.row_cap(), 2);
+    assert!(matches!(
+        empty.columns(),
+        [Column::NullableInt64(values)] if values.is_empty()
+    ));
+    let all_null = database.catalog().table("all_null_readings").unwrap();
+    assert_eq!(all_null.row_cap(), all_null_rows.len() + 1);
+    assert!(matches!(
+        all_null.columns(),
+        [Column::NullableInt64(values)] if values == &all_null_rows
+    ));
+    assert_eq!(
+        cached_metrics(&mut database).rows,
+        [
+            vec![
+                Value::String("rusthouse_tables".to_owned()),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("rusthouse_columns".to_owned()),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("rusthouse_retained_rows".to_owned()),
+                Value::Int64(3),
+            ],
+            vec![
+                Value::String("rusthouse_retained_value_bytes".to_owned()),
+                Value::Int64(27),
+            ],
+            vec![
+                Value::String("rusthouse_index_scanned_blocks".to_owned()),
+                Value::Int64(0),
+            ],
+            vec![
+                Value::String("rusthouse_index_pruned_blocks".to_owned()),
+                Value::Int64(0),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn nullable_mixed_runs_import_at_every_exact_limit_with_null_positions() {
+    let directory = TestDirectory::new();
+    let path = directory.join("mixed.snapshot");
+    let rows = [None, None, Some(7), Some(7), None, Some(-2)];
+    let payload_len = NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN + 9 + 17 + 9 + 17;
+    let payload_codec = NullableI64RlePayloadCodec::new(rows.len(), 4, payload_len);
+    let snapshot_codec = SnapshotCodec::new(payload_len);
+    save_int64_table_rle_to_file(
+        &path,
+        &table(Schema::int64("reading", true), rows.len(), &rows),
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap();
+    let mut database = Database::with_table_limits(TableLimits::new(rows.len(), 1, rows.len()));
+
+    database
+        .restore_int64_table_rle_from_file(
+            "mixed_readings",
+            &path,
+            Schema::int64("reading", true),
+            rows.len(),
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+
+    assert_eq!(
+        fs::metadata(path).unwrap().len() as usize,
+        SNAPSHOT_HEADER_LEN + payload_len
+    );
+    let restored = database.catalog().table("MIXED_READINGS").unwrap();
+    assert_eq!(
+        restored.limits(),
+        TableLimits::new(rows.len(), 1, rows.len())
+    );
+    assert!(matches!(
+        restored.columns(),
+        [Column::NullableInt64(values)] if values == &rows
+    ));
+    let results = database
+        .execute("SELECT reading FROM mixed_readings")
+        .unwrap();
+    let [StatementResult::Query(result)] = results.as_slice() else {
+        panic!("SELECT must return one query result")
+    };
+    assert_eq!(
+        result.rows,
+        [
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Int64(7)],
+            vec![Value::Int64(7)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Int64(-2)],
+        ]
+    );
+    assert_eq!(
+        cached_metrics(&mut database).rows[2..4],
+        [
+            vec![
+                Value::String("rusthouse_retained_rows".to_owned()),
+                Value::Int64(6),
+            ],
+            vec![
+                Value::String("rusthouse_retained_value_bytes".to_owned()),
+                Value::Int64(54),
+            ],
+        ]
+    );
+    assert!(matches!(
+        database.execute("INSERT INTO mixed_readings VALUES (9)"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table rows",
+            actual: 7,
+            max: 6,
+        })
+    ));
+}
+
+#[test]
+fn corruption_and_non_nullable_schema_mismatch_preserve_catalog_and_cached_metrics() {
     let directory = TestDirectory::new();
     let valid_path = directory.join("valid.snapshot");
     let corrupt_path = directory.join("corrupt.snapshot");
@@ -204,18 +398,6 @@ fn corruption_and_nullability_failures_preserve_catalog_and_cached_metrics() {
         Err(DatabaseRleSnapshotRestoreError::Snapshot(
             Int64TableRleFileRestoreError::Table(InsertError::NullNotAllowed { ref column })
         )) if column == "value"
-    ));
-    assert!(matches!(
-        database.restore_int64_table_rle_from_file(
-            "nullable_schema",
-            valid_path,
-            Schema::int64("value", true),
-            1,
-            snapshot_codec,
-            payload_codec,
-        ),
-        Err(DatabaseRleSnapshotRestoreError::NullableColumn { ref column })
-            if column == "value"
     ));
     assert_eq!(database.catalog().table_count(), 1);
     assert!(database.catalog().table_exists("existing"));

@@ -1583,10 +1583,12 @@ legacy high-level restore helper intentionally continues to accept only the
 uncompressed row format.
 `Database::restore_int64_table_rle_from_file` imports that same bounded RLE
 format as one caller-named typed batch table. Case-insensitive duplicate names
-are rejected before the source is opened; decoding, non-nullability, SQL
-identifier, and configured table-limit checks all finish before the catalog or
-cached metrics change. A successful import is immediately queryable by
-`SELECT` and retains the caller-supplied row cap for later inserts.
+are rejected before the source is opened. The caller may supply an `Int64` or
+`Nullable(Int64)` schema; nullable imports preserve exact NULL positions in
+physical nullable storage. Decoding, schema compatibility, SQL identifier, and
+configured table-limit checks all finish before the catalog or cached metrics
+change. A successful import is immediately queryable by `SELECT` and retains
+the caller-supplied row cap for later inserts.
 The legacy save and restore helpers use row-only payloads, so
 their column schema and table row-cap metadata remain caller-supplied and are
 not authenticated by the snapshot. The destination batch table name is also
