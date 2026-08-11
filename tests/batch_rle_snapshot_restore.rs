@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::batch::engine::{QueryResult, StatementResult};
 use rusthouse::batch::error::Error;
+use rusthouse::batch::storage::Column;
 use rusthouse::batch::value::Value;
 use rusthouse::snapshot::{NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN, SNAPSHOT_HEADER_LEN};
 use rusthouse::{
@@ -59,6 +60,113 @@ fn cached_metrics(database: &mut Database) -> QueryResult {
         panic!("system.metrics must return one query result")
     };
     result.clone()
+}
+
+fn rle_shape(rows: &[Option<i64>]) -> (usize, usize) {
+    let run_count =
+        usize::from(!rows.is_empty()) + rows.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    let value_run_count = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, value)| value.is_some() && (*index == 0 || rows[*index - 1] != **value))
+        .count();
+    let payload_len = NULLABLE_I64_RLE_PAYLOAD_HEADER_LEN + run_count * 9 + value_run_count * 8;
+    (run_count, payload_len)
+}
+
+#[test]
+fn nullable_rle_imports_empty_all_null_mixed_runs_and_exact_limits() {
+    let directory = TestDirectory::new();
+    let cases = [
+        ("empty", 3, vec![]),
+        ("all-null", 3, vec![None, None, None]),
+        (
+            "mixed-run",
+            7,
+            vec![None, None, Some(4), Some(4), None, Some(-3)],
+        ),
+        (
+            "exact-limit",
+            4,
+            vec![None, Some(i64::MIN), Some(i64::MAX), None],
+        ),
+    ];
+
+    for (case, row_cap, rows) in cases {
+        let path = directory.join(&format!("{case}.snapshot"));
+        let (run_count, payload_len) = rle_shape(&rows);
+        let payload_codec = NullableI64RlePayloadCodec::new(rows.len(), run_count, payload_len);
+        let snapshot_codec = SnapshotCodec::new(payload_len);
+        save_int64_table_rle_to_file(
+            &path,
+            &table(Schema::int64("measurement", true), row_cap, &rows),
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+        let limits = TableLimits::new(row_cap, 1, row_cap);
+        let mut database = Database::with_table_limits(limits);
+
+        database
+            .restore_int64_table_rle_from_file(
+                "Archive",
+                path,
+                Schema::int64("measurement", true),
+                row_cap,
+                snapshot_codec,
+                payload_codec,
+            )
+            .unwrap();
+
+        let restored = database.catalog().table("archive").unwrap();
+        assert_eq!(restored.row_cap(), row_cap, "case {case}");
+        assert_eq!(restored.limits(), limits, "case {case}");
+        let [Column::NullableInt64(restored_rows)] = restored.columns() else {
+            panic!("case {case} must use physical Nullable(Int64) storage");
+        };
+        assert_eq!(restored_rows, &rows, "case {case}");
+        assert_eq!(
+            cached_metrics(&mut database).rows,
+            [
+                vec![
+                    Value::String("rusthouse_tables".to_owned()),
+                    Value::Int64(1),
+                ],
+                vec![
+                    Value::String("rusthouse_columns".to_owned()),
+                    Value::Int64(1),
+                ],
+                vec![
+                    Value::String("rusthouse_retained_rows".to_owned()),
+                    Value::Int64(rows.len() as i64),
+                ],
+                vec![
+                    Value::String("rusthouse_retained_value_bytes".to_owned()),
+                    Value::Int64((rows.len() * 9) as i64),
+                ],
+                vec![
+                    Value::String("rusthouse_index_scanned_blocks".to_owned()),
+                    Value::Int64(0),
+                ],
+                vec![
+                    Value::String("rusthouse_index_pruned_blocks".to_owned()),
+                    Value::Int64(0),
+                ],
+            ],
+            "case {case}"
+        );
+
+        if case == "exact-limit" {
+            assert!(matches!(
+                database.execute("INSERT INTO archive VALUES (1)"),
+                Err(Error::ResourceLimitExceeded {
+                    resource: "table rows",
+                    actual: 5,
+                    max: 4,
+                })
+            ));
+        }
+    }
 }
 
 #[test]
@@ -144,7 +252,7 @@ fn existing_rle_saver_imports_to_select_at_every_exact_limit() {
 }
 
 #[test]
-fn corruption_and_nullability_failures_preserve_catalog_and_cached_metrics() {
+fn corruption_and_mismatched_nonnullable_schema_preserve_catalog_and_cached_metrics() {
     let directory = TestDirectory::new();
     let valid_path = directory.join("valid.snapshot");
     let corrupt_path = directory.join("corrupt.snapshot");
@@ -204,18 +312,6 @@ fn corruption_and_nullability_failures_preserve_catalog_and_cached_metrics() {
         Err(DatabaseRleSnapshotRestoreError::Snapshot(
             Int64TableRleFileRestoreError::Table(InsertError::NullNotAllowed { ref column })
         )) if column == "value"
-    ));
-    assert!(matches!(
-        database.restore_int64_table_rle_from_file(
-            "nullable_schema",
-            valid_path,
-            Schema::int64("value", true),
-            1,
-            snapshot_codec,
-            payload_codec,
-        ),
-        Err(DatabaseRleSnapshotRestoreError::NullableColumn { ref column })
-            if column == "value"
     ));
     assert_eq!(database.catalog().table_count(), 1);
     assert!(database.catalog().table_exists("existing"));
