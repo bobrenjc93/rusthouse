@@ -144,6 +144,7 @@ pub(crate) struct ParameterizedQueryLimits {
     pub(crate) max_scan_rows: usize,
     pub(crate) max_groups: usize,
     pub(crate) max_ordering_state_bytes: usize,
+    pub(crate) max_aggregate_state_cells: usize,
     pub(crate) max_aggregate_state_bytes: usize,
     pub(crate) max_threads: usize,
 }
@@ -2711,6 +2712,7 @@ impl Database {
                 max_scan_rows: 0,
                 max_groups: 0,
                 max_ordering_state_bytes: 0,
+                max_aggregate_state_cells: 0,
                 max_aggregate_state_bytes: 0,
                 max_threads: 0,
             },
@@ -2721,8 +2723,9 @@ impl Database {
     ///
     /// Caller limits may only tighten the database's configured result-byte,
     /// result-row, result-value, scan-row, group-count, ordering-state,
-    /// aggregate-state, and supported global-aggregate worker limits. Zero
-    /// leaves the corresponding configured limit in place.
+    /// aggregate-state-cell, aggregate-state-byte, and supported
+    /// global-aggregate worker limits. Zero leaves the corresponding configured
+    /// limit in place.
     /// Result-shape validation applies the effective row, value, and byte
     /// limits before result rows are materialized; the effective scan and group
     /// limits are charged independently of `LIMIT`.
@@ -2738,6 +2741,7 @@ impl Database {
             max_scan_rows,
             max_groups,
             max_ordering_state_bytes,
+            max_aggregate_state_cells,
             max_aggregate_state_bytes,
             max_threads,
         } = requested_limits;
@@ -2769,6 +2773,13 @@ impl Database {
                 .max_ordering_state_bytes
                 .min(max_ordering_state_bytes)
         };
+        let max_aggregate_state_cells = if max_aggregate_state_cells == 0 {
+            self.query_result_limits.max_aggregate_state_cells
+        } else {
+            self.query_result_limits
+                .max_aggregate_state_cells
+                .min(max_aggregate_state_cells)
+        };
         let max_aggregate_state_bytes = if max_aggregate_state_bytes == 0 {
             self.query_result_limits.max_aggregate_state_bytes
         } else {
@@ -2782,6 +2793,7 @@ impl Database {
             max_values,
             max_groups,
             max_ordering_state_bytes,
+            max_aggregate_state_cells,
             max_aggregate_state_bytes,
             max_bytes: self.query_result_limits.max_bytes.min(max_result_bytes),
             ..self.query_result_limits
@@ -9488,6 +9500,7 @@ mod tests {
                     max_scan_rows: 0,
                     max_groups: 0,
                     max_ordering_state_bytes: 0,
+                    max_aggregate_state_cells: 0,
                     max_aggregate_state_bytes: 0,
                     max_threads,
                 },
@@ -14094,6 +14107,7 @@ mod tests {
                                 max_scan_rows: 0,
                                 max_groups: 0,
                                 max_ordering_state_bytes: 0,
+                                max_aggregate_state_cells: 0,
                                 max_aggregate_state_bytes: 0,
                                 max_threads: 2,
                             },
