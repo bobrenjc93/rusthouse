@@ -365,9 +365,9 @@ The exact case-insensitive `SHOW FUNCTIONS` returns every executable scalar,
 aggregate, compatibility-probe, and window function as one `String` column
 named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
 `ABS`, `AVG`, `CAST`, `CEIL`, `COUNT`, `countIf`, `currentDatabase`, `empty`,
-`FLOOR`, `LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`, `ROUND`, `ROW_NUMBER`,
-`SUM`, `toString`, `UPPER`, and `version`. Arguments and trailing clauses are
-rejected.
+`FLOOR`, `ifNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`, `ROUND`,
+`ROW_NUMBER`, `SUM`, `toString`, `UPPER`, and `version`. Arguments and trailing
+clauses are rejected.
 The result uses the normal query row, value, byte, retained-result, and
 formatted-output limits.
 The exact case-insensitive query `SELECT name FROM system.functions` returns
@@ -578,6 +578,21 @@ and output materialization. Like `CAST`, `toString` is currently restricted to
 ungrouped scalar queries and cannot be combined with aggregate projections or
 `GROUP BY`. All normal result row, value, byte, retained-result, and formatted
 output limits apply.
+`ifNull(nullable_int64_column, signed_int64_literal)` is the exact
+case-insensitive NULL-replacement projection for a physical `Nullable(Int64)`
+column. Present values, including both `Int64` extrema, are returned unchanged;
+each absent value is replaced by the literal, so the result is non-null
+`Int64`. The literal accepts exact base-10 `Int64` syntax with an optional `+`
+or `-`, including both extrema. An optional `AS alias` is preserved; otherwise,
+the result name is normalized to `ifNull(<column>, <literal>)` with canonical
+integer spelling. `WHERE` filters source rows first, then ordering by that
+normalized expression or its alias evaluates replacement values with stable
+ties before `LIMIT`/`OFFSET` pagination and materialization. The projection is
+restricted to ungrouped queries. Non-nullable or non-`Int64` columns, nonliteral
+fallbacks, extra or missing arguments, aggregate combinations, and `GROUP BY`
+are rejected with typed errors. Because it produces fixed-size `Int64` values,
+it adds no variable payload; all normal scan, result row, value, byte,
+retained-result, and formatted-output bounds still apply.
 `LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
@@ -1575,6 +1590,15 @@ replacement failures, and every pre-rename failure preserves the destination.
 `save_int64_table_rle_to_file` is the opt-in compressed counterpart. It uses
 `NullableI64RlePayloadCodec` with the same atomic replacement guarantees and
 keeps RLE encoding and replacement failures typed separately.
+`Database::save_int64_table_rle_to_file` exposes that bounded row-only format
+for a named one-column batch table. It accepts physical `Int64` and
+`Nullable(Int64)`, validates table existence and shape before destination
+access, and preserves exact row order and NULL positions without persisting
+the table name, column name, nullability, or row cap. Its matching
+`SharedDatabase::try_save_int64_table_rle_to_file` makes one nonblocking read
+lock attempt and holds the guard through validation, encoding, and atomic
+replacement. Writer contention, poisoning, validation, RLE bounds, replacement
+stages, and whether the destination was already replaced remain typed.
 `restore_int64_table_rle_from_file` is its bounded reopen path: it accepts the
 row-only format's caller-supplied schema and row cap, rejects non-regular and
 oversized files before decoding, and keeps filesystem, envelope, RLE payload,
