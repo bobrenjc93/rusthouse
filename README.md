@@ -73,9 +73,9 @@ Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `SUM(Nullable(Int64))`,
 `MIN(Float64)`, `MAX(Int64)`, `MAX(Nullable(Int64))`, `MAX(Float64)`, `AVG(Int64)`, or
 `AVG(Nullable(Int64))`, and an exact
 two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
-`SUM(Int64)` or `AVG(Int64)` (including a physical `Nullable(Int64)` argument),
-or a physically non-nullable `MIN(Int64)`, `MIN(Float64)`, `MAX(Int64)`, or
-`MAX(Float64)`, as well as `COUNT(nullable_int64_column)` plus
+`SUM(Int64)`, `MIN(Int64)`, or `AVG(Int64)` (including a physical
+`Nullable(Int64)` argument), or a physically non-nullable `MIN(Float64)`,
+`MAX(Int64)`, or `MAX(Float64)`, as well as `COUNT(nullable_int64_column)` plus
 `AVG(the_same_column)`, use
 deterministic contiguous chunks when more than 262,144 rows match. A grouped
 query also uses those chunks when it has exactly one non-nullable `Bool`
@@ -87,8 +87,8 @@ checked conversion of the filtered cardinality; a same-column nullable
 `COUNT`/`AVG` pair derives its NULL-ignoring count from the AVG partitions'
 checked present-value count. The existing checked sum-and-count lanes target
 about 131,072 rows each. Release-mode crossover
-measurements kept smaller inputs sequential. Paired `SUM(Int64)` and
-`AVG(Int64)`, and sole `SUM`, `AVG`, `MIN`, and `MAX` admit physical
+measurements kept smaller inputs sequential. Paired `SUM(Int64)`, `MIN(Int64)`,
+and `AVG(Int64)`, and sole `SUM`, `AVG`, `MIN`, and `MAX` admit physical
 `Nullable(Int64)` arguments;
 the other paired Int64 shapes require a physically non-nullable argument.
 Nullable SUM/AVG partitions ignore absent values and reduce checked i128 sum
@@ -121,7 +121,7 @@ multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-cou
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
 row-count/`MAX(Float64)` pairs or the same-column nullable `COUNT`/`AVG` pair
 (including all other `COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema, `AVG(Float64)`,
-grouped nullable SUM, MIN, MAX, or AVG, paired nullable MIN or MAX, and
+grouped nullable SUM, MIN, MAX, or AVG, paired nullable MAX, and
 other aggregate functions remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
@@ -149,9 +149,9 @@ parallel chunks above the global threshold. Nullable SUM/AVG chunks and their
 ordered reduction use a checked `i128` sum and checked present-value count;
 nullable MIN/MAX chunks ignore absent values and reduce optional extrema in chunk
 order. At or below the threshold, without worker admission, or after a worker
-failure, the complete computation runs sequentially. Grouped and paired
-nullable shapes remain sequential except for the exact ungrouped
-`COUNT(*)`/`COUNT()` plus nullable `SUM` or `AVG` pair and
+failure, the complete computation runs sequentially. Grouped nullable shapes
+remain sequential. Paired nullable shapes remain sequential except for the
+exact ungrouped `COUNT(*)`/`COUNT()` plus nullable `SUM`, `MIN`, or `AVG` pair and
 `COUNT(nullable_column)` plus `AVG(the_same_column)` pair.
 These nullable shapes compose with filters, grouping, HAVING, ordering,
 pagination, and other supported aggregate projections. Other operations retain
