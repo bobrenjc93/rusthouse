@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use rusthouse::batch::error::Error;
-use rusthouse::batch::value::Value;
+use rusthouse::batch::value::{DataType, Value};
 use rusthouse::snapshot::INT64_TABLE_PAYLOAD_FIXED_LEN;
 use rusthouse::{
     Database, DatabaseMetrics, DatabaseSnapshotRestoreEntry, DatabaseSnapshotRestoreError,
@@ -73,7 +73,17 @@ fn write_snapshot(
     row_cap: usize,
     rows: &[Option<i64>],
 ) -> (SnapshotCodec, Int64TablePayloadCodec) {
-    let mut table = Int64Table::new(Schema::int64(column, false), row_cap);
+    write_snapshot_with_nullability(path, column, false, row_cap, rows)
+}
+
+fn write_snapshot_with_nullability(
+    path: &Path,
+    column: &str,
+    nullable: bool,
+    row_cap: usize,
+    rows: &[Option<i64>],
+) -> (SnapshotCodec, Int64TablePayloadCodec) {
+    let mut table = Int64Table::new(Schema::int64(column, nullable), row_cap);
     table.append_batch(rows).unwrap();
     let (snapshot_codec, payload_codec) = codecs(column, row_cap, rows);
     let payload = payload_codec.encode(&table).unwrap();
@@ -121,6 +131,54 @@ fn restores_one_int64_snapshot_as_a_queryable_table() {
             retained_value_bytes: 24,
         })
     );
+}
+
+#[test]
+fn restores_nullable_snapshot_with_name_null_order_cap_and_cached_metrics() {
+    let directory = TestDirectory::new();
+    let path = directory.join("nullable.snapshot");
+    let rows = [Some(i64::MIN), None, Some(i64::MAX)];
+    let (snapshot_codec, payload_codec) =
+        write_snapshot_with_nullability(&path, "Measurement", true, 4, &rows);
+    let database = SharedDatabase::with_table_limits(TableLimits::new(4, 1, 4));
+
+    database
+        .try_restore_int64_table_from_file("Readings", path, snapshot_codec, payload_codec)
+        .unwrap();
+
+    let query = database.query("SELECT Measurement FROM readings;").unwrap();
+    assert_eq!(query.columns[0].name, "Measurement");
+    assert_eq!(
+        query.rows,
+        vec![
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+    assert_eq!(
+        database.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 1,
+            column_count: 1,
+            retained_row_count: 3,
+            retained_value_bytes: 27,
+        })
+    );
+
+    database
+        .execute("INSERT INTO readings VALUES (0);")
+        .unwrap();
+    assert!(matches!(
+        database.execute("INSERT INTO readings VALUES (1);"),
+        Err(rusthouse::SharedDatabaseError::Sql(
+            Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 5,
+                max: 4,
+            }
+        ))
+    ));
 }
 
 #[test]

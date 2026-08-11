@@ -451,7 +451,12 @@ pub enum DatabaseSnapshotRestoreError {
     Snapshot(Int64TablePayloadFileRestoreError),
     /// Both the primary and explicit backup snapshots failed bounded restore.
     Recovery(Int64TablePayloadFileRecoveryError),
-    /// This `Database` adapter accepts only a non-nullable `Int64` column.
+    /// A snapshot API that retains the non-nullable boundary rejected a
+    /// nullable `Int64` column.
+    ///
+    /// The primary [`Database::restore_int64_table_from_file`] path accepts
+    /// nullable columns; backup, replacement, and set restore keep returning
+    /// this variant for them.
     NullableColumn { column: String },
     /// The caller name, decoded schema, duplicate name, or configured table
     /// limits were rejected by batch storage.
@@ -1925,8 +1930,8 @@ impl Database {
             .set_worker_cap(global_aggregate_worker_cap)
     }
 
-    /// Reopens one self-describing, non-nullable `Int64` snapshot as a named
-    /// batch table.
+    /// Reopens one self-describing `Int64` or `Nullable(Int64)` snapshot as a
+    /// named batch table.
     ///
     /// The snapshot supplies the column name, persisted row cap, and rows;
     /// `table_name` supplies its name in this database. The envelope and
@@ -1935,12 +1940,11 @@ impl Database {
     /// table must fit its column and cell limits. Its persisted row cap is
     /// retained for subsequent inserts.
     ///
-    /// This `Database` adapter imports exactly one table with one non-nullable
-    /// `Int64` column. The payload codec supports nullable schemas and rows,
-    /// but this adapter rejects a decoded nullable column before registration.
-    /// Corruption, invalid identifiers, duplicate table names, nullability, and
-    /// every resource limit are checked before the catalog or cached metrics
-    /// are changed.
+    /// This `Database` adapter imports exactly one table with one `Int64` or
+    /// `Nullable(Int64)` column, preserving the decoded column name,
+    /// nullability, NULL positions, row order, and row cap. Corruption, invalid
+    /// identifiers, duplicate table names, and every resource limit are checked
+    /// before the catalog or cached metrics are changed.
     pub fn restore_int64_table_from_file(
         &mut self,
         table_name: &str,
@@ -1953,7 +1957,7 @@ impl Database {
         }
 
         let restored = restore_int64_table_payload_from_file(path, snapshot_codec, payload_codec)?;
-        self.register_restored_int64_table(table_name, restored)
+        self.register_reopened_int64_table(table_name, restored)
     }
 
     /// Imports one bounded row-only RLE `Int64` snapshot as a named batch
@@ -2206,6 +2210,20 @@ impl Database {
         Ok(())
     }
 
+    fn register_reopened_int64_table(
+        &mut self,
+        table_name: &str,
+        restored: Int64Table,
+    ) -> std::result::Result<(), DatabaseSnapshotRestoreError> {
+        let table = self
+            .prepare_decoded_int64_table(table_name, restored)
+            .map_err(DatabaseSnapshotRestoreError::Table)?;
+        let measurements = TableMeasurements::read(&table);
+        self.catalog.register_table(table)?;
+        self.measurements.add(measurements);
+        Ok(())
+    }
+
     fn replace_restored_int64_table(
         &mut self,
         table_name: &str,
@@ -2241,13 +2259,19 @@ impl Database {
                 column: column.name().to_owned(),
             });
         }
+        self.prepare_decoded_int64_table(table_name, restored)
+            .map_err(RestoredInt64TableValidationError::Table)
+    }
+
+    fn prepare_decoded_int64_table(&self, table_name: &str, restored: Int64Table) -> Result<Table> {
+        let column = restored.schema().column();
+        let nullable = column.is_nullable();
         if restored.row_cap() > self.table_limits.max_rows {
             return Err(Error::ResourceLimitExceeded {
                 resource: "table row cap",
                 actual: restored.row_cap(),
                 max: self.table_limits.max_rows,
-            }
-            .into());
+            });
         }
 
         let column_name = column.name().to_owned();
@@ -2256,13 +2280,21 @@ impl Database {
             max_columns: self.table_limits.max_columns,
             max_cells: self.table_limits.max_cells,
         };
-        let values = restored
-            .into_values()
-            .into_iter()
-            .map(|value| value.expect("the decoded snapshot column is non-nullable"))
-            .collect();
-        Table::with_int64_values(table_name.to_owned(), column_name, values, restored_limits)
-            .map_err(RestoredInt64TableValidationError::Table)
+        let values = restored.into_values();
+        if nullable {
+            Table::with_nullable_int64_values(
+                table_name.to_owned(),
+                column_name,
+                values,
+                restored_limits,
+            )
+        } else {
+            let values = values
+                .into_iter()
+                .map(|value| value.expect("the decoded snapshot column is non-nullable"))
+                .collect();
+            Table::with_int64_values(table_name.to_owned(), column_name, values, restored_limits)
+        }
     }
 
     /// Atomically saves one nullable or non-nullable, one-column `Int64` batch

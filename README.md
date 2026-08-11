@@ -1503,8 +1503,8 @@ nonblocking write-lock attempt before accessing the source file, then delegates
 bounded decoding, validation, and atomic registration to
 `Database::restore_int64_table_from_file` while retaining that guard. Reader or
 writer contention, lock poisoning, and the existing typed snapshot restore
-failures remain distinct. Every failure leaves catalog data and cached metrics
-unchanged.
+failures remain distinct. Both `Int64` and `Nullable(Int64)` snapshots use this
+same path, and every failure leaves catalog data and cached metrics unchanged.
 `SharedDatabase::try_restore_int64_tables_from_files` extends those guarantees
 to the transactional snapshot-set restore. It makes one nonblocking write-lock
 attempt before any source access and holds the guard while delegating the
@@ -1554,12 +1554,14 @@ with the envelope's lower-level `encode`, `create_new_file`, and Unix
 `replace_file` APIs.
 `Database::restore_int64_table_from_file` connects that bounded,
 self-describing reopen path to the typed batch SQL database. The caller chooses
-the batch table name; the snapshot supplies its `Int64` column name, persisted
-row cap, and rows. The API accepts only a non-nullable column, enforces the
-database's configured `TableLimits`, preserves the persisted row cap, and
-registers the table plus its cached metrics only after all decoding and storage
-validation succeeds. Duplicate names resolve case-insensitively just like SQL
-table names and leave the existing catalog unchanged.
+the batch table name; the snapshot supplies its `Int64` or `Nullable(Int64)`
+column name, persisted row cap, and rows. The API preserves nullability, exact
+NULL positions, row order, and the persisted row cap, enforces the database's
+configured `TableLimits`, and registers the table plus its cached metrics only
+after all decoding and storage validation succeeds. Duplicate names resolve
+case-insensitively just like SQL table names and leave the existing catalog
+unchanged. The backup, replacement, and set-restore APIs retain their existing
+non-nullable boundary.
 `Database::replace_int64_table_from_file` applies the same bounded decoding and
 table validation to one existing caller-named table. Lookup is
 case-insensitive, but the catalog's stored table-name spelling is preserved;
