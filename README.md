@@ -68,7 +68,8 @@ unknown (and therefore excluded) in a numeric HAVING comparison. `COUNT` and
 non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
 global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
-Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `SUM(Nullable(Int64))`,
+Global `countIf(Bool)`, a sole ungrouped `COUNT(Nullable(Int64))`,
+`SUM(Int64)`, `SUM(Nullable(Int64))`,
 `MIN(Int64)`, `MIN(Nullable(Int64))`,
 `MIN(Float64)`, `MAX(Int64)`, `MAX(Nullable(Int64))`, `MAX(Float64)`, `AVG(Int64)`, or
 `AVG(Nullable(Int64))`, and an exact
@@ -92,7 +93,9 @@ measurements kept smaller inputs sequential. Paired `SUM(Int64)`, `MIN(Int64)`,
 physical `Nullable(Int64)` arguments.
 Nullable SUM/AVG partitions ignore absent values and reduce checked i128 sum
 and present-count partials in chunk order; nullable MIN/MAX partitions ignore
-absent values and reduce optional extrema in chunk order.
+absent values and reduce optional extrema in chunk order. Sole nullable COUNT
+partitions likewise ignore absent values and reduce checked count partials in
+chunk order.
 Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
@@ -143,8 +146,9 @@ semantics for both `Int64` storage forms.
 arguments. `SUM`, `MIN`, `MAX`, and `AVG` ignore absent values. `SUM`, `MIN`,
 and `MAX` return typed `Int64` `NULL` for empty or all-`NULL` inputs, while
 `AVG` returns typed `Float64` `NULL`; `COUNT(column)` counts only present
-values. Sole ungrouped nullable integer `SUM`, `MIN`, `MAX`, and `AVG` use deterministic
-parallel chunks above the global threshold. Nullable SUM/AVG chunks and their
+values. Sole ungrouped nullable integer `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`
+use deterministic parallel chunks above the global threshold. Nullable COUNT chunks use checked
+present-value counts; nullable SUM/AVG chunks and their
 ordered reduction use a checked `i128` sum and checked present-value count;
 nullable MIN/MAX chunks ignore absent values and reduce optional extrema in chunk
 order. At or below the threshold, without worker admission, or after a worker
