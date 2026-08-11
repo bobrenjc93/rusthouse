@@ -5084,6 +5084,9 @@ enum ResolvedItem {
         source: usize,
         literal: i64,
     },
+    CastNullableInt64ToInt64 {
+        source: usize,
+    },
     CastInt64ToFloat64 {
         source: usize,
     },
@@ -5331,15 +5334,12 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
-                if actual == DataType::Int64
-                    && !matches!(
-                        target_type,
-                        DataType::Float64 | DataType::Bool | DataType::String
-                    )
-                {
-                    reject_nullable_operation(table, source, "CAST")?;
-                }
                 let resolved = match (actual, *target_type) {
+                    (DataType::Int64, DataType::Int64)
+                        if table.column_is_nullable_int64(source) =>
+                    {
+                        Some(ResolvedItem::CastNullableInt64ToInt64 { source })
+                    }
                     (DataType::Int64, DataType::Float64) => {
                         Some(ResolvedItem::CastInt64ToFloat64 { source })
                     }
@@ -5854,6 +5854,9 @@ fn execute_projection(
                                 *literal,
                             )?
                         }
+                        ResolvedItem::CastNullableInt64ToInt64 { source } => {
+                            table.columns()[*source].value(*row)
+                        }
                         ResolvedItem::CastInt64ToFloat64 { source } => {
                             int64_to_float64_at(table, *source, *row).to_owned()
                         }
@@ -6052,6 +6055,7 @@ fn validate_projection_result_limits(
                     input_type: DataType::String,
                 } => Some(*source),
                 ResolvedItem::Int64Subtract { .. }
+                | ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastStringToFloat64 { .. }
@@ -6139,7 +6143,8 @@ fn validate_grouped_result_limits(
                         "Int64 subtraction projections are restricted to ungrouped queries"
                     )
                 }
-                ResolvedItem::CastInt64ToFloat64 { .. }
+                ResolvedItem::CastNullableInt64ToInt64 { .. }
+                | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
@@ -7872,7 +7877,8 @@ impl GroupedData<'_> {
                                 "Int64 subtraction projections are restricted to ungrouped queries"
                             )
                         }
-                        ResolvedItem::CastInt64ToFloat64 { .. }
+                        ResolvedItem::CastNullableInt64ToInt64 { .. }
+                        | ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastBoolToFloat64 { .. }
                         | ResolvedItem::CastStringToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. }
@@ -8265,6 +8271,9 @@ fn resolved_expression_name(
         ResolvedItem::Int64Subtract { source, literal } => {
             sql::int64_subtraction_name(&table.schema()[*source].name, *literal)
         }
+        ResolvedItem::CastNullableInt64ToInt64 { source } => {
+            format!("CAST({} AS Int64)", table.schema()[*source].name)
+        }
         ResolvedItem::CastInt64ToFloat64 { source } => {
             format!("CAST({} AS Float64)", table.schema()[*source].name)
         }
@@ -8417,6 +8426,9 @@ fn order_source_rows(
                 // source values so NULL placement is preserved and overflow
                 // is checked only after ordering and pagination select rows.
                 ResolvedItem::Int64Subtract { source, .. } => {
+                    table.columns()[source].cmp_at(left, right)
+                }
+                ResolvedItem::CastNullableInt64ToInt64 { source } => {
                     table.columns()[source].cmp_at(left, right)
                 }
                 ResolvedItem::CastInt64ToFloat64 { source } => {
@@ -8675,7 +8687,8 @@ fn order_grouped_rows(
                         "Int64 subtraction projections are restricted to ungrouped queries"
                     )
                 }
-                ResolvedItem::CastInt64ToFloat64 { .. }
+                ResolvedItem::CastNullableInt64ToInt64 { .. }
+                | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }

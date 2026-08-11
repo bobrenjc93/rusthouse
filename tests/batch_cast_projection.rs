@@ -921,16 +921,146 @@ fn nullable_int64_to_float64_propagates_typed_nulls_through_selection_and_orderi
         .rows,
         [vec![Value::Null(DataType::Float64)]]
     );
+}
+
+#[test]
+fn nullable_int64_identity_cast_preserves_values_aliases_and_row_selection() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64); \
+             ALTER TABLE readings ADD COLUMN measurement Nullable(Int64); \
+             INSERT INTO readings VALUES \
+             (1, NULL), (2, -9223372036854775808), (3, -1), (4, 0), \
+             (5, 9223372036854775807), (6, NULL); \
+             CREATE TABLE missing (measurement Nullable(Int64)); \
+             INSERT INTO missing VALUES (NULL), (NULL), (NULL);",
+        )
+        .expect("setup");
+
+    let all = query(
+        &mut database,
+        "SELECT CAST(measurement AS Int64) FROM readings \
+         ORDER BY CAST(measurement AS Int64) DESC",
+    );
+    assert_eq!(
+        all.columns,
+        [ResultColumn {
+            name: "CAST(measurement AS Int64)".to_owned(),
+            data_type: DataType::Int64,
+        }]
+    );
+    assert_eq!(
+        all.rows,
+        [
+            vec![Value::Int64(i64::MAX)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(-1)],
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Null(DataType::Int64)],
+        ]
+    );
+
+    let selected = query(
+        &mut database,
+        "SELECT CAST(measurement AS Int64) AS original FROM readings \
+         WHERE measurement IS NULL OR measurement >= 0 \
+         ORDER BY original LIMIT 3 OFFSET 1",
+    );
+    assert_eq!(
+        selected.columns,
+        [ResultColumn {
+            name: "original".to_owned(),
+            data_type: DataType::Int64,
+        }]
+    );
+    assert_eq!(
+        selected.rows,
+        [
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
 
     assert_eq!(
-        database.execute("SELECT CAST(measurement AS Int64) FROM readings"),
-        Err(Error::UnsupportedNullableOperation {
-            table: "readings".to_owned(),
-            column: "measurement".to_owned(),
-            operation: "CAST",
-        }),
-        "nullable CAST AS Int64 must remain unsupported",
+        query(
+            &mut database,
+            "SELECT CAST(measurement AS Int64) AS original FROM missing \
+             ORDER BY original LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Null(DataType::Int64)],
+        ]
     );
+}
+
+#[test]
+fn nullable_int64_identity_cast_obeys_result_caps() {
+    let setup = "CREATE TABLE samples (reading Nullable(Int64)); \
+                 INSERT INTO samples VALUES (NULL), (1), (2);";
+    let mut row_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 2,
+        max_values: 2,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    row_limited.execute(setup).expect("setup");
+    assert_eq!(
+        query(
+            &mut row_limited,
+            "SELECT CAST(reading AS Int64) FROM samples LIMIT 2",
+        )
+        .rows,
+        [vec![Value::Null(DataType::Int64)], vec![Value::Int64(1)]]
+    );
+    assert_eq!(
+        row_limited.execute("SELECT CAST(reading AS Int64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 2,
+        })
+    );
+
+    let mut value_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 3,
+        max_values: 5,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    value_limited.execute(setup).expect("setup");
+    assert_eq!(
+        value_limited.execute("SELECT CAST(reading AS Int64), CAST(reading AS Int64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result values",
+            actual: 6,
+            max: 5,
+        })
+    );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    byte_limited
+        .execute(
+            "CREATE TABLE samples (reading Nullable(Int64)); INSERT INTO samples VALUES (NULL);",
+        )
+        .expect("setup");
+    assert!(matches!(
+        byte_limited.execute("SELECT CAST(reading AS Int64) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            max: 0,
+            ..
+        })
+    ));
 }
 
 #[test]
