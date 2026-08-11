@@ -33,6 +33,7 @@ pub const SUPPORTED_FUNCTION_NAMES: &[&str] = &[
     "currentDatabase",
     "empty",
     "FLOOR",
+    "ifNull",
     "LENGTH",
     "lengthUTF8",
     "LOWER",
@@ -385,6 +386,12 @@ pub enum SelectItem {
     Int64Subtract {
         name: String,
         literal: i64,
+        alias: Option<String>,
+    },
+    /// Replaces a physical `Nullable(Int64)` column's NULLs with one literal.
+    IfNullInt64 {
+        name: String,
+        fallback: i64,
         alias: Option<String>,
     },
     Cast {
@@ -2369,6 +2376,19 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::ToString { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("ifNull") {
+                let name = self.expect_identifier("Nullable(Int64) column in ifNull")?;
+                self.expect(&TokenKind::Comma, "',' after the ifNull column")?;
+                let fallback = self.parse_signed_int64_literal("ifNull fallback")?;
+                self.expect(&TokenKind::RightParen, "')' after ifNull expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::IfNullInt64 {
+                    name,
+                    fallback,
+                    alias,
+                });
+            }
+
             if name.eq_ignore_ascii_case("LENGTH") {
                 let name = self.expect_identifier("String column in LENGTH")?;
                 self.expect(&TokenKind::RightParen, "')' after LENGTH expression")?;
@@ -2541,6 +2561,15 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY toString expression",
             )?;
             Ok(format!("toString({argument})"))
+        } else if name.eq_ignore_ascii_case("ifNull") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("Nullable(Int64) column in ORDER BY ifNull")?;
+            self.expect(&TokenKind::Comma, "',' after the ORDER BY ifNull column")?;
+            let fallback = self.parse_signed_int64_literal("ORDER BY ifNull fallback")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY ifNull expression",
+            )?;
+            Ok(if_null_int64_name(&argument, fallback))
         } else {
             Ok(name)
         }
@@ -3182,6 +3211,10 @@ fn lower_in_predicate(column: String, literals: Vec<Value>) -> Predicate {
 
 pub(crate) fn int64_subtraction_name(column: &str, literal: i64) -> String {
     format!("{column} - {literal}")
+}
+
+pub(crate) fn if_null_int64_name(column: &str, fallback: i64) -> String {
+    format!("ifNull({column}, {fallback})")
 }
 
 #[cfg(test)]
