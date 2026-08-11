@@ -664,6 +664,98 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
     limits: HttpListenerLimits,
     max_in_flight_connections: NonZeroUsize,
 ) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_concurrently(
+        listener,
+        database,
+        limits,
+        max_in_flight_connections,
+        HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
+    )
+}
+
+/// Concurrently serves a finite number of read-write HTTP connections that
+/// require an `X-ClickHouse-Key` credential.
+///
+/// This is the opt-in concurrent counterpart to
+/// [`serve_http_with_clickhouse_key`]. `max_in_flight_connections` is an
+/// explicit, nonzero upper bound on accepted connections whose exchange has
+/// not finished. The total accepted-connection budget remains
+/// `max_connections`; passing zero for that budget still returns immediately.
+/// Every exchange uses the default resource limits and absolute deadlines.
+/// Authenticated SQL, CSV, and TabSeparated inserts retain the atomic,
+/// nonblocking ingestion behavior of the single-exchange handler.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Interrupted accepts are retried. Connection-local
+/// failures are returned in [`HttpListenerReport::connection_failures`].
+pub fn serve_http_concurrently_with_clickhouse_key(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    max_connections: usize,
+    max_in_flight_connections: NonZeroUsize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_concurrently_with_clickhouse_key_and_limits(
+        listener,
+        database,
+        expected_clickhouse_key,
+        HttpListenerLimits::new(max_connections, HttpQueryLimits::default()),
+        max_in_flight_connections,
+    )
+}
+
+/// Concurrently serves finite, bounded, read-write,
+/// `X-ClickHouse-Key`-authenticated HTTP connections with explicit limits.
+///
+/// At most `max_in_flight_connections` accepted connections are handled at
+/// once. Each absolute read and write deadline starts at that connection's
+/// acceptance, including any time before its worker begins running. Capacity is
+/// released only after the exchange finishes and the response direction is
+/// shut down. A cap of one therefore has the same acceptance and exchange
+/// ordering as the sequential authenticated listener.
+///
+/// Every accepted connection consumes one slot from
+/// [`HttpListenerLimits::max_connections`], including authentication,
+/// protocol, query, ingestion, and transport failures. Each connection
+/// receives at most one response. Authenticated inserts use the configured
+/// HTTP, CSV, and TSV limits and remain atomic and nonblocking under database
+/// contention. Transport failures are isolated from other connections and
+/// sorted by acceptance position in the final report even when exchanges
+/// finish in a different order. This function does not provide TLS, sessions,
+/// or daemon lifecycle management.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when accepting
+/// a connection fails. Interrupted accepts are retried. Connections accepted
+/// before an accept failure are allowed to finish and are included in that
+/// report. Connection-local failures are returned in
+/// [`HttpListenerReport::connection_failures`].
+pub fn serve_http_concurrently_with_clickhouse_key_and_limits(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_concurrently(
+        listener,
+        database,
+        limits,
+        max_in_flight_connections,
+        HttpListenerHandler::ClickHouseKeyReadWrite(expected_clickhouse_key),
+    )
+}
+
+fn serve_http_concurrently(
+    listener: &TcpListener,
+    database: &SharedDatabase,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+    handler: HttpListenerHandler<'_>,
+) -> Result<HttpListenerReport, HttpListenerError> {
     let mut report = HttpListenerReport::default();
     let mut accept_failure = None;
 
@@ -694,7 +786,7 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
                         &stream,
                         accepted_at,
                         limits,
-                        HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
+                        handler,
                     );
 
                     // Half-close the response direction first so the peer can

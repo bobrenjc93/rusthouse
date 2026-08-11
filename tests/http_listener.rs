@@ -11,8 +11,10 @@ use rusthouse::batch::csv::CsvIngestLimits;
 use rusthouse::batch::engine::Database;
 use rusthouse::{
     HttpListenerError, HttpListenerLimits, HttpListenerReport, HttpQueryError, HttpQueryLimits,
-    SharedDatabase, handle_http_query, handle_http_query_read_only_with_clickhouse_key,
-    serve_http_read_only, serve_http_read_only_concurrently_with_clickhouse_key_and_limits,
+    SharedDatabase, Value, handle_http_query, handle_http_query_read_only_with_clickhouse_key,
+    serve_http_concurrently_with_clickhouse_key,
+    serve_http_concurrently_with_clickhouse_key_and_limits, serve_http_read_only,
+    serve_http_read_only_concurrently_with_clickhouse_key_and_limits,
     serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_limits,
     serve_http_with_clickhouse_key, serve_http_with_clickhouse_key_and_limits,
 };
@@ -581,6 +583,225 @@ fn capped_authenticated_concurrency_with_cap_one_waits_before_accepting_the_next
     let report = worker.join().unwrap().unwrap();
     assert_eq!(report.accepted_connections, 2);
     assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn concurrent_read_write_listener_commits_beside_a_stalled_connection() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let served_database = database.clone();
+    let worker = thread::spawn(move || {
+        serve_http_concurrently_with_clickhouse_key(
+            &listener,
+            &served_database,
+            "correct-key",
+            2,
+            NonZeroUsize::new(2).unwrap(),
+        )
+    });
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client read timeout");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+        .expect("write incomplete authenticated request");
+
+    let mut pipelined_insert = post_target_with_clickhouse_key(
+        "/insert",
+        b"INSERT INTO events VALUES (7);",
+        "correct-key",
+    );
+    pipelined_insert.extend_from_slice(
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+    );
+    let (insert_response, insert_client) = start_exchange(address, pipelined_insert);
+    let insert_response = insert_response
+        .recv_timeout(Duration::from_secs(1))
+        .expect("write must finish while the first connection remains stalled");
+    assert!(insert_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(body(&insert_response).is_empty());
+    assert_eq!(
+        insert_response
+            .windows(b"HTTP/1.1".len())
+            .filter(|window| *window == b"HTTP/1.1")
+            .count(),
+        1
+    );
+    insert_client.join().expect("insert client did not panic");
+
+    stalled
+        .write_all(b"\r\n\r\n")
+        .expect("complete stalled request");
+    finish_request_stream(&stalled);
+    let mut stalled_response = Vec::new();
+    stalled
+        .read_to_end(&mut stalled_response)
+        .expect("read completed stalled response");
+    assert_eq!(body(&stalled_response), b"Ok.\n");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+    let rows = database.query("SELECT id FROM events;").unwrap();
+    assert_eq!(rows.rows, vec![vec![Value::Int64(7)]]);
+}
+
+#[test]
+fn concurrent_read_write_listener_with_cap_one_serializes_acceptance() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let limits = HttpListenerLimits {
+        read_timeout: IO_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let served_database = database.clone();
+    let worker = thread::spawn(move || {
+        serve_http_concurrently_with_clickhouse_key_and_limits(
+            &listener,
+            &served_database,
+            "correct-key",
+            limits,
+            NonZeroUsize::new(1).unwrap(),
+        )
+    });
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client read timeout");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+        .expect("write incomplete authenticated request");
+
+    let (insert_response, insert_client) = start_exchange(
+        address,
+        post_target_with_clickhouse_key(
+            "/insert",
+            b"INSERT INTO events VALUES (11);",
+            "correct-key",
+        ),
+    );
+    assert!(matches!(
+        insert_response.recv_timeout(Duration::from_millis(200)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+
+    stalled
+        .write_all(b"\r\n\r\n")
+        .expect("complete stalled request");
+    finish_request_stream(&stalled);
+    let mut stalled_response = Vec::new();
+    stalled
+        .read_to_end(&mut stalled_response)
+        .expect("read completed stalled response");
+    assert_eq!(body(&stalled_response), b"Ok.\n");
+
+    let insert_response = insert_response
+        .recv_timeout(IO_TIMEOUT)
+        .expect("write proceeds after cap-one capacity is released");
+    assert!(insert_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    insert_client.join().expect("insert client did not panic");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+    assert_eq!(
+        database.query("SELECT COUNT(*) FROM events;").unwrap().rows[0][0],
+        Value::Int64(1)
+    );
+}
+
+#[test]
+fn concurrent_read_write_listener_enforces_nonblocking_contention_and_ingest_limits() {
+    let mut initial = Database::new();
+    initial
+        .execute("CREATE TABLE events (id Int64, label String);")
+        .unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let reader = inner.read().unwrap();
+    let limits = HttpListenerLimits::new(
+        4,
+        HttpQueryLimits {
+            csv_ingest_limits: CsvIngestLimits::new(1_024, 1, 2),
+            ..HttpQueryLimits::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let served_database = database.clone();
+    let worker = thread::spawn(move || {
+        serve_http_concurrently_with_clickhouse_key_and_limits(
+            &listener,
+            &served_database,
+            "correct-key",
+            limits,
+            NonZeroUsize::new(2).unwrap(),
+        )
+    });
+
+    let contended = exchange(
+        address,
+        &post_target_with_clickhouse_key(
+            "/insert",
+            b"INSERT INTO events VALUES (9, 'blocked');",
+            "correct-key",
+        ),
+    );
+    assert!(contended.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    assert_eq!(body(&contended), br#"{"error":"database is unavailable"}"#);
+    assert_eq!(reader.catalog().table("events").unwrap().row_count(), 0);
+    drop(reader);
+
+    let over_limit = exchange(
+        address,
+        &post_target_with_clickhouse_key(
+            "/insert/events",
+            b"id,label\n1,one\n2,two\n",
+            "correct-key",
+        ),
+    );
+    assert!(over_limit.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert!(String::from_utf8_lossy(body(&over_limit)).contains("exceeding the limit of 1"));
+    assert_eq!(
+        database.query("SELECT COUNT(*) FROM events;").unwrap().rows[0][0],
+        Value::Int64(0)
+    );
+
+    let inserted = exchange(
+        address,
+        &post_target_with_clickhouse_key("/insert/events", b"id,label\n1,one\n", "correct-key"),
+    );
+    assert!(inserted.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+    let later_read = exchange(
+        address,
+        &post_query_with_clickhouse_key("SELECT id, label FROM events;", "correct-key"),
+    );
+    assert_eq!(
+        body(&later_read),
+        br#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"]]}"#
+    );
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 4);
+    assert_eq!(report.successful_exchanges, 4);
     assert!(report.connection_failures.is_empty());
 }
 
