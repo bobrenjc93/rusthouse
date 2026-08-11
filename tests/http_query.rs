@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use rusthouse::batch::csv::CsvIngestLimits;
 use rusthouse::batch::engine::{
-    Database, LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES, QueryResultLimits,
-    ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES, ResultColumn,
+    Database, ESTIMATED_GROUP_KEY_CELL_BYTES, LENGTH_UTF8_ORDERING_CACHE_ENTRY_BYTES,
+    QueryResultLimits, ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES, ResultColumn,
     STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES,
 };
 use rusthouse::batch::error::Error;
@@ -3196,6 +3196,206 @@ fn concurrent_parameterized_max_group_key_cell_requests_are_isolated() {
                 };
                 let request = format!(
                     "GET /?max_group_key_cells={requested_max}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                );
+                started.wait();
+                (request_index % 4, exchange(&database, request.as_bytes()))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let (case, response) = handle.join().unwrap();
+        if case == 1 {
+            assert_eq!(response, expected_failure);
+        } else {
+            assert_eq!(response, expected_success);
+        }
+    }
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_group_key_bytes_enforces_exact_utf8_and_composite_boundaries() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE labels (label String); \
+             CREATE TABLE tuples (value Int64, label String, active Bool); \
+             CREATE TABLE left_tuples (value Int64, label String, active Bool); \
+             CREATE TABLE right_tuples (value Int64, label String, active Bool); \
+             INSERT INTO labels VALUES ('é'), ('雪'), ('é'); \
+             INSERT INTO tuples VALUES (1, 'é', true), (2, '雪', false), \
+                 (1, 'é', true), (3, 'é', false); \
+             INSERT INTO left_tuples VALUES (1, 'é', true), (2, '雪', false); \
+             INSERT INTO right_tuples VALUES (2, '雪', false), (3, 'é', false);",
+        )
+        .unwrap();
+    let string_key_bytes = 2 * ESTIMATED_GROUP_KEY_CELL_BYTES;
+    let composite_key_bytes = 12 * ESTIMATED_GROUP_KEY_CELL_BYTES;
+    let cases = [
+        (
+            "SELECT+label%2C+COUNT%28%2A%29+AS+n+FROM+labels+GROUP+BY+label+ORDER+BY+label%3B",
+            string_key_bytes,
+            r#"{"columns":[{"name":"label","type":"String"},{"name":"n","type":"Int64"}],"rows":[["é",2],["雪",1]]}"#,
+        ),
+        (
+            "SELECT+DISTINCT+value%2C+label%2C+active+FROM+tuples+ORDER+BY+value%3B",
+            composite_key_bytes,
+            r#"{"columns":[{"name":"value","type":"Int64"},{"name":"label","type":"String"},{"name":"active","type":"Bool"}],"rows":[[1,"é",true],[2,"雪",false],[3,"é",false]]}"#,
+        ),
+        (
+            "SELECT+value%2C+label%2C+active+FROM+left_tuples+UNION+DISTINCT+SELECT+value%2C+label%2C+active+FROM+right_tuples%3B",
+            composite_key_bytes,
+            r#"{"columns":[{"name":"value","type":"Int64"},{"name":"label","type":"String"},{"name":"active","type":"Bool"}],"rows":[[1,"é",true],[2,"雪",false],[3,"é",false]]}"#,
+        ),
+    ];
+
+    for method in ["GET", "POST"] {
+        for (query, exact_bytes, expected_body) in cases {
+            let exact = format!(
+                "{method} /?max%5Fgroup%5Fkey%5Fbytes={exact_bytes}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, exact.as_bytes()),
+                "HTTP/1.1 200 OK",
+                expected_body,
+            );
+
+            let one_byte_short = exact_bytes - 1;
+            let exceeded = format!(
+                "{method} /?query={query}&max_group_key_bytes={one_byte_short} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, exceeded.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &format!(
+                    r#"{{"error":"SELECT group key bytes requires at least {exact_bytes}, exceeding the limit of {one_byte_short}"}}"#
+                ),
+            );
+        }
+    }
+}
+
+#[test]
+fn parameterized_max_group_key_bytes_zero_and_larger_values_never_relax_defaults() {
+    let required_bytes = 3 * ESTIMATED_GROUP_KEY_CELL_BYTES;
+    let configured_limits = QueryResultLimits {
+        max_group_key_bytes: required_bytes - 1,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+
+    for (method, requested_max) in [
+        ("GET", "0".to_owned()),
+        ("POST", required_bytes.to_string()),
+        ("GET", usize::MAX.to_string()),
+    ] {
+        let request = format!(
+            "{method} /?query=SELECT+DISTINCT+value+FROM+samples%3B&max_group_key_bytes={requested_max} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert_response(
+            &exchange(&database, request.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            &format!(
+                r#"{{"error":"SELECT group key bytes requires at least {required_bytes}, exceeding the limit of {}"}}"#,
+                required_bytes - 1
+            ),
+        );
+    }
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_group_key_bytes_rejects_invalid_values_for_get_and_post() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_group_key_bytes= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_group_key_bytes=1&query=SELECT+1%3B&max%5Fgroup%5Fkey%5Fbytes=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_group_key_bytes parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_group_key_bytes=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_group_key_bytes parameter must be a decimal integer"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_group_key_bytes={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_group_key_bytes parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_parameterized_max_group_key_byte_requests_are_isolated() {
+    use std::sync::Barrier;
+
+    let exact_bytes = 3 * ESTIMATED_GROUP_KEY_CELL_BYTES;
+    let configured_limits = QueryResultLimits {
+        max_group_key_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE samples (value Int64); \
+             INSERT INTO samples VALUES (1), (2), (3);",
+        )
+        .unwrap();
+    let query = "SELECT+DISTINCT+value+FROM+samples+ORDER+BY+value%3B";
+    let success_request = format!(
+        "GET /?query={query}&max_group_key_bytes={exact_bytes} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    let failure_request = format!(
+        "GET /?max_group_key_bytes={}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        exact_bytes - 1
+    );
+    let expected_success = exchange(&database, success_request.as_bytes());
+    let expected_failure = exchange(&database, failure_request.as_bytes());
+
+    let request_count = 12;
+    let started = Arc::new(Barrier::new(request_count));
+    let handles = (0..request_count)
+        .map(|request_index| {
+            let database = database.clone();
+            let started = Arc::clone(&started);
+            thread::spawn(move || {
+                let requested_max = match request_index % 4 {
+                    0 => exact_bytes.to_string(),
+                    1 => (exact_bytes - 1).to_string(),
+                    2 => "0".to_owned(),
+                    _ => usize::MAX.to_string(),
+                };
+                let request = format!(
+                    "GET /?max_group_key_bytes={requested_max}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
                 );
                 started.wait();
                 (request_index % 4, exchange(&database, request.as_bytes()))
