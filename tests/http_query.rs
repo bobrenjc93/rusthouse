@@ -2068,6 +2068,179 @@ fn concurrent_parameterized_max_ordering_state_requests_are_isolated() {
 }
 
 #[test]
+fn parameterized_max_aggregate_state_cells_enforces_global_and_grouped_boundaries() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE samples (g Int64, value Int64); \
+             INSERT INTO samples VALUES (1, 10), (2, 20);",
+        )
+        .unwrap();
+    let cases = [
+        (
+            "SELECT+COUNT%28%2A%29+AS+n%2C+SUM%28value%29+AS+total+FROM+samples%3B",
+            r#"{"columns":[{"name":"n","type":"Int64"},{"name":"total","type":"Int64"}],"rows":[[2,30]]}"#,
+        ),
+        (
+            "SELECT+g%2C+COUNT%28%2A%29+AS+n+FROM+samples+GROUP+BY+g+ORDER+BY+g%3B",
+            r#"{"columns":[{"name":"g","type":"Int64"},{"name":"n","type":"Int64"}],"rows":[[1,1],[2,1]]}"#,
+        ),
+    ];
+
+    for method in ["GET", "POST"] {
+        for (query, expected_body) in cases {
+            let exact = format!(
+                "{method} /?max_aggregate_state_cells=2&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, exact.as_bytes()),
+                "HTTP/1.1 200 OK",
+                expected_body,
+            );
+
+            let one_cell_short = format!(
+                "{method} /?query={query}&max_aggregate_state_cells=1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            assert_response(
+                &exchange(&database, one_cell_short.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                r#"{"error":"SELECT aggregate state cells requires at least 2, exceeding the limit of 1"}"#,
+            );
+        }
+    }
+
+    let configured_limits = QueryResultLimits {
+        max_aggregate_state_cells: 1,
+        ..QueryResultLimits::default()
+    };
+    let configured = SharedDatabase::with_query_result_limits(configured_limits);
+    configured
+        .execute(
+            "CREATE TABLE samples (g Int64, value Int64); \
+             INSERT INTO samples VALUES (1, 10), (2, 20);",
+        )
+        .unwrap();
+    for (method, requested_max) in [
+        ("GET", "0".to_owned()),
+        ("POST", "2".to_owned()),
+        ("GET", usize::MAX.to_string()),
+    ] {
+        let request = format!(
+            "{method} /?query={}&max_aggregate_state_cells={requested_max} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            cases[0].0,
+        );
+        assert_response(
+            &exchange(&configured, request.as_bytes()),
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"SELECT aggregate state cells requires at least 2, exceeding the limit of 1"}"#,
+        );
+    }
+    assert_eq!(configured.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
+fn parameterized_max_aggregate_state_cells_rejects_invalid_values() {
+    let database = SharedDatabase::default();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+
+    for method in ["GET", "POST"] {
+        let cases = [
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_aggregate_state_cells= HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"GET query parameters must have nonempty names and values"}"#
+                    .replace("GET", method),
+            ),
+            (
+                format!(
+                    "{method} /?max_aggregate_state_cells=1&query=SELECT+1%3B&max%5Faggregate%5Fstate%5Fcells=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"duplicate max_aggregate_state_cells parameter"}"#.to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?query=SELECT+1%3B&max_aggregate_state_cells=1.0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_aggregate_state_cells parameter must be a decimal integer"}"#
+                    .to_owned(),
+            ),
+            (
+                format!(
+                    "{method} /?max_aggregate_state_cells={overflow}&query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                ),
+                r#"{"error":"max_aggregate_state_cells parameter is out of range"}"#.to_owned(),
+            ),
+        ];
+        for (request, expected_body) in cases {
+            assert_response(
+                &exchange(&database, request.as_bytes()),
+                "HTTP/1.1 400 Bad Request",
+                &expected_body,
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_parameterized_max_aggregate_state_cell_requests_are_isolated() {
+    use std::sync::Barrier;
+
+    let configured_limits = QueryResultLimits {
+        max_aggregate_state_cells: 2,
+        ..QueryResultLimits::default()
+    };
+    let database = SharedDatabase::with_query_result_limits(configured_limits);
+    database
+        .execute(
+            "CREATE TABLE samples (g Int64); \
+             INSERT INTO samples VALUES (1), (2);",
+        )
+        .unwrap();
+    let query = "SELECT+g%2C+COUNT%28%2A%29+AS+n+FROM+samples+GROUP+BY+g+ORDER+BY+g%3B";
+    let success_request = format!(
+        "GET /?query={query}&max_aggregate_state_cells=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    let failure_request = format!(
+        "GET /?max_aggregate_state_cells=1&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    let expected_success = exchange(&database, success_request.as_bytes());
+    let expected_failure = exchange(&database, failure_request.as_bytes());
+
+    let request_count = 12;
+    let started = Arc::new(Barrier::new(request_count));
+    let handles = (0..request_count)
+        .map(|request_index| {
+            let database = database.clone();
+            let started = Arc::clone(&started);
+            thread::spawn(move || {
+                let requested_max = match request_index % 4 {
+                    0 => "2".to_owned(),
+                    1 => "1".to_owned(),
+                    2 => "0".to_owned(),
+                    _ => usize::MAX.to_string(),
+                };
+                let request = format!(
+                    "GET /?max_aggregate_state_cells={requested_max}&query={query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                );
+                started.wait();
+                (request_index % 4, exchange(&database, request.as_bytes()))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let (case, response) = handle.join().unwrap();
+        if case == 1 {
+            assert_eq!(response, expected_failure);
+        } else {
+            assert_eq!(response, expected_success);
+        }
+    }
+    assert_eq!(database.query_result_limits().unwrap(), configured_limits);
+}
+
+#[test]
 fn parameterized_max_aggregate_state_bytes_enforces_fixed_and_dynamic_boundaries() {
     let database = SharedDatabase::default();
     database
