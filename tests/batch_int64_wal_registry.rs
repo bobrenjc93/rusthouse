@@ -96,20 +96,38 @@ fn create_two_table_registry(path: &Path) {
 }
 
 fn assert_nullable_query_behavior(database: &mut Database, table: &str) {
-    for (expression, operation) in [("CAST(v AS String)", "CAST"), ("ABS(v)", "ABS")] {
-        let error = database
-            .execute(&format!("SELECT {expression} FROM {table}"))
-            .unwrap_err();
-        assert_eq!(
-            error,
-            Error::UnsupportedNullableOperation {
-                table: "Alpha".to_owned(),
-                column: "v".to_owned(),
-                operation,
-            },
-            "expression {expression}"
-        );
-    }
+    let error = database
+        .execute(&format!("SELECT CAST(v AS String) FROM {table}"))
+        .unwrap_err();
+    assert_eq!(
+        error,
+        Error::UnsupportedNullableOperation {
+            table: "Alpha".to_owned(),
+            column: "v".to_owned(),
+            operation: "CAST",
+        }
+    );
+
+    let results = database
+        .execute(&format!(
+            "SELECT ABS(v) AS magnitude FROM {table} \
+             WHERE v IS NULL OR v = 9223372036854775807 ORDER BY magnitude"
+        ))
+        .unwrap();
+    let [StatementResult::Query(absolute)] = results.as_slice() else {
+        panic!("expected nullable ABS query")
+    };
+    assert_eq!(
+        absolute.rows,
+        [
+            vec![Value::Null(rusthouse::batch::value::DataType::Int64)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+    assert_eq!(
+        database.execute(&format!("SELECT ABS(v) FROM {table}")),
+        Err(Error::NumericOverflow("ABS(Int64)".to_owned()))
+    );
 
     let results = database
         .execute(&format!(

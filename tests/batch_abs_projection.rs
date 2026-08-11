@@ -104,6 +104,102 @@ fn projects_checked_int64_absolute_values_with_aliases_filters_and_limits() {
 }
 
 #[test]
+fn nullable_int64_abs_propagates_null_and_preserves_ordering_and_deferred_overflow() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (reading Nullable(Int64)); \
+             INSERT INTO samples VALUES \
+             (NULL), (-3), (2), (NULL), (3), (-1), (-9223372036854775808); \
+             CREATE TABLE all_null (reading Nullable(Int64)); \
+             INSERT INTO all_null VALUES (NULL), (NULL), (NULL);",
+        )
+        .expect("setup");
+
+    let selected = query(
+        &mut database,
+        "SELECT reading, ABS(reading) AS magnitude FROM samples \
+         WHERE reading IS NULL OR reading != -9223372036854775808 \
+         ORDER BY ABS(reading) LIMIT 4 OFFSET 1",
+    );
+    assert_eq!(
+        selected.columns,
+        [
+            ResultColumn {
+                name: "reading".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "magnitude".to_owned(),
+                data_type: DataType::Int64,
+            },
+        ]
+    );
+    assert_eq!(
+        selected.rows,
+        [
+            vec![Value::Null(DataType::Int64), Value::Null(DataType::Int64)],
+            vec![Value::Int64(-1), Value::Int64(1)],
+            vec![Value::Int64(2), Value::Int64(2)],
+            vec![Value::Int64(-3), Value::Int64(3)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT ABS(reading) AS magnitude FROM samples \
+             WHERE reading IS NULL OR reading != -9223372036854775808 \
+             ORDER BY magnitude DESC",
+        )
+        .rows,
+        [
+            vec![Value::Int64(3)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(1)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Null(DataType::Int64)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT ABS(reading) AS magnitude FROM samples ORDER BY magnitude LIMIT 6",
+        )
+        .rows,
+        [
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(3)],
+        ]
+    );
+    assert_eq!(
+        database.execute(
+            "SELECT ABS(reading) AS magnitude FROM samples ORDER BY magnitude DESC LIMIT 1"
+        ),
+        Err(Error::NumericOverflow("ABS(Int64)".to_owned()))
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT ABS(reading) AS magnitude FROM all_null \
+             ORDER BY magnitude DESC LIMIT 2 OFFSET 1",
+        )
+        .rows,
+        [
+            vec![Value::Null(DataType::Int64)],
+            vec![Value::Null(DataType::Int64)],
+        ]
+    );
+}
+
+#[test]
 fn projects_float64_fractions_and_canonicalizes_signed_zero() {
     let mut database = Database::new();
     database
@@ -367,6 +463,35 @@ fn abs_projection_obeys_result_caps() {
             ..
         })
     ));
+
+    let mut nullable_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 2,
+        max_values: 2,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    nullable_limited
+        .execute(
+            "CREATE TABLE samples (reading Nullable(Int64)); \
+             INSERT INTO samples VALUES (NULL), (-2), (3);",
+        )
+        .expect("setup");
+    assert_eq!(
+        query(
+            &mut nullable_limited,
+            "SELECT ABS(reading) FROM samples LIMIT 2",
+        )
+        .rows,
+        [vec![Value::Null(DataType::Int64)], vec![Value::Int64(2)],]
+    );
+    assert_eq!(
+        nullable_limited.execute("SELECT ABS(reading) FROM samples"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 2,
+        })
+    );
 }
 
 #[test]
