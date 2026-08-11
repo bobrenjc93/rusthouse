@@ -80,9 +80,11 @@ two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
 `AVG(the_same_column)`, use
 deterministic contiguous chunks when more than 262,144 rows match. A grouped
 query also uses those chunks when it has exactly one non-nullable `Bool`
-grouping column and exactly one `COUNT(*)` or `COUNT()` aggregate. Ordered
-partition reduction preserves first-seen Bool grouping before the normal
-grouped ordering and pagination stages. The paired
+grouping column and exactly one aggregate: `COUNT(*)`, `COUNT()`, or
+`COUNT(nullable_int64_column)` over physical `Nullable(Int64)` storage. Ordered
+partition reduction preserves first-seen Bool grouping, including groups whose
+nullable count is zero, before the normal grouped ordering and pagination
+stages. The paired
 shapes preserve either projection order. Row-count pairs derive `COUNT` with a
 checked conversion of the filtered cardinality; a same-column nullable
 `COUNT`/`AVG` pair derives its NULL-ignoring count from the AVG partitions'
@@ -94,8 +96,8 @@ physical `Nullable(Int64)` arguments.
 Nullable SUM/AVG partitions ignore absent values and reduce checked i128 sum
 and present-count partials in chunk order; nullable MIN/MAX partitions ignore
 absent values and reduce optional extrema in chunk order. Sole nullable COUNT
-partitions likewise ignore absent values and reduce checked count partials in
-chunk order.
+partitions, including the supported Bool-grouped shape, likewise ignore absent
+values and reduce checked count partials in chunk order.
 Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
@@ -117,7 +119,8 @@ reduced directly without
 allocating a partial-results collection. Ordered reduction preserves the first
 occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
-or below the threshold, other grouped shapes (including `COUNT(column)`, more
+or below the threshold, other grouped shapes (including `COUNT(column)` unless
+it is the sole physical nullable integer count grouped by one Bool key, more
 than one grouping column, non-Bool keys, or multiple aggregates), and
 multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
@@ -153,9 +156,10 @@ ordered reduction use a checked `i128` sum and checked present-value count;
 nullable MIN/MAX chunks ignore absent values and reduce optional extrema in chunk
 order. At or below the threshold, without worker admission, or after a worker
 failure, the complete computation runs sequentially. Grouped nullable shapes
-remain sequential. Paired nullable shapes remain sequential except for the
-exact ungrouped `COUNT(*)`/`COUNT()` plus nullable `SUM`, `MIN`, `MAX`, or `AVG` pair and
-`COUNT(nullable_column)` plus `AVG(the_same_column)` pair.
+remain sequential except for a sole `COUNT(nullable_int64_column)` grouped by
+one physical Bool key. Paired nullable shapes remain sequential except for the
+exact ungrouped `COUNT(*)`/`COUNT()` plus nullable `SUM`, `MIN`, `MAX`, or `AVG`
+pair and `COUNT(nullable_column)` plus `AVG(the_same_column)` pair.
 These nullable shapes compose with filters, grouping, HAVING, ordering,
 pagination, and other supported aggregate projections. Other operations retain
 their documented nullable restrictions.
