@@ -69,7 +69,7 @@ non-nullable `Bool` argument is true after `WHERE` filtering. It supports both
 global and grouped aggregation, including aliases, `HAVING`, ordering, and
 pagination. `countIf(*)` and non-`Bool` arguments are rejected.
 Global `countIf(Bool)`, a sole ungrouped `SUM(Int64)`, `SUM(Nullable(Int64))`,
-`MIN(Int64)`,
+`MIN(Int64)`, `MIN(Nullable(Int64))`,
 `MIN(Float64)`, `MAX(Int64)`, `MAX(Float64)`, `AVG(Int64)`, or
 `AVG(Nullable(Int64))`, and an exact
 two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
@@ -83,11 +83,12 @@ grouped ordering and pagination stages. The paired
 shape preserves either projection order and derives its row count with a
 checked conversion of the filtered cardinality while the existing checked
 sum-and-count lanes target about 131,072 rows each. Release-mode crossover
-measurements kept smaller inputs sequential. Int64 scalar and paired shapes
-require a physically non-nullable argument except for the sole
-`SUM(Nullable(Int64))` and `AVG(Nullable(Int64))` shapes. Their partitions
-ignore absent values and reduce checked i128 sum and present-count partials in
-chunk order.
+measurements kept smaller inputs sequential. Paired Int64 shapes require a
+physically non-nullable argument. Sole `MAX(Int64)` does too, while sole `SUM`,
+`AVG`, and `MIN` admit physical `Nullable(Int64)` arguments. Nullable SUM/AVG
+partitions ignore absent values and reduce checked i128 sum and present-count
+partials in chunk order; nullable MIN partitions ignore absent values and
+reduce optional extrema in chunk order.
 Helper threads share one nonblocking process-wide admission budget; total lanes
 are capped at the database's configured aggregate worker cap, 16, and the
 process's available parallelism. The per-database cap defaults to 16, so
@@ -103,7 +104,8 @@ share the process-wide budget. Parameterized HTTP queries may additionally set
 retains the database cap, while a nonzero value can only tighten it. Checked count
 partials and checked i128 SUM/AVG sum-and-count partials are reduced in chunk
 order; the paired row count is checked independently from matched rows. Optional
-Int64 and Float64 extrema partials are reduced directly without
+Int64 and Float64 extrema partials, including nullable Int64 MIN partials, are
+reduced directly without
 allocating a partial-results collection. Ordered reduction preserves the first
 occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
@@ -113,8 +115,8 @@ multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-cou
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
 row-count/`MAX(Float64)` pairs (including
 `COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema, `AVG(Float64)`,
-paired or grouped nullable SUM or AVG, and other aggregate functions remain
-sequential.
+paired or grouped nullable SUM, MIN, or AVG, sole nullable MAX, and other
+aggregate functions remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
@@ -136,12 +138,13 @@ semantics for both `Int64` storage forms.
 arguments. `SUM`, `MIN`, `MAX`, and `AVG` ignore absent values. `SUM`, `MIN`,
 and `MAX` return typed `Int64` `NULL` for empty or all-`NULL` inputs, while
 `AVG` returns typed `Float64` `NULL`; `COUNT(column)` counts only present
-values. Sole ungrouped nullable integer `SUM` and `AVG` use deterministic
-parallel chunks above the global threshold; each chunk and the ordered reduction
-use a checked `i128` sum and checked present-value count before producing the
-typed result. At or below the threshold, without worker admission, or after a
-worker failure, the complete checked computation runs sequentially. Grouped and
-paired nullable shapes remain sequential.
+values. Sole ungrouped nullable integer `SUM`, `MIN`, and `AVG` use deterministic
+parallel chunks above the global threshold. Nullable SUM/AVG chunks and their
+ordered reduction use a checked `i128` sum and checked present-value count;
+nullable MIN chunks ignore absent values and reduce optional extrema in chunk
+order. At or below the threshold, without worker admission, or after a worker
+failure, the complete computation runs sequentially. Grouped and paired
+nullable shapes remain sequential.
 These nullable shapes compose with filters, grouping, HAVING, ordering,
 pagination, and other supported aggregate projections. Other operations retain
 their documented nullable restrictions.
