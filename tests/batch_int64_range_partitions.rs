@@ -246,6 +246,41 @@ fn nullable_add_column_invalidates_range_metadata_and_backfills_partitioned_rows
 }
 
 #[test]
+fn conditional_non_nullable_add_preserves_indexes_on_no_op_and_invalidates_on_add() {
+    let mut database = Database::new();
+    database
+        .create_int64_range_partitioned_table("Events", "id", partitions())
+        .expect("partitioned table is valid");
+    database
+        .create_int64_min_max_index(
+            "events",
+            "id",
+            Int64MinMaxIndexLimits::new(2, 3, usize::MAX),
+        )
+        .expect("sparse index is valid");
+
+    database
+        .execute("ALTER TABLE Events ADD COLUMN IF NOT EXISTS ID String")
+        .expect("an existing name is a no-op even with a different requested type");
+    let table = database.catalog().table("events").unwrap();
+    assert_eq!(table.schema().len(), 1);
+    assert_eq!(table.int64_range_partition_count(), Some(3));
+    assert_eq!(table.int64_min_max_index_info().unwrap().indexed_rows, 6);
+
+    database
+        .execute("ALTER TABLE Events ADD COLUMN IF NOT EXISTS label String")
+        .expect("an absent non-nullable column is added");
+    let table = database.catalog().table("events").unwrap();
+    assert_eq!(table.int64_range_partition_count(), None);
+    assert_eq!(table.int64_min_max_index_info().unwrap().indexed_rows, 6);
+    assert!(matches!(
+        &table.columns()[1],
+        rusthouse::batch::storage::Column::String(values)
+            if values == &["", "", "", "", "", ""]
+    ));
+}
+
+#[test]
 fn invalid_layouts_and_construction_limits_are_typed_and_atomic() {
     let limits = Int64RangePartitionLimits::new(4, 4, 32);
     let cases = [

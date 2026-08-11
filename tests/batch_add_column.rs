@@ -60,6 +60,71 @@ fn parses_exact_alter_table_add_column_syntax_for_every_type() {
 }
 
 #[test]
+fn parses_conditional_non_nullable_add_column_syntax_for_every_type() {
+    for (sql, table, name, data_type) in [
+        (
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS count Int64",
+            "events",
+            "count",
+            DataType::Int64,
+        ),
+        (
+            "alter table Events add column if not exists Ratio float64;",
+            "Events",
+            "Ratio",
+            DataType::Float64,
+        ),
+        (
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS active Bool",
+            "events",
+            "active",
+            DataType::Bool,
+        ),
+        (
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS label String;",
+            "events",
+            "label",
+            DataType::String,
+        ),
+    ] {
+        assert_eq!(
+            parse(sql).expect("valid conditional ALTER TABLE ADD COLUMN"),
+            [Statement::AddColumnIfNotExists {
+                table: table.to_owned(),
+                column: ColumnDef {
+                    name: name.to_owned(),
+                    data_type,
+                },
+            }]
+        );
+    }
+}
+
+#[test]
+fn if_remains_a_column_identifier_without_the_complete_modifier() {
+    assert_eq!(
+        parse("ALTER TABLE events ADD COLUMN IF Int64").unwrap(),
+        [Statement::AddColumn {
+            table: "events".to_owned(),
+            column: ColumnDef {
+                name: "IF".to_owned(),
+                data_type: DataType::Int64,
+            },
+        }]
+    );
+    assert_eq!(
+        parse("ALTER TABLE events ADD COLUMN IF NOT EXISTS IF String").unwrap(),
+        [Statement::AddColumnIfNotExists {
+            table: "events".to_owned(),
+            column: ColumnDef {
+                name: "IF".to_owned(),
+                data_type: DataType::String,
+            },
+        }]
+    );
+}
+
+#[test]
 fn parses_exact_case_insensitive_nullable_int64_add_column_syntax() {
     for (sql, table, column) in [
         (
@@ -147,7 +212,6 @@ fn rejects_every_other_alter_table_add_column_shape() {
         "ALTER TABLE events ADD COLUMN payload",
         "ALTER TABLE events ADD COLUMN payload UInt64",
         "ALTER TABLE events ADD COLUMN IF EXISTS payload Nullable(Int64)",
-        "ALTER TABLE events ADD COLUMN IF NOT EXISTS payload Int64",
     ] {
         assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
     }
@@ -160,6 +224,21 @@ fn rejects_every_other_alter_table_add_column_shape() {
             message: "unexpected trailing input after ALTER TABLE ADD COLUMN".to_owned(),
         })
     );
+}
+
+#[test]
+fn rejects_malformed_conditional_add_column_modifiers() {
+    for sql in [
+        "ALTER TABLE events ADD COLUMN IF NOT",
+        "ALTER TABLE events ADD COLUMN IF NOT EXIST payload Int64",
+        "ALTER TABLE events ADD COLUMN IF NOT payload Int64",
+        "ALTER TABLE events ADD COLUMN IF EXISTS payload Int64",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS payload",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS payload Int64 AFTER id",
+    ] {
+        assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
+    }
 }
 
 #[test]
@@ -219,7 +298,7 @@ fn add_column_accepts_the_exact_cell_limit_and_rejects_before_mutation() {
     assert!(matches!(&table.columns()[1], Column::String(values) if values == &["", "", ""]));
 
     assert_eq!(
-        database.execute("ALTER TABLE events ADD COLUMN active Bool;"),
+        database.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS active Bool;"),
         Err(Error::ResourceLimitExceeded {
             resource: "table cells",
             actual: 9,
@@ -268,7 +347,7 @@ fn add_column_accepts_the_exact_column_limit_and_rejects_before_mutation() {
         .expect("two columns and two cells exactly fit both limits");
 
     assert_eq!(
-        database.execute("ALTER TABLE events ADD COLUMN active Bool;"),
+        database.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS active Bool;"),
         Err(Error::ResourceLimitExceeded {
             resource: "table columns",
             actual: 3,
@@ -450,6 +529,81 @@ fn populated_table_backfills_every_physical_type_and_exposes_metadata() {
             Value::String("new".to_owned()),
         ]]
     );
+}
+
+#[test]
+fn conditional_non_nullable_add_backfills_all_types_and_show_create_replays() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Events (id Int64); \
+             INSERT INTO Events VALUES (2), (1); \
+             ALTER TABLE Events ADD COLUMN IF NOT EXISTS count Int64; \
+             ALTER TABLE events ADD COLUMN IF NOT EXISTS ratio Float64; \
+             ALTER TABLE EVENTS ADD COLUMN IF NOT EXISTS active Bool; \
+             ALTER TABLE Events ADD COLUMN IF NOT EXISTS label String;",
+        )
+        .expect("all four absent columns are added");
+
+    let table = database.catalog().table("events").unwrap();
+    assert!(matches!(&table.columns()[1], Column::Int64(values) if values == &[0, 0]));
+    assert!(matches!(&table.columns()[2], Column::Float64(values) if values == &[0.0, 0.0]));
+    assert!(matches!(&table.columns()[3], Column::Bool(values) if values == &[false, false]));
+    assert!(matches!(&table.columns()[4], Column::String(values) if values == &["", ""]));
+
+    let ddl =
+        "CREATE TABLE Events (id Int64, count Int64, ratio Float64, active Bool, label String)";
+    assert_eq!(
+        query(&mut database, "SHOW CREATE TABLE events").rows,
+        [vec![Value::String(ddl.to_owned())]]
+    );
+    let mut replayed = Database::new();
+    replayed.execute(ddl).expect("SHOW CREATE output replays");
+    assert_eq!(
+        query(&mut replayed, "SHOW CREATE TABLE EVENTS").rows,
+        [vec![Value::String(ddl.to_owned())]]
+    );
+}
+
+#[test]
+fn conditional_non_nullable_add_is_a_bounded_no_op_for_any_physical_type() {
+    let limits = TableLimits::new(2, 5, 10);
+    let mut database = Database::with_table_limits(limits);
+    database
+        .execute(
+            "CREATE TABLE Mixed (integer_value Int64, float_value Float64, bool_value Bool, string_value String); \
+             ALTER TABLE Mixed ADD COLUMN nullable_value Nullable(Int64); \
+             INSERT INTO Mixed VALUES (7, 1.5, true, 'kept', 9), (8, 2.5, false, 'also kept', NULL);",
+        )
+        .expect("setup reaches the exact column and cell limits");
+    let ddl = query(&mut database, "SHOW CREATE TABLE mixed").rows;
+    let retained_bytes = database
+        .catalog()
+        .table("mixed")
+        .unwrap()
+        .retained_value_bytes();
+
+    for sql in [
+        "ALTER TABLE mixed ADD COLUMN IF NOT EXISTS INTEGER_VALUE String",
+        "ALTER TABLE MIXED ADD COLUMN IF NOT EXISTS FLOAT_VALUE Bool",
+        "ALTER TABLE Mixed ADD COLUMN IF NOT EXISTS BOOL_VALUE Int64",
+        "ALTER TABLE mixed ADD COLUMN IF NOT EXISTS STRING_VALUE Float64",
+        "ALTER TABLE Mixed ADD COLUMN IF NOT EXISTS NULLABLE_VALUE String",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Ok(vec![StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 0,
+            }])
+        );
+    }
+
+    let table = database.catalog().table("mixed").unwrap();
+    assert_eq!(table.schema().len(), limits.max_columns);
+    assert_eq!(table.retained_cell_count(), limits.max_cells);
+    assert_eq!(table.retained_value_bytes(), retained_bytes);
+    assert_eq!(query(&mut database, "SHOW CREATE TABLE mixed").rows, ddl);
 }
 
 #[test]
@@ -699,6 +853,10 @@ fn every_failed_add_leaves_schema_physical_columns_rows_and_capacity_unchanged()
 
     assert_eq!(
         database.execute("ALTER TABLE missing ADD COLUMN score Float64;"),
+        Err(Error::TableNotFound("missing".to_owned()))
+    );
+    assert_eq!(
+        database.execute("ALTER TABLE missing ADD COLUMN IF NOT EXISTS score Float64;"),
         Err(Error::TableNotFound("missing".to_owned()))
     );
     assert_eq!(
