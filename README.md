@@ -914,6 +914,7 @@ parameter, one optional decimal `max_result_values` parameter, one optional
 decimal `max_result_bytes` parameter, one optional decimal `max_rows_to_read`
 parameter, one optional decimal `max_rows_to_group_by` parameter, one optional
 decimal `max_ordering_state_bytes` parameter, one optional decimal
+`max_aggregate_state_cells` parameter, one optional decimal
 `max_aggregate_state_bytes` parameter, one optional decimal `max_threads`
 parameter, one optional decimal `readonly` parameter, and one optional
 `default_format` parameter in any order with `query`, including percent-encoded
@@ -957,6 +958,12 @@ cap is checked before allocating the ordered `ROW_NUMBER` row-index vector, the
 single-key `lengthUTF8` cache, or the single-key String-to-`Float64` parsed-key
 cache. It does not change `SHOW SETTINGS`, `system.settings`, or the persistent
 database configuration.
+`max_aggregate_state_cells` has the same decimal syntax and zero behavior. A
+nonzero value tightens the configured aggregate-state cell limit only for that
+request, while a larger value never relaxes the configured limit. The effective
+cap is checked before allocating either global or grouped aggregate states. It
+does not change `SHOW SETTINGS`, `system.settings`, or the persistent database
+configuration.
 `max_aggregate_state_bytes` has the same decimal syntax and zero behavior. A
 nonzero value tightens the configured aggregate-state byte limit only for that
 request, while a larger value never relaxes the configured limit. The effective
@@ -981,11 +988,11 @@ same SQL byte limit as a POST body; the database, workload-limit, and format
 parameters do not count toward that limit. Empty parameters or values,
 duplicate `query`, `database`, `max_result_rows`, `max_result_values`,
 `max_result_bytes`, `max_rows_to_read`, `max_rows_to_group_by`,
-`max_ordering_state_bytes`, `max_aggregate_state_bytes`, `max_threads`,
-`readonly`, or `default_format` parameters, malformed or overflowing workload
-limits, malformed or out-of-range `readonly` values, unknown parameters,
-malformed escapes, non-default database values, unsupported formats, and
-invalid SQL UTF-8 are rejected.
+`max_ordering_state_bytes`, `max_aggregate_state_cells`,
+`max_aggregate_state_bytes`, `max_threads`, `readonly`, or `default_format`
+parameters, malformed or overflowing workload limits, malformed or out-of-range
+`readonly` values, unknown parameters, malformed escapes, non-default database
+values, unsupported formats, and invalid SQL UTF-8 are rejected.
 Parameter validation follows configured authentication and precedes database
 lock admission. GET requests and every request handled by any read-only API use
 the read-only, exactly-one-statement nonblocking `SharedDatabase::try_query`
