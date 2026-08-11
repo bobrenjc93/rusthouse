@@ -14,6 +14,15 @@ fn partitions() -> Vec<Int64RangePartition> {
     ]
 }
 
+fn between_partitions() -> Vec<Int64RangePartition> {
+    vec![
+        Int64RangePartition::new(i64::MIN, -100, vec![i64::MIN, -100]),
+        Int64RangePartition::new(-10, 10, vec![10, -10, 0]),
+        Int64RangePartition::new(50, 100, vec![100, 50, 75]),
+        Int64RangePartition::new(1_000, i64::MAX, vec![i64::MAX, 1_000]),
+    ]
+}
+
 fn query(database: &mut Database, sql: &str) -> QueryResult {
     let results = database.execute(sql).expect("query succeeds");
     let [StatementResult::Query(result)] = results.as_slice() else {
@@ -99,6 +108,156 @@ fn selects_across_partitions_with_boundaries_alias_order_and_pagination() {
             table: "Events".to_owned(),
             column: "NULL".to_owned(),
         })
+    );
+}
+
+#[test]
+fn between_routes_validated_ranges_and_preserves_exact_source_order() {
+    let make_database = |max_scan_rows| {
+        let mut database = Database::with_query_result_limits(QueryResultLimits {
+            max_scan_rows,
+            ..QueryResultLimits::default()
+        });
+        database
+            .create_int64_range_partitioned_table("ranges", "id", between_partitions())
+            .expect("partitioned table is valid");
+        database
+    };
+    let mut database = make_database(6);
+
+    assert!(
+        query(
+            &mut database,
+            "SELECT id FROM ranges WHERE id BETWEEN 11 AND 49",
+        )
+        .rows
+        .is_empty(),
+        "a range disjoint from every partition admits no source rows",
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id FROM ranges WHERE id BETWEEN -5 AND 60",
+        )
+        .rows,
+        vec![
+            vec![Value::Int64(10)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(50)],
+        ],
+        "overlapping partitions are re-evaluated exactly in source order",
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id FROM ranges WHERE id >= -5 AND id <= 60",
+        )
+        .rows,
+        vec![
+            vec![Value::Int64(10)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(50)],
+        ],
+        "the equivalent normalized range uses the same metadata path",
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id FROM ranges WHERE id BETWEEN 50 AND 50",
+        )
+        .rows,
+        vec![vec![Value::Int64(50)]],
+    );
+    assert!(
+        query(
+            &mut database,
+            "SELECT id FROM ranges WHERE id BETWEEN 60 AND -5",
+        )
+        .rows
+        .is_empty(),
+        "reversed bounds admit no partitions",
+    );
+    for (sql, expected) in [
+        (
+            "SELECT id FROM ranges WHERE id BETWEEN -9223372036854775808 AND -9223372036854775808",
+            i64::MIN,
+        ),
+        (
+            "SELECT id FROM ranges WHERE id BETWEEN 9223372036854775807 AND 9223372036854775807",
+            i64::MAX,
+        ),
+    ] {
+        assert_eq!(
+            query(&mut database, sql).rows,
+            vec![vec![Value::Int64(expected)]],
+        );
+    }
+
+    let mut below_scan_boundary = make_database(5);
+    assert_eq!(
+        below_scan_boundary.execute("SELECT id FROM ranges WHERE id BETWEEN -5 AND 60 LIMIT 0"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT scanned rows",
+            actual: 6,
+            max: 5,
+        }),
+        "the scan limit charges every row in the two admitted partitions",
+    );
+
+    for sql in [
+        "SELECT id FROM ranges WHERE id NOT BETWEEN -5 AND 60",
+        "SELECT id FROM ranges WHERE id BETWEEN -5.0 AND 60.0",
+        "SELECT id FROM ranges WHERE id BETWEEN -5 AND 60 AND id != 0",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::ResourceLimitExceeded {
+                resource: "SELECT scanned rows",
+                actual: 10,
+                max: 6,
+            }),
+            "unsupported shape must keep the full-scan fallback for {sql}",
+        );
+    }
+
+    database
+        .execute("INSERT INTO ranges VALUES (55)")
+        .expect("successful mutation");
+    assert_eq!(
+        database
+            .catalog()
+            .table("ranges")
+            .expect("table remains")
+            .int64_range_partition_count(),
+        None,
+    );
+    assert_eq!(
+        database.execute("SELECT id FROM ranges WHERE id BETWEEN -5 AND 60"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT scanned rows",
+            actual: 11,
+            max: 6,
+        }),
+        "invalidated partition metadata restores complete scan charging",
+    );
+
+    let mut unbounded_after_mutation = make_database(usize::MAX);
+    unbounded_after_mutation
+        .execute("INSERT INTO ranges VALUES (55)")
+        .expect("successful mutation");
+    assert_eq!(
+        query(
+            &mut unbounded_after_mutation,
+            "SELECT id FROM ranges WHERE id BETWEEN -5 AND 60",
+        )
+        .rows,
+        vec![
+            vec![Value::Int64(10)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(50)],
+            vec![Value::Int64(55)],
+        ],
+        "the invalidated full scan retains exact BETWEEN evaluation",
     );
 }
 

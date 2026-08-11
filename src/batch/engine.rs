@@ -4266,18 +4266,17 @@ impl Database {
         // Validated range partitions can reduce the source rows charged to
         // the scan limit. A sparse index can then narrow physical candidates,
         // but does not reduce that charge for an ordinary table.
-        let int64_filter = predicate.as_ref().and_then(CompiledPredicate::int64_filter);
-        let int64_index_filter = predicate
+        let int64_metadata_filter = predicate
             .as_ref()
-            .and_then(CompiledPredicate::int64_index_filter);
+            .and_then(CompiledPredicate::int64_metadata_filter);
         let int64_nullness = predicate
             .as_ref()
             .and_then(CompiledPredicate::int64_nullness);
-        let source_rows = int64_filter
+        let source_rows = int64_metadata_filter
             .and_then(|(column, filter)| table.int64_range_partition_rows(column, filter))
             .unwrap_or(0..table.row_count());
         enforce_select_scan_rows(source_rows.len(), query_result_limits)?;
-        let indexed_scan = int64_index_filter
+        let indexed_scan = int64_metadata_filter
             .and_then(|(column, filter)| {
                 table.int64_min_max_index_scan(column, filter, source_rows.clone())
             })
@@ -9472,9 +9471,7 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    /// Returns a direct comparison suitable for range-partition routing.
-    /// Compound predicates deliberately remain on that path's full-scan
-    /// fallback so adding sparse-index shapes cannot change scan-limit charges.
+    /// Returns a direct `Int64` comparison suitable for metadata pruning.
     fn int64_filter(&self) -> Option<(usize, Int64Filter)> {
         let Self::Comparison {
             left,
@@ -9513,11 +9510,11 @@ impl CompiledPredicate {
         Some((column, filter))
     }
 
-    /// Returns the shapes that an `Int64` min/max index can reject safely.
+    /// Returns the shapes that `Int64` range metadata can reject safely.
     /// This includes any exact positive inclusive-range conjunction after
     /// predicate normalization. Every surviving row is still evaluated by
     /// `self`.
-    fn int64_index_filter(&self) -> Option<(usize, Int64Filter)> {
+    fn int64_metadata_filter(&self) -> Option<(usize, Int64Filter)> {
         self.int64_filter()
             .or_else(|| self.int64_inclusive_range_filter())
     }

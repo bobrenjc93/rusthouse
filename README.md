@@ -778,9 +778,10 @@ TABLE DELETE`), or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
 by default. This scanned-row limit is checked against the full source table
 before matching-row indices or replacement values are allocated, so `WHERE`
 selectivity and `LIMIT` do not reduce it for ordinary tables. A supported
-direct predicate on validated `Int64` range partitions instead charges only
-physical ranges that remain possible; each `UNION` operand and each `CROSS
-JOIN` input has its own source scan. String assignments additionally bound
+direct comparison or positive inclusive-range predicate on validated `Int64`
+range partitions instead charges only physical ranges that remain possible;
+each `UNION` operand and each `CROSS JOIN` input has its own source scan. String
+assignments additionally bound
 their matched replacement payload to 16 MiB by default before cloning any
 replacement values.
 It is distinct from the 10,000-row output limit, which applies after filtering,
@@ -843,19 +844,24 @@ row, and retained-value-byte metrics report its normal flattened storage and
 do not count pruning metadata as scalar payload.
 
 For a direct comparison between that `Int64` key and an `Int64` literal using
-`=`, `<`, `<=`, `>`, or `>=` (in either operand order), SELECT discards ranges
-whose inclusive bounds make a match impossible. The normal compiled predicate
-still checks every row in the admitted ranges, and the existing projection,
-aliases, aggregation, ordering, `LIMIT`, and `OFFSET` paths remain authoritative.
-The SELECT scan-row limit is charged to admitted physical ranges. Composite,
-`!=`, cross-type, other-column, and unpartitioned predicates use the complete
-existing scan path. Empty matches therefore preserve typed aggregate `NULL`
-results, while the batch engine's existing typed nullable/non-nullable column
-and NULL-predicate behavior is unchanged. Any successful row or schema mutation
-that could stale the bounds drops the pruning metadata; later SELECTs safely
-fall back to a complete scan. This is local metadata for the in-memory,
-single-process, single-node engine. It is not SQL `PARTITION BY`, distributed
-partition routing, sharding, replication, or a durable partition format.
+`=`, `<`, `<=`, `>`, or `>=` (in either operand order), or an exact positive
+inclusive range on that key with `Int64` literal bounds, SELECT discards ranges
+whose inclusive bounds make a match impossible. `column BETWEEN lower AND
+upper`, the equivalent `column >= lower AND column <= upper`, and forms
+normalized to that conjunction share this partition path. Reversed bounds
+admit no partitions. The normal compiled predicate still checks every row in
+the admitted ranges, and the existing projection, aliases, aggregation,
+ordering, `LIMIT`, and `OFFSET` paths remain authoritative. Source order is
+unchanged, and the SELECT scan-row limit is charged to admitted physical
+ranges. Other composites, `NOT BETWEEN`, `!=`, cross-type, other-column, and
+unpartitioned predicates use the complete existing scan path. Empty matches
+therefore preserve typed aggregate `NULL` results, while the batch engine's
+existing typed nullable/non-nullable column and NULL-predicate behavior is
+unchanged. Any successful row or schema mutation that could stale the bounds
+drops the pruning metadata; later SELECTs safely fall back to a complete scan.
+This is local metadata for the in-memory, single-process, single-node engine.
+It is not SQL `PARTITION BY`, distributed partition routing, sharding,
+replication, or a durable partition format.
 
 Running `rusthouse` without options retains the legacy line-oriented `Int64`
 session. It reads one statement from each nonempty input line and prints a row

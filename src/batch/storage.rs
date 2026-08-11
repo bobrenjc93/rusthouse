@@ -903,7 +903,7 @@ impl Table {
             .map(|set| set.partitions.len())
     }
 
-    /// Narrows a direct key comparison to the contiguous physical rows in
+    /// Narrows a supported key predicate to the contiguous physical rows in
     /// partitions that can possibly satisfy it. `None` means complete-scan
     /// fallback; an empty range means every partition was pruned.
     pub(crate) fn int64_range_partition_rows(
