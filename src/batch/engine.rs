@@ -2930,14 +2930,23 @@ impl Database {
                 })
             }
             Statement::AddColumn { table, column } => {
-                self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
-                let existing = self.catalog.table(&table)?;
-                validate_show_create_addition(existing, &column, false)?;
-                self.table_mut(&table)?.add_column(column)?;
-                Ok(StatementResult::Command {
-                    tag: "ALTER TABLE",
-                    affected_rows: 0,
-                })
+                self.execute_add_column_statement(table, column)
+            }
+            Statement::AddColumnIfNotExists { table, column } => {
+                let column_exists = self
+                    .catalog
+                    .table(&table)?
+                    .schema()
+                    .iter()
+                    .any(|field| field.name.eq_ignore_ascii_case(&column.name));
+                if column_exists {
+                    Ok(StatementResult::Command {
+                        tag: "ALTER TABLE",
+                        affected_rows: 0,
+                    })
+                } else {
+                    self.execute_add_column_statement(table, column)
+                }
             }
             Statement::AddNullableInt64Column { table, column } => {
                 self.execute_add_nullable_int64_column_statement(table, column)
@@ -3151,6 +3160,7 @@ impl Database {
             | Statement::RenameTable { .. }
             | Statement::RenameColumn { .. }
             | Statement::AddColumn { .. }
+            | Statement::AddColumnIfNotExists { .. }
             | Statement::AddNullableInt64Column { .. }
             | Statement::AddNullableInt64ColumnIfNotExists { .. }
             | Statement::DropColumn { .. }
@@ -3167,6 +3177,21 @@ impl Database {
                     .to_owned(),
             )),
         }
+    }
+
+    fn execute_add_column_statement(
+        &mut self,
+        table: String,
+        column: ColumnDef,
+    ) -> Result<StatementResult> {
+        self.reject_unlogged_wal_mutation(&table, "ALTER TABLE ADD COLUMN")?;
+        let existing = self.catalog.table(&table)?;
+        validate_show_create_addition(existing, &column, false)?;
+        self.table_mut(&table)?.add_column(column)?;
+        Ok(StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 0,
+        })
     }
 
     fn execute_add_nullable_int64_column_statement(
@@ -4402,6 +4427,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. }
         | Statement::AddColumn { .. }
+        | Statement::AddColumnIfNotExists { .. }
         | Statement::AddNullableInt64Column { .. }
         | Statement::AddNullableInt64ColumnIfNotExists { .. }
         | Statement::DropColumn { .. }

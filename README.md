@@ -251,14 +251,15 @@ before mutation, leaving schema, data, row count, and row cap unchanged. A
 positional insert or complete explicit list must include the new field, while
 an explicit subset may omit it and receive its typed default. Nullable types
 other than `Nullable(Int64)`, default expressions, and placement clauses are not
-supported by this statement. The exact form
-`ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <name> Nullable(Int64)` performs
-the same nullable addition when the case-insensitive column name is absent and
-is a successful no-op when it is already present, regardless of the existing
-column's physical type. Other `IF NOT EXISTS` ADD COLUMN forms are not
-supported, and a missing table still fails. Each actual addition is preflighted
-against the table's persistent column and physical-cell caps before its default
-vector is allocated. A trailing semicolon is optional.
+supported by this statement. The form
+`ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <name> <type>` supports `Int64`,
+`Float64`, `Bool`, `String`, and exact `Nullable(Int64)`. It performs the same
+typed addition when the case-insensitive column name is absent and is a
+successful no-op when it is already present, regardless of the existing
+column's physical type. A missing table still fails. Each actual addition is
+preflighted against the table's persistent column and physical-cell caps before
+its default vector is allocated; no-ops allocate no column storage, invalidate
+no indexes, and emit no WAL records. A trailing semicolon is optional.
 
 `ALTER TABLE <table> RENAME COLUMN <source> TO <destination>` changes only the
 stored column display name. Table, source-column, destination-collision, and

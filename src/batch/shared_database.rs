@@ -1083,6 +1083,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         }),
         Statement::RenameColumn { .. }
         | Statement::AddColumn { .. }
+        | Statement::AddColumnIfNotExists { .. }
         | Statement::AddNullableInt64Column { .. }
         | Statement::AddNullableInt64ColumnIfNotExists { .. }
         | Statement::DropColumn { .. }
