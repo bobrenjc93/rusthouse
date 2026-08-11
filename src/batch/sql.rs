@@ -112,6 +112,12 @@ pub enum Statement {
         table: String,
         column: String,
     },
+    /// Conditional exact nullable addition; an existing case-insensitive
+    /// column name is a no-op regardless of its physical type.
+    AddNullableInt64ColumnIfNotExists {
+        table: String,
+        column: String,
+    },
     DropColumn {
         table: String,
         column: String,
@@ -1764,6 +1770,21 @@ impl<'a> Parser<'a> {
         let table = self.expect_identifier("table name")?;
         if self.eat_keyword("ADD") {
             self.expect_keyword("COLUMN")?;
+            let if_not_exists = if self.at_keyword("IF") {
+                let lexer = self.lexer;
+                let current = self.current.clone();
+                self.advance();
+                if self.eat_keyword("NOT") {
+                    self.expect_keyword("EXISTS")?;
+                    true
+                } else {
+                    self.lexer = lexer;
+                    self.current = current;
+                    false
+                }
+            } else {
+                false
+            };
             let name = self.expect_identifier("column name")?;
             if is_reserved_column_name(&name) {
                 return Err(Error::ReservedIdentifier {
@@ -1789,10 +1810,17 @@ impl<'a> Parser<'a> {
                 if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                     return self.error("unexpected trailing input after ALTER TABLE ADD COLUMN");
                 }
-                return Ok(Statement::AddNullableInt64Column {
-                    table,
-                    column: name,
-                });
+                return if if_not_exists {
+                    Ok(Statement::AddNullableInt64ColumnIfNotExists {
+                        table,
+                        column: name,
+                    })
+                } else {
+                    Ok(Statement::AddNullableInt64Column {
+                        table,
+                        column: name,
+                    })
+                };
             }
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
@@ -1800,6 +1828,13 @@ impl<'a> Parser<'a> {
                     "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(Int64)"
                 ),
             })?;
+            if if_not_exists {
+                return Err(Error::Sql {
+                    position,
+                    message: "ADD COLUMN IF NOT EXISTS is supported only for Nullable(Int64)"
+                        .to_owned(),
+                });
+            }
             if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("unexpected trailing input after ALTER TABLE ADD COLUMN");
             }
