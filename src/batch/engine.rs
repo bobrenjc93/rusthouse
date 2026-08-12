@@ -163,11 +163,11 @@ pub(crate) struct ParameterizedQueryLimits {
 /// A reusable in-memory SQL database.
 ///
 /// Checked `Int64` column-minus-literal expressions, `CAST`, `toString`,
-/// `ifNull`, `isNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`, `ABS`,
-/// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window
-/// forms provide bounded projections in ungrouped queries. `ifNull`, `isNull`,
-/// and the nullable `Int64` identity `CAST` may also derive fixed-size values
-/// from physical columns already admitted by `GROUP BY`.
+/// `ifNull`, `isNull`, `isNotNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`,
+/// `ABS`, `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER`
+/// window forms provide bounded projections in ungrouped queries. `ifNull`,
+/// `isNull`, and the nullable `Int64` identity `CAST` may also derive fixed-size
+/// values from physical columns already admitted by `GROUP BY`.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
@@ -5421,6 +5421,9 @@ enum ResolvedItem {
         source: usize,
         group_position: Option<usize>,
     },
+    IsNotNull {
+        source: usize,
+    },
     CastNullableInt64ToInt64 {
         source: usize,
         group_position: Option<usize>,
@@ -5712,6 +5715,22 @@ fn resolve_select_items(
                     name: alias
                         .clone()
                         .unwrap_or_else(|| sql::is_null_name(&table.schema()[source].name)),
+                    data_type: DataType::Bool,
+                });
+            }
+            SelectItem::IsNotNull { name, alias } => {
+                let source = table.column_index(name)?;
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "isNotNull projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::IsNotNull { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| sql::is_not_null_name(&table.schema()[source].name)),
                     data_type: DataType::Bool,
                 });
             }
@@ -6268,6 +6287,9 @@ fn execute_projection(
                         ResolvedItem::IsNull { source, .. } => {
                             Value::Bool(is_null_at(table, *source, *row))
                         }
+                        ResolvedItem::IsNotNull { source } => {
+                            Value::Bool(!is_null_at(table, *source, *row))
+                        }
                         ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
                             table.columns()[*source].value(*row)
                         }
@@ -6471,6 +6493,7 @@ fn validate_projection_result_limits(
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::IfNullInt64 { .. }
                 | ResolvedItem::IsNull { .. }
+                | ResolvedItem::IsNotNull { .. }
                 | ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
@@ -6575,6 +6598,9 @@ fn validate_grouped_result_limits(
                     group_position: None,
                     ..
                 } => unreachable!("grouped isNull arguments are validated"),
+                ResolvedItem::IsNotNull { .. } => {
+                    unreachable!("isNotNull projections are restricted to ungrouped queries")
+                }
                 ResolvedItem::CastNullableInt64ToInt64 {
                     group_position: Some(_),
                     ..
@@ -8396,6 +8422,11 @@ impl GroupedData<'_> {
                             group_position: None,
                             ..
                         } => unreachable!("grouped isNull arguments are validated"),
+                        ResolvedItem::IsNotNull { .. } => {
+                            unreachable!(
+                                "isNotNull projections are restricted to ungrouped queries"
+                            )
+                        }
                         ResolvedItem::CastNullableInt64ToInt64 {
                             group_position: Some(position),
                             ..
@@ -8801,6 +8832,7 @@ fn resolved_expression_name(
             source, fallback, ..
         } => sql::if_null_int64_name(&table.schema()[*source].name, *fallback),
         ResolvedItem::IsNull { source, .. } => sql::is_null_name(&table.schema()[*source].name),
+        ResolvedItem::IsNotNull { source } => sql::is_not_null_name(&table.schema()[*source].name),
         ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
@@ -8959,6 +8991,9 @@ fn order_source_rows(
                     .cmp(&if_null_int64_at(table, source, right, fallback)),
                 ResolvedItem::IsNull { source, .. } => {
                     is_null_at(table, source, left).cmp(&is_null_at(table, source, right))
+                }
+                ResolvedItem::IsNotNull { source } => {
+                    (!is_null_at(table, source, left)).cmp(&!is_null_at(table, source, right))
                 }
                 ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
                     table.columns()[source].cmp_at(left, right)
@@ -9239,6 +9274,9 @@ fn order_grouped_rows(
                     group_position: None,
                     ..
                 } => unreachable!("grouped isNull arguments are validated"),
+                ResolvedItem::IsNotNull { .. } => {
+                    unreachable!("isNotNull projections are restricted to ungrouped queries")
+                }
                 ResolvedItem::CastNullableInt64ToInt64 {
                     group_position: Some(position),
                     ..
