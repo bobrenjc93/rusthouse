@@ -3345,6 +3345,22 @@
         "eval_c88a7f3d": 95,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:820",
+      "recordedAt": "2026-08-12T00:20:19.863Z",
+      "label": "PR #820",
+      "kind": "leaf",
+      "prNumber": 820,
+      "title": "Parallelize same-column Nullable COUNT and SUM",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 95,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
