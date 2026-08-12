@@ -1363,12 +1363,14 @@ remains nonblocking and allows concurrent readers.
 graceful-lifecycle variant. It takes ownership of its `TcpListener`, observes a
 caller-owned `AtomicBool`, and uses nonblocking accepts with a bounded 10 ms
 idle poll interval. Setting the flag stops new connection dispatch without
-requiring a wake-up client. A connection returned by an accept racing with the
-flag is closed without consuming the connection budget. All connections
-accepted before cancellation continue under their original absolute read and
-write deadlines; the function closes their response direction after one
-exchange, drains their workers, orders transport failures by acceptance, and
-then returns the usual `HttpListenerReport`. The explicit
+requiring a wake-up client. Completion waits at a full in-flight cap use the
+same bound, so a stalled accepted request cannot keep the admission socket open
+after cancellation. A connection returned by an accept racing with the flag is
+closed without consuming the connection budget. All connections accepted
+before cancellation continue under their original absolute read and write
+deadlines; the function closes their response direction after one exchange,
+drains their workers, orders transport failures by acceptance, and then
+returns the usual `HttpListenerReport`. The explicit
 `HttpListenerLimits::max_connections` still ends a finite run even if the flag
 remains false, and zero or an initially set flag returns without accepting.
 The in-flight cap is unchanged, including cap-one sequential acceptance. The

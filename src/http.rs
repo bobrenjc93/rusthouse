@@ -47,8 +47,8 @@ pub const DEFAULT_HTTP_CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(3
 /// Default absolute write-deadline duration for an accepted listener connection.
 pub const DEFAULT_HTTP_CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum idle wait between cancellation checks for the owned concurrent
-/// listener.
+/// Maximum wait between cancellation checks while the owned concurrent
+/// listener is idle or awaiting in-flight capacity.
 pub const DEFAULT_HTTP_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Resource limits for a single [`handle_http_query`] exchange.
@@ -686,9 +686,11 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
 /// dispatching new connections, closes the listener, and waits for every
 /// already accepted exchange to finish. While idle, a nonblocking accept is
 /// retried after at most [`DEFAULT_HTTP_ACCEPT_POLL_INTERVAL`], so cancellation
-/// does not depend on another client arriving. The flag is also checked after
-/// a successful accept; a connection returned by an accept racing with
-/// cancellation is closed without consuming the connection budget.
+/// does not depend on another client arriving. A full-capacity completion wait
+/// uses the same bound, so cancellation closes admission before a stalled
+/// worker drains. The flag is also checked after a successful accept; a
+/// connection returned by an accept racing with cancellation is closed without
+/// consuming the connection budget.
 ///
 /// `limits.max_connections` remains a finite upper bound when one is desired;
 /// the function returns normally when either that budget is exhausted or
@@ -737,7 +739,12 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
             }
 
             if workers.len() == max_in_flight_connections.get() {
-                receive_http_listener_completion(&completion_receiver, &mut workers, &mut report);
+                receive_http_listener_completion_with_timeout(
+                    &completion_receiver,
+                    &mut workers,
+                    &mut report,
+                    DEFAULT_HTTP_ACCEPT_POLL_INTERVAL,
+                );
                 continue;
             }
 
@@ -748,17 +755,12 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
                     if workers.is_empty() {
                         thread::sleep(DEFAULT_HTTP_ACCEPT_POLL_INTERVAL);
                     } else {
-                        match completion_receiver.recv_timeout(DEFAULT_HTTP_ACCEPT_POLL_INTERVAL) {
-                            Ok(completion) => finish_http_listener_completion(
-                                completion,
-                                &mut workers,
-                                &mut report,
-                            ),
-                            Err(RecvTimeoutError::Timeout) => {}
-                            Err(RecvTimeoutError::Disconnected) => {
-                                panic!("in-flight HTTP listener workers must report completion")
-                            }
-                        }
+                        receive_http_listener_completion_with_timeout(
+                            &completion_receiver,
+                            &mut workers,
+                            &mut report,
+                            DEFAULT_HTTP_ACCEPT_POLL_INTERVAL,
+                        );
                     }
                     continue;
                 }
@@ -997,6 +999,21 @@ fn receive_http_listener_completion(
         .recv()
         .expect("an in-flight HTTP listener worker must report completion");
     finish_http_listener_completion(completion, workers, report);
+}
+
+fn receive_http_listener_completion_with_timeout(
+    completion_receiver: &Receiver<HttpListenerCompletion>,
+    workers: &mut Vec<(usize, ScopedJoinHandle<'_, ()>)>,
+    report: &mut HttpListenerReport,
+    timeout: Duration,
+) {
+    match completion_receiver.recv_timeout(timeout) {
+        Ok(completion) => finish_http_listener_completion(completion, workers, report),
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("in-flight HTTP listener workers must report completion")
+        }
+    }
 }
 
 fn finish_http_listener_completion(

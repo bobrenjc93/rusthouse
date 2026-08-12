@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusthouse::batch::csv::CsvIngestLimits;
 use rusthouse::batch::engine::Database;
@@ -99,6 +99,33 @@ fn start_exchange(address: SocketAddr, request: Vec<u8>) -> (Receiver<Vec<u8>>, 
         .recv()
         .expect("client reports completed request");
     (response_receiver, worker)
+}
+
+fn wait_for_listener_to_close(address: SocketAddr) {
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(50)) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionRefused
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return;
+            }
+            Ok(stream) => drop(stream),
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {}
+            Err(error) => panic!("probe listener shutdown: {error}"),
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "listener remained open after cancellation"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn post_query(sql: &str) -> Vec<u8> {
@@ -628,21 +655,29 @@ fn cancellable_concurrent_listener_stops_after_becoming_idle() {
 }
 
 #[test]
-fn cancellable_concurrent_listener_drains_in_flight_work_without_accepting_more() {
+fn cancellable_concurrent_listener_closes_at_full_cap_before_draining_in_flight_work() {
+    let database = SharedDatabase::default();
+    database
+        .execute(&format!(
+            "CREATE TABLE payloads (value String); INSERT INTO payloads VALUES ('{}');",
+            "x".repeat(STALLED_RESPONSE_BYTES)
+        ))
+        .expect("create a response larger than the loopback socket buffers");
     let limits = HttpListenerLimits {
         read_timeout: IO_TIMEOUT,
-        write_timeout: IO_TIMEOUT,
+        write_timeout: Duration::from_secs(10),
         ..HttpListenerLimits::new(usize::MAX, HttpQueryLimits::default())
     };
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let address = listener.local_addr().expect("read loopback address");
     let stop_requested = Arc::new(AtomicBool::new(false));
     let served_stop_requested = Arc::clone(&stop_requested);
+    let served_database = database.clone();
     let (completion_sender, completion_receiver) = mpsc::channel();
     let worker = thread::spawn(move || {
         let result = serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
             listener,
-            &SharedDatabase::default(),
+            &served_database,
             "correct-key",
             limits,
             NonZeroUsize::new(1).unwrap(),
@@ -653,52 +688,42 @@ fn cancellable_concurrent_listener_drains_in_flight_work_without_accepting_more(
             .expect("report cancellable listener completion");
     });
 
-    let mut in_flight = TcpStream::connect(address).expect("connect in-flight client");
+    let mut in_flight = TcpStream::connect(address).expect("connect non-reading client");
     in_flight
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .expect("set in-flight client read timeout");
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set draining client read timeout");
     in_flight
         .set_write_timeout(Some(IO_TIMEOUT))
-        .expect("set in-flight client write timeout");
+        .expect("set draining client write timeout");
     in_flight
-        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
-        .expect("write incomplete in-flight request");
+        .write_all(&post_query_with_clickhouse_key(
+            "SELECT value FROM payloads;",
+            "correct-key",
+        ))
+        .expect("write request for a response that fills the socket buffers");
+    finish_request_stream(&in_flight);
 
-    // Give the loopback accept poll several complete intervals to dispatch the
-    // first request before cancellation. The incomplete request then keeps the
-    // sole worker occupied until this test explicitly finishes it.
-    thread::sleep(Duration::from_millis(100));
+    // Receiving the response prefix synchronizes with an accepted, running
+    // worker. The complete response is larger than the loopback socket
+    // buffers, so withholding the remaining reads keeps the cap occupied.
+    let mut response = vec![0];
+    in_flight
+        .read_exact(&mut response)
+        .expect("read response prefix from the accepted worker");
+    assert_eq!(response, b"H");
+
     stop_requested.store(true, Ordering::Release);
-
-    let mut after_cancellation =
-        TcpStream::connect(address).expect("queue client after cancellation");
-    after_cancellation
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .expect("set queued client read timeout");
-    after_cancellation
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .expect("set queued client write timeout");
-    after_cancellation
-        .write_all(
-            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
-        )
-        .expect("write queued request after cancellation");
-    finish_request_stream(&after_cancellation);
-
+    wait_for_listener_to_close(address);
     assert!(matches!(
         completion_receiver.recv_timeout(Duration::from_millis(100)),
         Err(RecvTimeoutError::Timeout)
     ));
 
     in_flight
-        .write_all(b"\r\n\r\n")
-        .expect("complete accepted request during draining");
-    finish_request_stream(&in_flight);
-    let mut in_flight_response = Vec::new();
-    in_flight
-        .read_to_end(&mut in_flight_response)
-        .expect("drained request receives its response");
-    assert_eq!(body(&in_flight_response), b"Ok.\n");
+        .read_to_end(&mut response)
+        .expect("drain the accepted response after admission closes");
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(body(&response).len() > STALLED_RESPONSE_BYTES);
 
     let report = completion_receiver
         .recv_timeout(IO_TIMEOUT)
@@ -708,18 +733,6 @@ fn cancellable_concurrent_listener_drains_in_flight_work_without_accepting_more(
     assert_eq!(report.accepted_connections, 1);
     assert_eq!(report.successful_exchanges, 1);
     assert!(report.connection_failures.is_empty());
-
-    let mut rejected_response = Vec::new();
-    match after_cancellation.read_to_end(&mut rejected_response) {
-        Ok(_) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
-            ) => {}
-        Err(error) => panic!("read queued connection shutdown: {error}"),
-    }
-    assert!(rejected_response.is_empty());
 }
 
 #[test]
