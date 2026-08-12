@@ -137,6 +137,12 @@ row-count/`MAX(Float64)` pairs or same-column nullable `COUNT`/`SUM` and `COUNT`
 (including all other `COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema, `AVG(Float64)`,
 grouped nullable SUM, MIN, MAX, or AVG, and
 other aggregate functions remain sequential.
+Internally, the private global scalar-extremum reducer owns raw-slice chunking,
+worker orchestration, and ordered partial reduction for these `Int64`,
+`Nullable(Int64)`, and `Float64` paths. The SQL engine owns query-shape
+recognition, physical-column resolution, and typed aggregate-state construction;
+the aggregate scheduler separately owns shared admission and deterministic
+partition boundaries.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
