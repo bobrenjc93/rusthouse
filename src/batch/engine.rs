@@ -7397,7 +7397,7 @@ fn execute_grouped_bool_min<'a>(
         AggregateSpec {
             function: AggregateFunction::Min,
             argument: Some(value_column),
-            input_type: Some(DataType::Int64 | DataType::Float64),
+            input_type: Some(DataType::Int64 | DataType::Float64 | DataType::Bool),
         },
     ] = aggregate_specs
     else {
@@ -7416,6 +7416,11 @@ fn execute_grouped_bool_min<'a>(
             grouped_bool_min::reduce_float64(group_values, values, matching_rows, parallelism)?,
             limits,
             Value::Float64,
+        ),
+        Column::Bool(values) => finish_grouped_bool_min(
+            grouped_bool_min::reduce_bool(group_values, values, matching_rows, parallelism)?,
+            limits,
+            Value::Bool,
         ),
         _ => Ok(None),
     }
@@ -11282,7 +11287,6 @@ mod tests {
             "SELECT active, included, MIN(value) FROM bool_min_events GROUP BY active, included",
             "SELECT value, MIN(id) FROM bool_min_events GROUP BY value",
             "SELECT active, MIN(nullable_value) FROM bool_min_events GROUP BY active",
-            "SELECT active, MIN(active) FROM bool_min_events GROUP BY active",
         ] {
             BUDGET.reset_peak();
             query(&mut database, unsupported_sql);
@@ -11429,6 +11433,165 @@ mod tests {
     }
 
     #[test]
+    fn grouped_bool_min_of_bool_is_narrow_bounded_and_sequentially_differential() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 4;
+        let mut database = grouped_bool_min_database(row_count, |id| {
+            let active = id == 1 || id == row_count;
+            let included = id != 3;
+            (i64::try_from(id % 2).unwrap(), active, included)
+        });
+        let same_column_sql =
+            "SELECT active AS enabled, MIN(active) AS minimum FROM bool_min_events GROUP BY active";
+        let different_column_sql = "SELECT active AS enabled, MIN(included) AS minimum \
+                                    FROM bool_min_events GROUP BY active";
+
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, same_column_sql).rows,
+            [
+                vec![Value::Bool(false), Value::Bool(false)],
+                vec![Value::Bool(true), Value::Bool(true)],
+            ],
+            "same-column Bool MIN preserves the normal grouped Bool key tie-break"
+        );
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, different_column_sql).rows,
+            [
+                vec![Value::Bool(false), Value::Bool(false)],
+                vec![Value::Bool(true), Value::Bool(true)],
+            ],
+            "different-column Bool MIN preserves the normal grouped Bool key tie-break and minima"
+        );
+
+        let filtered_sql = "SELECT active AS enabled, MIN(included) AS minimum \
+                            FROM bool_min_events WHERE id > 1 GROUP BY active";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!(
+                    "{filtered_sql} HAVING minimum IS NOT NULL \
+                     ORDER BY minimum ASC, enabled DESC LIMIT 1 OFFSET 1"
+                ),
+            )
+            .rows,
+            [vec![Value::Bool(true), Value::Bool(true)]],
+            "filtering, Bool HAVING nullness, ordering, and pagination remain downstream"
+        );
+        assert!(
+            assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!("{filtered_sql} HAVING minimum IS NULL"),
+            )
+            .rows
+            .is_empty()
+        );
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+        BUDGET.reset_peak();
+        query(
+            &mut database,
+            &format!(
+                "SELECT active, MIN(included) FROM bool_min_events \
+                 WHERE id <= {} GROUP BY active",
+                GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+            ),
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "the exact matched-row threshold stays sequential"
+        );
+
+        BUDGET.reset_peak();
+        query(
+            &mut database,
+            &format!(
+                "SELECT active, MIN(included) FROM bool_min_events \
+                 WHERE id <= {} GROUP BY active",
+                GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1
+            ),
+        );
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "a different Bool value column above the threshold uses shared helpers"
+        );
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        BUDGET.reset_peak();
+        query(&mut database, same_column_sql);
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "the grouping Bool column can also be the MIN argument"
+        );
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        let sequential = force_global_aggregate_workers(&mut database, 1, different_column_sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts grouped Bool MIN helper admission");
+        assert_eq!(query(&mut database, different_column_sql), sequential);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        for (limits, expected_error) in [
+            (
+                QueryResultLimits {
+                    max_groups: 1,
+                    ..QueryResultLimits::default()
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT groups",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_values: 3,
+                    ..QueryResultLimits::default()
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result values",
+                    actual: 4,
+                    max: 3,
+                },
+            ),
+        ] {
+            database.query_result_limits = limits;
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+            let sequential_error = database.execute(different_column_sql);
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
+            let parallel_error = database.execute(different_column_sql);
+            assert_eq!(parallel_error, sequential_error);
+            assert_eq!(parallel_error, Err(expected_error));
+        }
+        database.query_result_limits = QueryResultLimits::default();
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+
+        for unsupported_sql in [
+            "SELECT MIN(included) FROM bool_min_events",
+            "SELECT active, MIN(included), COUNT(*) FROM bool_min_events GROUP BY active",
+            "SELECT active, included, MIN(included) FROM bool_min_events \
+             GROUP BY active, included",
+            "SELECT value, MIN(included) FROM bool_min_events GROUP BY value",
+        ] {
+            BUDGET.reset_peak();
+            query(&mut database, unsupported_sql);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use(),
+                0,
+                "unsupported Bool MIN shape stays sequential: {unsupported_sql}"
+            );
+        }
+    }
+
+    #[test]
     fn grouped_bool_float64_min_is_narrow_parallel_and_sequentially_differential() {
         static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
 
@@ -11547,7 +11710,6 @@ mod tests {
              GROUP BY active, included",
             "SELECT value, MIN(id) FROM bool_float_min_events GROUP BY value",
             "SELECT active, MAX(active) FROM bool_float_min_events GROUP BY active",
-            "SELECT active, MIN(active) FROM bool_float_min_events GROUP BY active",
         ] {
             BUDGET.reset_peak();
             query(&mut database, unsupported_sql);
