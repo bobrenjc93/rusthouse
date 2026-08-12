@@ -16,6 +16,7 @@ use crate::batch::scalar_cast::{
     checked_string_to_bool, checked_string_to_float64, checked_string_to_int64, decimal_text_cmp,
     ordering_string_to_float64, validate_string_to_float64_syntax, validate_string_to_int64_syntax,
 };
+use crate::batch::scalar_text;
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, AlterUpdateValue,
     ComparisonOperator, CrossJoin, CurrentDatabaseSelect, DeleteComparisonPredicate, Having,
@@ -9008,89 +9009,6 @@ fn bool_at(table: &Table, source: usize, row: usize) -> bool {
     values[row]
 }
 
-fn bool_string(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
-}
-
-// Rust's finite `f64` Display form is longest for the negative smallest
-// subnormal: `-0.` followed by its fractional decimal digits.
-const MAX_FLOAT64_TEXT_BYTES: usize = 327;
-
-struct Float64Text {
-    bytes: [u8; MAX_FLOAT64_TEXT_BYTES],
-    len: usize,
-}
-
-impl Float64Text {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[..self.len]).expect("Float64 text is ASCII")
-    }
-
-    fn into_string(self) -> String {
-        self.as_str().to_owned()
-    }
-}
-
-impl fmt::Write for Float64Text {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
-        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
-        destination.copy_from_slice(text.as_bytes());
-        self.len = end;
-        Ok(())
-    }
-}
-
-fn render_float64_text(value: f64) -> Float64Text {
-    debug_assert!(value.is_finite(), "stored Float64 values are finite");
-    let mut rendered = Float64Text {
-        bytes: [0; MAX_FLOAT64_TEXT_BYTES],
-        len: 0,
-    };
-    fmt::write(&mut rendered, format_args!("{value}"))
-        .expect("a finite Float64 decimal fits the bounded text buffer");
-    rendered
-}
-
-fn int64_text_len(value: i64) -> usize {
-    let magnitude = value.unsigned_abs();
-    let digits = if magnitude == 0 {
-        1
-    } else {
-        magnitude.ilog10() as usize + 1
-    };
-    digits + usize::from(value.is_negative())
-}
-
-fn int64_text_cmp(left: i64, right: i64) -> Ordering {
-    let (left_bytes, left_start) = render_int64_text(left);
-    let (right_bytes, right_start) = render_int64_text(right);
-    left_bytes[left_start..].cmp(&right_bytes[right_start..])
-}
-
-fn render_int64_text(value: i64) -> ([u8; 20], usize) {
-    let mut bytes = [0_u8; 20];
-    let mut start = bytes.len();
-    let mut magnitude = value.unsigned_abs();
-    loop {
-        start -= 1;
-        bytes[start] = b'0' + (magnitude % 10) as u8;
-        magnitude /= 10;
-        if magnitude == 0 {
-            break;
-        }
-    }
-    if value.is_negative() {
-        start -= 1;
-        bytes[start] = b'-';
-    }
-    (bytes, start)
-}
-
 fn checked_float64_to_int64(value: f64) -> Result<i64> {
     const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
 
@@ -9112,15 +9030,15 @@ fn stringify_value(table: &Table, source: usize, row: usize, input_type: DataTyp
         ValueRef::Null(_) => Value::Null(DataType::String),
         ValueRef::Int64(value) => {
             debug_assert_eq!(input_type, DataType::Int64);
-            Value::String(value.to_string())
+            Value::String(scalar_text::render_int64(value))
         }
         ValueRef::Float64(value) => {
             debug_assert_eq!(input_type, DataType::Float64);
-            Value::String(render_float64_text(value).into_string())
+            Value::String(scalar_text::render_float64(value))
         }
         ValueRef::Bool(value) => {
             debug_assert_eq!(input_type, DataType::Bool);
-            Value::String(bool_string(value).to_owned())
+            Value::String(scalar_text::render_bool(value))
         }
         ValueRef::String(value) => {
             debug_assert_eq!(input_type, DataType::String);
@@ -9134,15 +9052,15 @@ fn stringified_len(table: &Table, source: usize, row: usize, input_type: DataTyp
         ValueRef::Null(_) => 0,
         ValueRef::Int64(value) => {
             debug_assert_eq!(input_type, DataType::Int64);
-            int64_text_len(value)
+            scalar_text::int64_len(value)
         }
         ValueRef::Float64(value) => {
             debug_assert_eq!(input_type, DataType::Float64);
-            render_float64_text(value).len()
+            scalar_text::float64_len(value)
         }
         ValueRef::Bool(value) => {
             debug_assert_eq!(input_type, DataType::Bool);
-            bool_string(value).len()
+            scalar_text::bool_len(value)
         }
         ValueRef::String(value) => {
             debug_assert_eq!(input_type, DataType::String);
@@ -9167,17 +9085,15 @@ fn stringified_cmp(
         (_, ValueRef::Null(_)) => Ordering::Greater,
         (ValueRef::Int64(left), ValueRef::Int64(right)) => {
             debug_assert_eq!(input_type, DataType::Int64);
-            int64_text_cmp(left, right)
+            scalar_text::int64_cmp(left, right)
         }
         (ValueRef::Float64(left), ValueRef::Float64(right)) => {
             debug_assert_eq!(input_type, DataType::Float64);
-            let left = render_float64_text(left);
-            let right = render_float64_text(right);
-            left.as_str().cmp(right.as_str())
+            scalar_text::float64_cmp(left, right)
         }
         (ValueRef::Bool(left), ValueRef::Bool(right)) => {
             debug_assert_eq!(input_type, DataType::Bool);
-            left.cmp(&right)
+            scalar_text::bool_cmp(left, right)
         }
         (ValueRef::String(left), ValueRef::String(right)) => {
             debug_assert_eq!(input_type, DataType::String);
