@@ -1,23 +1,35 @@
-//! Private partial-state reduction for non-nullable `Int64` `MIN` grouped by `Bool`.
+//! Private partial-state reduction for supported non-nullable `MIN` values grouped by `Bool`.
 
 use super::aggregate_scheduler::{GlobalAggregateParallelism, run_grouped_aggregate};
 use super::error::Result;
+use super::global_scalar_extremum::first_float64_minimum;
 
-const WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-min-int64";
+const INT64_WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-min-int64";
+const FLOAT64_WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-min-float64";
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Partial {
-    false_min: Option<i64>,
-    true_min: Option<i64>,
+#[derive(Debug, PartialEq)]
+pub(super) struct Partial<T> {
+    false_min: Option<T>,
+    true_min: Option<T>,
     first_seen: Option<bool>,
 }
 
-impl Partial {
-    fn slot(&self, group: bool) -> Option<i64> {
+impl<T> Default for Partial<T> {
+    fn default() -> Self {
+        Self {
+            false_min: None,
+            true_min: None,
+            first_seen: None,
+        }
+    }
+}
+
+impl<T: Copy> Partial<T> {
+    fn slot(&self, group: bool) -> Option<T> {
         if group { self.true_min } else { self.false_min }
     }
 
-    fn slot_mut(&mut self, group: bool) -> &mut Option<i64> {
+    fn slot_mut(&mut self, group: bool) -> &mut Option<T> {
         if group {
             &mut self.true_min
         } else {
@@ -33,65 +45,104 @@ impl Partial {
         self.slot(group).is_some()
     }
 
-    pub(super) fn minimum(&self, group: bool) -> i64 {
+    pub(super) fn minimum(&self, group: bool) -> T {
         self.slot(group)
-            .expect("a present non-nullable Int64 group has a minimum")
+            .expect("a present non-nullable group has a minimum")
     }
 
-    fn observe(&mut self, group: bool, value: i64) {
+    fn observe<C>(&mut self, group: bool, value: T, first_minimum: &C)
+    where
+        C: Fn(T, T) -> T,
+    {
         self.first_seen.get_or_insert(group);
         let minimum = self.slot_mut(group);
-        *minimum = Some(minimum.map_or(value, |current| current.min(value)));
+        *minimum = Some(minimum.map_or(value, |current| first_minimum(current, value)));
     }
 }
 
-pub(super) fn reduce(
+pub(super) fn reduce_int64(
     group_values: &[bool],
     min_values: &[i64],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
-) -> Result<Partial> {
+) -> Result<Partial<i64>> {
     reduce_with_chunk(
         group_values,
         min_values,
         matching_rows,
         parallelism,
+        INT64_WORKER_NAME_PREFIX,
+        first_i64_minimum,
         scan_chunk,
     )
 }
 
-fn reduce_with_chunk<C>(
+pub(super) fn reduce_float64(
     group_values: &[bool],
-    min_values: &[i64],
+    min_values: &[f64],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
+) -> Result<Partial<f64>> {
+    reduce_with_chunk(
+        group_values,
+        min_values,
+        matching_rows,
+        parallelism,
+        FLOAT64_WORKER_NAME_PREFIX,
+        first_float64_minimum,
+        scan_chunk,
+    )
+}
+
+fn first_i64_minimum(left: i64, right: i64) -> i64 {
+    if right < left { right } else { left }
+}
+
+fn reduce_with_chunk<T, M, C>(
+    group_values: &[bool],
+    min_values: &[T],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    worker_name_prefix: &str,
+    first_minimum: M,
     chunk: C,
-) -> Result<Partial>
+) -> Result<Partial<T>>
 where
-    C: Fn(&[bool], &[i64], &[usize]) -> Result<Partial> + Sync,
+    T: Copy + Send + Sync,
+    M: Fn(T, T) -> T + Sync,
+    C: Fn(&[bool], &[T], &[usize], &M) -> Result<Partial<T>> + Sync,
 {
     run_grouped_aggregate(
         matching_rows,
         parallelism,
-        WORKER_NAME_PREFIX,
-        |rows| chunk(group_values, min_values, rows),
-        reduce_ordered,
+        worker_name_prefix,
+        |rows| chunk(group_values, min_values, rows, &first_minimum),
+        |partials| reduce_ordered(partials, &first_minimum),
     )
 }
 
-fn scan_chunk(
+fn scan_chunk<T, C>(
     group_values: &[bool],
-    min_values: &[i64],
+    min_values: &[T],
     matching_rows: &[usize],
-) -> Result<Partial> {
+    first_minimum: &C,
+) -> Result<Partial<T>>
+where
+    T: Copy,
+    C: Fn(T, T) -> T,
+{
     let mut partial = Partial::default();
     for row in matching_rows {
-        partial.observe(group_values[*row], min_values[*row]);
+        partial.observe(group_values[*row], min_values[*row], first_minimum);
     }
     Ok(partial)
 }
 
-fn reduce_ordered(partials: Vec<Partial>) -> Result<Partial> {
+fn reduce_ordered<T, C>(partials: Vec<Partial<T>>, first_minimum: &C) -> Result<Partial<T>>
+where
+    T: Copy,
+    C: Fn(T, T) -> T,
+{
     Ok(partials
         .into_iter()
         .fold(Partial::default(), |mut total, partial| {
@@ -99,10 +150,10 @@ fn reduce_ordered(partials: Vec<Partial>) -> Result<Partial> {
                 total.first_seen = partial.first_seen;
             }
             if let Some(minimum) = partial.false_min {
-                total.observe(false, minimum);
+                total.observe(false, minimum, first_minimum);
             }
             if let Some(minimum) = partial.true_min {
-                total.observe(true, minimum);
+                total.observe(true, minimum, first_minimum);
             }
             total
         }))
@@ -125,7 +176,7 @@ mod tests {
         matching_rows[second_partition] = 1;
         matching_rows[row_count - 1] = 2;
 
-        let successful_parallel = reduce(
+        let successful_parallel = reduce_int64(
             &group_values,
             &min_values,
             &matching_rows,
@@ -137,11 +188,13 @@ mod tests {
             &min_values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
-            |group_values, min_values, rows| {
+            INT64_WORKER_NAME_PREFIX,
+            first_i64_minimum,
+            |group_values, min_values, rows, first_minimum| {
                 if std::thread::current().name() == Some("rusthouse-group-bool-min-int64-1") {
                     panic!("injected grouped MIN worker failure");
                 }
-                scan_chunk(group_values, min_values, rows)
+                scan_chunk(group_values, min_values, rows, first_minimum)
             },
         )
         .expect("worker failure falls back to the complete grouped MIN locally");
@@ -153,5 +206,45 @@ mod tests {
         };
         assert_eq!(successful_parallel, expected);
         assert_eq!(failed_parallel, expected);
+    }
+
+    #[test]
+    fn float64_worker_failure_repeats_complete_input_with_first_ties_and_group_order() {
+        let group_values = [true, true, false];
+        let min_values = [-0.0, 0.0, f64::MIN];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_float64(
+            &group_values,
+            &min_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+        )
+        .expect("deterministic parallel grouped Float64 MIN succeeds");
+        let failed_parallel = reduce_with_chunk(
+            &group_values,
+            &min_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            FLOAT64_WORKER_NAME_PREFIX,
+            first_float64_minimum,
+            |group_values, min_values, rows, first_minimum| {
+                if std::thread::current().name() == Some("rusthouse-group-bool-min-float64-1") {
+                    panic!("injected grouped Float64 MIN worker failure");
+                }
+                scan_chunk(group_values, min_values, rows, first_minimum)
+            },
+        )
+        .expect("worker failure falls back to the complete grouped Float64 MIN locally");
+
+        for partial in [&successful_parallel, &failed_parallel] {
+            assert_eq!(partial.first_seen(), Some(true));
+            assert_eq!(partial.minimum(false), f64::MIN);
+            assert_eq!(partial.minimum(true).to_bits(), (-0.0_f64).to_bits());
+        }
     }
 }
