@@ -16,6 +16,7 @@ use super::engine::{
 #[cfg(unix)]
 use super::engine::{DatabaseRleSnapshotSaveError, DatabaseSnapshotSaveError};
 use super::error::Error;
+use super::json_compact_each_row::{JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits};
 use super::sql::{self, Statement};
 use super::tsv::{TsvIngestError, TsvIngestLimits};
 #[cfg(unix)]
@@ -61,6 +62,8 @@ pub enum SharedDatabaseError {
     CsvIngest(CsvIngestError),
     /// The database rejected a TSV ingestion request.
     TsvIngest(TsvIngestError),
+    /// The database rejected a JSONCompactEachRow ingestion request.
+    JsonCompactEachRowIngest(JsonCompactEachRowIngestError),
     /// The read-only query API received zero or multiple statements.
     QueryStatementCount { statements: usize },
     /// The read-only query API received a mutating statement.
@@ -77,6 +80,10 @@ impl fmt::Display for SharedDatabaseError {
             Self::Sql(error) => error.fmt(formatter),
             Self::CsvIngest(error) => write!(formatter, "database CSV ingestion failed: {error}"),
             Self::TsvIngest(error) => write!(formatter, "database TSV ingestion failed: {error}"),
+            Self::JsonCompactEachRowIngest(error) => write!(
+                formatter,
+                "database JSONCompactEachRow ingestion failed: {error}"
+            ),
             Self::QueryStatementCount { statements } => write!(
                 formatter,
                 "read-only query requires exactly one statement; found {statements}"
@@ -97,6 +104,7 @@ impl StdError for SharedDatabaseError {
             Self::Sql(error) => Some(error),
             Self::CsvIngest(error) => Some(error),
             Self::TsvIngest(error) => Some(error),
+            Self::JsonCompactEachRowIngest(error) => Some(error),
             Self::QueryStatementCount { .. }
             | Self::ReadOnlyStatementRequired { .. }
             | Self::DatabaseBusy
@@ -120,6 +128,12 @@ impl From<CsvIngestError> for SharedDatabaseError {
 impl From<TsvIngestError> for SharedDatabaseError {
     fn from(error: TsvIngestError) -> Self {
         Self::TsvIngest(error)
+    }
+}
+
+impl From<JsonCompactEachRowIngestError> for SharedDatabaseError {
+    fn from(error: JsonCompactEachRowIngestError) -> Self {
+        Self::JsonCompactEachRowIngest(error)
     }
 }
 
@@ -349,10 +363,11 @@ impl From<DatabaseRleSnapshotSaveError> for SharedDatabaseRleSnapshotSaveError {
 /// [`Self::try_execute_insert_batch`] similarly attempts
 /// one nonblocking write lock for an atomic `INSERT`-only batch, and
 /// [`Self::try_ingest_csv`], [`Self::try_ingest_csv_with_names`],
-/// [`Self::try_ingest_tsv`], and [`Self::try_ingest_tsv_with_names`] do the same
-/// for headerless `CSV`, `CSVWithNames`, headerless `TabSeparated`, and
-/// `TabSeparatedWithNames` ingestion. Results own their columns and values and
-/// remain valid after the lock is released.
+/// [`Self::try_ingest_tsv`], [`Self::try_ingest_tsv_with_names`], and
+/// [`Self::try_ingest_json_compact_each_row`] do the same for headerless `CSV`,
+/// `CSVWithNames`, headerless `TabSeparated`, `TabSeparatedWithNames`, and the
+/// one-column `JSONCompactEachRow` subset. Results own their columns and values
+/// and remain valid after the lock is released.
 ///
 /// A batch passed to [`Self::execute`] is not a rollback transaction: once
 /// parsing succeeds, earlier statements remain applied if a later statement
@@ -360,7 +375,8 @@ impl From<DatabaseRleSnapshotSaveError> for SharedDatabaseRleSnapshotSaveError {
 /// for the narrower `INSERT`-only case. [`Self::ingest_csv`],
 /// [`Self::ingest_csv_with_names`], [`Self::ingest_tsv`], and
 /// [`Self::ingest_tsv_with_names`] retain a write lock through their complete
-/// bounded, atomic import operations.
+/// bounded, atomic import operations. [`Self::ingest_json_compact_each_row`]
+/// provides the same lock boundary for its positional JSON subset.
 ///
 /// # Examples
 ///
@@ -1003,6 +1019,40 @@ impl SharedDatabase {
         let mut database = self.try_write()?;
         database
             .ingest_tsv_with_names(table, input, limits)
+            .map_err(Into::into)
+    }
+
+    /// Atomically ingests bounded one-column `JSONCompactEachRow` bytes under one write lock.
+    ///
+    /// The lock is retained through table lookup, complete UTF-8 and JSON
+    /// validation, limit and capacity preflight, WAL commit, and the one final
+    /// append. Empty input is a zero-row no-op after target validation.
+    pub fn ingest_json_compact_each_row(
+        &self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: JsonCompactEachRowIngestLimits,
+    ) -> Result<usize, SharedDatabaseError> {
+        self.write()?
+            .ingest_json_compact_each_row(table, input, limits)
+            .map_err(Into::into)
+    }
+
+    /// Attempts one bounded, atomic `JSONCompactEachRow` ingestion without waiting.
+    ///
+    /// Exactly one immediate write-lock attempt occurs before table lookup or
+    /// input access. An active reader or writer returns
+    /// [`SharedDatabaseError::DatabaseBusy`]; an acquired guard is retained
+    /// through complete validation and commit.
+    pub fn try_ingest_json_compact_each_row(
+        &self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: JsonCompactEachRowIngestLimits,
+    ) -> Result<usize, SharedDatabaseError> {
+        let mut database = self.try_write()?;
+        database
+            .ingest_json_compact_each_row(table, input, limits)
             .map_err(Into::into)
     }
 
