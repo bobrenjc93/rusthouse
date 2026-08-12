@@ -161,7 +161,8 @@ pub(crate) struct ParameterizedQueryLimits {
 /// Checked `Int64` column-minus-literal expressions, `CAST`, `toString`,
 /// `ifNull`, `isNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`, `ABS`,
 /// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window
-/// forms provide bounded projections in ungrouped queries.
+/// forms provide bounded projections in ungrouped queries. `isNull` may also
+/// derive a `Bool` from a physical column already admitted by `GROUP BY`.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
@@ -5211,6 +5212,7 @@ enum ResolvedItem {
     },
     IsNull {
         source: usize,
+        group_position: Option<usize>,
     },
     CastNullableInt64ToInt64 {
         source: usize,
@@ -5487,13 +5489,16 @@ fn resolve_select_items(
             }
             SelectItem::IsNull { name, alias } => {
                 let source = table.column_index(name)?;
-                if has_aggregate || !group_columns.is_empty() {
-                    return Err(Error::InvalidQuery(
-                        "isNull projections are only supported in ungrouped SELECT queries"
-                            .to_owned(),
-                    ));
+                let group_position = group_columns.iter().position(|column| *column == source);
+                if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
+                    return Err(Error::InvalidQuery(format!(
+                        "column '{name}' must appear in GROUP BY"
+                    )));
                 }
-                items.push(ResolvedItem::IsNull { source });
+                items.push(ResolvedItem::IsNull {
+                    source,
+                    group_position,
+                });
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
@@ -6031,7 +6036,7 @@ fn execute_projection(
                         ResolvedItem::IfNullInt64 { source, fallback } => {
                             Value::Int64(if_null_int64_at(table, *source, *row, *fallback))
                         }
-                        ResolvedItem::IsNull { source } => {
+                        ResolvedItem::IsNull { source, .. } => {
                             Value::Bool(is_null_at(table, *source, *row))
                         }
                         ResolvedItem::CastNullableInt64ToInt64 { source } => {
@@ -6328,9 +6333,14 @@ fn validate_grouped_result_limits(
                 ResolvedItem::IfNullInt64 { .. } => {
                     unreachable!("ifNull projections are restricted to ungrouped queries")
                 }
-                ResolvedItem::IsNull { .. } => {
-                    unreachable!("isNull projections are restricted to ungrouped queries")
-                }
+                ResolvedItem::IsNull {
+                    group_position: Some(_),
+                    ..
+                } => 0,
+                ResolvedItem::IsNull {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped isNull arguments are validated"),
                 ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
@@ -8125,9 +8135,17 @@ impl GroupedData<'_> {
                         ResolvedItem::IfNullInt64 { .. } => {
                             unreachable!("ifNull projections are restricted to ungrouped queries")
                         }
-                        ResolvedItem::IsNull { .. } => {
-                            unreachable!("isNull projections are restricted to ungrouped queries")
-                        }
+                        ResolvedItem::IsNull {
+                            group_position: Some(position),
+                            ..
+                        } => Value::Bool(matches!(
+                            self.keys[*group].value(*position),
+                            ValueRef::Null(_)
+                        )),
+                        ResolvedItem::IsNull {
+                            group_position: None,
+                            ..
+                        } => unreachable!("grouped isNull arguments are validated"),
                         ResolvedItem::CastNullableInt64ToInt64 { .. }
                         | ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastBoolToFloat64 { .. }
@@ -8525,7 +8543,7 @@ fn resolved_expression_name(
         ResolvedItem::IfNullInt64 { source, fallback } => {
             sql::if_null_int64_name(&table.schema()[*source].name, *fallback)
         }
-        ResolvedItem::IsNull { source } => sql::is_null_name(&table.schema()[*source].name),
+        ResolvedItem::IsNull { source, .. } => sql::is_null_name(&table.schema()[*source].name),
         ResolvedItem::CastNullableInt64ToInt64 { source } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
@@ -8682,7 +8700,7 @@ fn order_source_rows(
                     if_null_int64_at(table, source, left, fallback)
                         .cmp(&if_null_int64_at(table, source, right, fallback))
                 }
-                ResolvedItem::IsNull { source } => {
+                ResolvedItem::IsNull { source, .. } => {
                     is_null_at(table, source, left).cmp(&is_null_at(table, source, right))
                 }
                 ResolvedItem::CastNullableInt64ToInt64 { source } => {
@@ -8945,9 +8963,17 @@ fn order_grouped_rows(
                 ResolvedItem::IfNullInt64 { .. } => {
                     unreachable!("ifNull projections are restricted to ungrouped queries")
                 }
-                ResolvedItem::IsNull { .. } => {
-                    unreachable!("isNull projections are restricted to ungrouped queries")
-                }
+                ResolvedItem::IsNull {
+                    group_position: Some(position),
+                    ..
+                } => matches!(data.keys[left].value(position), ValueRef::Null(_)).cmp(&matches!(
+                    data.keys[right].value(position),
+                    ValueRef::Null(_)
+                )),
+                ResolvedItem::IsNull {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped isNull arguments are validated"),
                 ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
@@ -9315,41 +9341,62 @@ impl CompiledPredicate {
         Some((column, filter))
     }
 
-    /// Returns an exact comparison or positive inclusive range suitable for
+    /// Returns an exact comparison or positive two-sided range suitable for
     /// validated range-partition routing. Every admitted row is still checked
     /// by the complete predicate evaluator.
     fn int64_partition_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_filter()
-            .or_else(|| self.int64_inclusive_range_filter())
+        self.int64_filter().or_else(|| self.int64_range_filter())
     }
 
     /// Returns the shapes that an `Int64` min/max index can reject safely.
-    /// This includes any exact positive inclusive-range conjunction after
+    /// This includes any exact positive two-sided range conjunction after
     /// predicate normalization. Every surviving row is still evaluated by
     /// `self`.
     fn int64_index_filter(&self) -> Option<(usize, Int64Filter)> {
         self.int64_partition_filter()
     }
 
-    fn int64_inclusive_range_filter(&self) -> Option<(usize, Int64Filter)> {
+    fn int64_range_filter(&self) -> Option<(usize, Int64Filter)> {
         let Self::And(first, second) = self else {
             return None;
         };
         let (first_column, first_filter) = first.int64_filter()?;
         let (second_column, second_filter) = second.int64_filter()?;
-        let (lower_column, lower, upper_column, upper) = match (first_filter, second_filter) {
-            (Int64Filter::GreaterOrEqual(lower), Int64Filter::LessOrEqual(upper)) => {
-                (first_column, lower, second_column, upper)
-            }
-            (Int64Filter::LessOrEqual(upper), Int64Filter::GreaterOrEqual(lower)) => {
-                (second_column, lower, first_column, upper)
-            }
-            _ => return None,
-        };
+        let (lower_column, lower, lower_strict, upper_column, upper, upper_strict) =
+            match (first_filter, second_filter) {
+                (Int64Filter::GreaterOrEqual(lower), Int64Filter::LessOrEqual(upper)) => {
+                    (first_column, lower, false, second_column, upper, false)
+                }
+                (Int64Filter::LessOrEqual(upper), Int64Filter::GreaterOrEqual(lower)) => {
+                    (second_column, lower, false, first_column, upper, false)
+                }
+                (Int64Filter::Greater(lower), Int64Filter::LessOrEqual(upper)) => {
+                    (first_column, lower, true, second_column, upper, false)
+                }
+                (Int64Filter::LessOrEqual(upper), Int64Filter::Greater(lower)) => {
+                    (second_column, lower, true, first_column, upper, false)
+                }
+                (Int64Filter::GreaterOrEqual(lower), Int64Filter::Less(upper)) => {
+                    (first_column, lower, false, second_column, upper, true)
+                }
+                (Int64Filter::Less(upper), Int64Filter::GreaterOrEqual(lower)) => {
+                    (second_column, lower, false, first_column, upper, true)
+                }
+                (Int64Filter::Greater(lower), Int64Filter::Less(upper)) => {
+                    (first_column, lower, true, second_column, upper, true)
+                }
+                (Int64Filter::Less(upper), Int64Filter::Greater(lower)) => {
+                    (second_column, lower, true, first_column, upper, true)
+                }
+                _ => return None,
+            };
         if lower_column != upper_column {
             return None;
         }
-        Some((lower_column, Int64Filter::InclusiveRange { lower, upper }))
+        Some((
+            lower_column,
+            normalized_int64_range(lower, lower_strict, upper, upper_strict),
+        ))
     }
 
     fn int64_nullness(&self) -> Option<(usize, bool)> {
@@ -9401,6 +9448,39 @@ impl CompiledPredicate {
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
+    }
+}
+
+fn normalized_int64_range(
+    lower: i64,
+    lower_strict: bool,
+    upper: i64,
+    upper_strict: bool,
+) -> Int64Filter {
+    let lower = if lower_strict {
+        let Some(lower) = lower.checked_add(1) else {
+            return empty_int64_range();
+        };
+        lower
+    } else {
+        lower
+    };
+    let upper = if upper_strict {
+        let Some(upper) = upper.checked_sub(1) else {
+            return empty_int64_range();
+        };
+        upper
+    } else {
+        upper
+    };
+    Int64Filter::InclusiveRange { lower, upper }
+}
+
+const fn empty_int64_range() -> Int64Filter {
+    // Both metadata paths already treat lower > upper as an empty range.
+    Int64Filter::InclusiveRange {
+        lower: i64::MAX,
+        upper: i64::MIN,
     }
 }
 

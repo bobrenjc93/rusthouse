@@ -243,6 +243,68 @@ fn between_prunes_disjoint_ranges_and_rechecks_overlaps_in_source_order() {
 }
 
 #[test]
+fn strict_ranges_prune_partitions_and_recheck_boundaries_in_source_order() {
+    let mut database = Database::new();
+    database
+        .create_int64_range_partitioned_table("events", "id", between_partitions())
+        .expect("partitioned table is valid");
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM events WHERE id > 5 AND id <= 15",
+            vec![8, 9, 10, 15],
+        ),
+        (
+            "SELECT id FROM events WHERE 15 >= id AND 5 < id",
+            vec![8, 9, 10, 15],
+        ),
+        (
+            "SELECT id FROM events WHERE id >= 5 AND id < 15",
+            vec![8, 5, 9, 10],
+        ),
+        (
+            "SELECT id FROM events WHERE 15 > id AND 5 <= id",
+            vec![8, 5, 9, 10],
+        ),
+        (
+            "SELECT id FROM events WHERE id > 5 AND id < 15",
+            vec![8, 9, 10],
+        ),
+        (
+            "SELECT id FROM events WHERE 15 > id AND 5 < id",
+            vec![8, 9, 10],
+        ),
+        ("SELECT id FROM events WHERE id > 9 AND id <= 10", vec![10]),
+        ("SELECT id FROM events WHERE id > 10 AND id <= 10", vec![]),
+        ("SELECT id FROM events WHERE id >= 15 AND id < 5", vec![]),
+        (
+            "SELECT id FROM events WHERE id > 9223372036854775807 AND \
+             id <= 9223372036854775807",
+            vec![],
+        ),
+        (
+            "SELECT id FROM events WHERE id >= -9223372036854775808 AND \
+             id < -9223372036854775808",
+            vec![],
+        ),
+        (
+            "SELECT id FROM events WHERE id > -9223372036854775808 AND \
+             id < 9223372036854775807",
+            vec![-2, -9, -1, 8, 0, 5, 9, 20, 10, 15, 30],
+        ),
+    ] {
+        assert_eq!(
+            query(&mut database, sql).rows,
+            expected
+                .into_iter()
+                .map(|value| vec![Value::Int64(value)])
+                .collect::<Vec<_>>(),
+            "strict range result for {sql}",
+        );
+    }
+}
+
+#[test]
 fn between_reduces_scan_charges_at_the_boundary_and_falls_back_safely() {
     let boundary_limits = QueryResultLimits {
         max_scan_rows: 7,
@@ -283,6 +345,19 @@ fn between_reduces_scan_charges_at_the_boundary_and_falls_back_safely() {
         ],
         "reversed operands retain the same exact-boundary scan charge",
     );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id FROM events WHERE id > 5 AND id < 15",
+        )
+        .rows,
+        vec![
+            vec![Value::Int64(8)],
+            vec![Value::Int64(9)],
+            vec![Value::Int64(10)],
+        ],
+        "strict endpoints retain the seven-row physical scan charge",
+    );
 
     for sql in [
         "SELECT id FROM events WHERE id NOT BETWEEN 5 AND 15",
@@ -312,7 +387,7 @@ fn between_reduces_scan_charges_at_the_boundary_and_falls_back_safely() {
         None,
     );
     assert_eq!(
-        database.execute("SELECT id FROM events WHERE id <= 15 AND id >= 5"),
+        database.execute("SELECT id FROM events WHERE id < 15 AND id > 5"),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 14,
@@ -329,7 +404,7 @@ fn between_reduces_scan_charges_at_the_boundary_and_falls_back_safely() {
         .create_int64_range_partitioned_table("events", "id", between_partitions())
         .expect("partitioned table is valid");
     assert_eq!(
-        below_boundary.execute("SELECT id FROM events WHERE id <= 15 AND id >= 5"),
+        below_boundary.execute("SELECT id FROM events WHERE id < 15 AND id > 5"),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 7,

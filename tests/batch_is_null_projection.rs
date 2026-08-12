@@ -191,12 +191,126 @@ fn returns_false_for_every_non_nullable_physical_type() {
 }
 
 #[test]
-fn rejects_missing_grouped_aggregate_and_malformed_shapes() {
+fn projects_grouped_nullable_nullness_with_aggregates_having_order_and_pagination() {
     let mut database = Database::new();
     database
         .execute(
             "CREATE TABLE readings (value Nullable(Int64)); \
-             INSERT INTO readings VALUES (NULL), (1);",
+             INSERT INTO readings VALUES (NULL), (2), (NULL), (1), (2), (3);",
+        )
+        .expect("setup");
+
+    let grouped = query(
+        &mut database,
+        "SELECT isNull(value) AS missing, value AS grouped_value, COUNT(*) AS rows \
+         FROM readings GROUP BY value \
+         ORDER BY missing DESC, grouped_value ASC",
+    );
+    assert_eq!(
+        grouped.columns,
+        [
+            ResultColumn {
+                name: "missing".to_owned(),
+                data_type: DataType::Bool,
+            },
+            ResultColumn {
+                name: "grouped_value".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "rows".to_owned(),
+                data_type: DataType::Int64,
+            },
+        ]
+    );
+    assert_eq!(
+        grouped.rows,
+        [
+            vec![
+                Value::Bool(true),
+                Value::Null(DataType::Int64),
+                Value::Int64(2),
+            ],
+            vec![Value::Bool(false), Value::Int64(1), Value::Int64(1)],
+            vec![Value::Bool(false), Value::Int64(2), Value::Int64(2)],
+            vec![Value::Bool(false), Value::Int64(3), Value::Int64(1)],
+        ]
+    );
+
+    let paginated = query(
+        &mut database,
+        "SELECT COUNT(*) AS rows, isNull(value) AS missing \
+         FROM readings GROUP BY value HAVING rows >= 2 \
+         ORDER BY isNull(value) DESC LIMIT 1 OFFSET 1",
+    );
+    assert_eq!(
+        paginated.columns,
+        [
+            ResultColumn {
+                name: "rows".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "missing".to_owned(),
+                data_type: DataType::Bool,
+            },
+        ]
+    );
+    assert_eq!(paginated.rows, [vec![Value::Int64(2), Value::Bool(false)]]);
+}
+
+#[test]
+fn projects_grouped_all_null_and_non_nullable_keys() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE all_null (value Nullable(Int64)); \
+             INSERT INTO all_null VALUES (NULL), (NULL), (NULL); \
+             CREATE TABLE labels (kind String); \
+             INSERT INTO labels VALUES ('beta'), ('alpha'), ('beta');",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT isNull(value), COUNT(*) FROM all_null GROUP BY value",
+        )
+        .rows,
+        [vec![Value::Bool(true), Value::Int64(3)]]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT kind, isNull(kind) AS missing, COUNT(*) AS rows \
+             FROM labels GROUP BY kind ORDER BY isNull(kind), kind",
+        )
+        .rows,
+        [
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Bool(false),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("beta".to_owned()),
+                Value::Bool(false),
+                Value::Int64(2),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn rejects_ungrouped_is_null_sources_expression_grouping_and_malformed_shapes() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (value Nullable(Int64)); \
+             INSERT INTO readings VALUES (NULL), (1); \
+             CREATE TABLE samples (value Int64, other Int64); \
+             INSERT INTO samples VALUES (1, 10), (2, 20);",
         )
         .expect("setup");
 
@@ -207,20 +321,24 @@ fn rejects_missing_grouped_aggregate_and_malformed_shapes() {
             column: "missing".to_owned(),
         })
     );
-    for sql in [
-        "SELECT isNull(value) FROM readings GROUP BY value",
-        "SELECT isNull(value), COUNT(*) FROM readings",
+    for (sql, column) in [
+        ("SELECT isNull(value), COUNT(*) FROM readings", "value"),
+        (
+            "SELECT isNull(other), COUNT(*) FROM samples GROUP BY value",
+            "other",
+        ),
     ] {
         assert_eq!(
             database.execute(sql),
-            Err(Error::InvalidQuery(
-                "isNull projections are only supported in ungrouped SELECT queries".to_owned(),
-            )),
+            Err(Error::InvalidQuery(format!(
+                "column '{column}' must appear in GROUP BY"
+            ))),
             "{sql}"
         );
     }
 
     for sql in [
+        "SELECT isNull(value) FROM readings GROUP BY isNull(value)",
         "SELECT isNull() FROM readings",
         "SELECT isNull(*) FROM readings",
         "SELECT isNull(value, value) FROM readings",
@@ -304,6 +422,27 @@ fn obeys_selected_result_and_retained_result_bounds() {
         Err(Error::ResultLimitExceeded {
             bytes: exact_bytes,
             max_bytes: exact_bytes - 1,
+        })
+    );
+
+    let grouped_sql = "SELECT isNull(value) AS missing FROM readings \
+                       GROUP BY value ORDER BY missing DESC LIMIT 1";
+    assert_eq!(
+        query(&mut exact, grouped_sql).rows,
+        [vec![Value::Bool(true)]]
+    );
+
+    let mut group_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_groups: 2,
+        ..QueryResultLimits::default()
+    });
+    group_limited.execute(setup).expect("setup");
+    assert_eq!(
+        group_limited.execute(grouped_sql),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT groups",
+            actual: 3,
+            max: 2,
         })
     );
 }
