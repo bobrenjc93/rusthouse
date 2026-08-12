@@ -3441,6 +3441,22 @@
         "eval_c88a7f3d": 95,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:841",
+      "recordedAt": "2026-08-12T04:54:27.071Z",
+      "label": "PR #841",
+      "kind": "leaf",
+      "prNumber": 841,
+      "title": "Add cancellable concurrent read-only HTTP serving",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 95,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }

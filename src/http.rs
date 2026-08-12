@@ -7,7 +7,8 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,10 @@ pub const DEFAULT_HTTP_CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(3
 
 /// Default absolute write-deadline duration for an accepted listener connection.
 pub const DEFAULT_HTTP_CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum wait between cancellation checks while the owned concurrent
+/// listener is idle or awaiting in-flight capacity.
+pub const DEFAULT_HTTP_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Resource limits for a single [`handle_http_query`] exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -673,6 +678,161 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_and_limits(
     )
 }
 
+/// Concurrently serves cancellable, bounded, read-only,
+/// `X-ClickHouse-Key`-authenticated HTTP connections.
+///
+/// This opt-in lifecycle API owns `listener` so it can safely put only that
+/// listener into nonblocking mode. When `stop_requested` is true, it stops
+/// dispatching new connections, closes the listener, and waits for every
+/// already accepted exchange to finish. While idle, a nonblocking accept is
+/// retried after at most [`DEFAULT_HTTP_ACCEPT_POLL_INTERVAL`], so cancellation
+/// does not depend on another client arriving. A full-capacity completion wait
+/// uses the same bound, so cancellation closes admission before a stalled
+/// worker drains. The flag is also checked after a successful accept; a
+/// connection returned by an accept racing with cancellation is closed without
+/// consuming the connection budget.
+///
+/// `limits.max_connections` remains a finite upper bound when one is desired;
+/// the function returns normally when either that budget is exhausted or
+/// cancellation is observed. `max_in_flight_connections` retains its existing
+/// meaning, and a cap of one preserves sequential acceptance. Accepted workers
+/// keep their acceptance-based absolute deadlines, one-response shutdown,
+/// failure isolation, and acceptance-ordered final reporting while they drain.
+/// The caller may use a very large connection budget for a listener whose
+/// ordinary termination boundary is cancellation.
+///
+/// This function does not provide TLS. Callers must arrange transport security
+/// before sending a key or query over an untrusted network.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when enabling
+/// nonblocking mode or accepting a connection fails. Interrupted accepts are
+/// retried. Connections accepted before an accept failure or cancellation are
+/// allowed to finish and are included in that report. Connection-local
+/// failures are returned in [`HttpListenerReport::connection_failures`].
+pub fn serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
+    listener: TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+    stop_requested: &AtomicBool,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    let mut report = HttpListenerReport::default();
+    if limits.max_connections == 0 || stop_requested.load(Ordering::Acquire) {
+        return Ok(report);
+    }
+
+    if let Err(source) = listener.set_nonblocking(true) {
+        return Err(HttpListenerError::Accept { report, source });
+    }
+
+    let mut accept_failure = None;
+    thread::scope(|scope| {
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        let mut workers = Vec::new();
+
+        while report.accepted_connections < limits.max_connections {
+            if stop_requested.load(Ordering::Acquire) {
+                break;
+            }
+
+            if workers.len() == max_in_flight_connections.get() {
+                receive_http_listener_completion_with_timeout(
+                    &completion_receiver,
+                    &mut workers,
+                    &mut report,
+                    DEFAULT_HTTP_ACCEPT_POLL_INTERVAL,
+                );
+                continue;
+            }
+
+            let (stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if workers.is_empty() {
+                        thread::sleep(DEFAULT_HTTP_ACCEPT_POLL_INTERVAL);
+                    } else {
+                        receive_http_listener_completion_with_timeout(
+                            &completion_receiver,
+                            &mut workers,
+                            &mut report,
+                            DEFAULT_HTTP_ACCEPT_POLL_INTERVAL,
+                        );
+                    }
+                    continue;
+                }
+                Err(source) => {
+                    accept_failure = Some(source);
+                    break;
+                }
+            };
+
+            // Do not dispatch a connection returned by an accept that raced
+            // with the cancellation store.
+            if stop_requested.load(Ordering::Acquire) {
+                drop(stream);
+                break;
+            }
+
+            let accepted_at = Instant::now();
+            report.accepted_connections += 1;
+            let connection = report.accepted_connections;
+            let completion_sender = completion_sender.clone();
+            let worker = scope.spawn(move || {
+                let exchange = panic::catch_unwind(AssertUnwindSafe(|| {
+                    // Accepted streams are used with blocking, deadline-bound
+                    // I/O even on platforms that inherit listener mode.
+                    let exchange = stream
+                        .set_nonblocking(false)
+                        .map_err(HttpQueryError::Read)
+                        .and_then(|()| {
+                            handle_http_listener_connection(
+                                database,
+                                &stream,
+                                accepted_at,
+                                limits,
+                                HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
+                            )
+                        });
+
+                    let _ = stream.shutdown(Shutdown::Write);
+                    exchange
+                }));
+
+                match exchange {
+                    Ok(exchange) => {
+                        let _ = completion_sender.send((connection, Some(exchange)));
+                    }
+                    Err(payload) => {
+                        let _ = completion_sender.send((connection, None));
+                        panic::resume_unwind(payload);
+                    }
+                }
+            });
+            workers.push((connection, worker));
+        }
+
+        // Ownership lets this lifecycle boundary close admission before it
+        // waits for accepted exchanges to drain.
+        drop(listener);
+        while !workers.is_empty() {
+            receive_http_listener_completion(&completion_receiver, &mut workers, &mut report);
+        }
+    });
+
+    report
+        .connection_failures
+        .sort_unstable_by_key(|failure| failure.connection);
+
+    match accept_failure {
+        Some(source) => Err(HttpListenerError::Accept { report, source }),
+        None => Ok(report),
+    }
+}
+
 /// Concurrently serves a finite number of read-write HTTP connections that
 /// require an `X-ClickHouse-Key` credential.
 ///
@@ -835,9 +995,32 @@ fn receive_http_listener_completion(
     workers: &mut Vec<(usize, ScopedJoinHandle<'_, ()>)>,
     report: &mut HttpListenerReport,
 ) {
-    let (connection, exchange) = completion_receiver
+    let completion = completion_receiver
         .recv()
         .expect("an in-flight HTTP listener worker must report completion");
+    finish_http_listener_completion(completion, workers, report);
+}
+
+fn receive_http_listener_completion_with_timeout(
+    completion_receiver: &Receiver<HttpListenerCompletion>,
+    workers: &mut Vec<(usize, ScopedJoinHandle<'_, ()>)>,
+    report: &mut HttpListenerReport,
+    timeout: Duration,
+) {
+    match completion_receiver.recv_timeout(timeout) {
+        Ok(completion) => finish_http_listener_completion(completion, workers, report),
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("in-flight HTTP listener workers must report completion")
+        }
+    }
+}
+
+fn finish_http_listener_completion(
+    (connection, exchange): HttpListenerCompletion,
+    workers: &mut Vec<(usize, ScopedJoinHandle<'_, ()>)>,
+    report: &mut HttpListenerReport,
+) {
     let worker_position = workers
         .iter()
         .position(|(worker_connection, _)| *worker_connection == connection)

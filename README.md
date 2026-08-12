@@ -1359,6 +1359,24 @@ sequential authenticated behavior, while a larger cap lets a complete request
 finish without waiting behind a stalled client. `SharedDatabase` read admission
 remains nonblocking and allows concurrent readers.
 
+`serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled` is the
+graceful-lifecycle variant. It takes ownership of its `TcpListener`, observes a
+caller-owned `AtomicBool`, and uses nonblocking accepts with a bounded 10 ms
+idle poll interval. Setting the flag stops new connection dispatch without
+requiring a wake-up client. Completion waits at a full in-flight cap use the
+same bound, so a stalled accepted request cannot keep the admission socket open
+after cancellation. A connection returned by an accept racing with the flag is
+closed without consuming the connection budget. All connections accepted
+before cancellation continue under their original absolute read and write
+deadlines; the function closes their response direction after one exchange,
+drains their workers, orders transport failures by acceptance, and then
+returns the usual `HttpListenerReport`. The explicit
+`HttpListenerLimits::max_connections` still ends a finite run even if the flag
+remains false, and zero or an initially set flag returns without accepting.
+The in-flight cap is unchanged, including cap-one sequential acceptance. The
+flag is a graceful admission boundary, not a way to interrupt an accepted
+request.
+
 `serve_http_concurrently_with_clickhouse_key` provides the same capped lifecycle
 with read-write access. It takes the expected key, finite connection budget,
 and nonzero in-flight cap; use
