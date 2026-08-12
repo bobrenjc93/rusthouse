@@ -14,6 +14,7 @@ use crate::batch::aggregate_scheduler::{
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
+use crate::batch::grouped_bool_min;
 use crate::batch::json_compact_each_row::{
     self, JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
 };
@@ -7402,19 +7403,13 @@ fn execute_grouped_bool_min<'a>(
         return Ok(None);
     };
 
-    let partial = reduce_grouped_bool_min(
-        group_values,
-        values,
-        matching_rows,
-        parallelism,
-        grouped_bool_min_chunk,
-    )?;
+    let partial = grouped_bool_min::reduce(group_values, values, matching_rows, parallelism)?;
     let group_count = usize::from(partial.present(false)) + usize::from(partial.present(true));
     enforce_grouped_bool_limits(group_count, limits)?;
 
     let mut keys = Vec::with_capacity(group_count);
     let mut minimums = Vec::with_capacity(group_count);
-    if let Some(first) = partial.first_seen {
+    if let Some(first) = partial.first_seen() {
         keys.push(GroupKey::One(ValueRef::Bool(first)));
         minimums.push(Value::Int64(partial.minimum(first)));
         let second = !first;
@@ -7735,93 +7730,6 @@ fn reduce_grouped_bool_sum_partials(
                 })?;
             Ok(total)
         })
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct GroupedBoolMinPartial {
-    false_min: Option<i64>,
-    true_min: Option<i64>,
-    first_seen: Option<bool>,
-}
-
-impl GroupedBoolMinPartial {
-    fn slot(&self, group: bool) -> Option<i64> {
-        if group { self.true_min } else { self.false_min }
-    }
-
-    fn slot_mut(&mut self, group: bool) -> &mut Option<i64> {
-        if group {
-            &mut self.true_min
-        } else {
-            &mut self.false_min
-        }
-    }
-
-    fn present(&self, group: bool) -> bool {
-        self.slot(group).is_some()
-    }
-
-    fn minimum(&self, group: bool) -> i64 {
-        self.slot(group)
-            .expect("a present non-nullable Int64 group has a minimum")
-    }
-
-    fn observe(&mut self, group: bool, value: i64) {
-        self.first_seen.get_or_insert(group);
-        let minimum = self.slot_mut(group);
-        *minimum = Some(minimum.map_or(value, |current| current.min(value)));
-    }
-}
-
-fn reduce_grouped_bool_min<C>(
-    group_values: &[bool],
-    min_values: &[i64],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    chunk: C,
-) -> Result<GroupedBoolMinPartial>
-where
-    C: Fn(&[bool], &[i64], &[usize]) -> Result<GroupedBoolMinPartial> + Sync,
-{
-    reduce_grouped_bool(
-        group_values,
-        matching_rows,
-        parallelism,
-        "rusthouse-group-bool-min-int64",
-        |group_values, rows| chunk(group_values, min_values, rows),
-        reduce_grouped_bool_min_partials,
-    )
-}
-
-fn grouped_bool_min_chunk(
-    group_values: &[bool],
-    min_values: &[i64],
-    matching_rows: &[usize],
-) -> Result<GroupedBoolMinPartial> {
-    let mut partial = GroupedBoolMinPartial::default();
-    for row in matching_rows {
-        partial.observe(group_values[*row], min_values[*row]);
-    }
-    Ok(partial)
-}
-
-fn reduce_grouped_bool_min_partials(
-    partials: Vec<GroupedBoolMinPartial>,
-) -> Result<GroupedBoolMinPartial> {
-    Ok(partials
-        .into_iter()
-        .fold(GroupedBoolMinPartial::default(), |mut total, partial| {
-            if total.first_seen.is_none() {
-                total.first_seen = partial.first_seen;
-            }
-            if let Some(minimum) = partial.false_min {
-                total.observe(false, minimum);
-            }
-            if let Some(minimum) = partial.true_min {
-                total.observe(true, minimum);
-            }
-            total
-        }))
 }
 
 fn paired_global_count_aggregate(
@@ -11860,47 +11768,6 @@ mod tests {
                 "unsupported grouped shape stays sequential: {unsupported_sql}"
             );
         }
-    }
-
-    #[test]
-    fn grouped_bool_min_worker_failure_repeats_complete_input_locally() {
-        let group_values = [true, false, true];
-        let min_values = [i64::MAX, 7, i64::MIN];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        matching_rows[row_count - 1] = 2;
-
-        let successful_parallel = reduce_grouped_bool_min(
-            &group_values,
-            &min_values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            grouped_bool_min_chunk,
-        )
-        .expect("deterministic parallel grouped MIN succeeds");
-        let failed_parallel = reduce_grouped_bool_min(
-            &group_values,
-            &min_values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            |group_values, min_values, rows| {
-                if std::thread::current().name() == Some("rusthouse-group-bool-min-int64-1") {
-                    panic!("injected grouped MIN worker failure");
-                }
-                grouped_bool_min_chunk(group_values, min_values, rows)
-            },
-        )
-        .expect("worker failure falls back to the complete grouped MIN locally");
-
-        let expected = GroupedBoolMinPartial {
-            false_min: Some(7),
-            true_min: Some(i64::MIN),
-            first_seen: Some(true),
-        };
-        assert_eq!(successful_parallel, expected);
-        assert_eq!(failed_parallel, expected);
     }
 
     #[test]
