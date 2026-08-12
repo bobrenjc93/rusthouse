@@ -342,6 +342,35 @@ fn nullness_delete_handles_mixed_and_all_null_nullable_data_atomically() {
 }
 
 #[test]
+fn nullness_delete_operates_on_a_directly_created_trailing_nullable_column() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Readings (id Int64, value Nullable(Int64)); \
+             INSERT INTO Readings VALUES (1, NULL), (2, 20), (3, NULL), (4, 40);",
+        )
+        .expect("mixed nullable setup succeeds");
+
+    assert_eq!(
+        database.execute("ALTER TABLE readings DELETE WHERE value IS NULL"),
+        Ok(vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 2,
+        }])
+    );
+    assert_eq!(ids(&database, "readings"), [2, 4]);
+
+    assert_eq!(
+        database.execute("DELETE FROM readings WHERE value IS NOT NULL"),
+        Ok(vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 2,
+        }])
+    );
+    assert!(ids(&database, "readings").is_empty());
+}
+
+#[test]
 fn nullness_delete_has_typed_non_nullable_semantics() {
     let mut database = Database::new();
     database
