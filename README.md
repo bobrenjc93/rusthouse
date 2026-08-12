@@ -141,11 +141,12 @@ cap is an admission rejection and leaves existing state unchanged. Each block
 records its first row, row count, non-null minimum/maximum, and null count;
 all-null blocks therefore have no extrema. Physical column vectors support
 `Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL accepts
-the exact one-column `CREATE TABLE <name> (<column> Nullable(Int64))` shape
-case-insensitively; other nullable types and nullable multi-column declarations
-remain outside the bounded grammar. Library APIs and WAL recovery can also
-create this physical storage. The index metadata has explicit nullable-block
-semantics for both `Int64` storage forms.
+either a sole `Nullable(Int64)` column or a non-nullable prefix followed by
+exactly one trailing `Nullable(Int64)` column in `CREATE TABLE`,
+case-insensitively. Leading nullable columns in a multi-column schema, multiple
+nullable columns, and other nullable types remain outside the bounded grammar.
+Library APIs and WAL recovery can also create this physical storage. The index
+metadata has explicit nullable-block semantics for both `Int64` storage forms.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` accept physical `Nullable(Int64)`
 arguments. `SUM`, `MIN`, `MAX`, and `AVG` ignore absent values. `SUM`, `MIN`,
 and `MAX` return typed `Int64` `NULL` for empty or all-`NULL` inputs, while
@@ -192,11 +193,12 @@ or replacing/restoring the table invalidates it.
 pruning runs. This work remains counted if later query processing fails;
 unindexed fallbacks and errors before pruning do not increment either counter.
 
-`DELETE FROM <table> WHERE <comparison> [AND <comparison>]` and its ClickHouse
-mutation spelling, `ALTER TABLE <table> DELETE WHERE <comparison> [AND
-<comparison>]`, remove rows matching one typed column-to-literal comparison or
-the conjunction of exactly two such comparisons. Both spellings lower to the
-same bounded atomic deletion path. Each comparison has the form `<column>
+`DELETE FROM <table> WHERE <predicate>` and its ClickHouse mutation spelling,
+`ALTER TABLE <table> DELETE WHERE <predicate>`, remove rows matching either one
+typed column-to-literal comparison, the conjunction of exactly two such
+comparisons, or one exact `<column> IS NULL` or `<column> IS NOT NULL` atom.
+Both spellings lower to the same bounded atomic deletion path and nullness uses
+the same typed evaluator as `SELECT WHERE`. Each comparison has the form `<column>
 <operator> <literal>`. Supported operators are `=`, `!=`, `<>`, `<`, `<=`,
 `>`, and `>=`;
 `!=` and `<>` are equivalent. The two comparisons may reference different
@@ -207,8 +209,9 @@ row count is checked against the configured scan limit before any row is
 inspected or changed. Missing names, type errors, malformed or extra
 predicates, and scan-limit failures leave the table unchanged; after
 validation and the bounded scan, all matching row indexes are passed to one
-atomic deletion. `OR`, a third comparison, other predicate forms or clauses,
-and bare `NULL` are not supported by this narrow form. A successful command
+atomic deletion. A nullness atom cannot be combined with another predicate.
+`OR`, a third comparison, other predicate forms or clauses, and bare `NULL`
+comparisons are not supported by this narrow form. A successful command
 reports its deleted-row count through the library API and is silent in
 formatted CLI output.
 
@@ -445,14 +448,15 @@ and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns canonical, replayable DDL as a bounded
 `String`, preserving the stored table and column display names and schema order
 while normalizing type spellings. Schemas with no nullable columns and
-sole-column `Nullable(Int64)` tables use one `CREATE TABLE` statement. For a
-mixed schema, the result creates the non-nullable prefix before the first
-nullable column (or creates a first nullable column by itself), then emits
-ordered `ALTER TABLE ... ADD COLUMN` statements for the remainder so it stays
-inside the bounded grammar. Because the normal executor accepts at most 4,096
-statements, additions that would require a 4,097th replay statement are
-rejected without changing the table, even when a larger custom column limit is
-configured.
+schemas with exactly one trailing `Nullable(Int64)` column use one
+`CREATE TABLE` statement. Other mixed schemas created through `ALTER TABLE` or
+library APIs use the non-nullable prefix before the first nullable column (or a
+first nullable column by itself), then emit ordered
+`ALTER TABLE ... ADD COLUMN` statements for the remainder so the output stays
+inside the bounded grammar.
+Because the normal executor accepts at most 4,096 statements, additions that
+would require a 4,097th replay statement are rejected without changing the
+table, even when a larger custom column limit is configured.
 `DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
 and `type` `String` columns, rendering physical nullable `Int64` storage as
 `Nullable(Int64)`. It uses case-insensitive table lookup and applies the normal
@@ -793,8 +797,8 @@ accept that exact raw `\N` field as SQL `NULL` only for a physical
 `Nullable(Int64)` column. A String containing the two characters `\N` is
 written as `\\N` and imports as String data rather than being mistaken for
 NULL.
-A table-backed `SELECT`, one- or two-comparison `DELETE` (including `ALTER
-TABLE DELETE`), or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
+A table-backed `SELECT`, supported `DELETE` (including `ALTER TABLE DELETE`),
+or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
 by default. This scanned-row limit is checked against the full source table
 before matching-row indices or replacement values are allocated, so `WHERE`
 selectivity and `LIMIT` do not reduce it for ordinary tables. A supported

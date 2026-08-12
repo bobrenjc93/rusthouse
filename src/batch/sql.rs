@@ -89,6 +89,18 @@ pub enum Statement {
         name: String,
         column: String,
     },
+    /// A non-nullable prefix followed by exactly one `Nullable(Int64)` column.
+    CreateTableWithTrailingNullableInt64 {
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_column: String,
+    },
+    /// Conditional form of the bounded trailing-nullable CREATE shape.
+    CreateTableWithTrailingNullableInt64IfNotExists {
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_column: String,
+    },
     DropTable {
         name: String,
     },
@@ -180,6 +192,12 @@ pub enum Statement {
         table: String,
         first: DeleteComparisonPredicate,
         second: DeleteComparisonPredicate,
+    },
+    /// Exact nullness deletion: `DELETE FROM <table> WHERE <column> IS [NOT] NULL`.
+    DeleteNullness {
+        table: String,
+        column: String,
+        is_null: bool,
     },
     Insert {
         table: String,
@@ -1688,13 +1706,6 @@ impl<'a> Parser<'a> {
             let position = self.position();
             let type_name = self.expect_identifier("column type")?;
             if type_name.eq_ignore_ascii_case("Nullable") {
-                if !columns.is_empty() {
-                    return Err(Error::Sql {
-                        position,
-                        message: "Nullable(Int64) is supported only as the sole table column"
-                            .to_owned(),
-                    });
-                }
                 self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
                 let nested_position = self.position();
                 let nested_type = self.expect_identifier("type inside Nullable")?;
@@ -1708,8 +1719,9 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(&TokenKind::RightParen, "')' after Nullable(Int64)")?;
                 if self.at(&TokenKind::Comma) {
-                    return self
-                        .error("Nullable(Int64) is supported only as the sole table column");
+                    return self.error(
+                        "Nullable(Int64) is supported only as the sole column or the final column after a non-nullable prefix",
+                    );
                 }
                 nullable_int64_column = Some(column_name);
                 break;
@@ -1744,6 +1756,21 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after CREATE TABLE");
         }
         if let Some(column) = nullable_int64_column {
+            if !columns.is_empty() {
+                return if if_not_exists {
+                    Ok(Statement::CreateTableWithTrailingNullableInt64IfNotExists {
+                        name,
+                        columns,
+                        nullable_column: column,
+                    })
+                } else {
+                    Ok(Statement::CreateTableWithTrailingNullableInt64 {
+                        name,
+                        columns,
+                        nullable_column: column,
+                    })
+                };
+            }
             return if if_not_exists {
                 Ok(Statement::CreateNullableInt64TableIfNotExists { name, column })
             } else {
@@ -1974,7 +2001,24 @@ impl<'a> Parser<'a> {
         self.expect_keyword("WHERE")?;
         self.predicate_depth = 0;
         self.predicate_nodes = 0;
-        let first = self.parse_delete_comparison()?;
+        let first_column = self.expect_identifier("column name")?;
+        if self.eat_keyword("IS") {
+            let is_null = !self.eat_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            self.record_predicate_node()?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error(
+                    "DELETE nullness predicate supports exactly one column IS NULL or column IS NOT NULL atom",
+                );
+            }
+            return Ok(Statement::DeleteNullness {
+                table,
+                column: first_column,
+                is_null,
+            });
+        }
+
+        let first = self.parse_delete_comparison_after_column(first_column)?;
         if self.eat_keyword("AND") {
             let second = self.parse_delete_comparison()?;
             self.record_predicate_node()?;
@@ -2010,6 +2054,13 @@ impl<'a> Parser<'a> {
 
     fn parse_delete_comparison(&mut self) -> Result<DeleteComparisonPredicate> {
         let column = self.expect_identifier("column name")?;
+        self.parse_delete_comparison_after_column(column)
+    }
+
+    fn parse_delete_comparison_after_column(
+        &mut self,
+        column: String,
+    ) -> Result<DeleteComparisonPredicate> {
         let operator = self.parse_comparison_operator()?;
         let literal = self.parse_literal()?;
         self.record_predicate_node()?;
