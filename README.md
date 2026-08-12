@@ -80,9 +80,11 @@ two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
 `SUM(the_same_column)` or `AVG(the_same_column)`, use
 deterministic contiguous chunks when more than 262,144 rows match. A grouped
 query also uses those chunks when it has exactly one non-nullable `Bool`
-grouping column and exactly one `COUNT(*)`, `COUNT()`, or `COUNT(column)`
-aggregate, or exactly one `SUM(physical_non_nullable_int64_column)` or
-`AVG(physical_non_nullable_int64_column)` aggregate.
+grouping column and exactly one `COUNT(*)`, `COUNT()`, `COUNT(column)`, or
+`countIf(physical_non_nullable_bool_column)` aggregate, or exactly one
+`SUM(physical_non_nullable_int64_column)` or
+`AVG(physical_non_nullable_int64_column)` aggregate. The `countIf` argument may
+be the grouping column or a different physical Bool column.
 The `COUNT(column)` argument must be a physical nullable `Int64` column or a
 non-nullable `Int64`, `Float64`, `Bool`, or `String` column. Nullable grouped COUNT
 partials track group row presence separately from present values, so all-NULL
@@ -879,8 +881,8 @@ constructor configure the scan and output limits.
 `Database::with_global_aggregate_worker_cap` and the matching `SharedDatabase`
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
 parallel global aggregates and the narrow Bool-grouped row count, `COUNT` of a
-nullable Int64 or physical non-nullable column, or non-nullable Int64
-`SUM`/`AVG` shapes. The
+nullable Int64 or physical non-nullable column, Bool-grouped `countIf`, or
+non-nullable Int64 `SUM`/`AVG` shapes. The
 configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
@@ -1093,8 +1095,8 @@ persistent database configuration.
 `max_threads` has the same decimal syntax. Zero retains the database's
 `global_aggregate_worker_cap`; a nonzero value is combined with that cap using
 the smaller value. It applies only to supported parallel aggregates in that
-request, including supported Bool-grouped `COUNT`, `SUM`, and `AVG`, and never
-changes `SHOW SETTINGS` or `system.settings`. The
+request, including supported Bool-grouped `COUNT`, `countIf`, `SUM`, and `AVG`,
+and never changes `SHOW SETTINGS` or `system.settings`. The
 available-hardware and fixed 16-lane ceilings still apply, and simultaneous
 requests continue to share the process-wide nonblocking helper admission
 budget.
