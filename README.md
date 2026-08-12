@@ -379,9 +379,9 @@ The exact case-insensitive `SHOW FUNCTIONS` returns every executable scalar,
 aggregate, compatibility-probe, and window function as one `String` column
 named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
 `ABS`, `AVG`, `CAST`, `CEIL`, `COUNT`, `countIf`, `currentDatabase`, `empty`,
-`FLOOR`, `ifNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`, `ROUND`,
-`ROW_NUMBER`, `SUM`, `toString`, `UPPER`, and `version`. Arguments and trailing
-clauses are rejected.
+`FLOOR`, `ifNull`, `isNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`,
+`ROUND`, `ROW_NUMBER`, `SUM`, `toString`, `UPPER`, and `version`. Arguments and
+trailing clauses are rejected.
 The result uses the normal query row, value, byte, retained-result, and
 formatted-output limits.
 The exact case-insensitive query `SELECT name FROM system.functions` returns
