@@ -2,6 +2,8 @@
 
 mod aggregate_scheduler;
 mod global_scalar_extremum;
+mod grouped_bool_count;
+mod grouped_bool_max;
 mod grouped_bool_min;
 mod scalar_cast;
 mod scalar_float64;

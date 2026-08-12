@@ -55,13 +55,16 @@ The private `batch::aggregate_scheduler` module owns process-wide aggregate-work
 deterministic contiguous partitioning. Its generic grouped-aggregate driver additionally owns
 scoped worker spawning, ordered partial collection, admission release, and complete-input fallback
 after a spawn failure or worker panic. The execution engine retains SQL shape recognition and the
-Bool-grouped `COUNT`/`SUM`/`AVG` partial and reduction semantics, supplying only row-chunk work and a
-thread-name prefix to the scheduler; physical non-nullable `COUNT(column)` reuses the row-count
-chunks without reading argument values. The scheduler has no SQL or aggregate-state policy. The
-private `batch::grouped_bool_min` module owns the non-nullable `Int64` `MIN` partial, chunk scan,
-ordered reduction, and its fixed worker-name prefix. The engine retains SQL eligibility, physical
-column dispatch, grouped resource limits, and result construction, while the scheduler continues to
-own admission, worker lifecycle, and complete-input fallback.
+Bool-grouped `SUM`/`AVG` partial and reduction semantics, supplying only row-chunk work and a
+thread-name prefix to the scheduler. The scheduler has no SQL or aggregate-state policy. The private
+`batch::grouped_bool_count` module owns the Bool-grouped `COUNT`/`countIf` partial, row-count,
+nullable-column and `countIf` chunk scans, checked ordered reduction, and fixed worker-name prefix;
+physical non-nullable `COUNT(column)` reuses its row-count scan without reading argument values. The
+private `batch::grouped_bool_min` module similarly owns the non-nullable `Int64` `MIN` partial, chunk
+scan, ordered reduction, and fixed worker-name prefix. The private `batch::grouped_bool_max` module
+owns the corresponding non-nullable `Int64` `MAX` reduction boundary. The engine retains SQL
+eligibility, physical column dispatch, grouped resource limits, and result construction, while the
+scheduler continues to own admission, worker lifecycle, and complete-input fallback.
 
 The initial engine remains single-process and single-node. Validated `Int64` range partitions are
 local table metadata used only to prune impossible physical row ranges before the existing exact
@@ -87,8 +90,8 @@ HTTP query may copy and tighten that cap through `max_threads` without mutating 
 Parameterized queries can likewise copy and tighten the configured ordering-state byte cap through
 `max_ordering_state_bytes`; the request-local copy is applied before allocating supported ordering
 caches and never mutates settings. Hardware and a fixed 16-lane ceiling remain hard upper bounds;
-grouped shapes other than the supported Bool `COUNT`/`SUM`/`MIN`/`AVG` cases, different-column COUNT
-pairs, and other multi-aggregate nullable projections stay sequential. On Unix, one opted-in,
+grouped shapes other than the supported Bool `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` cases, different-column
+COUNT pairs, and other multi-aggregate nullable projections stay sequential. On Unix, one opted-in,
 one-column `Int64` or `Nullable(Int64)` table can use a bounded, checksummed, fsync-ordered WAL for
 crash-safe appends, truncates, and replacements. A registry can durably publish a caller-bounded set
 of those independent table WALs and recover their complete committed prefixes as one catalog unit.
