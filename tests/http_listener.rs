@@ -2,6 +2,7 @@ use std::error::Error as StdError;
 use std::io::{Cursor, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
@@ -15,6 +16,7 @@ use rusthouse::{
     serve_http_concurrently_with_clickhouse_key,
     serve_http_concurrently_with_clickhouse_key_and_limits, serve_http_read_only,
     serve_http_read_only_concurrently_with_clickhouse_key_and_limits,
+    serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled,
     serve_http_read_only_with_clickhouse_key, serve_http_read_only_with_limits,
     serve_http_with_clickhouse_key, serve_http_with_clickhouse_key_and_limits,
 };
@@ -581,6 +583,236 @@ fn capped_authenticated_concurrency_with_cap_one_waits_before_accepting_the_next
     fast_client.join().expect("fast client did not panic");
 
     let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn cancellable_concurrent_listener_stops_after_becoming_idle() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let served_stop_requested = Arc::clone(&stop_requested);
+    let (completion_sender, completion_receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
+            listener,
+            &SharedDatabase::default(),
+            "correct-key",
+            HttpListenerLimits::new(usize::MAX, HttpQueryLimits::default()),
+            NonZeroUsize::new(2).unwrap(),
+            &served_stop_requested,
+        );
+        completion_sender
+            .send(result)
+            .expect("report cancellable listener completion");
+    });
+
+    let response = exchange(
+        address,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+    );
+    assert_eq!(body(&response), b"Ok.\n");
+
+    stop_requested.store(true, Ordering::Release);
+    let report = completion_receiver
+        .recv_timeout(IO_TIMEOUT)
+        .expect("idle listener observes cancellation")
+        .expect("idle cancellation returns a report");
+    worker.join().expect("cancellable listener did not panic");
+
+    assert_eq!(report.accepted_connections, 1);
+    assert_eq!(report.successful_exchanges, 1);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn cancellable_concurrent_listener_drains_in_flight_work_without_accepting_more() {
+    let limits = HttpListenerLimits {
+        read_timeout: IO_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(usize::MAX, HttpQueryLimits::default())
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let served_stop_requested = Arc::clone(&stop_requested);
+    let (completion_sender, completion_receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
+            listener,
+            &SharedDatabase::default(),
+            "correct-key",
+            limits,
+            NonZeroUsize::new(1).unwrap(),
+            &served_stop_requested,
+        );
+        completion_sender
+            .send(result)
+            .expect("report cancellable listener completion");
+    });
+
+    let mut in_flight = TcpStream::connect(address).expect("connect in-flight client");
+    in_flight
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set in-flight client read timeout");
+    in_flight
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set in-flight client write timeout");
+    in_flight
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+        .expect("write incomplete in-flight request");
+
+    // Give the loopback accept poll several complete intervals to dispatch the
+    // first request before cancellation. The incomplete request then keeps the
+    // sole worker occupied until this test explicitly finishes it.
+    thread::sleep(Duration::from_millis(100));
+    stop_requested.store(true, Ordering::Release);
+
+    let mut after_cancellation =
+        TcpStream::connect(address).expect("queue client after cancellation");
+    after_cancellation
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set queued client read timeout");
+    after_cancellation
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set queued client write timeout");
+    after_cancellation
+        .write_all(
+            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+        )
+        .expect("write queued request after cancellation");
+    finish_request_stream(&after_cancellation);
+
+    assert!(matches!(
+        completion_receiver.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+
+    in_flight
+        .write_all(b"\r\n\r\n")
+        .expect("complete accepted request during draining");
+    finish_request_stream(&in_flight);
+    let mut in_flight_response = Vec::new();
+    in_flight
+        .read_to_end(&mut in_flight_response)
+        .expect("drained request receives its response");
+    assert_eq!(body(&in_flight_response), b"Ok.\n");
+
+    let report = completion_receiver
+        .recv_timeout(IO_TIMEOUT)
+        .expect("listener returns after its accepted worker drains")
+        .expect("draining cancellation returns a report");
+    worker.join().expect("cancellable listener did not panic");
+    assert_eq!(report.accepted_connections, 1);
+    assert_eq!(report.successful_exchanges, 1);
+    assert!(report.connection_failures.is_empty());
+
+    let mut rejected_response = Vec::new();
+    match after_cancellation.read_to_end(&mut rejected_response) {
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+            ) => {}
+        Err(error) => panic!("read queued connection shutdown: {error}"),
+    }
+    assert!(rejected_response.is_empty());
+}
+
+#[test]
+fn cancellable_concurrent_listener_with_cap_one_serializes_acceptance() {
+    let limits = HttpListenerLimits {
+        read_timeout: IO_TIMEOUT,
+        write_timeout: IO_TIMEOUT,
+        ..HttpListenerLimits::new(2, HttpQueryLimits::default())
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let served_stop_requested = Arc::clone(&stop_requested);
+    let worker = thread::spawn(move || {
+        serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
+            listener,
+            &SharedDatabase::default(),
+            "correct-key",
+            limits,
+            NonZeroUsize::new(1).unwrap(),
+            &served_stop_requested,
+        )
+    });
+
+    let mut stalled = TcpStream::connect(address).expect("connect stalled client");
+    stalled
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client read timeout");
+    stalled
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set stalled client write timeout");
+    stalled
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key")
+        .expect("write incomplete authenticated request");
+
+    let (fast_response, fast_client) = start_exchange(
+        address,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n".to_vec(),
+    );
+    assert!(matches!(
+        fast_response.recv_timeout(Duration::from_millis(200)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+
+    stalled
+        .write_all(b"\r\n\r\n")
+        .expect("complete stalled request");
+    finish_request_stream(&stalled);
+    let mut stalled_response = Vec::new();
+    stalled
+        .read_to_end(&mut stalled_response)
+        .expect("read completed stalled response");
+    assert_eq!(body(&stalled_response), b"Ok.\n");
+
+    let fast_response = fast_response
+        .recv_timeout(IO_TIMEOUT)
+        .expect("second client proceeds after cap-one capacity is released");
+    assert_eq!(body(&fast_response), b"Ok.\n");
+    fast_client.join().expect("fast client did not panic");
+
+    let report = worker.join().unwrap().unwrap();
+    assert_eq!(report.accepted_connections, 2);
+    assert_eq!(report.successful_exchanges, 2);
+    assert!(report.connection_failures.is_empty());
+}
+
+#[test]
+fn cancellable_concurrent_listener_completes_its_finite_budget_without_cancellation() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let served_stop_requested = Arc::clone(&stop_requested);
+    let worker = thread::spawn(move || {
+        serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
+            listener,
+            &SharedDatabase::default(),
+            "correct-key",
+            HttpListenerLimits::new(2, HttpQueryLimits::default()),
+            NonZeroUsize::new(2).unwrap(),
+            &served_stop_requested,
+        )
+    });
+
+    for _ in 0..2 {
+        let response = exchange(
+            address,
+            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct-key\r\n\r\n",
+        );
+        assert_eq!(body(&response), b"Ok.\n");
+    }
+
+    let report = worker.join().unwrap().unwrap();
+    assert!(!stop_requested.load(Ordering::Acquire));
     assert_eq!(report.accepted_connections, 2);
     assert_eq!(report.successful_exchanges, 2);
     assert!(report.connection_failures.is_empty());
