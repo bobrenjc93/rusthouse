@@ -12,6 +12,10 @@ use crate::batch::aggregate_scheduler::{GlobalAggregateParallelism, parallel_agg
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
+use crate::batch::scalar_cast::{
+    checked_string_to_bool, checked_string_to_float64, checked_string_to_int64, decimal_text_cmp,
+    ordering_string_to_float64, validate_string_to_float64_syntax, validate_string_to_int64_syntax,
+};
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, AlterUpdateValue,
     ComparisonOperator, CrossJoin, CurrentDatabaseSelect, DeleteComparisonPredicate, Having,
@@ -4266,14 +4270,16 @@ impl Database {
         // Validated range partitions can reduce the source rows charged to
         // the scan limit. A sparse index can then narrow physical candidates,
         // but does not reduce that charge for an ordinary table.
-        let int64_filter = predicate.as_ref().and_then(CompiledPredicate::int64_filter);
+        let int64_partition_filter = predicate
+            .as_ref()
+            .and_then(CompiledPredicate::int64_partition_filter);
         let int64_index_filter = predicate
             .as_ref()
             .and_then(CompiledPredicate::int64_index_filter);
         let int64_nullness = predicate
             .as_ref()
             .and_then(CompiledPredicate::int64_nullness);
-        let source_rows = int64_filter
+        let source_rows = int64_partition_filter
             .and_then(|(column, filter)| table.int64_range_partition_rows(column, filter))
             .unwrap_or(0..table.row_count());
         enforce_select_scan_rows(source_rows.len(), query_result_limits)?;
@@ -8613,22 +8619,17 @@ fn order_source_rows(
         match items[order.output] {
             ResolvedItem::CastStringToInt64 { source } => {
                 for row in rows.iter().copied() {
-                    decimal_text(string_at(table, source, row))
-                        .ok_or_else(invalid_string_to_int64_cast)?;
+                    validate_string_to_int64_syntax(string_at(table, source, row))?;
                 }
             }
             ResolvedItem::CastStringToFloat64 { source } => {
                 for row in rows.iter().copied() {
-                    float64_text(string_at(table, source, row))
-                        .then_some(())
-                        .ok_or_else(invalid_string_to_float64_cast)?;
+                    validate_string_to_float64_syntax(string_at(table, source, row))?;
                 }
             }
             ResolvedItem::CastStringToBool { source } => {
                 for row in rows.iter().copied() {
-                    bool_text(string_at(table, source, row))
-                        .map(|_| ())
-                        .ok_or_else(invalid_string_to_bool_cast)?;
+                    checked_string_to_bool(string_at(table, source, row))?;
                 }
             }
             _ => {}
@@ -8687,9 +8688,9 @@ fn order_source_rows(
                     != 0.0)
                     .cmp(&(float64_at(table, source, right) != 0.0)),
                 ResolvedItem::CastStringToBool { source } => {
-                    let left = bool_text(string_at(table, source, left))
+                    let left = checked_string_to_bool(string_at(table, source, left))
                         .expect("String-to-Bool ordering syntax is validated");
-                    let right = bool_text(string_at(table, source, right))
+                    let right = checked_string_to_bool(string_at(table, source, right))
                         .expect("String-to-Bool ordering syntax is validated");
                     left.cmp(&right)
                 }
@@ -8861,9 +8862,7 @@ fn order_source_rows_by_string_to_float64(
     let mut cached = Vec::with_capacity(rows.len());
     for row in rows.iter().copied() {
         let value = string_at(table, source, row);
-        if !float64_text(value) {
-            return Err(invalid_string_to_float64_cast());
-        }
+        validate_string_to_float64_syntax(value)?;
         cached.push(CachedStringToFloat64Order {
             row,
             key: ordering_string_to_float64(value),
@@ -9101,160 +9100,6 @@ fn checked_float64_to_int64(value: f64) -> Result<i64> {
     Ok(value.trunc() as i64)
 }
 
-fn checked_string_to_int64(value: &str) -> Result<i64> {
-    decimal_text(value).ok_or_else(invalid_string_to_int64_cast)?;
-    value
-        .parse::<i64>()
-        .map_err(|_| Error::NumericOverflow("CAST(String AS Int64)".to_owned()))
-}
-
-fn invalid_string_to_int64_cast() -> Error {
-    Error::InvalidCast {
-        source_type: DataType::String,
-        target_type: DataType::Int64,
-    }
-}
-
-fn checked_string_to_float64(value: &str) -> Result<f64> {
-    if !float64_text(value) {
-        return Err(invalid_string_to_float64_cast());
-    }
-    let value = value
-        .parse::<f64>()
-        .map_err(|_| Error::NumericOverflow("CAST(String AS Float64)".to_owned()))?;
-    if !value.is_finite() {
-        return Err(Error::NumericOverflow("CAST(String AS Float64)".to_owned()));
-    }
-    Ok(value)
-}
-
-fn invalid_string_to_float64_cast() -> Error {
-    Error::InvalidCast {
-        source_type: DataType::String,
-        target_type: DataType::Float64,
-    }
-}
-
-fn checked_string_to_bool(value: &str) -> Result<bool> {
-    bool_text(value).ok_or_else(invalid_string_to_bool_cast)
-}
-
-fn invalid_string_to_bool_cast() -> Error {
-    Error::InvalidCast {
-        source_type: DataType::String,
-        target_type: DataType::Bool,
-    }
-}
-
-fn bool_text(value: &str) -> Option<bool> {
-    if value.eq_ignore_ascii_case("true") {
-        Some(true)
-    } else if value.eq_ignore_ascii_case("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn float64_text(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let mut position = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
-    let integer_start = position;
-    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
-        position += 1;
-    }
-    let integer_digits = position - integer_start;
-
-    let mut fractional_digits = 0;
-    if bytes.get(position) == Some(&b'.') {
-        position += 1;
-        let fractional_start = position;
-        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
-            position += 1;
-        }
-        fractional_digits = position - fractional_start;
-    }
-    if integer_digits == 0 && fractional_digits == 0 {
-        return false;
-    }
-
-    if matches!(bytes.get(position), Some(b'e' | b'E')) {
-        position += 1;
-        if matches!(bytes.get(position), Some(b'+' | b'-')) {
-            position += 1;
-        }
-        let exponent_start = position;
-        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
-            position += 1;
-        }
-        if position == exponent_start {
-            return false;
-        }
-    }
-    position == bytes.len()
-}
-
-fn ordering_string_to_float64(value: &str) -> f64 {
-    debug_assert!(float64_text(value));
-    value.parse::<f64>().unwrap_or_else(|_| {
-        if value.starts_with('-') {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        }
-    })
-}
-
-#[derive(Clone, Copy)]
-struct DecimalText<'a> {
-    negative: bool,
-    magnitude: &'a [u8],
-}
-
-fn decimal_text(value: &str) -> Option<DecimalText<'_>> {
-    let bytes = value.as_bytes();
-    let (negative, digits) = match bytes.first() {
-        Some(b'-') => (true, &bytes[1..]),
-        Some(b'+') => (false, &bytes[1..]),
-        Some(_) => (false, bytes),
-        None => return None,
-    };
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-
-    let first_nonzero = digits.iter().position(|digit| *digit != b'0');
-    let magnitude = first_nonzero.map_or_else(
-        || &digits[digits.len() - 1..],
-        |first_nonzero| &digits[first_nonzero..],
-    );
-    Some(DecimalText {
-        negative: negative && magnitude != b"0",
-        magnitude,
-    })
-}
-
-fn decimal_text_cmp(left: &str, right: &str) -> Ordering {
-    let left = decimal_text(left).expect("String-to-Int64 ordering values were validated");
-    let right = decimal_text(right).expect("String-to-Int64 ordering values were validated");
-    match (left.negative, right.negative) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        (left_negative, _) => {
-            let magnitude_order = left
-                .magnitude
-                .len()
-                .cmp(&right.magnitude.len())
-                .then_with(|| left.magnitude.cmp(right.magnitude));
-            if left_negative {
-                magnitude_order.reverse()
-            } else {
-                magnitude_order
-            }
-        }
-    }
-}
-
 fn string_at(table: &Table, source: usize, row: usize) -> &str {
     let Column::String(values) = &table.columns()[source] else {
         unreachable!("String scalar input type is resolved")
@@ -9472,9 +9317,7 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    /// Returns a direct comparison suitable for range-partition routing.
-    /// Compound predicates deliberately remain on that path's full-scan
-    /// fallback so adding sparse-index shapes cannot change scan-limit charges.
+    /// Returns a direct comparison suitable for metadata pruning.
     fn int64_filter(&self) -> Option<(usize, Int64Filter)> {
         let Self::Comparison {
             left,
@@ -9513,13 +9356,20 @@ impl CompiledPredicate {
         Some((column, filter))
     }
 
+    /// Returns an exact comparison or positive inclusive range suitable for
+    /// validated range-partition routing. Every admitted row is still checked
+    /// by the complete predicate evaluator.
+    fn int64_partition_filter(&self) -> Option<(usize, Int64Filter)> {
+        self.int64_filter()
+            .or_else(|| self.int64_inclusive_range_filter())
+    }
+
     /// Returns the shapes that an `Int64` min/max index can reject safely.
     /// This includes any exact positive inclusive-range conjunction after
     /// predicate normalization. Every surviving row is still evaluated by
     /// `self`.
     fn int64_index_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_filter()
-            .or_else(|| self.int64_inclusive_range_filter())
+        self.int64_partition_filter()
     }
 
     fn int64_inclusive_range_filter(&self) -> Option<(usize, Int64Filter)> {
