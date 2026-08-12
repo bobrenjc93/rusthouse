@@ -1,4 +1,4 @@
-//! Bounded HTTP exchanges and finite TCP serving.
+//! Bounded HTTP exchanges and finite or cancellable TCP serving.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
@@ -719,6 +719,24 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
     max_in_flight_connections: NonZeroUsize,
     stop_requested: &AtomicBool,
 ) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_concurrently_until_cancelled(
+        listener,
+        database,
+        limits,
+        max_in_flight_connections,
+        stop_requested,
+        HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
+    )
+}
+
+fn serve_http_concurrently_until_cancelled(
+    listener: TcpListener,
+    database: &SharedDatabase,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+    stop_requested: &AtomicBool,
+    handler: HttpListenerHandler<'_>,
+) -> Result<HttpListenerReport, HttpListenerError> {
     let mut report = HttpListenerReport::default();
     if limits.max_connections == 0 || stop_requested.load(Ordering::Acquire) {
         return Ok(report);
@@ -794,7 +812,7 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
                                 &stream,
                                 accepted_at,
                                 limits,
-                                HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
+                                handler,
                             )
                         });
 
@@ -905,6 +923,55 @@ pub fn serve_http_concurrently_with_clickhouse_key_and_limits(
         database,
         limits,
         max_in_flight_connections,
+        HttpListenerHandler::ClickHouseKeyReadWrite(expected_clickhouse_key),
+    )
+}
+
+/// Concurrently serves cancellable, bounded, read-write,
+/// `X-ClickHouse-Key`-authenticated HTTP connections.
+///
+/// This graceful-lifecycle counterpart to
+/// [`serve_http_concurrently_with_clickhouse_key_and_limits`] owns `listener`
+/// so cancellation can close admission before already accepted exchanges are
+/// drained. It polls the listener and full-capacity completion waits at most
+/// every [`DEFAULT_HTTP_ACCEPT_POLL_INTERVAL`]. Once `stop_requested` is true,
+/// no newly accepted connection is dispatched; an accept racing with the flag
+/// is closed without consuming the connection budget.
+///
+/// Connections accepted before cancellation continue through the existing
+/// read-write handler with their acceptance-based absolute deadlines and
+/// configured HTTP, CSV, and TSV limits. Authenticated inserts therefore keep
+/// their atomic, nonblocking commit behavior. Each exchange retains the
+/// one-response shutdown policy, the in-flight cap, failure isolation, and
+/// acceptance-ordered failure reporting. The function returns after either
+/// cancellation is observed and all accepted workers drain, or
+/// `limits.max_connections` exchanges have been accepted and completed. A
+/// zero connection budget or an initially set flag returns immediately.
+///
+/// This function does not provide TLS. Callers must arrange transport security
+/// before sending a key or query over an untrusted network.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when enabling
+/// nonblocking mode or accepting a connection fails. Interrupted accepts are
+/// retried. Connections accepted before an accept failure or cancellation are
+/// allowed to finish and are included in that report. Connection-local
+/// failures are returned in [`HttpListenerReport::connection_failures`].
+pub fn serve_http_concurrently_with_clickhouse_key_until_cancelled(
+    listener: TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+    stop_requested: &AtomicBool,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_concurrently_until_cancelled(
+        listener,
+        database,
+        limits,
+        max_in_flight_connections,
+        stop_requested,
         HttpListenerHandler::ClickHouseKeyReadWrite(expected_clickhouse_key),
     )
 }
