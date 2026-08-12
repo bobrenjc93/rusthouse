@@ -18,6 +18,9 @@ use crate::batch::format::{
     write_csv, write_csv_rows, write_json, write_json_compact_each_row,
     write_json_each_row_with_limit, write_json_string, write_tsv, write_tsv_rows,
 };
+use crate::batch::json_compact_each_row::{
+    JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
+};
 use crate::batch::shared_database::{DatabaseMetricsSnapshot, DatabaseMetricsWithTables};
 use crate::batch::sql::{self, Statement};
 use crate::batch::storage::validate_table_name;
@@ -71,6 +74,11 @@ pub struct HttpQueryLimits {
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub tsv_ingest_limits: TsvIngestLimits,
+    /// Byte, row, and value limits for one `POST /insert/<table>`
+    /// `JSONCompactEachRow` body.
+    ///
+    /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
+    pub json_compact_each_row_ingest_limits: JsonCompactEachRowIngestLimits,
     /// Maximum bytes in the complete HTTP response, including its headers.
     pub max_response_bytes: usize,
 }
@@ -83,6 +91,7 @@ impl Default for HttpQueryLimits {
             max_sql_bytes: DEFAULT_MAX_HTTP_SQL_BYTES,
             csv_ingest_limits: CsvIngestLimits::default(),
             tsv_ingest_limits: TsvIngestLimits::default(),
+            json_compact_each_row_ingest_limits: JsonCompactEachRowIngestLimits::default(),
             max_response_bytes: DEFAULT_MAX_HTTP_RESPONSE_BYTES,
         }
     }
@@ -542,8 +551,9 @@ pub fn serve_http_read_only_with_clickhouse_key_and_limits(
 ///
 /// Every accepted connection is dispatched through
 /// [`handle_http_query_with_clickhouse_key`] with default exchange limits, so
-/// correctly authenticated SQL, CSV, and TabSeparated inserts use the same
-/// bounded, atomic, nonblocking ingestion paths as the single-exchange API.
+/// correctly authenticated SQL, CSV, TabSeparated, and JSONCompactEachRow
+/// inserts use the same bounded, atomic, nonblocking ingestion paths as the
+/// single-exchange API.
 /// Later connections observe committed writes through the shared database.
 /// Missing, duplicate, empty, and incorrect credentials are ordinary bounded
 /// `401 Unauthorized` exchanges and are rejected before an insert body is read
@@ -842,8 +852,8 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
 /// not finished. The total accepted-connection budget remains
 /// `max_connections`; passing zero for that budget still returns immediately.
 /// Every exchange uses the default resource limits and absolute deadlines.
-/// Authenticated SQL, CSV, and TabSeparated inserts retain the atomic,
-/// nonblocking ingestion behavior of the single-exchange handler.
+/// Authenticated SQL, CSV, TabSeparated, and JSONCompactEachRow inserts retain
+/// the atomic, nonblocking ingestion behavior of the single-exchange handler.
 ///
 /// # Errors
 ///
@@ -880,11 +890,11 @@ pub fn serve_http_concurrently_with_clickhouse_key(
 /// [`HttpListenerLimits::max_connections`], including authentication,
 /// protocol, query, ingestion, and transport failures. Each connection
 /// receives at most one response. Authenticated inserts use the configured
-/// HTTP, CSV, and TSV limits and remain atomic and nonblocking under database
-/// contention. Transport failures are isolated from other connections and
-/// sorted by acceptance position in the final report even when exchanges
-/// finish in a different order. This function does not provide TLS, sessions,
-/// or daemon lifecycle management.
+/// HTTP, CSV, TSV, and JSONCompactEachRow limits and remain atomic and
+/// nonblocking under database contention. Transport failures are isolated from
+/// other connections and sorted by acceptance position in the final report
+/// even when exchanges finish in a different order. This function does not
+/// provide TLS, sessions, or daemon lifecycle management.
 ///
 /// # Errors
 ///
@@ -1173,7 +1183,9 @@ fn serve_http_connections(
 /// input in physical schema order. Exact `X-ClickHouse-Format: TabSeparated`
 /// similarly selects headerless TSV in physical schema order, while
 /// `TabSeparatedWithNames` selects named TSV; `CSVWithNames` may also be
-/// selected explicitly. The corresponding independent ingestion limits and
+/// selected explicitly. Exact `X-ClickHouse-Format: JSONCompactEachRow`
+/// selects the one-column positional JSON importer for an `Int64` or
+/// `Nullable(Int64)` table. The corresponding independent ingestion limits and
 /// nonblocking [`SharedDatabase`] importer are used. Success returns an empty
 /// `200 OK` response. The unauthenticated handlers do not expose either route.
 /// The insertion-capable `X-ClickHouse-Key`-authenticated and named-principal
@@ -1534,7 +1546,7 @@ pub fn handle_http_query_read_only_with_clickhouse_key_and_limits(
 /// constant work regardless of either comparison's result.
 ///
 /// Correctly authenticated requests expose the same bounded, atomic,
-/// nonblocking SQL, CSV, and TSV insertion paths as
+/// nonblocking SQL, CSV, TSV, and JSONCompactEachRow insertion paths as
 /// [`handle_http_query_with_clickhouse_key`]. The configured user and key must
 /// each be a nonempty HTTP field value without leading or trailing optional
 /// whitespace, and both are validated before any request input is read. Every
@@ -2041,6 +2053,11 @@ fn handle_http_query_exchange(
                 TableInsertFormat::TabSeparatedWithNames => {
                     database.try_ingest_tsv_with_names(&table, body, limits.tsv_ingest_limits)
                 }
+                TableInsertFormat::JsonCompactEachRow => database.try_ingest_json_compact_each_row(
+                    &table,
+                    body,
+                    limits.json_compact_each_row_ingest_limits,
+                ),
             };
             return match result {
                 Ok(_) => output
@@ -2633,6 +2650,12 @@ fn read_table_insert_body(
                 limits.tsv_ingest_limits,
             )
         }
+        TableInsertFormat::JsonCompactEachRow => read_json_compact_each_row_body(
+            input,
+            content_length,
+            limits.max_sql_bytes,
+            limits.json_compact_each_row_ingest_limits,
+        ),
     }
 }
 
@@ -2671,6 +2694,29 @@ fn read_tsv_body(
                 bytes: content_length,
                 max_bytes: tsv_limits.max_bytes,
             })
+            .to_string(),
+        )
+        .into());
+    }
+    read_body_with_length(input, content_length)
+}
+
+fn read_json_compact_each_row_body(
+    input: &mut impl Read,
+    content_length: Option<usize>,
+    max_http_body_bytes: usize,
+    json_limits: JsonCompactEachRowIngestLimits,
+) -> Result<Vec<u8>, RequestReadError> {
+    let content_length = bounded_body_length(content_length, max_http_body_bytes)?;
+    if content_length > json_limits.max_bytes {
+        return Err(RequestFailure::owned(
+            Status::BAD_REQUEST,
+            SharedDatabaseError::JsonCompactEachRowIngest(
+                JsonCompactEachRowIngestError::ByteLimitExceeded {
+                    bytes: content_length,
+                    max_bytes: json_limits.max_bytes,
+                },
+            )
             .to_string(),
         )
         .into());
@@ -2841,6 +2887,7 @@ enum TableInsertFormat {
     CsvWithNames,
     TabSeparated,
     TabSeparatedWithNames,
+    JsonCompactEachRow,
 }
 
 impl TableInsertFormat {
@@ -2851,6 +2898,9 @@ impl TableInsertFormat {
             Self::TabSeparated => "TabSeparated INSERT does not accept an output format selector",
             Self::TabSeparatedWithNames => {
                 "TabSeparatedWithNames INSERT does not accept an output format selector"
+            }
+            Self::JsonCompactEachRow => {
+                "JSONCompactEachRow INSERT does not accept an output format selector"
             }
         }
     }
@@ -3177,6 +3227,7 @@ fn parse_headers(
             Some(b"CSV") => TableInsertFormat::Csv,
             Some(b"TabSeparated") => TableInsertFormat::TabSeparated,
             Some(b"TabSeparatedWithNames") => TableInsertFormat::TabSeparatedWithNames,
+            Some(b"JSONCompactEachRow") => TableInsertFormat::JsonCompactEachRow,
             Some(_) => {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,

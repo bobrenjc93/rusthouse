@@ -11,6 +11,7 @@ use rusthouse::batch::engine::{
     STRING_TO_FLOAT64_ORDERING_CACHE_ENTRY_BYTES,
 };
 use rusthouse::batch::error::Error;
+use rusthouse::batch::json_compact_each_row::JsonCompactEachRowIngestLimits;
 use rusthouse::batch::tsv::TsvIngestLimits;
 use rusthouse::batch::value::Value;
 use rusthouse::{
@@ -9902,6 +9903,195 @@ fn authenticated_csv_routes_ingest_nullable_int64_writer_tokens() {
 }
 
 #[test]
+fn authenticated_json_compact_each_row_insert_ingests_nullable_int64_rows() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE readings (value Nullable(Int64));")
+        .unwrap();
+    let input = b"[null]\n[-7]\r\n[9223372036854775807]\n";
+    let (request, _) = request_with_authorization_for_target(
+        "/insert/readings",
+        input,
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Database: default\r\n\
+         X-ClickHouse-Format: JSONCompactEachRow\r\n",
+    );
+
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &request),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT value FROM readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[null],[-7],[9223372036854775807]]}"#,
+    );
+}
+
+#[test]
+fn json_compact_each_row_insert_rejects_late_malformed_input_atomically() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (value Int64); \
+             INSERT INTO readings VALUES (9);",
+        )
+        .unwrap();
+    let input = b"[1]\n[late]\n";
+    let (request, _) = request_with_authorization_for_target(
+        "/insert/readings",
+        input,
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Format: JSONCompactEachRow\r\n",
+    );
+
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &request),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"database JSONCompactEachRow ingestion failed: JSONCompactEachRow record at line 2 is not valid JSON at byte column 2"}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT value FROM readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[9]]}"#,
+    );
+}
+
+#[test]
+fn json_compact_each_row_insert_preserves_http_and_format_limits() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE readings (value Int64);")
+        .unwrap();
+    let input = b"[1]\n[2]\n";
+    let (request, body_offset) = request_with_authorization_for_target(
+        "/insert/readings",
+        input,
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Format: JSONCompactEachRow\r\n",
+    );
+
+    let mut http_limited_input = Cursor::new(&request);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        &mut http_limited_input,
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: input.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(http_limited_input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"request body exceeds configured byte limit"}"#,
+    );
+
+    let mut format_limited_input = Cursor::new(&request);
+    response.clear();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        &mut format_limited_input,
+        &mut response,
+        HttpQueryLimits {
+            json_compact_each_row_ingest_limits: JsonCompactEachRowIngestLimits::new(
+                input.len() - 1,
+                2,
+                2,
+            ),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(format_limited_input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        &format!(
+            r#"{{"error":"database JSONCompactEachRow ingestion failed: JSONCompactEachRow input is {} bytes, exceeding the limit of {} bytes"}}"#,
+            input.len(),
+            input.len() - 1,
+        ),
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT value FROM readings;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
+fn json_compact_each_row_insert_returns_503_without_waiting_for_a_reader() {
+    let mut initial = Database::new();
+    initial
+        .execute("CREATE TABLE readings (value Int64);")
+        .unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let mut reader = Some(inner.read().unwrap());
+    let (request, _) = request_with_authorization_for_target(
+        "/insert/readings",
+        b"[1]\n",
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Format: JSONCompactEachRow\r\n",
+    );
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        sender
+            .send(authenticated_exchange(
+                &worker_database,
+                "correct-token",
+                &request,
+            ))
+            .unwrap();
+    });
+
+    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(response) => response,
+        Err(error) => {
+            drop(reader.take());
+            worker.join().unwrap();
+            panic!("HTTP JSONCompactEachRow admission blocked behind a reader: {error}");
+        }
+    };
+    assert_response(
+        &response,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    assert_eq!(
+        reader
+            .as_ref()
+            .unwrap()
+            .catalog()
+            .table("readings")
+            .unwrap()
+            .row_count(),
+        0,
+    );
+    drop(reader.take());
+    worker.join().unwrap();
+}
+
+#[test]
 fn authenticated_headerless_csv_insert_ingests_all_physical_types_in_schema_order() {
     let database = SharedDatabase::default();
     database
@@ -10299,7 +10489,7 @@ fn table_insert_authentication_precedes_exact_format_validation_and_body_reads()
 }
 
 #[test]
-fn table_insert_rejects_nonexact_and_duplicate_headerless_formats_before_body_reads() {
+fn table_insert_rejects_nonexact_and_duplicate_formats_before_body_reads() {
     let database = SharedDatabase::default();
     database.execute("CREATE TABLE events (id Int64);").unwrap();
 
@@ -10310,6 +10500,8 @@ fn table_insert_rejects_nonexact_and_duplicate_headerless_formats_before_body_re
         "X-ClickHouse-Format: tabseparated\r\n",
         "X-ClickHouse-Format: Tabseparated\r\n",
         "X-ClickHouse-Format: TabSeparatedWithnames\r\n",
+        "X-ClickHouse-Format: jsoncompacteachrow\r\n",
+        "X-ClickHouse-Format: JsonCompactEachRow\r\n",
     ] {
         let headers = format!("Authorization: Bearer correct-token\r\n{format_headers}");
         let (request, body_offset) =

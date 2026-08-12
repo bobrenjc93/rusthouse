@@ -1135,7 +1135,8 @@ body. The route is not recognized by `handle_http_query` or
 `handle_http_query_with_limits`.
 
 Those insertion-capable handlers also expose exact `POST /insert/<table>` for
-`CSV`, `CSVWithNames`, `TabSeparated`, or `TabSeparatedWithNames` ingestion.
+`CSV`, `CSVWithNames`, `TabSeparated`, `TabSeparatedWithNames`, or
+`JSONCompactEachRow` ingestion.
 `<table>` is one literal RustHouse SQL identifier; extra path segments, query
 strings, and percent-encoded names are not accepted. The request requires one
 decimal `Content-Length`. With no format header the body remains `CSVWithNames`, so
@@ -1150,6 +1151,10 @@ matching-case column-name header. Their headers may contain any nonempty
 target-column subset without duplicates and in any order; omitted columns
 receive `NULL` for `Nullable(Int64)`, or `0`, `0.0`, `false`, or an empty string
 according to their non-nullable schema type.
+An exact `X-ClickHouse-Format: JSONCompactEachRow` selects the existing
+one-column positional JSON importer. The target must have one `Int64` or
+`Nullable(Int64)` column, and each line must be a one-element array such as
+`[-7]` or `[null]`; only the nullable target accepts `null`.
 Duplicate, differently cased, and other format values return `400 Bad Request`.
 The route calls the corresponding nonblocking `SharedDatabase::try_ingest_*`
 method, so typed input, schema, capacity, and format-specific limit failures
@@ -1182,13 +1187,15 @@ database-header validation, the bounded body or URL query is read and decoded.
 Standard authenticated POST insertion is disabled when an output format was
 selected. A parameterized headerless or named CSV or TSV insert validates the
 exact SQL shape and both the HTTP and corresponding format byte caps before
-reading its body. The standard and explicit SQL routes complete SQL parsing
-before their immediate write-lock attempt; the headerless and named CSV and TSV
-routes pass their bounded bytes to the selected ingestion API, which attempts
-the lock before table lookup or parsing. Any active reader or writer
-returns the same deterministic `503 Service Unavailable`; a poisoned lock
-returns `500 Internal Server Error`. Validation and commit occur under the
-acquired write lock so concurrent work cannot expose or cause a partial batch.
+reading its body. Direct CSV, TSV, and JSONCompactEachRow table inserts apply
+the same pre-read byte-cap ordering. The standard and explicit SQL routes
+complete SQL parsing before their immediate write-lock attempt; the CSV, TSV,
+and JSONCompactEachRow routes pass their bounded bytes to the selected
+ingestion API, which attempts the lock before table lookup or parsing. Any
+active reader or writer returns the same deterministic `503 Service
+Unavailable`; a poisoned lock returns `500 Internal Server Error`. Validation
+and commit occur under the acquired write lock so concurrent work cannot expose
+or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSV`, `CSVWithNames`, `TabSeparated`,
@@ -1280,14 +1287,16 @@ same deterministic `503 Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a
 POST body or decoded GET SQL, and 16 MiB for the complete response including
-headers. CSV and TSV insertion each additionally apply their own ingestion
-defaults of 8 MiB, 100,000 rows, and 1,000,000 values; the default 1 MiB HTTP
-body cap is reached first for byte size. `HttpQueryLimits::csv_ingest_limits`
-and `HttpQueryLimits::tsv_ingest_limits` configure the two formats independently.
-For table insertion, including parameterized query-plus-data CSV and TSV
-insertion, the declared `Content-Length` must fit the HTTP byte cap and the
-selected format's byte cap before the handler allocates or reads the body. Header limits
-apply to all routes, as does the complete-response limit.
+headers. CSV and TSV insertion each additionally default to 8 MiB, 100,000
+rows, and 1,000,000 values; JSONCompactEachRow defaults to 8 MiB, 100,000 rows,
+and 100,000 values. The default 1 MiB HTTP body cap is reached first for byte
+size. `HttpQueryLimits::csv_ingest_limits`,
+`HttpQueryLimits::tsv_ingest_limits`, and
+`HttpQueryLimits::json_compact_each_row_ingest_limits` configure the formats
+independently. For table insertion, including parameterized query-plus-data CSV
+and TSV insertion, the declared `Content-Length` must fit the HTTP byte cap and
+the selected format's byte cap before the handler allocates or reads the body.
+Header limits apply to all routes, as does the complete-response limit.
 The full response is prepared and checked before anything is written. Call an
 authenticated handler's `*_and_limits` variant with `HttpQueryLimits` to set
 explicit insertion limits. Each call reads exactly one header block and, only
