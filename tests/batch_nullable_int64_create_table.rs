@@ -364,6 +364,31 @@ fn mixed_create_rejects_duplicate_names_without_publishing_or_replacing() {
 }
 
 #[test]
+fn direct_mixed_create_ast_rejects_an_empty_non_nullable_prefix_without_panicking() {
+    for statement in [
+        Statement::CreateTableWithTrailingNullableInt64 {
+            name: "plain".to_owned(),
+            columns: Vec::new(),
+            nullable_column: "value".to_owned(),
+        },
+        Statement::CreateTableWithTrailingNullableInt64IfNotExists {
+            name: "conditional".to_owned(),
+            columns: Vec::new(),
+            nullable_column: "value".to_owned(),
+        },
+    ] {
+        let mut database = Database::new();
+        assert_eq!(
+            database.execute_statement(statement),
+            Err(Error::InvalidQuery(
+                "a table must contain at least one column".to_owned()
+            ))
+        );
+        assert_eq!(database.catalog().table_count(), 0);
+    }
+}
+
+#[test]
 fn conditional_nullable_create_preserves_the_existing_table() {
     let mut database = Database::new();
     database

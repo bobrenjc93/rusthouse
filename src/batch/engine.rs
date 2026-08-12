@@ -1454,7 +1454,6 @@ impl Database {
             };
         }
 
-        debug_assert!(!columns.is_empty());
         let mut table = Table::with_limits(name, columns, self.table_limits)?;
         table.add_nullable_int64_column(nullable_column)?;
         let measurements = TableMeasurements::read(&table);
@@ -4721,7 +4720,9 @@ fn show_create_column_count(table: &Table) -> usize {
         .iter()
         .position(|column| matches!(column, Column::NullableInt64(_)))
         .map_or(table.schema().len(), |index| {
-            if index.saturating_add(1) == table.schema().len() {
+            if index.saturating_add(1) == table.schema().len()
+                && table.schema().len() <= sql::DEFAULT_MAX_AST_LIST_ITEMS
+            {
                 table.schema().len()
             } else {
                 index.max(1)
@@ -4738,7 +4739,12 @@ fn show_create_statement_count_after_addition(table: &Table, added_nullable: boo
         Some(index) => 1_usize
             .saturating_add(table.schema().len().saturating_add(1))
             .saturating_sub(index.max(1)),
-        None if added_nullable => 1,
+        None if added_nullable
+            && table.schema().len().saturating_add(1) <= sql::DEFAULT_MAX_AST_LIST_ITEMS =>
+        {
+            1
+        }
+        None if added_nullable => 2,
         None => 1,
     }
 }
