@@ -1,11 +1,13 @@
 //! Bounded ingestion for one-column `JSONCompactEachRow` input.
 //!
 //! This intentionally small positional subset accepts one JSON array per
-//! physical line. Every array contains exactly one JSON number, or `null` for
-//! a `Nullable(Int64)` target. The target must be an existing one-column
-//! `Int64`, `Nullable(Int64)`, or `Float64` table. `Int64` targets retain their
-//! integer-only syntax, while `Float64` targets accept every finite JSON number.
-//! Input is completely validated and prepared before the caller commits any row.
+//! physical line. Every array contains exactly one JSON number, the exact JSON
+//! literal `true` or `false` for a `Bool` target, or `null` for a
+//! `Nullable(Int64)` target. The target must be an existing one-column
+//! `Int64`, `Nullable(Int64)`, `Float64`, or `Bool` table. `Int64` targets retain
+//! their integer-only syntax, while `Float64` targets accept every finite JSON
+//! number. Input is completely validated and prepared before the caller commits
+//! any row.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -67,7 +69,7 @@ pub enum JsonCompactEachRowIngestError {
     InvalidUtf8 { valid_up_to: usize },
     /// The target does not have exactly one physical column.
     UnsupportedColumnCount { actual: usize },
-    /// The sole target column is not `Int64`, `Nullable(Int64)`, or `Float64`.
+    /// The sole target column is not a supported numeric or `Bool` type.
     UnsupportedColumnType { column: String, actual: DataType },
     /// A physical row crosses the configured row bound.
     RowLimitExceeded {
@@ -120,7 +122,7 @@ impl fmt::Display for JsonCompactEachRowIngestError {
             ),
             Self::UnsupportedColumnType { column, actual } => write!(
                 formatter,
-                "JSONCompactEachRow ingestion requires column '{column}' to be Int64, Nullable(Int64), or Float64; found {actual}"
+                "JSONCompactEachRow ingestion requires column '{column}' to be Int64, Nullable(Int64), Float64, or Bool; found {actual}"
             ),
             Self::RowLimitExceeded {
                 line,
@@ -258,7 +260,10 @@ fn validate_target(table: &Table) -> Result<(), JsonCompactEachRowIngestError> {
         });
     }
     let column = &table.schema()[0];
-    if !matches!(column.data_type, DataType::Int64 | DataType::Float64) {
+    if !matches!(
+        column.data_type,
+        DataType::Int64 | DataType::Float64 | DataType::Bool
+    ) {
         return Err(JsonCompactEachRowIngestError::UnsupportedColumnType {
             column: column.name.clone(),
             actual: column.data_type,
@@ -302,13 +307,14 @@ fn parse_value(
                 Err(invalid_value(line, expected))
             }
         }
-        (DataType::Int64 | DataType::Float64, ParsedJsonValue::Null | ParsedJsonValue::Other) => {
+        (DataType::Bool, ParsedJsonValue::Bool(value)) => Ok(Value::Bool(value)),
+        (DataType::Int64, ParsedJsonValue::Number { .. }) => Err(invalid_value(line, expected)),
+        (DataType::Int64 | DataType::Float64 | DataType::Bool, _) => {
             Err(invalid_value(line, expected))
         }
-        (DataType::Bool | DataType::String, _) => {
+        (DataType::String, _) => {
             unreachable!("target type was validated before values were parsed")
         }
-        (DataType::Int64, ParsedJsonValue::Number { .. }) => Err(invalid_value(line, expected)),
     }
 }
 
@@ -323,6 +329,7 @@ fn invalid_value(line: usize, expected: DataType) -> JsonCompactEachRowIngestErr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParsedJsonValue {
     Null,
+    Bool(bool),
     Number {
         start: usize,
         end: usize,
@@ -429,6 +436,8 @@ fn record_root_array_value(frames: &[JsonFrame], token: JsonToken, parsed: &mut 
     if parsed.first_value.is_none() {
         parsed.first_value = Some(match token.kind {
             JsonTokenKind::Null => ParsedJsonValue::Null,
+            JsonTokenKind::True => ParsedJsonValue::Bool(true),
+            JsonTokenKind::False => ParsedJsonValue::Bool(false),
             JsonTokenKind::Number { is_integer } => ParsedJsonValue::Number {
                 start: token.start,
                 end: token.end,

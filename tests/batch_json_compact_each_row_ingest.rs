@@ -143,6 +143,107 @@ fn float64_json_number_forms_and_writer_output_round_trip_exactly() {
 }
 
 #[test]
+fn bool_writer_output_round_trips_exact_json_literals() {
+    let mut source = Database::new();
+    source
+        .execute(
+            "CREATE TABLE source (value Bool); \
+             INSERT INTO source VALUES (true), (false), (true);",
+        )
+        .unwrap();
+    let result = query(&mut source, "SELECT value FROM source;");
+    let mut input = Vec::new();
+    write_json_compact_each_row(&mut input, &result).unwrap();
+    assert_eq!(input, b"[true]\n[false]\n[true]\n");
+
+    let mut target = Database::with_table_limits(TableLimits::new(3, 1, 3));
+    target.execute("CREATE TABLE target (value Bool);").unwrap();
+    assert_eq!(
+        target.ingest_json_compact_each_row(
+            "target",
+            &input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 3, 3),
+        ),
+        Ok(3),
+    );
+    assert_eq!(values(&mut target, "target"), result.rows);
+}
+
+#[test]
+fn bool_late_malformed_or_incompatible_values_roll_back_every_prepared_row() {
+    let mut database = Database::with_max_rows_per_table(4);
+    database
+        .execute("CREATE TABLE flags (value Bool); INSERT INTO flags VALUES (false);")
+        .unwrap();
+
+    for rejected in [
+        b"[true]\n[null]\n".as_slice(),
+        b"[true]\n[0]\n".as_slice(),
+        b"[true]\n[1.0]\n".as_slice(),
+        b"[true]\n[\"false\"]\n".as_slice(),
+    ] {
+        assert_eq!(
+            database.ingest_json_compact_each_row(
+                "flags",
+                rejected,
+                JsonCompactEachRowIngestLimits::new(rejected.len(), 2, 2),
+            ),
+            Err(JsonCompactEachRowIngestError::InvalidValue {
+                line: 2,
+                column: 1,
+                expected: DataType::Bool,
+            }),
+        );
+    }
+
+    let malformed = b"[true]\n[false] trailing\n";
+    assert!(matches!(
+        database.ingest_json_compact_each_row(
+            "flags",
+            malformed,
+            JsonCompactEachRowIngestLimits::new(malformed.len(), 2, 2),
+        ),
+        Err(JsonCompactEachRowIngestError::InvalidJson { line: 2, .. })
+    ));
+    assert_eq!(values(&mut database, "flags"), [vec![Value::Bool(false)]],);
+}
+
+#[test]
+fn bool_ingestion_succeeds_at_exact_input_and_table_limits() {
+    let input = b"[true]\n[false]\n";
+    let limits = JsonCompactEachRowIngestLimits::new(input.len(), 2, 2);
+    let mut database = Database::with_table_limits(TableLimits::new(2, 1, 2));
+    database
+        .execute("CREATE TABLE flags (value Bool);")
+        .unwrap();
+
+    assert_eq!(
+        database.ingest_json_compact_each_row("flags", input, limits),
+        Ok(2),
+    );
+
+    let one_more = b"[true]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "flags",
+            one_more,
+            JsonCompactEachRowIngestLimits::new(one_more.len(), 1, 1),
+        ),
+        Err(JsonCompactEachRowIngestError::Database(
+            Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 3,
+                max: 2,
+            }
+        )),
+    );
+    assert_eq!(
+        values(&mut database, "flags"),
+        [vec![Value::Bool(true)], vec![Value::Bool(false)]],
+    );
+}
+
+#[test]
 fn empty_and_all_null_writer_inputs_round_trip_for_nullable_int64() {
     let mut source = Database::new();
     source
@@ -492,7 +593,7 @@ fn float64_late_failures_and_exact_limits_leave_the_table_atomic() {
 }
 
 #[test]
-fn rejects_targets_outside_the_one_column_numeric_subset_without_mutation() {
+fn rejects_targets_outside_the_one_column_supported_subset_without_mutation() {
     let input = b"[1]\n";
     let limits = JsonCompactEachRowIngestLimits::new(input.len(), 1, 1);
     let mut database = Database::new();
@@ -523,6 +624,69 @@ impl AsRef<[u8]> for InaccessibleInput {
     fn as_ref(&self) -> &[u8] {
         panic!("contended nonblocking ingestion must not access its input")
     }
+}
+
+#[test]
+fn shared_bool_ingestion_preserves_blocking_and_nonblocking_contention() {
+    let mut initial = Database::with_max_rows_per_table(2);
+    initial.execute("CREATE TABLE flags (value Bool);").unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+
+    let reader = inner.read().unwrap();
+    assert_eq!(
+        database.try_ingest_json_compact_each_row(
+            "missing",
+            InaccessibleInput,
+            JsonCompactEachRowIngestLimits::new(0, 0, 0),
+        ),
+        Err(SharedDatabaseError::DatabaseBusy),
+    );
+
+    let blocking_database = database.clone();
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let input = b"[true]\n";
+        sender
+            .send(blocking_database.ingest_json_compact_each_row(
+                "flags",
+                input,
+                JsonCompactEachRowIngestLimits::new(input.len(), 1, 1),
+            ))
+            .unwrap();
+    });
+    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(reader);
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Ok(1),
+    );
+    worker.join().unwrap();
+
+    let writer = inner.write().unwrap();
+    assert_eq!(
+        database.try_ingest_json_compact_each_row(
+            "missing",
+            InaccessibleInput,
+            JsonCompactEachRowIngestLimits::new(0, 0, 0),
+        ),
+        Err(SharedDatabaseError::DatabaseBusy),
+    );
+    drop(writer);
+
+    let input = b"[false]\n";
+    assert_eq!(
+        database.try_ingest_json_compact_each_row(
+            "flags",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 1, 1),
+        ),
+        Ok(1),
+    );
+    assert_eq!(
+        database.query("SELECT value FROM flags;").unwrap().rows,
+        [vec![Value::Bool(true)], vec![Value::Bool(false)]],
+    );
 }
 
 #[test]

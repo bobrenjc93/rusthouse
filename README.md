@@ -1634,16 +1634,18 @@ row is appended.
 
 `Database::ingest_json_compact_each_row` adds a deliberately narrow,
 dependency-free positional JSON importer for existing one-column `Int64`,
-`Nullable(Int64)`, and `Float64` tables. Each physical LF or CRLF record must be
-a complete one-element JSON array such as `[-7]`, `[6.25e-3]`, or `[null]`;
-JSON whitespace around the array and value is accepted. `Int64` targets retain
-their integer-only syntax and range checks. `Float64` targets accept every JSON
-number form that parses to a finite value, including integer, decimal,
-exponent, normal extrema, subnormal, and signed-zero forms. Only nullable
-integer targets accept `null`. Empty input appends no rows, while empty arrays,
-wider arrays, booleans, strings, objects, nested arrays, trailing content,
-malformed JSON, invalid UTF-8, out-of-range integers, and non-finite Float64
-overflow are rejected.
+`Nullable(Int64)`, `Float64`, and `Bool` tables. Each physical LF or CRLF record
+must be a complete one-element JSON array such as `[-7]`, `[6.25e-3]`,
+`[null]`, or `[true]`; JSON whitespace around the array and value is accepted.
+`Int64` targets retain their integer-only syntax and range checks. `Float64`
+targets accept every JSON number form that parses to a finite value, including
+integer, decimal, exponent, normal extrema, subnormal, and signed-zero forms.
+`Bool` targets accept only the exact JSON literals `true` and `false`; they
+reject `null`, numbers, and strings. Only nullable integer targets accept
+`null`. Empty input appends no rows, while empty arrays, wider arrays,
+type-incompatible values, objects, nested arrays, trailing content, malformed
+JSON, invalid UTF-8, out-of-range integers, and non-finite Float64 overflow are
+rejected.
 
 Callers provide complete-input byte, physical-row, and total-value limits.
 RustHouse validates the target shape, the entire input, those limits, and the
