@@ -51,6 +51,13 @@ allocation. Focused module tests cover signed zero, subnormal values, extrema, h
 and comparison ties; the existing SQL-boundary differential and resource-limit tests continue to
 cover complete query behavior.
 
+The private `batch::group_index` module owns borrowed group-key identity, specialized zero-, one-,
+two-, and many-column probing, and reconstruction in first-seen group-number order. The execution
+engine retains SQL grouping policy, reusable many-key probe allocation, group numbering, aggregate
+state, and all group/key resource accounting. Focused module tests cover `NULL`, signed zero,
+borrowed strings, first-seen order, and the stack-backed two-key versus reusable many-key probe
+paths; SQL grouping differentials continue to cover end-to-end query semantics.
+
 The private `batch::aggregate_scheduler` module owns process-wide aggregate-worker admission and
 deterministic contiguous partitioning. Its generic grouped-aggregate driver additionally owns
 scoped worker spawning, ordered partial collection, admission release, and complete-input fallback

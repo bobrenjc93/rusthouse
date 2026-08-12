@@ -13,6 +13,7 @@ use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
 use crate::batch::global_scalar_extremum;
+use crate::batch::group_index::{GroupIndex, GroupKey};
 use crate::batch::grouped_bool_count;
 use crate::batch::grouped_bool_max;
 use crate::batch::grouped_bool_min;
@@ -8165,137 +8166,6 @@ fn max_global_float64(
     AggregateState::Max(
         global_scalar_extremum::max_float64(values, matching_rows, parallelism).map(Value::Float64),
     )
-}
-
-#[derive(Debug)]
-enum GroupIndex<'a> {
-    Global,
-    One(HashMap<ValueRef<'a>, usize>),
-    Multiple(HashMap<Box<[ValueRef<'a>]>, usize>),
-}
-
-impl<'a> GroupIndex<'a> {
-    fn new(column_count: usize) -> Self {
-        match column_count {
-            0 => Self::Global,
-            1 => Self::One(HashMap::new()),
-            _ => Self::Multiple(HashMap::new()),
-        }
-    }
-
-    fn find(
-        &self,
-        table: &'a Table,
-        columns: &[usize],
-        row: usize,
-        multiple_key_probe: &mut Vec<ValueRef<'a>>,
-    ) -> Option<usize> {
-        match self {
-            Self::Global => Some(0),
-            Self::One(groups) => {
-                let key = table.columns()[columns[0]].value_ref(row);
-                groups.get(&key).copied()
-            }
-            Self::Multiple(groups) if columns.len() == 2 => {
-                let key = [
-                    table.columns()[columns[0]].value_ref(row),
-                    table.columns()[columns[1]].value_ref(row),
-                ];
-                groups.get(key.as_slice()).copied()
-            }
-            Self::Multiple(groups) => {
-                multiple_key_probe.clear();
-                multiple_key_probe.extend(
-                    columns
-                        .iter()
-                        .map(|column| table.columns()[*column].value_ref(row)),
-                );
-                groups.get(multiple_key_probe.as_slice()).copied()
-            }
-        }
-    }
-
-    fn insert(
-        &mut self,
-        table: &'a Table,
-        columns: &[usize],
-        row: usize,
-        group: usize,
-        multiple_key_probe: &[ValueRef<'a>],
-    ) {
-        let previous = match self {
-            Self::Global => unreachable!("global aggregation has no grouped key to insert"),
-            Self::One(groups) => {
-                let key = table.columns()[columns[0]].value_ref(row);
-                groups.insert(key, group)
-            }
-            Self::Multiple(groups) if columns.len() == 2 => {
-                let key = [
-                    table.columns()[columns[0]].value_ref(row),
-                    table.columns()[columns[1]].value_ref(row),
-                ];
-                groups.insert(key.into(), group)
-            }
-            Self::Multiple(groups) => {
-                debug_assert_eq!(multiple_key_probe.len(), columns.len());
-                groups.insert(multiple_key_probe.into(), group)
-            }
-        };
-        debug_assert!(previous.is_none(), "new group keys must be unique");
-    }
-
-    fn into_keys(self, group_count: usize) -> Vec<GroupKey<'a>> {
-        let mut ordered = std::iter::repeat_with(|| None)
-            .take(group_count)
-            .collect::<Vec<_>>();
-        match self {
-            Self::Global => {
-                debug_assert_eq!(group_count, 1);
-                ordered[0] = Some(GroupKey::Empty);
-            }
-            Self::One(groups) => {
-                for (key, group) in groups {
-                    ordered[group] = Some(GroupKey::One(key));
-                }
-            }
-            Self::Multiple(groups) => {
-                for (key, group) in groups {
-                    ordered[group] = Some(GroupKey::Multiple(key));
-                }
-            }
-        }
-        ordered
-            .into_iter()
-            .map(|key| key.expect("every group index has a key"))
-            .collect()
-    }
-}
-
-#[derive(Debug)]
-enum GroupKey<'a> {
-    Empty,
-    One(ValueRef<'a>),
-    Multiple(Box<[ValueRef<'a>]>),
-}
-
-impl GroupKey<'_> {
-    fn value(&self, position: usize) -> ValueRef<'_> {
-        match self {
-            Self::Empty => unreachable!("a global aggregate has no grouped columns"),
-            Self::One(value) if position == 0 => *value,
-            Self::One(_) => unreachable!("single-column group position is zero"),
-            Self::Multiple(values) => values[position],
-        }
-    }
-
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (Self::Empty, Self::Empty) => Ordering::Equal,
-            (Self::One(left), Self::One(right)) => left.cmp(right),
-            (Self::Multiple(left), Self::Multiple(right)) => left.cmp(right),
-            _ => unreachable!("all keys for a query have the same shape"),
-        }
-    }
 }
 
 #[derive(Debug)]
