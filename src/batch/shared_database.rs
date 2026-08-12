@@ -1204,9 +1204,12 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         Statement::Delete { .. }
         | Statement::DeleteComparison { .. }
         | Statement::DeleteConjunction { .. }
-        | Statement::DeleteNullness { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
-            statement: "DELETE",
-        }),
+        | Statement::DeleteNullness { .. }
+        | Statement::DeleteNullnessConjunction { .. } => {
+            Err(SharedDatabaseError::ReadOnlyStatementRequired {
+                statement: "DELETE",
+            })
+        }
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => {
             Err(SharedDatabaseError::ReadOnlyStatementRequired {
                 statement: "INSERT",

@@ -150,15 +150,39 @@ fn parses_exact_single_nullness_delete_for_both_spellings() {
 }
 
 #[test]
-fn rejects_malformed_or_compound_delete_nullness_shapes() {
+fn parses_one_nullness_and_one_comparison_in_either_order_for_both_spellings() {
+    let expected = Ok(vec![Statement::DeleteNullnessConjunction {
+        table: "Readings".to_owned(),
+        nullness_column: "Value".to_owned(),
+        is_null: false,
+        comparison: DeleteComparisonPredicate {
+            column: "id".to_owned(),
+            operator: ComparisonOperator::GreaterOrEqual,
+            literal: Value::Int64(2),
+        },
+    }]);
+
+    for sql in [
+        "DELETE FROM Readings WHERE Value IS NOT NULL AND id >= 2;",
+        "DELETE FROM Readings WHERE id >= 2 AND Value IS NOT NULL;",
+        "ALTER TABLE Readings DELETE WHERE Value IS NOT NULL AND id >= 2;",
+        "ALTER TABLE Readings DELETE WHERE id >= 2 AND Value IS NOT NULL;",
+    ] {
+        assert_eq!(parse(sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn rejects_malformed_or_unsupported_delete_nullness_shapes() {
     for sql in [
         "DELETE FROM readings WHERE value IS",
         "DELETE FROM readings WHERE value IS NOT",
         "DELETE FROM readings WHERE value IS TRUE",
         "DELETE FROM readings WHERE value IS NOT FALSE",
-        "DELETE FROM readings WHERE value IS NULL AND id = 1",
         "DELETE FROM readings WHERE value IS NOT NULL OR id = 1",
-        "DELETE FROM readings WHERE id = 1 AND value IS NULL",
+        "DELETE FROM readings WHERE value IS NULL AND id = 1 OR id = 2",
+        "DELETE FROM readings WHERE value IS NULL AND id = 1 AND id < 3",
+        "DELETE FROM readings WHERE id = 1 AND value IS NULL AND id < 3",
         "DELETE FROM readings WHERE (value IS NULL)",
         "DELETE FROM readings WHERE NOT value IS NULL",
         "DELETE FROM readings WHERE value IS NULL LIMIT 1",
@@ -183,6 +207,14 @@ fn alter_table_delete_lowers_to_the_existing_delete_statement_shapes() {
         (
             "ALTER TABLE Events DELETE WHERE active = true AND label <> 'skip';",
             "DELETE FROM Events WHERE active = true AND label <> 'skip';",
+        ),
+        (
+            "ALTER TABLE Events DELETE WHERE reading IS NULL AND id >= 2;",
+            "DELETE FROM Events WHERE reading IS NULL AND id >= 2;",
+        ),
+        (
+            "ALTER TABLE Events DELETE WHERE id >= 2 AND reading IS NOT NULL;",
+            "DELETE FROM Events WHERE id >= 2 AND reading IS NOT NULL;",
         ),
     ] {
         assert_eq!(
@@ -432,6 +464,129 @@ fn nullness_delete_rebuilds_an_admitted_nullable_int64_index() {
         panic!("expected one query result")
     };
     assert_eq!(result.rows, [[Value::Int64(1)], [Value::Int64(2)]]);
+}
+
+#[test]
+fn mixed_nullness_comparison_delete_handles_same_and_cross_column_predicates_in_both_orders() {
+    for predicate in [
+        "value IS NOT NULL AND value >= 2",
+        "value >= 2 AND value IS NOT NULL",
+    ] {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE readings (id Int64, value Nullable(Int64)); \
+                 INSERT INTO readings VALUES (1, NULL), (2, 1), (3, 2), (4, NULL);",
+            )
+            .expect("same-column setup succeeds");
+
+        assert_eq!(
+            database.execute(&format!("DELETE FROM readings WHERE {predicate}")),
+            Ok(vec![StatementResult::Command {
+                tag: "DELETE",
+                affected_rows: 1,
+            }]),
+            "{predicate}"
+        );
+        assert_eq!(ids(&database, "readings"), [1, 2, 4], "{predicate}");
+    }
+
+    for statement in [
+        "DELETE FROM readings WHERE value IS NULL AND active = true",
+        "ALTER TABLE readings DELETE WHERE active = true AND value IS NULL",
+    ] {
+        let database = SharedDatabase::default();
+        database
+            .execute(
+                "CREATE TABLE readings (id Int64, active Bool, value Nullable(Int64)); \
+                 INSERT INTO readings VALUES \
+                    (1, false, NULL), (2, true, NULL), (3, true, 30), (4, true, NULL);",
+            )
+            .expect("cross-column setup succeeds");
+
+        assert_eq!(
+            database.execute(statement),
+            Ok(vec![StatementResult::Command {
+                tag: "DELETE",
+                affected_rows: 2,
+            }]),
+            "{statement}"
+        );
+        assert_eq!(
+            database
+                .query("SELECT id, active, value FROM readings ORDER BY id")
+                .unwrap()
+                .rows,
+            [
+                vec![
+                    Value::Int64(1),
+                    Value::Bool(false),
+                    Value::Null(DataType::Int64)
+                ],
+                vec![Value::Int64(3), Value::Bool(true), Value::Int64(30)],
+            ],
+            "{statement}"
+        );
+        assert_eq!(database.metrics_snapshot().unwrap().retained_row_count, 2);
+    }
+}
+
+#[test]
+fn mixed_nullness_comparison_delete_has_zero_and_all_match_non_nullable_semantics() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2), (3);")
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database.execute("DELETE FROM events WHERE id IS NULL AND id >= 1"),
+        Ok(vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 0,
+        }])
+    );
+    assert_eq!(ids(&database, "events"), [1, 2, 3]);
+    assert_eq!(
+        database.execute("ALTER TABLE events DELETE WHERE id >= 1 AND id IS NOT NULL"),
+        Ok(vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 3,
+        }])
+    );
+    assert!(ids(&database, "events").is_empty());
+}
+
+#[test]
+fn mixed_nullness_comparison_delete_rebuilds_an_admitted_nullable_int64_index() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, value Nullable(Int64)); \
+             INSERT INTO readings VALUES (1, NULL), (2, 1), (3, 2), (4, NULL);",
+        )
+        .expect("setup succeeds");
+    assert!(matches!(
+        database
+            .create_int64_min_max_index(
+                "readings",
+                "value",
+                Int64MinMaxIndexLimits::new(2, 2, usize::MAX),
+            )
+            .unwrap(),
+        Int64MinMaxIndexAdmission::Created(_)
+    ));
+
+    database
+        .execute("DELETE FROM readings WHERE value IS NOT NULL AND id >= 2")
+        .expect("mixed delete succeeds");
+    let index = database
+        .catalog()
+        .table("readings")
+        .unwrap()
+        .int64_min_max_index_info()
+        .expect("the index remains admitted and is rebuilt");
+    assert_eq!(index.indexed_rows, 2);
+    assert_eq!(ids(&database, "readings"), [1, 4]);
 }
 
 #[test]
@@ -755,6 +910,29 @@ fn conjunction_validation_and_scan_failures_never_delete_rows() {
                 max: 2,
             },
         ),
+        (
+            "DELETE FROM events WHERE id IS NOT NULL AND active = 1",
+            Error::TypeMismatch {
+                context: "WHERE comparison".to_owned(),
+                expected: "Bool".to_owned(),
+                actual: "Int64".to_owned(),
+            },
+        ),
+        (
+            "DELETE FROM events WHERE absent IS NULL AND id >= 2",
+            Error::ColumnNotFound {
+                table: "events".to_owned(),
+                column: "absent".to_owned(),
+            },
+        ),
+        (
+            "ALTER TABLE events DELETE WHERE active = true AND id IS NOT NULL",
+            Error::ResourceLimitExceeded {
+                resource: "DELETE scanned rows",
+                actual: 3,
+                max: 2,
+            },
+        ),
     ];
 
     for (sql, error) in failures {
@@ -784,6 +962,15 @@ fn conjunction_validation_and_scan_failures_never_delete_rows() {
 
     assert!(matches!(
         database.execute("DELETE FROM events WHERE id >= 2 AND active = true AND score > 0.0"),
+        Err(Error::Sql { .. })
+    ));
+    assert!(matches!(
+        database.execute("DELETE FROM events WHERE id IS NOT NULL OR active = true"),
+        Err(Error::Sql { .. })
+    ));
+    assert!(matches!(
+        database
+            .execute("DELETE FROM events WHERE id IS NOT NULL AND active = true AND score > 0.0"),
         Err(Error::Sql { .. })
     ));
     assert_eq!(ids(&database, "events"), [1, 2, 3]);
@@ -853,6 +1040,7 @@ fn insert_only_execution_rejects_delete_without_mutation() {
         "DELETE FROM events WHERE id >= 1 AND id < 2",
         "DELETE FROM events WHERE id IS NULL",
         "ALTER TABLE events DELETE WHERE id IS NOT NULL",
+        "DELETE FROM events WHERE id IS NOT NULL AND id >= 1",
     ] {
         assert_eq!(
             database.execute_insert_batch(sql),
@@ -900,6 +1088,12 @@ fn shared_database_executes_delete_under_its_write_lock() {
     );
     assert_eq!(
         database.query("DELETE FROM events WHERE id >= 1 AND label = 'keep'"),
+        Err(SharedDatabaseError::ReadOnlyStatementRequired {
+            statement: "DELETE",
+        })
+    );
+    assert_eq!(
+        database.query("DELETE FROM events WHERE id IS NOT NULL AND label = 'keep'"),
         Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "DELETE",
         })

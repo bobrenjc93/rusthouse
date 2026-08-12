@@ -199,6 +199,13 @@ pub enum Statement {
         column: String,
         is_null: bool,
     },
+    /// Exactly one nullness atom and one typed comparison joined by `AND`.
+    DeleteNullnessConjunction {
+        table: String,
+        nullness_column: String,
+        is_null: bool,
+        comparison: DeleteComparisonPredicate,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -589,7 +596,7 @@ pub enum ComparisonOperator {
     GreaterOrEqual,
 }
 
-/// One column-to-literal comparison in a two-comparison `DELETE` predicate.
+/// One column-to-literal comparison in a compound `DELETE` predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteComparisonPredicate {
     pub column: String,
@@ -2003,14 +2010,19 @@ impl<'a> Parser<'a> {
         self.predicate_nodes = 0;
         let first_column = self.expect_identifier("column name")?;
         if self.eat_keyword("IS") {
-            let is_null = !self.eat_keyword("NOT");
-            self.expect_keyword("NULL")?;
-            self.record_predicate_node()?;
-            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
-                return self.error(
-                    "DELETE nullness predicate supports exactly one column IS NULL or column IS NOT NULL atom",
-                );
+            let is_null = self.parse_delete_nullness_after_is()?;
+            if self.eat_keyword("AND") {
+                let comparison = self.parse_delete_comparison()?;
+                self.record_predicate_node()?;
+                self.expect_delete_predicate_end()?;
+                return Ok(Statement::DeleteNullnessConjunction {
+                    table,
+                    nullness_column: first_column,
+                    is_null,
+                    comparison,
+                });
             }
+            self.expect_delete_predicate_end()?;
             return Ok(Statement::DeleteNullness {
                 table,
                 column: first_column,
@@ -2020,7 +2032,19 @@ impl<'a> Parser<'a> {
 
         let first = self.parse_delete_comparison_after_column(first_column)?;
         if self.eat_keyword("AND") {
-            let second = self.parse_delete_comparison()?;
+            let second_column = self.expect_identifier("column name")?;
+            if self.eat_keyword("IS") {
+                let is_null = self.parse_delete_nullness_after_is()?;
+                self.record_predicate_node()?;
+                self.expect_delete_predicate_end()?;
+                return Ok(Statement::DeleteNullnessConjunction {
+                    table,
+                    nullness_column: second_column,
+                    is_null,
+                    comparison: first,
+                });
+            }
+            let second = self.parse_delete_comparison_after_column(second_column)?;
             self.record_predicate_node()?;
             if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self
@@ -2050,6 +2074,23 @@ impl<'a> Parser<'a> {
                 literal: first.literal,
             },
         })
+    }
+
+    fn parse_delete_nullness_after_is(&mut self) -> Result<bool> {
+        let is_null = !self.eat_keyword("NOT");
+        self.expect_keyword("NULL")?;
+        self.record_predicate_node()?;
+        Ok(is_null)
+    }
+
+    fn expect_delete_predicate_end(&self) -> Result<()> {
+        if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::End) {
+            Ok(())
+        } else {
+            self.error(
+                "DELETE supports one comparison, two comparisons joined by AND, one nullness atom, or one nullness atom and one comparison joined by AND",
+            )
+        }
     }
 
     fn parse_delete_comparison(&mut self) -> Result<DeleteComparisonPredicate> {

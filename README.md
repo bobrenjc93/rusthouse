@@ -196,24 +196,23 @@ unindexed fallbacks and errors before pruning do not increment either counter.
 `DELETE FROM <table> WHERE <predicate>` and its ClickHouse mutation spelling,
 `ALTER TABLE <table> DELETE WHERE <predicate>`, remove rows matching either one
 typed column-to-literal comparison, the conjunction of exactly two such
-comparisons, or one exact `<column> IS NULL` or `<column> IS NOT NULL` atom.
-Both spellings lower to the same bounded atomic deletion path and nullness uses
-the same typed evaluator as `SELECT WHERE`. Each comparison has the form `<column>
-<operator> <literal>`. Supported operators are `=`, `!=`, `<>`, `<`, `<=`,
-`>`, and `>=`;
-`!=` and `<>` are equivalent. The two comparisons may reference different
-typed columns. Table and column lookup are case-insensitive, and literals
+comparisons, one exact `<column> IS NULL` or `<column> IS NOT NULL` atom, or
+exactly one such nullness atom conjoined with one typed column-to-literal
+comparison. The mixed conjunction accepts either atom order, and its atoms may
+reference the same or different columns. Both spellings lower to the same
+bounded atomic deletion path and nullness uses the same typed evaluator as
+`SELECT WHERE`. Each comparison has the form `<column> <operator> <literal>`.
+Supported operators are `=`, `!=`, `<>`, `<`, `<=`, `>`, and `>=`; `!=` and
+`<>` are equivalent. Table and column lookup are case-insensitive, and literals
 accept the same finite `Int64`, `Float64`, `Bool`, and `String` forms as
-`WHERE`. Both comparisons are resolved and type-checked, then the full source
-row count is checked against the configured scan limit before any row is
-inspected or changed. Missing names, type errors, malformed or extra
-predicates, and scan-limit failures leave the table unchanged; after
-validation and the bounded scan, all matching row indexes are passed to one
-atomic deletion. A nullness atom cannot be combined with another predicate.
-`OR`, a third comparison, other predicate forms or clauses, and bare `NULL`
-comparisons are not supported by this narrow form. A successful command
-reports its deleted-row count through the library API and is silent in
-formatted CLI output.
+`WHERE`. Every atom is resolved and type-checked, then the full source row count
+is checked against the configured scan limit before any row is inspected or
+changed. Missing names, type errors, malformed or extra predicates, and
+scan-limit failures leave the table unchanged; after validation and the
+bounded scan, all matching row indexes are passed to one atomic deletion. `OR`,
+a third atom, other predicate forms or clauses, and bare `NULL` comparisons are
+not supported by this narrow form. A successful command reports its deleted-row
+count through the library API and is silent in formatted CLI output.
 
 `INSERT INTO <table> (<columns>) VALUES ...` accepts any nonempty explicit
 column subset in any order. Names resolve case-insensitively, and each row must

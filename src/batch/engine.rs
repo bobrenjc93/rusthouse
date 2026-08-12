@@ -3255,6 +3255,27 @@ impl Database {
                 },
                 query_result_limits,
             ),
+            Statement::DeleteNullnessConjunction {
+                table,
+                nullness_column,
+                is_null,
+                comparison,
+            } => self.execute_delete_statement(
+                table,
+                Predicate::And(
+                    Box::new(if is_null {
+                        Predicate::IsNull {
+                            column: nullness_column,
+                        }
+                    } else {
+                        Predicate::IsNotNull {
+                            column: nullness_column,
+                        }
+                    }),
+                    Box::new(delete_comparison_predicate(comparison)),
+                ),
+                query_result_limits,
+            ),
             Statement::Insert { table, rows } => self.execute_insert_statement(table, None, rows),
             Statement::InsertWithColumns {
                 table,
@@ -3372,6 +3393,7 @@ impl Database {
             | Statement::DeleteComparison { .. }
             | Statement::DeleteConjunction { .. }
             | Statement::DeleteNullness { .. }
+            | Statement::DeleteNullnessConjunction { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
@@ -4646,7 +4668,8 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::Delete { .. }
         | Statement::DeleteComparison { .. }
         | Statement::DeleteConjunction { .. }
-        | Statement::DeleteNullness { .. } => "DELETE",
+        | Statement::DeleteNullness { .. }
+        | Statement::DeleteNullnessConjunction { .. } => "DELETE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)

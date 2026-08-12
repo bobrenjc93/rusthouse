@@ -349,7 +349,7 @@ fn active_wal_allows_add_column_no_ops_but_rejects_real_additions() {
 }
 
 #[test]
-fn active_wal_rejects_nullness_deletes_without_changing_data_or_log() {
+fn active_wal_rejects_nullness_and_mixed_deletes_without_changing_data_or_log() {
     let directory = TestDirectory::new();
     let path = directory.join("reject-nullness-delete.wal");
     let mut database = Database::new();
@@ -364,6 +364,8 @@ fn active_wal_rejects_nullness_deletes_without_changing_data_or_log() {
     for sql in [
         "DELETE FROM READINGS WHERE measurement IS NULL",
         "ALTER TABLE READINGS DELETE WHERE measurement IS NOT NULL",
+        "DELETE FROM READINGS WHERE measurement IS NOT NULL AND measurement >= 8",
+        "ALTER TABLE READINGS DELETE WHERE measurement >= 8 AND measurement IS NOT NULL",
     ] {
         assert_eq!(
             database.execute(sql),
