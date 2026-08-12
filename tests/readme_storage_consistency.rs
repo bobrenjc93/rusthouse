@@ -9,10 +9,11 @@ fn readme_documents_the_bounded_nullable_int64_sql_ddl_shape() {
     let readme = normalized_readme();
     let expected = "Physical column vectors support `Int64`, `Nullable(Int64)`, `Bool`, \
                     `Float64`, and `String` storage. SQL accepts either a sole \
-                    `Nullable(Int64)` column or a non-nullable prefix followed by exactly one \
-                    trailing `Nullable(Int64)` column in `CREATE TABLE`, case-insensitively. \
-                    Leading nullable columns in a multi-column schema, multiple nullable \
-                    columns, and other nullable types remain outside the bounded grammar.";
+                    `Nullable(Int64)` column or a non-nullable prefix followed by one or two \
+                    trailing `Nullable(Int64)` columns in `CREATE TABLE`, case-insensitively. \
+                    Leading nullable columns in a multi-column schema, more than two nullable \
+                    columns, interleaved nullable columns, and other nullable types remain \
+                    outside the bounded grammar.";
     let expected = expected.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(

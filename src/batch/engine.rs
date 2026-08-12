@@ -1446,7 +1446,7 @@ impl Database {
         &mut self,
         name: String,
         columns: Vec<ColumnDef>,
-        nullable_column: String,
+        nullable_columns: impl IntoIterator<Item = String>,
         if_not_exists: bool,
     ) -> Result<()> {
         if self.catalog.table_exists(&name) {
@@ -1458,7 +1458,9 @@ impl Database {
         }
 
         let mut table = Table::with_limits(name, columns, self.table_limits)?;
-        table.add_nullable_int64_column(nullable_column)?;
+        for nullable_column in nullable_columns {
+            table.add_nullable_int64_column(nullable_column)?;
+        }
         let measurements = TableMeasurements::read(&table);
         self.catalog.register_table(table)?;
         self.measurements.add(measurements);
@@ -3095,7 +3097,7 @@ impl Database {
                 self.create_table_with_trailing_nullable_int64(
                     name,
                     columns,
-                    nullable_column,
+                    [nullable_column],
                     false,
                 )?;
                 Ok(StatementResult::Command {
@@ -3111,7 +3113,39 @@ impl Database {
                 self.create_table_with_trailing_nullable_int64(
                     name,
                     columns,
-                    nullable_column,
+                    [nullable_column],
+                    true,
+                )?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::CreateTableWithTwoTrailingNullableInt64 {
+                name,
+                columns,
+                nullable_columns,
+            } => {
+                self.create_table_with_trailing_nullable_int64(
+                    name,
+                    columns,
+                    nullable_columns,
+                    false,
+                )?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::CreateTableWithTwoTrailingNullableInt64IfNotExists {
+                name,
+                columns,
+                nullable_columns,
+            } => {
+                self.create_table_with_trailing_nullable_int64(
+                    name,
+                    columns,
+                    nullable_columns,
                     true,
                 )?;
                 Ok(StatementResult::Command {
@@ -3406,6 +3440,8 @@ impl Database {
             | Statement::CreateNullableInt64TableIfNotExists { .. }
             | Statement::CreateTableWithTrailingNullableInt64 { .. }
             | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. }
+            | Statement::CreateTableWithTwoTrailingNullableInt64 { .. }
+            | Statement::CreateTableWithTwoTrailingNullableInt64IfNotExists { .. }
             | Statement::DropTable { .. }
             | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
@@ -4681,7 +4717,9 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::CreateNullableInt64Table { .. }
         | Statement::CreateNullableInt64TableIfNotExists { .. }
         | Statement::CreateTableWithTrailingNullableInt64 { .. }
-        | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. } => "CREATE TABLE",
+        | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. }
+        | Statement::CreateTableWithTwoTrailingNullableInt64 { .. }
+        | Statement::CreateTableWithTwoTrailingNullableInt64IfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. }
@@ -4781,37 +4819,50 @@ fn create_table_ddl_len(table: &Table) -> usize {
 }
 
 fn show_create_column_count(table: &Table) -> usize {
-    table
+    let Some(first_nullable) = table
         .columns()
         .iter()
         .position(|column| matches!(column, Column::NullableInt64(_)))
-        .map_or(table.schema().len(), |index| {
-            if index.saturating_add(1) == table.schema().len()
-                && table.schema().len() <= sql::DEFAULT_MAX_AST_LIST_ITEMS
-            {
-                table.schema().len()
-            } else {
-                index.max(1)
-            }
-        })
+    else {
+        return table.schema().len();
+    };
+    let nullable_suffix = &table.columns()[first_nullable..];
+    let supported_nullable_shape = (first_nullable == 0 && table.schema().len() == 1)
+        || (first_nullable > 0
+            && nullable_suffix.len() <= 2
+            && nullable_suffix
+                .iter()
+                .all(|column| matches!(column, Column::NullableInt64(_))));
+    if supported_nullable_shape && table.schema().len() <= sql::DEFAULT_MAX_AST_LIST_ITEMS {
+        table.schema().len()
+    } else {
+        first_nullable.max(1)
+    }
 }
 
 fn show_create_statement_count_after_addition(table: &Table, added_nullable: bool) -> usize {
-    match table
+    let resulting_columns = table.schema().len().saturating_add(1);
+    let Some(first_nullable) = table
         .columns()
         .iter()
         .position(|column| matches!(column, Column::NullableInt64(_)))
-    {
-        Some(index) => 1_usize
-            .saturating_add(table.schema().len().saturating_add(1))
-            .saturating_sub(index.max(1)),
-        None if added_nullable
-            && table.schema().len().saturating_add(1) <= sql::DEFAULT_MAX_AST_LIST_ITEMS =>
-        {
-            1
-        }
-        None if added_nullable => 2,
-        None => 1,
+        .or_else(|| added_nullable.then_some(table.schema().len()))
+    else {
+        return 1;
+    };
+    let nullable_suffix_len = resulting_columns.saturating_sub(first_nullable);
+    let existing_suffix_is_nullable = table.columns()[first_nullable.min(table.schema().len())..]
+        .iter()
+        .all(|column| matches!(column, Column::NullableInt64(_)));
+    let resulting_suffix_is_nullable = existing_suffix_is_nullable && added_nullable;
+    let supported_nullable_shape = (first_nullable == 0 && resulting_columns == 1)
+        || (first_nullable > 0 && nullable_suffix_len <= 2 && resulting_suffix_is_nullable);
+    if supported_nullable_shape && resulting_columns <= sql::DEFAULT_MAX_AST_LIST_ITEMS {
+        1
+    } else {
+        1_usize
+            .saturating_add(resulting_columns)
+            .saturating_sub(first_nullable.max(1))
     }
 }
 
