@@ -64,6 +64,34 @@ fn parser_lowers_case_insensitive_nullable_int64_to_a_bounded_ast_shape() {
                 nullable_column: "Measurement".to_owned(),
             },
         ),
+        (
+            "CREATE TABLE readings (id Int64, minimum Nullable(Int64), maximum Nullable(Int64))",
+            Statement::CreateTableWithTwoTrailingNullableInt64Columns {
+                name: "readings".to_owned(),
+                columns: vec![ColumnDef {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                }],
+                nullable_columns: ["minimum".to_owned(), "maximum".to_owned()],
+            },
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS Readings (ID Int64, Label String, Minimum nUlLaBlE(iNt64), Maximum Nullable(Int64)) ENGINE = Memory",
+            Statement::CreateTableWithTwoTrailingNullableInt64ColumnsIfNotExists {
+                name: "Readings".to_owned(),
+                columns: vec![
+                    ColumnDef {
+                        name: "ID".to_owned(),
+                        data_type: DataType::Int64,
+                    },
+                    ColumnDef {
+                        name: "Label".to_owned(),
+                        data_type: DataType::String,
+                    },
+                ],
+                nullable_columns: ["Minimum".to_owned(), "Maximum".to_owned()],
+            },
+        ),
     ] {
         assert_eq!(parse(sql), Ok(vec![expected]), "{sql:?}");
     }
@@ -112,6 +140,31 @@ fn parser_lowers_case_insensitive_nullable_int64_to_a_bounded_ast_shape() {
             max: 1,
         })
     );
+
+    assert!(
+        parse_with_limits(
+            "CREATE TABLE t (id Int64, low Nullable(Int64), high Nullable(Int64))",
+            BatchSqlLimits {
+                max_ast_list_items: 3,
+                ..BatchSqlLimits::default()
+            },
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        parse_with_limits(
+            "CREATE TABLE t (id Int64, low Nullable(Int64), high Nullable(Int64))",
+            BatchSqlLimits {
+                max_ast_list_items: 2,
+                ..BatchSqlLimits::default()
+            },
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SQL AST list items",
+            actual: 3,
+            max: 2,
+        })
+    );
 }
 
 #[test]
@@ -124,9 +177,11 @@ fn parser_rejects_nullable_shapes_outside_the_bounded_trailing_form() {
         "CREATE TABLE t (c Nullable((Int64)))",
         "CREATE TABLE t (c Nullable Int64)",
         "CREATE TABLE t (c Nullable(Int64) NULL)",
+        "CREATE TABLE t (a Nullable(Int64), b Nullable(Int64))",
         "CREATE TABLE t (c Nullable(Int64), d Int64)",
         "CREATE TABLE t (a Int64, c Nullable(Int64), d Int64)",
-        "CREATE TABLE t (a Int64, c Nullable(Int64), d Nullable(Int64))",
+        "CREATE TABLE t (a Int64, b Nullable(Int64), c Nullable(Int64), d Nullable(Int64))",
+        "CREATE TABLE t (a Int64, b Nullable(Int64), c Nullable(String))",
     ] {
         assert!(
             parse(sql).is_err(),
@@ -211,6 +266,103 @@ fn mixed_create_inserts_defaults_and_round_trips_storage_and_metadata() {
         panic!("SHOW CREATE output must recreate trailing nullable storage")
     };
     assert_eq!(values, &[None]);
+}
+
+#[test]
+fn two_trailing_nullable_columns_support_positional_and_subset_inserts_and_metadata() {
+    const DDL: &str =
+        "CREATE TABLE Readings (DeviceID Int64, Minimum Nullable(Int64), Maximum Nullable(Int64))";
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Readings (DeviceID Int64, Minimum Nullable(Int64), Maximum Nullable(Int64)); \
+             INSERT INTO readings VALUES (1, 10, NULL); \
+             INSERT INTO readings (DeviceID) VALUES (2); \
+             INSERT INTO readings (Maximum, DeviceID) VALUES (30, 3); \
+             INSERT INTO readings (Maximum, Minimum, DeviceID) VALUES (40, NULL, 4);",
+        )
+        .unwrap();
+
+    let table = database.catalog().table("READINGS").unwrap();
+    let [
+        Column::Int64(device_ids),
+        Column::NullableInt64(minimums),
+        Column::NullableInt64(maximums),
+    ] = table.columns()
+    else {
+        panic!("CREATE must stage both aligned NullableInt64 columns")
+    };
+    assert_eq!(device_ids, &[1, 2, 3, 4]);
+    assert_eq!(minimums, &[Some(10), None, None, None]);
+    assert_eq!(maximums, &[None, None, Some(30), Some(40)]);
+
+    assert_eq!(
+        query(&mut database, "DESCRIBE TABLE readings").rows,
+        [
+            vec![
+                Value::String("DeviceID".to_owned()),
+                Value::String("Int64".to_owned()),
+            ],
+            vec![
+                Value::String("Minimum".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+            vec![
+                Value::String("Maximum".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+        ]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT database, table, name, type, position FROM system.columns",
+        )
+        .rows,
+        [
+            vec![
+                Value::String("default".to_owned()),
+                Value::String("Readings".to_owned()),
+                Value::String("DeviceID".to_owned()),
+                Value::String("Int64".to_owned()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("default".to_owned()),
+                Value::String("Readings".to_owned()),
+                Value::String("Minimum".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("default".to_owned()),
+                Value::String("Readings".to_owned()),
+                Value::String("Maximum".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+                Value::Int64(3),
+            ],
+        ]
+    );
+    assert_eq!(
+        query(&mut database, "SHOW CREATE TABLE readings").rows,
+        [vec![Value::String(DDL.to_owned())]]
+    );
+
+    let mut recreated = Database::new();
+    recreated.execute(DDL).unwrap();
+    recreated
+        .execute("INSERT INTO readings (DeviceID) VALUES (9)")
+        .unwrap();
+    let [
+        _,
+        Column::NullableInt64(minimums),
+        Column::NullableInt64(maximums),
+    ] = recreated.catalog().table("readings").unwrap().columns()
+    else {
+        panic!("SHOW CREATE output must recreate both nullable columns")
+    };
+    assert_eq!(minimums, &[None]);
+    assert_eq!(maximums, &[None]);
 }
 
 #[test]
@@ -337,6 +489,61 @@ fn mixed_create_obeys_exact_table_limits_without_partial_registration() {
 }
 
 #[test]
+fn two_nullable_create_obeys_exact_column_and_cell_limits_atomically() {
+    let ddl = "CREATE TABLE readings (id Int64, low Nullable(Int64), high Nullable(Int64))";
+    let mut exact = Database::with_table_limits(TableLimits::new(2, 3, 3));
+    exact.execute(ddl).unwrap();
+    exact
+        .execute("INSERT INTO readings VALUES (1, NULL, 9)")
+        .unwrap();
+    assert_eq!(
+        exact.execute("INSERT INTO readings VALUES (2, 4, NULL)"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table cells",
+            actual: 6,
+            max: 3,
+        })
+    );
+    assert_eq!(exact.catalog().table("readings").unwrap().row_count(), 1);
+
+    let mut one_column_short = Database::with_table_limits(TableLimits::new(1, 2, 3));
+    assert_eq!(
+        one_column_short.execute(ddl),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table columns",
+            actual: 3,
+            max: 2,
+        })
+    );
+    assert_eq!(one_column_short.catalog().table_count(), 0);
+    let metrics = query(
+        &mut one_column_short,
+        "SELECT metric, value FROM system.metrics",
+    );
+    assert_eq!(metrics.rows[0][1], Value::Int64(0));
+    assert_eq!(metrics.rows[1][1], Value::Int64(0));
+
+    let mut one_cell_short = Database::with_table_limits(TableLimits::new(1, 3, 2));
+    one_cell_short.execute(ddl).unwrap();
+    assert_eq!(
+        one_cell_short.execute("INSERT INTO readings VALUES (1, NULL, NULL)"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table cells",
+            actual: 3,
+            max: 2,
+        })
+    );
+    assert_eq!(
+        one_cell_short
+            .catalog()
+            .table("readings")
+            .unwrap()
+            .row_count(),
+        0
+    );
+}
+
+#[test]
 fn mixed_create_rejects_duplicate_names_without_publishing_or_replacing() {
     let mut invalid = Database::new();
     assert_eq!(
@@ -344,6 +551,15 @@ fn mixed_create_rejects_duplicate_names_without_publishing_or_replacing() {
         Err(Error::DuplicateColumn("value".to_owned()))
     );
     assert_eq!(invalid.catalog().table_count(), 0);
+
+    let mut duplicate_nullable = Database::new();
+    assert_eq!(
+        duplicate_nullable.execute(
+            "CREATE TABLE readings (id Int64, Measurement Nullable(Int64), measurement Nullable(Int64))",
+        ),
+        Err(Error::DuplicateColumn("measurement".to_owned()))
+    );
+    assert_eq!(duplicate_nullable.catalog().table_count(), 0);
 
     let mut duplicate_table = Database::new();
     duplicate_table
@@ -361,6 +577,19 @@ fn mixed_create_rejects_duplicate_names_without_publishing_or_replacing() {
     assert_eq!(table.name(), "Readings");
     assert_eq!(table.schema()[0].name, "id");
     assert_eq!(table.row_count(), 1);
+}
+
+#[test]
+fn a_rejected_third_nullable_column_keeps_the_whole_batch_atomic() {
+    let mut database = Database::new();
+    assert!(matches!(
+        database.execute(
+            "CREATE TABLE first (id Int64); \
+             CREATE TABLE rejected (id Int64, low Nullable(Int64), high Nullable(Int64), extra Nullable(Int64));",
+        ),
+        Err(Error::Sql { .. })
+    ));
+    assert_eq!(database.catalog().table_count(), 0);
 }
 
 #[test]
@@ -389,22 +618,31 @@ fn direct_mixed_create_ast_rejects_an_empty_non_nullable_prefix_without_panickin
 }
 
 #[test]
-fn conditional_nullable_create_preserves_the_existing_table() {
-    let mut database = Database::new();
+fn conditional_two_nullable_create_creates_once_and_preserves_the_existing_table() {
+    let mut database = Database::with_table_limits(TableLimits::new(2, 3, 6));
     database
         .execute(
-            "CREATE TABLE IF NOT EXISTS Readings (ID Int64, Measurement Nullable(Int64)); \
-             INSERT INTO readings VALUES (1, NULL); \
-             CREATE TABLE IF NOT EXISTS READINGS (Replacement String, Other Nullable(Int64));",
+            "CREATE TABLE IF NOT EXISTS Readings (ID Int64, Minimum Nullable(Int64), Maximum Nullable(Int64)); \
+             INSERT INTO readings VALUES (1, NULL, 7); \
+             CREATE TABLE IF NOT EXISTS READINGS (Replacement String, Other Nullable(Int64), Final Nullable(Int64));",
         )
         .unwrap();
 
     let table = database.catalog().table("readings").unwrap();
     assert_eq!(table.name(), "Readings");
     assert_eq!(table.schema()[0].name, "ID");
-    assert_eq!(table.schema()[1].name, "Measurement");
-    let Column::NullableInt64(values) = &table.columns()[1] else {
-        panic!("existing nullable table must remain physical nullable storage")
+    assert_eq!(table.schema()[1].name, "Minimum");
+    assert_eq!(table.schema()[2].name, "Maximum");
+    let [
+        Column::Int64(ids),
+        Column::NullableInt64(minimums),
+        Column::NullableInt64(maximums),
+    ] = table.columns()
+    else {
+        panic!("existing table must retain both physical nullable columns")
     };
-    assert_eq!(values, &[None]);
+    assert_eq!(ids, &[1]);
+    assert_eq!(minimums, &[None]);
+    assert_eq!(maximums, &[Some(7)]);
+    assert_eq!(table.row_cap(), 2);
 }

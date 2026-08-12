@@ -101,6 +101,18 @@ pub enum Statement {
         columns: Vec<ColumnDef>,
         nullable_column: String,
     },
+    /// A non-nullable prefix followed by exactly two `Nullable(Int64)` columns.
+    CreateTableWithTwoTrailingNullableInt64Columns {
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_columns: [String; 2],
+    },
+    /// Conditional form of the bounded two-column nullable suffix shape.
+    CreateTableWithTwoTrailingNullableInt64ColumnsIfNotExists {
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_columns: [String; 2],
+    },
     DropTable {
         name: String,
     },
@@ -1693,7 +1705,7 @@ impl<'a> Parser<'a> {
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
-        let mut nullable_int64_column = None;
+        let mut nullable_int64_columns = Vec::new();
         loop {
             self.reserve_ast_list_item()?;
             let column_name = self.expect_identifier("column name")?;
@@ -1718,13 +1730,25 @@ impl<'a> Parser<'a> {
                     });
                 }
                 self.expect(&TokenKind::RightParen, "')' after Nullable(Int64)")?;
-                if self.at(&TokenKind::Comma) {
-                    return self.error(
-                        "Nullable(Int64) is supported only as the sole column or the final column after a non-nullable prefix",
-                    );
+                if columns.is_empty() && !nullable_int64_columns.is_empty() {
+                    return self
+                        .error("multiple Nullable(Int64) columns require a non-nullable prefix");
                 }
-                nullable_int64_column = Some(column_name);
+                nullable_int64_columns.push(column_name);
+                if self.eat(&TokenKind::Comma) {
+                    if nullable_int64_columns.len() == 2 {
+                        return self.error(
+                            "CREATE TABLE supports at most two trailing Nullable(Int64) columns",
+                        );
+                    }
+                    continue;
+                }
                 break;
+            }
+            if !nullable_int64_columns.is_empty() {
+                return self.error(
+                    "Nullable(Int64) columns must form the final suffix after a non-nullable prefix",
+                );
             }
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
@@ -1755,27 +1779,55 @@ impl<'a> Parser<'a> {
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error("unexpected trailing input after CREATE TABLE");
         }
-        if let Some(column) = nullable_int64_column {
-            if !columns.is_empty() {
+        match nullable_int64_columns.as_slice() {
+            [] => {}
+            [column] if columns.is_empty() => {
+                return if if_not_exists {
+                    Ok(Statement::CreateNullableInt64TableIfNotExists {
+                        name,
+                        column: column.clone(),
+                    })
+                } else {
+                    Ok(Statement::CreateNullableInt64Table {
+                        name,
+                        column: column.clone(),
+                    })
+                };
+            }
+            [column] => {
                 return if if_not_exists {
                     Ok(Statement::CreateTableWithTrailingNullableInt64IfNotExists {
                         name,
                         columns,
-                        nullable_column: column,
+                        nullable_column: column.clone(),
                     })
                 } else {
                     Ok(Statement::CreateTableWithTrailingNullableInt64 {
                         name,
                         columns,
-                        nullable_column: column,
+                        nullable_column: column.clone(),
                     })
                 };
             }
-            return if if_not_exists {
-                Ok(Statement::CreateNullableInt64TableIfNotExists { name, column })
-            } else {
-                Ok(Statement::CreateNullableInt64Table { name, column })
-            };
+            [first, second] => {
+                let nullable_columns = [first.clone(), second.clone()];
+                return if if_not_exists {
+                    Ok(
+                        Statement::CreateTableWithTwoTrailingNullableInt64ColumnsIfNotExists {
+                            name,
+                            columns,
+                            nullable_columns,
+                        },
+                    )
+                } else {
+                    Ok(Statement::CreateTableWithTwoTrailingNullableInt64Columns {
+                        name,
+                        columns,
+                        nullable_columns,
+                    })
+                };
+            }
+            _ => unreachable!("the parser bounds the nullable suffix to two columns"),
         }
         if if_not_exists {
             Ok(Statement::CreateTableIfNotExists { name, columns })
