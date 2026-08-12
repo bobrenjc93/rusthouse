@@ -1578,6 +1578,28 @@ limits. Invalid UTF-8, line endings, escapes, headers, field counts, typed
 values, configured limits, or remaining table capacity are rejected before any
 row is appended.
 
+`Database::ingest_json_compact_each_row` adds a deliberately narrow
+transactional input counterpart to the existing `JSONCompactEachRow` writer.
+It accepts an existing table with exactly one physical `Int64` or
+`Nullable(Int64)` column and maps each LF- or CRLF-delimited one-element JSON
+array positionally. Values are signed JSON integers in the full `Int64` range;
+the exact JSON token `null` is accepted only by the nullable column. Empty input
+is a zero-row no-op. JSON whitespace around an array and its value is accepted,
+but empty or multi-value arrays, nested values, strings, booleans, fractional or
+exponent numbers, leading-zero integers, trailing content, bare carriage
+returns, and out-of-range integers are rejected. This is not a general JSON
+parser and does not ingest the object-shaped `JSONEachRow` format.
+
+Callers provide complete-input byte, physical-row, and total-value limits.
+UTF-8, every line's complete JSON shape, every integer, all limits, and the
+table's remaining row and cell capacity are checked before one prepared-row
+commit. The commit uses the same WAL-first path as SQL, CSV, and TSV appends, so
+parse, capacity, and WAL failures publish no rows. The synchronized
+`SharedDatabase::ingest_json_compact_each_row` retains one write lock across
+lookup, input access, validation, WAL logging, and append. Its
+`try_ingest_json_compact_each_row` counterpart attempts that lock exactly once
+and returns `DatabaseBusy` before table lookup or input access when contended.
+
 ## Snapshot envelope
 
 `SnapshotCodec` encodes and validates bounded byte payloads using an explicit

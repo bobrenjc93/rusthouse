@@ -12,6 +12,9 @@ use crate::batch::aggregate_scheduler::{GlobalAggregateParallelism, parallel_agg
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
+use crate::batch::json_compact_each_row::{
+    self, JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
+};
 use crate::batch::scalar_cast::{
     checked_string_to_bool, checked_string_to_float64, checked_string_to_int64, decimal_text_cmp,
     ordering_string_to_float64, validate_string_to_float64_syntax, validate_string_to_int64_syntax,
@@ -2659,6 +2662,52 @@ impl Database {
         let rows = {
             let target = self.catalog.table(table)?;
             tsv::parse_rows_with_names(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        self.log_prepared_int64_append(table, &rows)?;
+        self.table_mut(table)?.append_prepared_insert_rows(rows);
+        Ok(affected_rows)
+    }
+
+    /// Atomically appends bounded, one-column `JSONCompactEachRow` input.
+    ///
+    /// Every physical line must be a JSON array containing exactly one signed
+    /// integer. The exact JSON token `null` is additionally accepted for a
+    /// physical `Nullable(Int64)` column. The existing target must contain
+    /// exactly one `Int64` or `Nullable(Int64)` column. JSON whitespace around
+    /// the array and value is accepted, as are LF and CRLF endings. Empty input
+    /// appends zero rows.
+    ///
+    /// UTF-8, every complete line and value, integer range, configured byte,
+    /// row, and value limits, and remaining table capacity are validated before
+    /// the WAL-first prepared-row commit. Every error leaves storage unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::engine::Database;
+    /// use rusthouse::batch::json_compact_each_row::JsonCompactEachRowIngestLimits;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute("CREATE TABLE readings (value Nullable(Int64));")?;
+    /// let input = b"[-7]\n[null]\n";
+    /// let rows = database.ingest_json_compact_each_row(
+    ///     "readings",
+    ///     input,
+    ///     JsonCompactEachRowIngestLimits::new(input.len(), 2, 2),
+    /// )?;
+    /// assert_eq!(rows, 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_json_compact_each_row(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: JsonCompactEachRowIngestLimits,
+    ) -> std::result::Result<usize, JsonCompactEachRowIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            json_compact_each_row::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
         self.log_prepared_int64_append(table, &rows)?;
