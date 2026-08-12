@@ -81,11 +81,13 @@ two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
 deterministic contiguous chunks when more than 262,144 rows match. A grouped
 query also uses those chunks when it has exactly one non-nullable `Bool`
 grouping column and exactly one `COUNT(*)`, `COUNT()`, or
-`COUNT(physical_nullable_int64_column)` aggregate. Nullable grouped COUNT
+`COUNT(physical_nullable_int64_column)` aggregate, or exactly one
+`SUM(physical_non_nullable_int64_column)` aggregate. Nullable grouped COUNT
 partials track group row presence separately from present values, so all-NULL
-groups remain visible with a zero count. Ordered partition reduction preserves
-first-seen Bool grouping before the normal grouped ordering and pagination
-stages. The paired
+groups remain visible with a zero count. Grouped SUM uses checked `i128`
+per-key partials and retains the normal final `Int64` overflow check. Ordered
+partition reduction preserves first-seen Bool grouping before the normal
+HAVING, grouped ordering, and pagination stages. The paired
 shapes preserve either projection order. Row-count pairs derive `COUNT` with a
 checked conversion of the filtered cardinality; same-column nullable
 `COUNT`/`SUM` and `COUNT`/`AVG` pairs derive their NULL-ignoring count from the
@@ -127,7 +129,7 @@ multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-cou
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
 row-count/`MAX(Float64)` pairs or same-column nullable `COUNT`/`SUM` and `COUNT`/`AVG` pairs
 (including all other `COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema, `AVG(Float64)`,
-grouped nullable SUM, MIN, MAX, or AVG, and
+grouped nullable SUM, grouped Float64 SUM, grouped AVG, MIN, or MAX, and
 other aggregate functions remain sequential.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
@@ -869,7 +871,7 @@ constructor configure the scan and output limits.
 `Database::with_global_aggregate_worker_cap` and the matching `SharedDatabase`
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
 parallel global aggregates and the narrow Bool-grouped row or nullable integer
-`COUNT` shapes. The
+`COUNT` and non-nullable `Int64` `SUM` shapes. The
 configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
@@ -1082,8 +1084,8 @@ persistent database configuration.
 `max_threads` has the same decimal syntax. Zero retains the database's
 `global_aggregate_worker_cap`; a nonzero value is combined with that cap using
 the smaller value. It applies only to supported parallel aggregates in that
-request, including Bool-grouped `COUNT`, and never changes `SHOW SETTINGS` or
-`system.settings`. The
+request, including Bool-grouped `COUNT` and non-nullable `Int64` `SUM`, and
+never changes `SHOW SETTINGS` or `system.settings`. The
 available-hardware and fixed 16-lane ceilings still apply, and simultaneous
 requests continue to share the process-wide nonblocking helper admission
 budget.
