@@ -2689,15 +2689,18 @@ impl Database {
     /// Atomically appends bounded, one-column `JSONCompactEachRow` input.
     ///
     /// Each physical line must be one JSON array containing exactly one JSON
-    /// integer. A `Nullable(Int64)` target also accepts JSON `null`; an
-    /// `Int64` target rejects it. The existing target must have exactly one
-    /// physical `Int64` or `Nullable(Int64)` column. JSON whitespace is
-    /// accepted around the array and value, and LF or CRLF records are
-    /// accepted. Empty input appends zero rows.
+    /// number. `Int64` and `Nullable(Int64)` targets require integer syntax and
+    /// range; nullable targets also accept JSON `null`. `Float64` targets accept
+    /// finite integer, decimal, and exponent forms but reject `null`. The
+    /// existing target must have exactly one physical `Int64`,
+    /// `Nullable(Int64)`, or `Float64` column. JSON whitespace is accepted around
+    /// the array and value, and LF or CRLF records are accepted. Empty input
+    /// appends zero rows.
     ///
-    /// UTF-8, JSON shape, every integer, all configured limits, and remaining
-    /// table capacity are validated before the existing WAL and one atomic
-    /// prepared-row append path runs. Every error leaves the table unchanged.
+    /// UTF-8, JSON shape, every typed number, all configured limits, and
+    /// remaining table capacity are validated before the existing WAL and one
+    /// atomic prepared-row append path runs. Every error leaves the table
+    /// unchanged.
     ///
     /// # Examples
     ///
@@ -2706,8 +2709,8 @@ impl Database {
     /// use rusthouse::batch::json_compact_each_row::JsonCompactEachRowIngestLimits;
     ///
     /// let mut database = Database::new();
-    /// database.execute("CREATE TABLE readings (value Nullable(Int64));")?;
-    /// let input = b"[-7]\n[null]\n";
+    /// database.execute("CREATE TABLE readings (value Float64);")?;
+    /// let input = b"[-7]\n[6.25e-3]\n";
     /// let rows = database.ingest_json_compact_each_row(
     ///     "readings",
     ///     input,
