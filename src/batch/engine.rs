@@ -21,6 +21,7 @@ use crate::batch::scalar_cast::{
 };
 use crate::batch::scalar_float64;
 use crate::batch::scalar_nullable_int64;
+use crate::batch::scalar_string;
 use crate::batch::scalar_text;
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, AlterUpdateValue,
@@ -6362,12 +6363,16 @@ fn execute_projection(
                         ResolvedItem::ToString { source, input_type } => {
                             stringify_value(table, *source, *row, *input_type)
                         }
-                        ResolvedItem::StringLength { source } => Value::Int64(
-                            string_length_to_i64(string_at(table, *source, *row).len())?,
-                        ),
-                        ResolvedItem::StringLengthUtf8 { source } => Value::Int64(
-                            string_length_utf8_to_i64(string_at(table, *source, *row))?,
-                        ),
+                        ResolvedItem::StringLength { source } => {
+                            Value::Int64(scalar_string::string_length_to_i64(
+                                string_at(table, *source, *row).len(),
+                            )?)
+                        }
+                        ResolvedItem::StringLengthUtf8 { source } => {
+                            Value::Int64(scalar_string::string_length_utf8_to_i64(string_at(
+                                table, *source, *row,
+                            ))?)
+                        }
                         ResolvedItem::StringEmpty { source } => {
                             Value::Int64(i64::from(string_at(table, *source, *row).is_empty()))
                         }
@@ -9320,11 +9325,11 @@ fn order_source_rows(
                 ResolvedItem::StringEmpty { source } => string_at(table, source, left)
                     .is_empty()
                     .cmp(&string_at(table, source, right).is_empty()),
-                ResolvedItem::StringLower { source } => ascii_lower_cmp(
+                ResolvedItem::StringLower { source } => scalar_string::ascii_lower_cmp(
                     string_at(table, source, left),
                     string_at(table, source, right),
                 ),
-                ResolvedItem::StringUpper { source } => ascii_upper_cmp(
+                ResolvedItem::StringUpper { source } => scalar_string::ascii_upper_cmp(
                     string_at(table, source, left),
                     string_at(table, source, right),
                 ),
@@ -9745,27 +9750,6 @@ fn stringified_cmp(
         }
         _ => unreachable!("toString input type is resolved"),
     }
-}
-
-fn ascii_lower_cmp(left: &str, right: &str) -> Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_lowercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
-}
-
-fn ascii_upper_cmp(left: &str, right: &str) -> Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_uppercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_uppercase()))
-}
-
-fn string_length_to_i64(length: usize) -> Result<i64> {
-    i64::try_from(length).map_err(|_| Error::NumericOverflow("LENGTH(String)".to_owned()))
-}
-
-fn string_length_utf8_to_i64(value: &str) -> Result<i64> {
-    i64::try_from(value.chars().count())
-        .map_err(|_| Error::NumericOverflow("lengthUTF8(String)".to_owned()))
 }
 
 fn if_null_int64_at(table: &Table, source: usize, row: usize, fallback: i64) -> i64 {
@@ -11713,24 +11697,6 @@ mod tests {
         );
         assert_eq!(database.catalog().table("events").unwrap().row_count(), 0);
         assert_eq!(database.catalog().table("samples").unwrap().row_count(), 0);
-    }
-
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn string_length_reports_int64_overflow() {
-        let overflow = usize::try_from(i64::MAX).unwrap() + 1;
-        assert_eq!(
-            string_length_to_i64(overflow),
-            Err(Error::NumericOverflow("LENGTH(String)".to_owned()))
-        );
-    }
-
-    #[test]
-    fn length_utf8_counts_unicode_scalars_without_allocating() {
-        assert_eq!(string_length_utf8_to_i64("ASCII"), Ok(5));
-        assert_eq!(string_length_utf8_to_i64("é東京"), Ok(3));
-        assert_eq!(string_length_utf8_to_i64("é"), Ok(2));
-        assert_eq!(string_length_utf8_to_i64("👨‍👩‍👧‍👦"), Ok(7));
     }
 
     #[test]

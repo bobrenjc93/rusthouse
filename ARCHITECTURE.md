@@ -25,6 +25,15 @@ Focused module tests keep each optimized length and ordering primitive different
 canonical rendered text; SQL-boundary tests retain the `CAST`/`toString` differential, signed-zero
 and extrema coverage, and exact result-limit behavior.
 
+The private `batch::scalar_string` module owns allocation-free ASCII-folded comparison for
+`LOWER` and `UPPER` ordering and checked conversion of String byte and Unicode-scalar lengths to
+`Int64`. ASCII folding deliberately leaves non-ASCII UTF-8 bytes unchanged, while `lengthUTF8`
+counts Unicode scalar values rather than bytes or grapheme clusters. The execution engine retains
+physical row access, projection allocation, stable source-row tie breaking, ordering and
+pagination, and result-limit accounting. Focused module tests compare the primitives with Rust's
+canonical allocating ASCII transforms and byte/scalar counts; SQL-boundary tests continue to
+cover Unicode projection results, ordering ties, pagination, and resource limits.
+
 The private `batch::scalar_nullable_int64` module owns the value-level primitives for nullable
 `Int64` `ABS`, column-minus-literal subtraction, and `ifNull`, including checked overflow, typed
 `NULL` propagation, and allocation-free absolute-value ordering. The execution engine retains type
