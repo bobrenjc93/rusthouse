@@ -1613,20 +1613,23 @@ values, configured limits, or remaining table capacity are rejected before any
 row is appended.
 
 `Database::ingest_json_compact_each_row` adds a deliberately narrow,
-dependency-free positional JSON importer for existing one-column `Int64` and
-`Nullable(Int64)` tables. Each physical LF or CRLF record must be a complete
-one-element JSON array such as `[-7]` or `[null]`; JSON whitespace around the
-array and value is accepted. The value must use JSON integer syntax and fit
-exactly in `Int64`. Only nullable targets accept `null`. Empty input appends no
-rows, while empty arrays, wider arrays, floating-point numbers, booleans,
-strings, objects, nested arrays, trailing content, malformed JSON, invalid
-UTF-8, and out-of-range integers are rejected.
+dependency-free positional JSON importer for existing one-column `Int64`,
+`Nullable(Int64)`, and `Float64` tables. Each physical LF or CRLF record must be
+a complete one-element JSON array such as `[-7]`, `[6.25e-3]`, or `[null]`;
+JSON whitespace around the array and value is accepted. `Int64` targets retain
+their integer-only syntax and range checks. `Float64` targets accept every JSON
+number form that parses to a finite value, including integer, decimal,
+exponent, normal extrema, subnormal, and signed-zero forms. Only nullable
+integer targets accept `null`. Empty input appends no rows, while empty arrays,
+wider arrays, booleans, strings, objects, nested arrays, trailing content,
+malformed JSON, invalid UTF-8, out-of-range integers, and non-finite Float64
+overflow are rejected.
 
 Callers provide complete-input byte, physical-row, and total-value limits.
 RustHouse validates the target shape, the entire input, those limits, and the
 table's remaining row and cell capacity before using the existing Int64 WAL
-commit and one prepared-row append. Thus a malformed late row, capacity error,
-or WAL failure publishes none of the batch. Output from
+commit when applicable and one prepared-row append. Thus a malformed late row,
+capacity error, or WAL failure publishes none of the batch. Output from
 `write_json_compact_each_row` round-trips directly when its result has one
 compatible column. `SharedDatabase::ingest_json_compact_each_row` holds one
 write lock from lookup through commit; the nonblocking

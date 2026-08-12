@@ -24,6 +24,17 @@ fn values(database: &mut Database, table: &str) -> Vec<Vec<Value>> {
     query(database, &format!("SELECT value FROM {table};")).rows
 }
 
+fn float_bits(rows: &[Vec<Value>]) -> Vec<u64> {
+    rows.iter()
+        .map(|row| {
+            let [Value::Float64(value)] = row.as_slice() else {
+                panic!("expected one Float64 value per row");
+            };
+            value.to_bits()
+        })
+        .collect()
+}
+
 #[test]
 fn writer_output_round_trips_signed_int64_extremes() {
     let mut source = Database::new();
@@ -55,6 +66,80 @@ fn writer_output_round_trips_signed_int64_extremes() {
         Ok(4),
     );
     assert_eq!(values(&mut target, "target"), result.rows);
+}
+
+#[test]
+fn float64_json_number_forms_and_writer_output_round_trip_exactly() {
+    let original_input = concat!(
+        "[42]\n",
+        "[-12.5]\n",
+        "[6.022e23]\n",
+        "[1.7976931348623157e308]\n",
+        "[-1.7976931348623157e308]\n",
+        "[2.2250738585072014e-308]\n",
+        "[5e-324]\n",
+        "[0]\n",
+        "[-0]\n",
+        "[-0.0]\n",
+        "[-0e10]\n",
+    )
+    .as_bytes();
+    let expected = [
+        42.0,
+        -12.5,
+        6.022e23,
+        f64::MAX,
+        f64::MIN,
+        f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        0.0,
+        -0.0,
+        -0.0,
+        -0.0,
+    ]
+    .map(f64::to_bits);
+
+    let mut source = Database::with_max_rows_per_table(expected.len());
+    source
+        .execute("CREATE TABLE source (value Float64);")
+        .unwrap();
+    assert_eq!(
+        source.ingest_json_compact_each_row(
+            "source",
+            original_input,
+            JsonCompactEachRowIngestLimits::new(
+                original_input.len(),
+                expected.len(),
+                expected.len(),
+            ),
+        ),
+        Ok(expected.len()),
+    );
+    let source_rows = values(&mut source, "source");
+    assert_eq!(float_bits(&source_rows), expected);
+
+    let result = query(&mut source, "SELECT value FROM source;");
+    let mut writer_output = Vec::new();
+    write_json_compact_each_row(&mut writer_output, &result).unwrap();
+    assert!(writer_output.windows(6).any(|bytes| bytes == b"[-0.0]"));
+
+    let mut target = Database::with_max_rows_per_table(expected.len());
+    target
+        .execute("CREATE TABLE target (value Float64);")
+        .unwrap();
+    assert_eq!(
+        target.ingest_json_compact_each_row(
+            "target",
+            &writer_output,
+            JsonCompactEachRowIngestLimits::new(
+                writer_output.len(),
+                expected.len(),
+                expected.len(),
+            ),
+        ),
+        Ok(expected.len()),
+    );
+    assert_eq!(float_bits(&values(&mut target, "target")), expected);
 }
 
 #[test]
@@ -213,6 +298,20 @@ fn late_malformed_rows_overflow_and_invalid_utf8_roll_back_every_prepared_row() 
         }),
     );
 
+    let float_syntax = b"[1]\n[2.0]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            float_syntax,
+            JsonCompactEachRowIngestLimits::new(float_syntax.len(), 2, 2),
+        ),
+        Err(JsonCompactEachRowIngestError::InvalidValue {
+            line: 2,
+            column: 1,
+            expected: DataType::Int64,
+        }),
+    );
+
     for valid_but_unsupported in [
         b"[true]\n".as_slice(),
         b"[{\"nested\":[1,null,false]}]\n".as_slice(),
@@ -332,7 +431,68 @@ fn exact_input_and_table_limits_succeed_and_every_exceeded_limit_is_atomic() {
 }
 
 #[test]
-fn rejects_targets_outside_the_one_column_int64_subset_without_mutation() {
+fn float64_late_failures_and_exact_limits_leave_the_table_atomic() {
+    let mut database = Database::with_table_limits(TableLimits::new(3, 1, 3));
+    database
+        .execute("CREATE TABLE readings (value Float64); INSERT INTO readings VALUES (9.5);")
+        .unwrap();
+
+    for rejected in [
+        b"[1.25]\n[1e309]\n".as_slice(),
+        b"[1.25]\n[null]\n".as_slice(),
+        b"[1.25]\n[\"2.5\"]\n".as_slice(),
+        b"[1.25]\n[true]\n".as_slice(),
+    ] {
+        assert_eq!(
+            database.ingest_json_compact_each_row(
+                "readings",
+                rejected,
+                JsonCompactEachRowIngestLimits::new(rejected.len(), 2, 2),
+            ),
+            Err(JsonCompactEachRowIngestError::InvalidValue {
+                line: 2,
+                column: 1,
+                expected: DataType::Float64,
+            }),
+        );
+    }
+    assert_eq!(
+        float_bits(&values(&mut database, "readings")),
+        [9.5_f64.to_bits()],
+    );
+
+    let exact = b"[1]\n[-2.5e0]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            exact,
+            JsonCompactEachRowIngestLimits::new(exact.len(), 2, 2),
+        ),
+        Ok(2),
+    );
+    let over_capacity = b"[3.5]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            over_capacity,
+            JsonCompactEachRowIngestLimits::new(over_capacity.len(), 1, 1),
+        ),
+        Err(JsonCompactEachRowIngestError::Database(
+            Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 4,
+                max: 3,
+            }
+        )),
+    );
+    assert_eq!(
+        float_bits(&values(&mut database, "readings")),
+        [9.5_f64.to_bits(), 1.0_f64.to_bits(), (-2.5_f64).to_bits()],
+    );
+}
+
+#[test]
+fn rejects_targets_outside_the_one_column_numeric_subset_without_mutation() {
     let input = b"[1]\n";
     let limits = JsonCompactEachRowIngestLimits::new(input.len(), 1, 1);
     let mut database = Database::new();
@@ -369,7 +529,7 @@ impl AsRef<[u8]> for InaccessibleInput {
 fn shared_blocking_and_nonblocking_apis_preserve_contention_and_rollback_semantics() {
     let mut initial = Database::with_max_rows_per_table(3);
     initial
-        .execute("CREATE TABLE readings (value Int64);")
+        .execute("CREATE TABLE readings (value Float64);")
         .unwrap();
     let inner = Arc::new(RwLock::new(initial));
     let database = SharedDatabase::from_arc(Arc::clone(&inner));
@@ -387,7 +547,7 @@ fn shared_blocking_and_nonblocking_apis_preserve_contention_and_rollback_semanti
     let blocking_database = database.clone();
     let (sender, receiver) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let input = b"[1]\n";
+        let input = b"[1.5]\n";
         sender
             .send(blocking_database.ingest_json_compact_each_row(
                 "readings",
@@ -415,7 +575,7 @@ fn shared_blocking_and_nonblocking_apis_preserve_contention_and_rollback_semanti
     );
     drop(writer);
 
-    let second = b"[-2]\n";
+    let second = b"[-2e0]\n";
     assert_eq!(
         database.try_ingest_json_compact_each_row(
             "readings",
@@ -437,6 +597,6 @@ fn shared_blocking_and_nonblocking_apis_preserve_contention_and_rollback_semanti
     ));
     assert_eq!(
         database.query("SELECT value FROM readings;").unwrap().rows,
-        [vec![Value::Int64(1)], vec![Value::Int64(-2)]],
+        [vec![Value::Float64(1.5)], vec![Value::Float64(-2.0)]],
     );
 }
