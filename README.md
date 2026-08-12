@@ -579,11 +579,17 @@ only when the corresponding row survives pagination and is converted.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
-are currently limited to ungrouped queries: they cannot be combined with
-aggregate projections or `GROUP BY`. Generated `String` payload bytes—four or
-five for booleans, one through twenty for integers, and one through 327 for
-finite floats—are charged exactly against the result-byte limit before
-materialization. No other source/target type pairs are accepted.
+other than the `Nullable(Int64)` identity form are currently limited to
+ungrouped queries: they cannot be combined with aggregate projections or
+`GROUP BY`. The identity form may be projected beside aggregates when its
+physical source column appears in `GROUP BY`; it derives both present values
+and typed `NULL` from the retained group key and supports normal aliases,
+aggregate `HAVING`, result ordering, and pagination. Expression grouping such
+as `GROUP BY CAST(value AS Int64)` remains unsupported, and an identity-cast
+source absent from `GROUP BY` is rejected. Generated `String` payload
+bytes—four or five for booleans, one through twenty for integers, and one
+through 327 for finite floats—are charged exactly against the result-byte
+limit before materialization. No other source/target type pairs are accepted.
 `toString(column)` is the case-insensitive ClickHouse-style String conversion
 for every physical type. `Int64`, `Float64`, and `Bool` inputs use exactly the
 same canonical formatting, lexicographic expression ordering, and generated

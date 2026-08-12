@@ -5419,6 +5419,7 @@ enum ResolvedItem {
     },
     CastNullableInt64ToInt64 {
         source: usize,
+        group_position: Option<usize>,
     },
     CastInt64ToFloat64 {
         source: usize,
@@ -5717,11 +5718,15 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
+                let group_position = group_columns.iter().position(|column| *column == source);
                 let resolved = match (actual, *target_type) {
                     (DataType::Int64, DataType::Int64)
                         if table.column_is_nullable_int64(source) =>
                     {
-                        Some(ResolvedItem::CastNullableInt64ToInt64 { source })
+                        Some(ResolvedItem::CastNullableInt64ToInt64 {
+                            source,
+                            group_position,
+                        })
                     }
                     (DataType::Int64, DataType::Float64) => {
                         Some(ResolvedItem::CastInt64ToFloat64 { source })
@@ -5775,10 +5780,26 @@ fn resolve_select_items(
                     });
                 };
                 if has_aggregate || !group_columns.is_empty() {
-                    return Err(Error::InvalidQuery(
-                        "CAST projections are only supported in ungrouped SELECT queries"
-                            .to_owned(),
-                    ));
+                    match &resolved {
+                        ResolvedItem::CastNullableInt64ToInt64 {
+                            group_position: Some(_),
+                            ..
+                        } => {}
+                        ResolvedItem::CastNullableInt64ToInt64 {
+                            group_position: None,
+                            ..
+                        } => {
+                            return Err(Error::InvalidQuery(format!(
+                                "column '{name}' must appear in GROUP BY"
+                            )));
+                        }
+                        _ => {
+                            return Err(Error::InvalidQuery(
+                                "CAST projections are only supported in ungrouped SELECT queries"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
                 }
                 items.push(resolved);
                 result_columns.push(ResultColumn {
@@ -6243,7 +6264,7 @@ fn execute_projection(
                         ResolvedItem::IsNull { source, .. } => {
                             Value::Bool(is_null_at(table, *source, *row))
                         }
-                        ResolvedItem::CastNullableInt64ToInt64 { source } => {
+                        ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
                             table.columns()[*source].value(*row)
                         }
                         ResolvedItem::CastInt64ToFloat64 { source } => {
@@ -6550,8 +6571,15 @@ fn validate_grouped_result_limits(
                     group_position: None,
                     ..
                 } => unreachable!("grouped isNull arguments are validated"),
-                ResolvedItem::CastNullableInt64ToInt64 { .. }
-                | ResolvedItem::CastInt64ToFloat64 { .. }
+                ResolvedItem::CastNullableInt64ToInt64 {
+                    group_position: Some(_),
+                    ..
+                } => 0,
+                ResolvedItem::CastNullableInt64ToInt64 {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped Nullable(Int64) CAST arguments are validated"),
+                ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
@@ -8364,8 +8392,15 @@ impl GroupedData<'_> {
                             group_position: None,
                             ..
                         } => unreachable!("grouped isNull arguments are validated"),
-                        ResolvedItem::CastNullableInt64ToInt64 { .. }
-                        | ResolvedItem::CastInt64ToFloat64 { .. }
+                        ResolvedItem::CastNullableInt64ToInt64 {
+                            group_position: Some(position),
+                            ..
+                        } => self.keys[*group].value(*position).to_owned(),
+                        ResolvedItem::CastNullableInt64ToInt64 {
+                            group_position: None,
+                            ..
+                        } => unreachable!("grouped Nullable(Int64) CAST arguments are validated"),
+                        ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastBoolToFloat64 { .. }
                         | ResolvedItem::CastStringToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. }
@@ -8762,7 +8797,7 @@ fn resolved_expression_name(
             source, fallback, ..
         } => sql::if_null_int64_name(&table.schema()[*source].name, *fallback),
         ResolvedItem::IsNull { source, .. } => sql::is_null_name(&table.schema()[*source].name),
-        ResolvedItem::CastNullableInt64ToInt64 { source } => {
+        ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
         ResolvedItem::CastInt64ToFloat64 { source } => {
@@ -8921,7 +8956,7 @@ fn order_source_rows(
                 ResolvedItem::IsNull { source, .. } => {
                     is_null_at(table, source, left).cmp(&is_null_at(table, source, right))
                 }
-                ResolvedItem::CastNullableInt64ToInt64 { source } => {
+                ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
                     table.columns()[source].cmp_at(left, right)
                 }
                 ResolvedItem::CastInt64ToFloat64 { source } => {
@@ -9200,8 +9235,17 @@ fn order_grouped_rows(
                     group_position: None,
                     ..
                 } => unreachable!("grouped isNull arguments are validated"),
-                ResolvedItem::CastNullableInt64ToInt64 { .. }
-                | ResolvedItem::CastInt64ToFloat64 { .. }
+                ResolvedItem::CastNullableInt64ToInt64 {
+                    group_position: Some(position),
+                    ..
+                } => data.keys[left]
+                    .value(position)
+                    .cmp(&data.keys[right].value(position)),
+                ResolvedItem::CastNullableInt64ToInt64 {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped Nullable(Int64) CAST arguments are validated"),
+                ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
