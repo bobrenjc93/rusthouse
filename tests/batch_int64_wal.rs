@@ -865,6 +865,74 @@ fn json_compact_each_row_appends_are_wal_first_and_recover_nullable_rows() {
 }
 
 #[test]
+fn empty_json_compact_each_row_ingest_never_consumes_wal_record_capacity() {
+    let directory = TestDirectory::new();
+    let path = directory.join("empty-json-compact-each-row.wal");
+    let limits = Int64WriteAheadLogLimits::new(64 * 1024, 16 * 1024, 2);
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (Measurement Nullable(Int64));")
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+
+    let bootstrap = fs::read(&path).unwrap();
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            b"",
+            JsonCompactEachRowIngestLimits::new(0, 0, 0),
+        ),
+        Ok(0),
+    );
+    assert_eq!(fs::read(&path).unwrap(), bootstrap);
+
+    let input = b"[7]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 1, 1),
+        ),
+        Ok(1),
+    );
+    let full_wal = fs::read(&path).unwrap();
+    assert_ne!(full_wal, bootstrap);
+
+    assert!(matches!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            b"[8]\n",
+            JsonCompactEachRowIngestLimits::new(4, 1, 1),
+        ),
+        Err(JsonCompactEachRowIngestError::Database(
+            Error::WriteAheadLog(Int64WriteAheadLogCommitError::Limit(
+                Int64WriteAheadLogLimitError::Records {
+                    records: 3,
+                    max_records: 2,
+                }
+            ))
+        ))
+    ));
+    assert_eq!(fs::read(&path).unwrap(), full_wal);
+
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            b"",
+            JsonCompactEachRowIngestLimits::new(0, 0, 0),
+        ),
+        Ok(0),
+    );
+    assert_eq!(fs::read(&path).unwrap(), full_wal);
+    assert_eq!(nullable_int64_values(&database, "readings"), [Some(7)]);
+
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert_eq!(nullable_int64_values(&recovered, "readings"), [Some(7)]);
+}
+
+#[test]
 fn rejected_json_compact_each_row_wal_commit_does_not_publish_storage_rows() {
     let directory = TestDirectory::new();
     let path = directory.join("bounded-json-compact-each-row.wal");

@@ -1380,7 +1380,7 @@ impl Database {
         table_name: &str,
         rows: &PreparedInsertRows,
     ) -> Result<()> {
-        if !self.wal_tracks(table_name) {
+        if rows.len() == 0 || !self.wal_tracks(table_name) {
             return Ok(());
         }
         let values = rows
