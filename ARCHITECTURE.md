@@ -55,11 +55,13 @@ The private `batch::aggregate_scheduler` module owns process-wide aggregate-work
 deterministic contiguous partitioning. Its generic grouped-aggregate driver additionally owns
 scoped worker spawning, ordered partial collection, admission release, and complete-input fallback
 after a spawn failure or worker panic. The execution engine retains SQL shape recognition and the
-Bool-grouped `COUNT`/`SUM`/`AVG` partial and reduction semantics, supplying only row-chunk work and a
-thread-name prefix to the scheduler; physical non-nullable `COUNT(column)` reuses the row-count
-chunks without reading argument values. The scheduler has no SQL or aggregate-state policy. The
-private `batch::grouped_bool_min` module owns the non-nullable `Int64` `MIN` partial, chunk scan,
-ordered reduction, and its fixed worker-name prefix. The engine retains SQL eligibility, physical
+Bool-grouped `SUM`/`AVG` partial and reduction semantics, supplying only row-chunk work and a
+thread-name prefix to the scheduler. The scheduler has no SQL or aggregate-state policy. The private
+`batch::grouped_bool_count` module owns the Bool-grouped `COUNT`/`countIf` partial, row-count,
+nullable-column and `countIf` chunk scans, checked ordered reduction, and fixed worker-name prefix;
+physical non-nullable `COUNT(column)` reuses its row-count scan without reading argument values. The
+private `batch::grouped_bool_min` module similarly owns the non-nullable `Int64` `MIN` partial, chunk
+scan, ordered reduction, and fixed worker-name prefix. The engine retains SQL eligibility, physical
 column dispatch, grouped resource limits, and result construction, while the scheduler continues to
 own admission, worker lifecycle, and complete-input fallback.
 
