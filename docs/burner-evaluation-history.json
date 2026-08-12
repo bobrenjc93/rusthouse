@@ -3681,6 +3681,22 @@
         "eval_c88a7f3d": 95,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:891",
+      "recordedAt": "2026-08-12T17:10:14.181Z",
+      "label": "PR #891",
+      "kind": "leaf",
+      "prNumber": 891,
+      "title": "Parallelize Bool-grouped non-nullable Float64 MAX",
+      "scores": {
+        "eval_9fbdfec0": 100,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 95,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }

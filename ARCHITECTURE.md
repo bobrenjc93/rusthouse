@@ -60,8 +60,8 @@ nullable-column and `countIf` chunk scans, checked ordered reduction, and fixed 
 physical non-nullable `COUNT(column)` reuses its row-count scan without reading argument values. The
 private `batch::grouped_bool_min` module similarly owns the non-nullable `Int64` and `Float64` `MIN`
 partials, chunk scans, ordered reduction, and fixed worker-name prefixes. The private
-`batch::grouped_bool_max` module owns the corresponding non-nullable `Int64` `MAX` reduction
-boundary. The private
+`batch::grouped_bool_max` module owns the corresponding non-nullable `Int64` and `Float64` `MAX`
+reduction boundary. The private
 `batch::grouped_bool_sum_avg` module owns the non-nullable `Int64` `SUM`/`AVG` per-key sum-and-count
 partial, chunk scan, first-seen ordering, mode-specific checked reduction and fixed worker-name
 prefixes. The engine retains SQL eligibility, physical column dispatch, grouped resource limits,
@@ -79,9 +79,9 @@ A deliberately narrow parallel path reduces global `countIf(Bool)`, sole ungroup
 two-item `COUNT(*)`/`COUNT()` plus `SUM(Int64)`, `AVG(Int64)`, `MIN(Int64)`, or `MAX(Int64)`
 (including physical `Nullable(Int64)`) or plus non-nullable `MIN(Float64)` or `MAX(Float64)`, the
 exact ungrouped `COUNT(nullable_int64_column)` plus `SUM(the_same_column)` or
-`AVG(the_same_column)`, and sole non-nullable `Int64` `SUM`, `MIN`, or `AVG` grouped by one physical
-Bool key over large filtered row sets with scoped workers admitted by one process-wide nonblocking
-budget.
+`AVG(the_same_column)`, and sole non-nullable `Int64` `SUM` or `AVG` or non-nullable `Int64` or
+`Float64` `MIN` or `MAX` grouped by one physical Bool key over large filtered row sets with scoped
+workers admitted by one process-wide nonblocking budget.
 Nullable COUNT chunks ignore absent values and use checked count reduction; nullable SUM/AVG
 chunks ignore absent values while preserving checked i128 sum and present-count reduction; nullable
 MIN/MAX chunks ignore absent values and reduce optional extrema. The paired shapes reuse the

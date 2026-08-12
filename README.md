@@ -84,7 +84,7 @@ grouping column and exactly one `COUNT(*)`, `COUNT()`, `COUNT(column)`, or
 `countIf(physical_non_nullable_bool_column)` aggregate, or exactly one
 `SUM(physical_non_nullable_int64_column)` or
 `MIN(physical_non_nullable_int64_or_float64_column)` or
-`MAX(physical_non_nullable_int64_column)` or
+`MAX(physical_non_nullable_int64_or_float64_column)` or
 `AVG(physical_non_nullable_int64_column)` aggregate. The `countIf` argument may
 be the grouping column or a different physical Bool column.
 The `COUNT(column)` argument must be a physical nullable `Int64` column or a
@@ -93,13 +93,13 @@ partials track group row presence separately from present values, so all-NULL
 groups remain visible with a zero count. Bool-grouped SUM/AVG partials maintain
 a checked i128 sum and checked row count for each key, then apply the normal
 checked Int64 SUM conversion or Float64 AVG finalization. Bool-grouped MIN and
-MAX partials retain one optional extremum per key: MIN supports physical
-non-nullable Int64 and Float64 values, while MAX supports Int64. Float64 MIN
-uses strict comparisons so equal values, including signed zero, retain their
-first occurrence. Ordered partition reduction preserves first-seen Bool
-grouping before the normal grouped HAVING, ordering, and pagination stages. The paired
-shapes preserve either projection order. Row-count pairs derive `COUNT` with a
-checked conversion of the filtered cardinality; same-column nullable
+MAX partials retain one optional extremum per key and support physical
+non-nullable Int64 and Float64 values. Float64 extrema use strict comparisons
+so equal values, including signed zero, retain their first occurrence. Ordered
+partition reduction preserves first-seen Bool grouping before the normal
+grouped HAVING, ordering, and pagination stages. The paired shapes preserve
+either projection order. Row-count pairs derive `COUNT` with a checked
+conversion of the filtered cardinality; same-column nullable
 `COUNT`/`SUM` and `COUNT`/`AVG` pairs derive their NULL-ignoring count from the
 SUM or AVG partitions' checked present-value count. The existing checked sum-and-count lanes target
 about 131,072 rows each. Release-mode crossover
@@ -133,7 +133,7 @@ allocating a partial-results collection. Ordered reduction preserves the first
 occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
 or below the threshold, other grouped shapes (including nullable aggregates,
-non-Int64 `SUM`/`MAX`/`AVG`, non-Int64-or-Float64 `MIN`, more than one grouping
+non-Int64 `SUM`/`AVG`, non-Int64-or-Float64 `MIN`/`MAX`, more than one grouping
 column, non-Bool keys, or multiple aggregates), and
 multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
@@ -148,7 +148,8 @@ recognition, physical-column resolution, and typed aggregate-state construction;
 the aggregate scheduler separately owns shared admission and deterministic
 partition boundaries. The private Bool-grouped MIN reducer uses that scheduler
 for non-nullable Int64 and Float64 columns, retaining per-key first-occurrence
-Float64 ties while reducing partitions in source order.
+Float64 ties while reducing partitions in source order; the private
+Bool-grouped MAX reducer provides the corresponding behavior.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
@@ -897,7 +898,7 @@ constructor accept a `NonZeroUsize` computation-lane cap for the supported
 parallel global aggregates and the narrow Bool-grouped row count, `COUNT` of a
 nullable Int64 or physical non-nullable column, Bool-grouped `countIf`, or
 non-nullable Int64 `SUM`/`MIN`/`MAX`/`AVG` shapes and non-nullable Float64
-`MIN` shape. The
+`MIN`/`MAX` shapes. The
 configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
