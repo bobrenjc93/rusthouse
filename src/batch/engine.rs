@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 #[cfg(test)]
 use crate::batch::aggregate_scheduler::TestGlobalAggregateWorkerBudget as GlobalAggregateWorkerBudget;
-use crate::batch::aggregate_scheduler::{GlobalAggregateParallelism, parallel_aggregate_partition};
+use crate::batch::aggregate_scheduler::{
+    GlobalAggregateParallelism, parallel_aggregate_partition, run_grouped_aggregate,
+};
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
@@ -21,6 +23,7 @@ use crate::batch::scalar_cast::{
 };
 use crate::batch::scalar_float64;
 use crate::batch::scalar_nullable_int64;
+use crate::batch::scalar_string;
 use crate::batch::scalar_text;
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, AlterUpdateValue,
@@ -6362,12 +6365,16 @@ fn execute_projection(
                         ResolvedItem::ToString { source, input_type } => {
                             stringify_value(table, *source, *row, *input_type)
                         }
-                        ResolvedItem::StringLength { source } => Value::Int64(
-                            string_length_to_i64(string_at(table, *source, *row).len())?,
-                        ),
-                        ResolvedItem::StringLengthUtf8 { source } => Value::Int64(
-                            string_length_utf8_to_i64(string_at(table, *source, *row))?,
-                        ),
+                        ResolvedItem::StringLength { source } => {
+                            Value::Int64(scalar_string::string_length_to_i64(
+                                string_at(table, *source, *row).len(),
+                            )?)
+                        }
+                        ResolvedItem::StringLengthUtf8 { source } => {
+                            Value::Int64(scalar_string::string_length_utf8_to_i64(string_at(
+                                table, *source, *row,
+                            ))?)
+                        }
                         ResolvedItem::StringEmpty { source } => {
                             Value::Int64(i64::from(string_at(table, *source, *row).is_empty()))
                         }
@@ -7391,7 +7398,7 @@ where
         values,
         matching_rows,
         parallelism,
-        "count",
+        "rusthouse-group-bool-count",
         chunk,
         reduce_grouped_bool_count_partials,
     )
@@ -7401,7 +7408,7 @@ fn reduce_grouped_bool<P, C, R>(
     values: &[bool],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
+    worker_name_prefix: &'static str,
     chunk: C,
     reduce: R,
 ) -> Result<P>
@@ -7410,80 +7417,13 @@ where
     C: Fn(&[bool], &[usize]) -> Result<P> + Sync,
     R: Fn(Vec<P>) -> Result<P>,
 {
-    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return chunk(values, matching_rows);
-    };
-
-    // Lanes receive deterministic contiguous slices of the already-filtered
-    // row indices. Reducing them in partition order preserves the first-seen
-    // Bool key. A failed spawn or panic discards every partial and repeats the
-    // complete grouping locally after releasing shared admission.
-    let parallel_result = try_parallel_grouped_bool(
-        values,
+    run_grouped_aggregate(
         matching_rows,
-        admission.helper_threads(),
-        worker_label,
-        &chunk,
+        parallelism,
+        worker_name_prefix,
+        |rows| chunk(values, rows),
         reduce,
-    );
-    drop(admission);
-    parallel_result.unwrap_or_else(|| chunk(values, matching_rows))
-}
-
-fn try_parallel_grouped_bool<P, C, R>(
-    values: &[bool],
-    matching_rows: &[usize],
-    helper_threads: usize,
-    worker_label: &'static str,
-    chunk: &C,
-    reduce: R,
-) -> Option<Result<P>>
-where
-    P: Send,
-    C: Fn(&[bool], &[usize]) -> Result<P> + Sync,
-    R: Fn(Vec<P>) -> Result<P>,
-{
-    debug_assert!(helper_threads > 0);
-    let worker_count = helper_threads.saturating_add(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(helper_threads);
-        let mut worker_failed = false;
-        for chunk_index in 1..worker_count {
-            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
-            let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-group-bool-{worker_label}-{chunk_index}"))
-                .spawn_scoped(scope, move || chunk(values, rows));
-            match spawn {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    worker_failed = true;
-                    break;
-                }
-            }
-        }
-
-        let mut partials = Vec::with_capacity(worker_count);
-        partials.push(chunk(
-            values,
-            parallel_aggregate_partition(matching_rows, worker_count, 0),
-        ));
-        for handle in handles {
-            match handle.join() {
-                Ok(partial) => partials.push(partial),
-                Err(_) => worker_failed = true,
-            }
-        }
-        if worker_failed {
-            return None;
-        }
-
-        Some(
-            partials
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
-                .and_then(reduce),
-        )
-    })
+    )
 }
 
 fn grouped_bool_count_chunk(
@@ -7605,7 +7545,7 @@ where
         group_values,
         matching_rows,
         parallelism,
-        "sum-int64",
+        "rusthouse-group-bool-sum-int64",
         |group_values, rows| chunk(group_values, sum_values, rows),
         reduce_grouped_bool_sum_partials,
     )
@@ -9320,11 +9260,11 @@ fn order_source_rows(
                 ResolvedItem::StringEmpty { source } => string_at(table, source, left)
                     .is_empty()
                     .cmp(&string_at(table, source, right).is_empty()),
-                ResolvedItem::StringLower { source } => ascii_lower_cmp(
+                ResolvedItem::StringLower { source } => scalar_string::ascii_lower_cmp(
                     string_at(table, source, left),
                     string_at(table, source, right),
                 ),
-                ResolvedItem::StringUpper { source } => ascii_upper_cmp(
+                ResolvedItem::StringUpper { source } => scalar_string::ascii_upper_cmp(
                     string_at(table, source, left),
                     string_at(table, source, right),
                 ),
@@ -9745,27 +9685,6 @@ fn stringified_cmp(
         }
         _ => unreachable!("toString input type is resolved"),
     }
-}
-
-fn ascii_lower_cmp(left: &str, right: &str) -> Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_lowercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
-}
-
-fn ascii_upper_cmp(left: &str, right: &str) -> Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_uppercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_uppercase()))
-}
-
-fn string_length_to_i64(length: usize) -> Result<i64> {
-    i64::try_from(length).map_err(|_| Error::NumericOverflow("LENGTH(String)".to_owned()))
-}
-
-fn string_length_utf8_to_i64(value: &str) -> Result<i64> {
-    i64::try_from(value.chars().count())
-        .map_err(|_| Error::NumericOverflow("lengthUTF8(String)".to_owned()))
 }
 
 fn if_null_int64_at(table: &Table, source: usize, row: usize, fallback: i64) -> i64 {
@@ -11713,24 +11632,6 @@ mod tests {
         );
         assert_eq!(database.catalog().table("events").unwrap().row_count(), 0);
         assert_eq!(database.catalog().table("samples").unwrap().row_count(), 0);
-    }
-
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn string_length_reports_int64_overflow() {
-        let overflow = usize::try_from(i64::MAX).unwrap() + 1;
-        assert_eq!(
-            string_length_to_i64(overflow),
-            Err(Error::NumericOverflow("LENGTH(String)".to_owned()))
-        );
-    }
-
-    #[test]
-    fn length_utf8_counts_unicode_scalars_without_allocating() {
-        assert_eq!(string_length_utf8_to_i64("ASCII"), Ok(5));
-        assert_eq!(string_length_utf8_to_i64("é東京"), Ok(3));
-        assert_eq!(string_length_utf8_to_i64("é"), Ok(2));
-        assert_eq!(string_length_utf8_to_i64("👨‍👩‍👧‍👦"), Ok(7));
     }
 
     #[test]

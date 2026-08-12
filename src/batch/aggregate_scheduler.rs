@@ -322,9 +322,81 @@ pub(super) fn parallel_aggregate_partition(
     &matching_rows[start..start + partition_len]
 }
 
+/// Runs one grouped aggregate over admitted, deterministically ordered lanes.
+///
+/// SQL shape recognition, partial construction, and partial reduction remain
+/// caller policy. This driver owns only worker admission and lifecycle. If a
+/// helper cannot be spawned or panics, it releases admission before repeating
+/// the complete input on the calling thread.
+pub(super) fn run_grouped_aggregate<P, E, C, R>(
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    worker_name_prefix: &str,
+    chunk: C,
+    reduce: R,
+) -> Result<P, E>
+where
+    P: Send,
+    E: Send,
+    C: Fn(&[usize]) -> Result<P, E> + Sync,
+    R: Fn(Vec<P>) -> Result<P, E>,
+{
+    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
+        return chunk(matching_rows);
+    };
+
+    let helper_threads = admission.helper_threads();
+    debug_assert!(helper_threads > 0);
+    let worker_count = helper_threads.saturating_add(1);
+    let chunk = &chunk;
+    let parallel_result = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(helper_threads);
+        let mut worker_failed = false;
+        for chunk_index in 1..worker_count {
+            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
+            let spawn = std::thread::Builder::new()
+                .name(format!("{worker_name_prefix}-{chunk_index}"))
+                .spawn_scoped(scope, move || chunk(rows));
+            match spawn {
+                Ok(handle) => handles.push(handle),
+                Err(_) => {
+                    worker_failed = true;
+                    break;
+                }
+            }
+        }
+
+        let mut partials = Vec::with_capacity(worker_count);
+        partials.push(chunk(parallel_aggregate_partition(
+            matching_rows,
+            worker_count,
+            0,
+        )));
+        for handle in handles {
+            match handle.join() {
+                Ok(partial) => partials.push(partial),
+                Err(_) => worker_failed = true,
+            }
+        }
+        if worker_failed {
+            return None;
+        }
+
+        Some(
+            partials
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(reduce),
+        )
+    });
+    drop(admission);
+    parallel_result.unwrap_or_else(|| chunk(matching_rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn worker_selection_stays_sequential_through_the_row_threshold() {
@@ -420,5 +492,74 @@ mod tests {
         assert_eq!(parallel_aggregate_partition(&short_rows, 3, 0), [3]);
         assert_eq!(parallel_aggregate_partition(&short_rows, 3, 1), [5]);
         assert!(parallel_aggregate_partition(&short_rows, 3, 2).is_empty());
+    }
+
+    #[test]
+    fn grouped_driver_collects_partitions_in_order_and_preserves_worker_names() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let rows = (0..row_count).collect::<Vec<_>>();
+
+        let partials = run_grouped_aggregate(
+            &rows,
+            GlobalAggregateParallelism::fixed(3),
+            "rusthouse-group-bool-count",
+            |partition| {
+                Ok::<_, ()>(vec![(
+                    partition[0],
+                    partition.len(),
+                    std::thread::current().name().map(str::to_owned),
+                )])
+            },
+            |partials| Ok(partials.into_iter().flatten().collect::<Vec<_>>()),
+        )
+        .expect("grouped driver succeeds");
+
+        assert_eq!(partials.len(), 3);
+        for (worker_index, partial) in partials.iter().enumerate() {
+            let expected = parallel_aggregate_partition(&rows, 3, worker_index);
+            assert_eq!((partial.0, partial.1), (expected[0], expected.len()));
+        }
+        assert_eq!(
+            partials[1].2.as_deref(),
+            Some("rusthouse-group-bool-count-1")
+        );
+        assert_eq!(
+            partials[2].2.as_deref(),
+            Some("rusthouse-group-bool-count-2")
+        );
+    }
+
+    #[test]
+    fn grouped_driver_releases_admission_before_complete_input_panic_fallback() {
+        static BUDGET: TestGlobalAggregateWorkerBudget =
+            TestGlobalAggregateWorkerBudget::for_test(2);
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let rows = (0..row_count).collect::<Vec<_>>();
+        let used_fallback = AtomicBool::new(false);
+        let parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(3).unwrap(), &BUDGET);
+
+        let result = run_grouped_aggregate(
+            &rows,
+            parallelism,
+            "rusthouse-group-bool-test-panic",
+            |partition| {
+                if partition.len() == row_count {
+                    assert_eq!(BUDGET.helpers_in_use(), 0);
+                    used_fallback.store(true, Ordering::Release);
+                    return Ok::<_, ()>(partition.len());
+                }
+                if partition[0] > 0 {
+                    panic!("injected grouped worker failure");
+                }
+                Ok(partition.len())
+            },
+            |_| panic!("worker failure must discard every partial"),
+        )
+        .expect("complete-input fallback succeeds");
+
+        assert_eq!(result, row_count);
+        assert!(used_fallback.load(Ordering::Acquire));
+        assert_eq!(BUDGET.helpers_in_use(), 0);
     }
 }
