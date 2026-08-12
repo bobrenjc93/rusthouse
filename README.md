@@ -84,6 +84,7 @@ grouping column and exactly one `COUNT(*)`, `COUNT()`, `COUNT(column)`, or
 `countIf(physical_non_nullable_bool_column)` aggregate, or exactly one
 `SUM(physical_non_nullable_int64_column)` or
 `MIN(physical_non_nullable_int64_column)` or
+`MAX(physical_non_nullable_int64_column)` or
 `AVG(physical_non_nullable_int64_column)` aggregate. The `countIf` argument may
 be the grouping column or a different physical Bool column.
 The `COUNT(column)` argument must be a physical nullable `Int64` column or a
@@ -91,10 +92,10 @@ non-nullable `Int64`, `Float64`, `Bool`, or `String` column. Nullable grouped CO
 partials track group row presence separately from present values, so all-NULL
 groups remain visible with a zero count. Bool-grouped SUM/AVG partials maintain
 a checked i128 sum and checked row count for each key, then apply the normal
-checked Int64 SUM conversion or Float64 AVG finalization. Bool-grouped MIN
-partials retain one optional Int64 minimum per key. Ordered partition reduction
-preserves first-seen Bool grouping before the normal grouped HAVING, ordering,
-and pagination stages. The paired
+checked Int64 SUM conversion or Float64 AVG finalization. Bool-grouped MIN and
+MAX partials retain one optional Int64 extremum per key. Ordered partition
+reduction preserves first-seen Bool grouping before the normal grouped HAVING,
+ordering, and pagination stages. The paired
 shapes preserve either projection order. Row-count pairs derive `COUNT` with a
 checked conversion of the filtered cardinality; same-column nullable
 `COUNT`/`SUM` and `COUNT`/`AVG` pairs derive their NULL-ignoring count from the
@@ -890,7 +891,7 @@ constructor configure the scan and output limits.
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
 parallel global aggregates and the narrow Bool-grouped row count, `COUNT` of a
 nullable Int64 or physical non-nullable column, Bool-grouped `countIf`, or
-non-nullable Int64 `SUM`/`MIN`/`AVG` shapes. The
+non-nullable Int64 `SUM`/`MIN`/`MAX`/`AVG` shapes. The
 configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
@@ -1104,7 +1105,7 @@ persistent database configuration.
 `global_aggregate_worker_cap`; a nonzero value is combined with that cap using
 the smaller value. It applies only to supported parallel aggregates in that
 request, including supported Bool-grouped `COUNT`, `countIf`, `SUM`, `MIN`, and
-`AVG`, and never changes `SHOW SETTINGS` or `system.settings`. The
+`MAX`, and `AVG`, and never changes `SHOW SETTINGS` or `system.settings`. The
 available-hardware and fixed 16-lane ceilings still apply, and simultaneous
 requests continue to share the process-wide nonblocking helper admission
 budget.
