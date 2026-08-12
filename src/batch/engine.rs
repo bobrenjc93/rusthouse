@@ -1164,8 +1164,8 @@ impl Database {
 
     /// Creates an empty database with an explicit nonzero computation-lane cap
     /// for supported parallel aggregates, including sole nullable `Int64`
-    /// `COUNT`, Bool-grouped row count, and Bool-grouped nullable `Int64`
-    /// `COUNT`, plus sole non-nullable Int64 `SUM` grouped by Bool.
+    /// `COUNT`, Bool-grouped row count and physical non-nullable column count,
+    /// and sole non-nullable Int64 `SUM` grouped by Bool.
     ///
     /// A cap of one keeps those aggregates sequential. Higher caps remain
     /// subject to the process-wide worker budget, available hardware, and the
@@ -7231,6 +7231,17 @@ fn execute_grouped_bool_count<'a>(
         (None, None) => {
             reduce_grouped_bool_count(values, matching_rows, parallelism, grouped_bool_count_chunk)?
         }
+        (Some(argument), Some(input_type))
+            if table.columns()[argument].data_type() == input_type
+                && matches!(
+                    table.columns()[argument],
+                    Column::Int64(_) | Column::Float64(_) | Column::Bool(_) | Column::String(_)
+                ) =>
+        {
+            // Every selected row contributes, so reuse the row-count chunks
+            // without reading or allocating the argument column's values.
+            reduce_grouped_bool_count(values, matching_rows, parallelism, grouped_bool_count_chunk)?
+        }
         (Some(argument), Some(DataType::Int64)) if table.column_is_nullable_int64(argument) => {
             let Column::NullableInt64(count_values) = &table.columns()[argument] else {
                 unreachable!("grouped nullable Int64 COUNT shape is resolved")
@@ -10187,13 +10198,16 @@ mod tests {
     fn grouped_bool_count_database(row_count: usize) -> Database {
         let mut database = Database::new();
         database
-            .execute("CREATE TABLE bool_events (id Int64, active Bool);")
+            .execute(
+                "CREATE TABLE bool_events \
+                 (id Int64, score Float64, active Bool, label String);",
+            )
             .expect("grouped Bool COUNT differential setup");
         if row_count > 0 {
             for first_id in (1..=row_count).step_by(50_000) {
                 let last_id = first_id.saturating_add(49_999).min(row_count);
                 let rows = (first_id..=last_id)
-                    .map(|id| format!("({id}, {})", id == 1))
+                    .map(|id| format!("({id}, {id}.0, {}, 'row')", id == 1))
                     .collect::<Vec<_>>()
                     .join(",");
                 database
@@ -10859,7 +10873,8 @@ mod tests {
         assert_eq!(BUDGET.helpers_in_use(), 0);
 
         for unsupported_sql in [
-            "SELECT active, COUNT(active) FROM bool_nullable_events GROUP BY active",
+            "SELECT active, COUNT(active), COUNT(measurement) \
+             FROM bool_nullable_events GROUP BY active",
             "SELECT active, COUNT(measurement), COUNT(*) \
              FROM bool_nullable_events GROUP BY active",
         ] {
@@ -11409,7 +11424,7 @@ mod tests {
 
         let one_group = assert_global_aggregate_worker_differential(
             &mut database,
-            "SELECT active AS enabled, COUNT() AS n FROM bool_events \
+            "SELECT active AS enabled, COUNT(active) AS n FROM bool_events \
              WHERE active = false GROUP BY active",
         );
         assert_eq!(
@@ -11422,7 +11437,7 @@ mod tests {
 
         let two_groups = assert_global_aggregate_worker_differential(
             &mut database,
-            "SELECT active, COUNT(*) FROM bool_events GROUP BY active",
+            "SELECT active, COUNT(id) FROM bool_events GROUP BY active",
         );
         assert_eq!(
             two_groups.rows,
@@ -11438,11 +11453,24 @@ mod tests {
 
         let paged = assert_global_aggregate_worker_differential(
             &mut database,
-            "SELECT active AS enabled, COUNT() AS n FROM bool_events \
+            "SELECT active AS enabled, COUNT(label) AS n FROM bool_events \
              WHERE id > 0 GROUP BY active HAVING n >= 1 \
              ORDER BY n DESC, enabled ASC LIMIT 1 OFFSET 1",
         );
         assert_eq!(paged.rows, [vec![Value::Bool(true), Value::Int64(1)]]);
+
+        let float_count = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT active, COUNT(score) AS n FROM bool_events \
+             WHERE id > 1 GROUP BY active HAVING n > 0 ORDER BY active",
+        );
+        assert_eq!(
+            float_count.rows,
+            [vec![
+                Value::Bool(false),
+                Value::Int64(i64::try_from(row_count - 1).unwrap()),
+            ]]
+        );
     }
 
     #[test]
@@ -11459,7 +11487,7 @@ mod tests {
         let boundary = query(
             &mut database,
             &format!(
-                "SELECT active, COUNT(*) FROM bool_events \
+                "SELECT active, COUNT(id) FROM bool_events \
                  WHERE id <= {} GROUP BY active",
                 GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
             ),
@@ -11471,7 +11499,7 @@ mod tests {
         let above_boundary = query(
             &mut database,
             &format!(
-                "SELECT active, COUNT() FROM bool_events \
+                "SELECT active, COUNT(score) FROM bool_events \
                  WHERE id <= {} GROUP BY active",
                 GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1
             ),
@@ -11480,45 +11508,37 @@ mod tests {
         assert!(BUDGET.peak_helpers_in_use() > 0);
         assert_eq!(BUDGET.helpers_in_use(), 0);
 
-        BUDGET.reset_peak();
-        let unsupported = query(
-            &mut database,
-            "SELECT active, COUNT(active) FROM bool_events GROUP BY active",
-        );
-        assert_eq!(unsupported.rows.len(), 2);
-        assert_eq!(
-            BUDGET.peak_helpers_in_use(),
-            0,
-            "COUNT(column) remains on the sequential grouped path"
-        );
+        for unsupported_sql in [
+            "SELECT label, COUNT(id) FROM bool_events GROUP BY label",
+            "SELECT active, COUNT(id), COUNT(label) FROM bool_events GROUP BY active",
+        ] {
+            let sequential = force_global_aggregate_workers(&mut database, 1, unsupported_sql);
+            database.global_aggregate_parallelism =
+                GlobalAggregateParallelism::budgeted(worker_cap, &BUDGET);
+            BUDGET.reset_peak();
+            let unsupported = query(&mut database, unsupported_sql);
+            assert_eq!(
+                unsupported, sequential,
+                "differential for {unsupported_sql}"
+            );
+            assert_eq!(
+                BUDGET.peak_helpers_in_use(),
+                0,
+                "unsupported grouped shape stays sequential: {unsupported_sql}"
+            );
+        }
 
-        BUDGET.reset_peak();
-        let unsupported = query(
-            &mut database,
-            "SELECT active, COUNT(*), COUNT() FROM bool_events GROUP BY active",
-        );
-        assert_eq!(unsupported.rows.len(), 2);
-        assert_eq!(
-            BUDGET.peak_helpers_in_use(),
-            0,
-            "multiple aggregates remain on the sequential grouped path"
-        );
-
+        let fallback_sql =
+            "SELECT active, COUNT(label) FROM bool_events GROUP BY active ORDER BY active";
+        let sequential = force_global_aggregate_workers(&mut database, 1, fallback_sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(worker_cap, &BUDGET);
         BUDGET.reset_peak();
         let held = BUDGET
             .acquire_for_test(BUDGET.helper_limit())
             .expect("test saturates the helper budget");
-        let exhausted = query(
-            &mut database,
-            "SELECT active, COUNT(*) FROM bool_events GROUP BY active",
-        );
-        assert_eq!(
-            exhausted.rows[0],
-            [
-                Value::Bool(false),
-                Value::Int64(i64::try_from(row_count - 1).unwrap()),
-            ]
-        );
+        let exhausted = query(&mut database, fallback_sql);
+        assert_eq!(exhausted, sequential);
         assert_eq!(
             BUDGET.helpers_in_use(),
             BUDGET.helper_limit(),
@@ -11530,10 +11550,10 @@ mod tests {
         database.query_result_limits.max_groups = 1;
         database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
         let sequential_limit =
-            database.execute("SELECT active, COUNT(*) FROM bool_events GROUP BY active");
+            database.execute("SELECT active, COUNT(id) FROM bool_events GROUP BY active");
         database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
         let parallel_limit =
-            database.execute("SELECT active, COUNT(*) FROM bool_events GROUP BY active");
+            database.execute("SELECT active, COUNT(id) FROM bool_events GROUP BY active");
         assert_eq!(parallel_limit, sequential_limit);
         assert_eq!(
             parallel_limit,
@@ -11550,10 +11570,10 @@ mod tests {
         };
         database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
         let sequential_limit =
-            database.execute("SELECT active, COUNT(*) FROM bool_events GROUP BY active");
+            database.execute("SELECT active, COUNT(id) FROM bool_events GROUP BY active");
         database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
         let parallel_limit =
-            database.execute("SELECT active, COUNT(*) FROM bool_events GROUP BY active");
+            database.execute("SELECT active, COUNT(id) FROM bool_events GROUP BY active");
         assert_eq!(parallel_limit, sequential_limit);
         assert_eq!(
             parallel_limit,
