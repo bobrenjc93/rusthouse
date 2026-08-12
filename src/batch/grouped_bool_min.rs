@@ -6,6 +6,7 @@ use super::global_scalar_extremum::first_float64_minimum;
 
 const INT64_WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-min-int64";
 const FLOAT64_WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-min-float64";
+const BOOL_WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-min-bool";
 
 #[derive(Debug, PartialEq)]
 pub(super) struct Partial<T> {
@@ -94,8 +95,29 @@ pub(super) fn reduce_float64(
     )
 }
 
+pub(super) fn reduce_bool(
+    group_values: &[bool],
+    min_values: &[bool],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+) -> Result<Partial<bool>> {
+    reduce_with_chunk(
+        group_values,
+        min_values,
+        matching_rows,
+        parallelism,
+        BOOL_WORKER_NAME_PREFIX,
+        first_bool_minimum,
+        scan_chunk,
+    )
+}
+
 fn first_i64_minimum(left: i64, right: i64) -> i64 {
     if right < left { right } else { left }
+}
+
+fn first_bool_minimum(left: bool, right: bool) -> bool {
+    left && right
 }
 
 fn reduce_with_chunk<T, M, C>(
@@ -246,5 +268,63 @@ mod tests {
             assert_eq!(partial.minimum(false), f64::MIN);
             assert_eq!(partial.minimum(true).to_bits(), (-0.0_f64).to_bits());
         }
+    }
+
+    #[test]
+    fn bool_worker_failure_repeats_complete_input_for_same_or_different_columns() {
+        let group_values = [true, false, true];
+        let min_values = [true, true, false];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_bool(
+            &group_values,
+            &min_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+        )
+        .expect("deterministic parallel grouped Bool MIN succeeds");
+        let failed_parallel = reduce_with_chunk(
+            &group_values,
+            &min_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            BOOL_WORKER_NAME_PREFIX,
+            first_bool_minimum,
+            |group_values, min_values, rows, first_minimum| {
+                if std::thread::current().name() == Some("rusthouse-group-bool-min-bool-1") {
+                    panic!("injected grouped Bool MIN worker failure");
+                }
+                scan_chunk(group_values, min_values, rows, first_minimum)
+            },
+        )
+        .expect("worker failure falls back to the complete grouped Bool MIN locally");
+
+        let expected = Partial {
+            false_min: Some(true),
+            true_min: Some(false),
+            first_seen: Some(true),
+        };
+        assert_eq!(successful_parallel, expected);
+        assert_eq!(failed_parallel, expected);
+
+        let same_column = reduce_bool(
+            &group_values,
+            &group_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+        )
+        .expect("same-column grouped Bool MIN succeeds");
+        assert_eq!(
+            same_column,
+            Partial {
+                false_min: Some(false),
+                true_min: Some(true),
+                first_seen: Some(true),
+            }
+        );
     }
 }

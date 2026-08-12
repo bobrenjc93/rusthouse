@@ -58,7 +58,7 @@ after a spawn failure or worker panic. The scheduler has no SQL or aggregate-sta
 `batch::grouped_bool_count` module owns the Bool-grouped `COUNT`/`countIf` partial, row-count,
 nullable-column and `countIf` chunk scans, checked ordered reduction, and fixed worker-name prefix;
 physical non-nullable `COUNT(column)` reuses its row-count scan without reading argument values. The
-private `batch::grouped_bool_min` module similarly owns the non-nullable `Int64` and `Float64` `MIN`
+private `batch::grouped_bool_min` module similarly owns the non-nullable `Int64`, `Float64`, and `Bool` `MIN`
 partials, chunk scans, ordered reduction, and fixed worker-name prefixes. The private
 `batch::grouped_bool_max` module owns the corresponding non-nullable `Int64` and `Float64` `MAX`
 reduction boundary. The private
@@ -82,8 +82,9 @@ two-item `COUNT(*)`/`COUNT()` plus `SUM(Int64)`, `AVG(Int64)`, `MIN(Int64)`, or 
 (including physical `Nullable(Int64)`) or plus non-nullable `MIN(Float64)` or `MAX(Float64)`, the
 exact ungrouped `COUNT(nullable_int64_column)` plus `SUM(the_same_column)` or
 `AVG(the_same_column)`, and sole non-nullable `Int64` `SUM` or `AVG` or non-nullable `Int64` or
-`Float64` `MIN` or `MAX` grouped by one physical Bool key over large filtered row sets with scoped
-workers admitted by one process-wide nonblocking budget.
+`Float64` `MIN` or `MAX`, or non-nullable `Bool` `MIN`, grouped by one physical Bool key over large
+filtered row sets with scoped workers admitted by one process-wide nonblocking budget. The Bool
+`MIN` argument may be the grouping key itself or another physical Bool column.
 Nullable COUNT chunks ignore absent values and use checked count reduction; nullable SUM/AVG
 chunks ignore absent values while preserving checked i128 sum and present-count reduction; nullable
 MIN/MAX chunks ignore absent values and reduce optional extrema. The paired shapes reuse the
