@@ -56,7 +56,8 @@ deterministic contiguous partitioning. Its generic grouped-aggregate driver addi
 scoped worker spawning, ordered partial collection, admission release, and complete-input fallback
 after a spawn failure or worker panic. The execution engine retains SQL shape recognition and the
 Bool-grouped `COUNT`/`SUM`/`AVG` partial and reduction semantics, supplying only row-chunk work and a
-thread-name prefix to the scheduler; the scheduler has no SQL or aggregate-state policy.
+thread-name prefix to the scheduler; physical non-nullable `COUNT(column)` reuses the row-count
+chunks without reading argument values. The scheduler has no SQL or aggregate-state policy.
 
 The initial engine remains single-process and single-node. Validated `Int64` range partitions are
 local table metadata used only to prune impossible physical row ranges before the existing exact

@@ -80,10 +80,11 @@ two-item ungrouped projection containing `COUNT(*)` or `COUNT()` plus either
 `SUM(the_same_column)` or `AVG(the_same_column)`, use
 deterministic contiguous chunks when more than 262,144 rows match. A grouped
 query also uses those chunks when it has exactly one non-nullable `Bool`
-grouping column and exactly one `COUNT(*)`, `COUNT()`, or
-`COUNT(physical_nullable_int64_column)` aggregate, or exactly one
-`SUM(physical_non_nullable_int64_column)` or
-`AVG(physical_non_nullable_int64_column)` aggregate. Nullable grouped COUNT
+grouping column and exactly one `COUNT(*)`, `COUNT()`, or `COUNT(column)`
+aggregate, or exactly one `SUM(physical_non_nullable_int64_column)` or
+`AVG(physical_non_nullable_int64_column)` aggregate.
+The `COUNT(column)` argument must be a physical nullable `Int64` column or a
+non-nullable `Int64`, `Float64`, `Bool`, or `String` column. Nullable grouped COUNT
 partials track group row presence separately from present values, so all-NULL
 groups remain visible with a zero count. Bool-grouped SUM/AVG partials maintain
 a checked i128 sum and checked row count for each key, then apply the normal
@@ -124,9 +125,8 @@ reduced directly without
 allocating a partial-results collection. Ordered reduction preserves the first
 occurrence of equal Float64 extrema, including signed zero. A sequential fallback
 preserves the same result when budget or OS workers are unavailable. Inputs at
-or below the threshold, other grouped shapes (including `COUNT` of a
-non-nullable column, nullable or non-Int64 `SUM`, more than one grouping column,
-non-Bool keys, or multiple aggregates), and
+or below the threshold, other grouped shapes (including nullable or non-Int64
+`SUM`, more than one grouping column, non-Bool keys, or multiple aggregates), and
 multi-aggregate projections other than the exact row-count/`SUM(Int64)`, row-count/`AVG(Int64)`,
 row-count/`MIN(Int64)`, row-count/`MIN(Float64)`, row-count/`MAX(Int64)`, or
 row-count/`MAX(Float64)` pairs or same-column nullable `COUNT`/`SUM` and `COUNT`/`AVG` pairs
@@ -878,8 +878,9 @@ all unselected cells and table metadata.
 constructor configure the scan and output limits.
 `Database::with_global_aggregate_worker_cap` and the matching `SharedDatabase`
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
-parallel global aggregates and the narrow Bool-grouped row count, nullable
-integer `COUNT`, or non-nullable Int64 `SUM`/`AVG` shapes. The
+parallel global aggregates and the narrow Bool-grouped row count, `COUNT` of a
+nullable Int64 or physical non-nullable column, or non-nullable Int64
+`SUM`/`AVG` shapes. The
 configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
