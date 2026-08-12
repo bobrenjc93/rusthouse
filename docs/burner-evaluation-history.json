@@ -3697,6 +3697,22 @@
         "eval_c88a7f3d": 95,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:892",
+      "recordedAt": "2026-08-12T18:11:14.723Z",
+      "label": "PR #892",
+      "kind": "leaf",
+      "prNumber": 892,
+      "title": "Extract the global Int64 SUM/AVG reducer",
+      "scores": {
+        "eval_9fbdfec0": 100,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 95,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }

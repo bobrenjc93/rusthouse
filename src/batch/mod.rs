@@ -1,6 +1,7 @@
 //! Bounded, semicolon-delimited SQL batch execution for CLI export formats.
 
 mod aggregate_scheduler;
+mod global_int64_sum_avg;
 mod global_scalar_extremum;
 mod grouped_bool_count;
 mod grouped_bool_max;

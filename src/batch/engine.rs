@@ -12,6 +12,7 @@ use crate::batch::aggregate_scheduler::{GlobalAggregateParallelism, parallel_agg
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
+use crate::batch::global_int64_sum_avg;
 use crate::batch::global_scalar_extremum;
 use crate::batch::grouped_bool_count;
 use crate::batch::grouped_bool_max;
@@ -7089,8 +7090,8 @@ fn execute_grouped<'a>(
                         &aggregate_specs[aggregate_state],
                         parallelism,
                     )?;
-                    present_count = Some(partial.count);
-                    partial.into_state(function)
+                    present_count = Some(partial.count());
+                    finalize_global_int64_sum_avg(partial, function)
                 }
                 (AggregateFunction::Min, DataType::Int64) => min_global_int64(
                     table,
@@ -7361,9 +7362,7 @@ fn execute_grouped_bool_sum_or_avg<'a>(
     let mut aggregates = Vec::with_capacity(group_count);
     let finished_value = |group| {
         let (sum, count) = partial.sum_and_count(group);
-        SumIntPartial { sum, count }
-            .into_state(spec.function)
-            .finish(spec)
+        finalize_int64_sum_and_count(sum, count, spec.function).finish(spec)
     };
     if let Some(first) = partial.first_seen() {
         keys.push(GroupKey::One(ValueRef::Bool(first)));
@@ -7843,12 +7842,6 @@ fn reduce_count_if_counts(partial_counts: Vec<i64>) -> Result<i64> {
     })
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SumIntPartial {
-    sum: i128,
-    count: u64,
-}
-
 fn sum_or_avg_global_int64(
     table: &Table,
     matching_rows: &[usize],
@@ -7861,7 +7854,7 @@ fn sum_or_avg_global_int64(
     ));
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
     global_int64_sum_partial(table, matching_rows, spec, parallelism)
-        .map(|partial| partial.into_state(spec.function))
+        .map(|partial| finalize_global_int64_sum_avg(partial, spec.function))
 }
 
 fn global_int64_sum_partial(
@@ -7869,221 +7862,48 @@ fn global_int64_sum_partial(
     matching_rows: &[usize],
     spec: &AggregateSpec,
     parallelism: GlobalAggregateParallelism,
-) -> Result<SumIntPartial> {
+) -> Result<global_int64_sum_avg::Partial> {
     debug_assert!(matches!(
         spec.function,
         AggregateFunction::Sum | AggregateFunction::Avg
     ));
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
+    let operation = match spec.function {
+        AggregateFunction::Sum => global_int64_sum_avg::Operation::Sum,
+        AggregateFunction::Avg => global_int64_sum_avg::Operation::Avg,
+        _ => unreachable!("only SUM and AVG share Int64 sum/count partials"),
+    };
     match &table.columns()[spec.argument.expect("SUM or AVG argument")] {
-        Column::Int64(values) => reduce_global_int64_sum(
+        Column::Int64(values) => {
+            global_int64_sum_avg::reduce_int64(values, matching_rows, parallelism, operation)
+        }
+        Column::NullableInt64(values) => global_int64_sum_avg::reduce_nullable_int64(
             values,
             matching_rows,
             parallelism,
-            spec.function,
-            sum_int64_chunk,
-        ),
-        Column::NullableInt64(values) => reduce_global_int64_sum(
-            values,
-            matching_rows,
-            parallelism,
-            spec.function,
-            nullable_int64_chunk,
+            operation,
         ),
         _ => unreachable!("SUM or AVG input type and physical nullability are resolved"),
     }
 }
 
-fn reduce_global_int64_sum<T, C>(
-    values: &[T],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
+fn finalize_global_int64_sum_avg(
+    partial: global_int64_sum_avg::Partial,
     function: AggregateFunction,
-    chunk: C,
-) -> Result<SumIntPartial>
-where
-    T: Sync,
-    C: Fn(&[T], &[usize], AggregateFunction) -> Result<SumIntPartial> + Sync,
-{
-    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return chunk(values, matching_rows, function);
-    };
-
-    // As with countIf, every lane receives a deterministic contiguous slice
-    // of the filtered row indices. Partials are reduced in that same order.
-    // A worker failure discards all partials and repeats the complete SUM or
-    // AVG sum/count computation on the query thread after releasing its
-    // process-wide admission.
-    let parallel_result = try_parallel_sum_int64(
-        values,
-        matching_rows,
-        admission.helper_threads(),
-        function,
-        &chunk,
-    );
-    drop(admission);
-    parallel_result.unwrap_or_else(|| chunk(values, matching_rows, function))
+) -> AggregateState {
+    let (sum, count) = partial.sum_and_count();
+    finalize_int64_sum_and_count(sum, count, function)
 }
 
-fn try_parallel_sum_int64<T, C>(
-    values: &[T],
-    matching_rows: &[usize],
-    helper_threads: usize,
+fn finalize_int64_sum_and_count(
+    sum: i128,
+    count: u64,
     function: AggregateFunction,
-    chunk: &C,
-) -> Option<Result<SumIntPartial>>
-where
-    T: Sync,
-    C: Fn(&[T], &[usize], AggregateFunction) -> Result<SumIntPartial> + Sync,
-{
-    debug_assert!(helper_threads > 0);
-    debug_assert!(matches!(
-        function,
-        AggregateFunction::Sum | AggregateFunction::Avg
-    ));
-    let worker_count = helper_threads.saturating_add(1);
-    let thread_label = match function {
-        AggregateFunction::Sum => "sum",
-        AggregateFunction::Avg => "avg",
-        _ => unreachable!("only SUM and AVG share Int64 sum/count workers"),
-    };
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(helper_threads);
-        let mut worker_failed = false;
-        for chunk_index in 1..worker_count {
-            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
-            let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-{thread_label}-int64-{chunk_index}"))
-                .spawn_scoped(scope, move || chunk(values, rows, function));
-            match spawn {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    worker_failed = true;
-                    break;
-                }
-            }
-        }
-
-        let mut partial_results = Vec::with_capacity(worker_count);
-        partial_results.push(chunk(
-            values,
-            parallel_aggregate_partition(matching_rows, worker_count, 0),
-            function,
-        ));
-        for handle in handles {
-            match handle.join() {
-                Ok(result) => partial_results.push(result),
-                Err(_) => worker_failed = true,
-            }
-        }
-        if worker_failed {
-            return None;
-        }
-
-        Some(
-            partial_results
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
-                .and_then(|partials| reduce_sum_int64_partials(partials, function)),
-        )
-    })
-}
-
-fn sum_int64_chunk(
-    values: &[i64],
-    matching_rows: &[usize],
-    function: AggregateFunction,
-) -> Result<SumIntPartial> {
-    matching_rows
-        .iter()
-        .try_fold(SumIntPartial::default(), |partial, row| {
-            Ok(SumIntPartial {
-                sum: partial
-                    .sum
-                    .checked_add(i128::from(values[*row]))
-                    .ok_or_else(|| {
-                        Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
-                    })?,
-                count: partial.count.checked_add(1).ok_or_else(|| {
-                    Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
-                })?,
-            })
-        })
-}
-
-fn nullable_int64_chunk(
-    values: &[Option<i64>],
-    matching_rows: &[usize],
-    function: AggregateFunction,
-) -> Result<SumIntPartial> {
-    debug_assert!(matches!(
-        function,
-        AggregateFunction::Sum | AggregateFunction::Avg
-    ));
-    matching_rows
-        .iter()
-        .try_fold(SumIntPartial::default(), |partial, row| {
-            let Some(value) = values[*row] else {
-                return Ok(partial);
-            };
-            Ok(SumIntPartial {
-                sum: partial.sum.checked_add(i128::from(value)).ok_or_else(|| {
-                    Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
-                })?,
-                count: partial.count.checked_add(1).ok_or_else(|| {
-                    Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
-                })?,
-            })
-        })
-}
-
-fn reduce_sum_int64_partials(
-    partials: Vec<SumIntPartial>,
-    function: AggregateFunction,
-) -> Result<SumIntPartial> {
-    partials
-        .into_iter()
-        .try_fold(SumIntPartial::default(), |total, partial| {
-            Ok(SumIntPartial {
-                sum: total.sum.checked_add(partial.sum).ok_or_else(|| {
-                    Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
-                })?,
-                count: total.count.checked_add(partial.count).ok_or_else(|| {
-                    Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
-                })?,
-            })
-        })
-}
-
-fn int64_sum_overflow_context(function: AggregateFunction) -> &'static str {
+) -> AggregateState {
     match function {
-        AggregateFunction::Sum => "SUM(Int64) exact sum",
-        AggregateFunction::Avg => "AVG(Int64) sum",
+        AggregateFunction::Sum => AggregateState::SumInt { sum, count },
+        AggregateFunction::Avg => AggregateState::AvgInt { sum, count },
         _ => unreachable!("only SUM and AVG share Int64 sum/count partials"),
-    }
-}
-
-fn int64_count_overflow_context(function: AggregateFunction) -> &'static str {
-    match function {
-        AggregateFunction::Sum => "SUM count",
-        AggregateFunction::Avg => "AVG count",
-        _ => unreachable!("only SUM and AVG share Int64 sum/count partials"),
-    }
-}
-
-impl SumIntPartial {
-    fn into_state(self, function: AggregateFunction) -> AggregateState {
-        match function {
-            AggregateFunction::Sum => AggregateState::SumInt {
-                sum: self.sum,
-                count: self.count,
-            },
-            AggregateFunction::Avg => AggregateState::AvgInt {
-                sum: self.sum,
-                count: self.count,
-            },
-            _ => unreachable!("only SUM and AVG share Int64 sum/count partials"),
-        }
     }
 }
 
@@ -12856,49 +12676,6 @@ mod tests {
     }
 
     #[test]
-    fn paired_nullable_int64_sum_worker_failure_repeats_the_complete_input_locally() {
-        let values = [Some(1), None, Some(17)];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        matching_rows[row_count - 1] = 2;
-
-        let successful_parallel = reduce_global_int64_sum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            AggregateFunction::Sum,
-            nullable_int64_chunk,
-        )
-        .expect("deterministic parallel nullable SUM succeeds");
-        let partial = reduce_global_int64_sum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            AggregateFunction::Sum,
-            |values, rows, function| {
-                if std::thread::current().name() == Some("rusthouse-sum-int64-1") {
-                    panic!("injected nullable SUM worker failure");
-                }
-                nullable_int64_chunk(values, rows, function)
-            },
-        )
-        .expect("worker failure falls back to a complete local nullable SUM");
-
-        assert_eq!(partial, successful_parallel);
-        assert_eq!(partial.count, u64::try_from(row_count - 1).unwrap());
-        assert_eq!(
-            partial.sum,
-            i128::try_from(row_count).unwrap().saturating_sub(2) + 17
-        );
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
-        );
-    }
-
-    #[test]
     fn paired_nullable_int64_sum_forced_workers_preserve_resource_limits() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let fixed_bytes = 2_usize.saturating_mul(
@@ -13185,49 +12962,6 @@ mod tests {
         assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
         drop(held);
         assert_eq!(BUDGET.helpers_in_use(), 0);
-    }
-
-    #[test]
-    fn nullable_int64_sum_worker_failure_preserves_same_column_count_partial() {
-        let values = [Some(1), None, Some(17)];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        matching_rows[row_count - 1] = 2;
-
-        let successful_parallel = reduce_global_int64_sum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            AggregateFunction::Sum,
-            nullable_int64_chunk,
-        )
-        .expect("deterministic parallel nullable SUM succeeds");
-        let partial = reduce_global_int64_sum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            AggregateFunction::Sum,
-            |values, rows, function| {
-                if std::thread::current().name() == Some("rusthouse-sum-int64-1") {
-                    panic!("injected nullable SUM worker failure");
-                }
-                nullable_int64_chunk(values, rows, function)
-            },
-        )
-        .expect("worker failure falls back to a complete local nullable SUM");
-
-        assert_eq!(partial, successful_parallel);
-        assert_eq!(partial.count, u64::try_from(row_count - 1).unwrap());
-        assert_eq!(
-            partial.sum,
-            i128::try_from(row_count).unwrap().saturating_sub(2) + 17
-        );
-        assert_eq!(
-            count_present_values(partial.count),
-            Ok(i64::try_from(row_count - 1).unwrap())
-        );
     }
 
     #[test]
@@ -13644,49 +13378,6 @@ mod tests {
     }
 
     #[test]
-    fn nullable_int64_avg_worker_failure_preserves_same_column_count_partial() {
-        let values = [Some(1), None, Some(17)];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        matching_rows[row_count - 1] = 2;
-
-        let successful_parallel = reduce_global_int64_sum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            AggregateFunction::Avg,
-            nullable_int64_chunk,
-        )
-        .expect("deterministic parallel nullable AVG succeeds");
-        let partial = reduce_global_int64_sum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            AggregateFunction::Avg,
-            |values, rows, function| {
-                if std::thread::current().name() == Some("rusthouse-avg-int64-1") {
-                    panic!("injected nullable AVG worker failure");
-                }
-                nullable_int64_chunk(values, rows, function)
-            },
-        )
-        .expect("worker failure falls back to a complete local nullable AVG");
-
-        assert_eq!(partial, successful_parallel);
-        assert_eq!(partial.count, u64::try_from(row_count - 1).unwrap());
-        assert_eq!(
-            partial.sum,
-            i128::try_from(row_count).unwrap().saturating_sub(2) + 17
-        );
-        assert_eq!(
-            count_present_values(partial.count),
-            Ok(i64::try_from(row_count - 1).unwrap())
-        );
-    }
-
-    #[test]
     fn sole_nullable_int64_avg_forced_workers_preserve_resource_limits() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let fixed_bytes =
@@ -14020,38 +13711,6 @@ mod tests {
     }
 
     #[test]
-    fn global_count_sum_int64_worker_failure_repeats_the_complete_pair_locally() {
-        let values = [1, 17];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        let partial = reduce_global_int64_sum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            AggregateFunction::Sum,
-            |values, rows, function| {
-                if std::thread::current().name() == Some("rusthouse-sum-int64-1") {
-                    panic!("injected paired COUNT/SUM worker failure");
-                }
-                sum_int64_chunk(values, rows, function)
-            },
-        )
-        .expect("worker failure falls back to a complete local SUM");
-
-        assert_eq!(partial.count, u64::try_from(row_count).unwrap());
-        assert_eq!(
-            partial.sum,
-            i128::try_from(row_count).unwrap().saturating_sub(1) + 17
-        );
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
-        );
-    }
-
-    #[test]
     fn global_avg_int64_forced_workers_match_empty_null_having_and_pagination() {
         let mut database = avg_int64_database(0, |_| unreachable!("empty input"));
         let first_page = assert_global_aggregate_worker_differential(
@@ -14287,38 +13946,6 @@ mod tests {
         assert!(
             OBSERVED_BUDGET.peak_helpers_in_use() > 0,
             "sole AVG(Int64) grouped by Bool uses the shared helper budget"
-        );
-    }
-
-    #[test]
-    fn global_count_avg_int64_worker_failure_repeats_the_complete_pair_locally() {
-        let values = [1, 17];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        let partial = reduce_global_int64_sum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            AggregateFunction::Avg,
-            |values, rows, function| {
-                if std::thread::current().name() == Some("rusthouse-avg-int64-1") {
-                    panic!("injected paired COUNT/AVG worker failure");
-                }
-                sum_int64_chunk(values, rows, function)
-            },
-        )
-        .expect("worker failure falls back to a complete local AVG");
-
-        assert_eq!(partial.count, u64::try_from(row_count).unwrap());
-        assert_eq!(
-            partial.sum,
-            i128::try_from(row_count).unwrap().saturating_sub(1) + 17
-        );
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
         );
     }
 
@@ -15239,45 +14866,6 @@ mod tests {
         assert_eq!(
             reduce_count_if_counts(vec![i64::MAX, 1]),
             Err(Error::NumericOverflow("countIf".to_owned()))
-        );
-        assert_eq!(
-            reduce_sum_int64_partials(
-                vec![
-                    SumIntPartial {
-                        sum: i128::MAX,
-                        count: 1,
-                    },
-                    SumIntPartial { sum: 1, count: 1 },
-                ],
-                AggregateFunction::Sum,
-            ),
-            Err(Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))
-        );
-        assert_eq!(
-            reduce_sum_int64_partials(
-                vec![
-                    SumIntPartial {
-                        sum: i128::MAX,
-                        count: 1,
-                    },
-                    SumIntPartial { sum: 1, count: 1 },
-                ],
-                AggregateFunction::Avg,
-            ),
-            Err(Error::NumericOverflow("AVG(Int64) sum".to_owned()))
-        );
-        assert_eq!(
-            reduce_sum_int64_partials(
-                vec![
-                    SumIntPartial {
-                        sum: 0,
-                        count: u64::MAX,
-                    },
-                    SumIntPartial { sum: 0, count: 1 },
-                ],
-                AggregateFunction::Avg,
-            ),
-            Err(Error::NumericOverflow("AVG count".to_owned()))
         );
         #[cfg(target_pointer_width = "64")]
         assert_eq!(
