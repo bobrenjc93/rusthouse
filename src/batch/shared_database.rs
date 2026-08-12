@@ -366,8 +366,8 @@ impl From<DatabaseRleSnapshotSaveError> for SharedDatabaseRleSnapshotSaveError {
 /// [`Self::try_ingest_tsv`], [`Self::try_ingest_tsv_with_names`], and
 /// [`Self::try_ingest_json_compact_each_row`] do the same for headerless `CSV`,
 /// `CSVWithNames`, headerless `TabSeparated`, `TabSeparatedWithNames`, and the
-/// one-column `JSONCompactEachRow` subset. Results own their columns and values
-/// and remain valid after the lock is released.
+/// narrow one- or two-column `JSONCompactEachRow` subset. Results own their
+/// columns and values and remain valid after the lock is released.
 ///
 /// A batch passed to [`Self::execute`] is not a rollback transaction: once
 /// parsing succeeds, earlier statements remain applied if a later statement
@@ -1022,7 +1022,8 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
-    /// Atomically ingests bounded one-column `JSONCompactEachRow` bytes under one write lock.
+    /// Atomically ingests bounded one- or two-column `JSONCompactEachRow` bytes
+    /// under one write lock.
     ///
     /// The lock is retained through table lookup, complete UTF-8 and JSON
     /// validation, limit and capacity preflight, WAL commit, and the one final

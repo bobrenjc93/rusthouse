@@ -1599,22 +1599,25 @@ values, configured limits, or remaining table capacity are rejected before any
 row is appended.
 
 `Database::ingest_json_compact_each_row` adds a deliberately narrow,
-dependency-free positional JSON importer for existing one-column `Int64` and
-`Nullable(Int64)` tables. Each physical LF or CRLF record must be a complete
-one-element JSON array such as `[-7]` or `[null]`; JSON whitespace around the
-array and value is accepted. The value must use JSON integer syntax and fit
-exactly in `Int64`. Only nullable targets accept `null`. Empty input appends no
-rows, while empty arrays, wider arrays, floating-point numbers, booleans,
-strings, objects, nested arrays, trailing content, malformed JSON, invalid
-UTF-8, and out-of-range integers are rejected.
+dependency-free positional JSON importer for existing one-column `Int64` or
+`Nullable(Int64)` tables and exactly two-column non-nullable `Int64` tables.
+Each physical LF or CRLF record must be a complete JSON array whose positional
+width matches the target, such as `[-7]`, `[null]`, or `[4,-9]`; JSON whitespace
+around the array and values is accepted. Values must use JSON integer syntax
+and fit exactly in `Int64`. Only a one-column nullable target accepts `null`.
+Empty input appends no rows, while empty or wrong-width arrays, floating-point
+numbers, booleans, strings, objects, nested arrays, trailing content, malformed
+JSON, invalid UTF-8, and out-of-range integers are rejected.
 
 Callers provide complete-input byte, physical-row, and total-value limits.
 RustHouse validates the target shape, the entire input, those limits, and the
 table's remaining row and cell capacity before using the existing Int64 WAL
 commit and one prepared-row append. Thus a malformed late row, capacity error,
-or WAL failure publishes none of the batch. Output from
+or WAL failure publishes none of the batch. The existing WAL remains limited
+to one-column `Int64` and `Nullable(Int64)` tables. Output from
 `write_json_compact_each_row` round-trips directly when its result has one
-compatible column. `SharedDatabase::ingest_json_compact_each_row` holds one
+compatible column or exactly two non-nullable `Int64` columns.
+`SharedDatabase::ingest_json_compact_each_row` holds one
 write lock from lookup through commit; the nonblocking
 `try_ingest_json_compact_each_row` makes one immediate lock attempt and returns
 `DatabaseBusy` before table lookup or input access when contended.

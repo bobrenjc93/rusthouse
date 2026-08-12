@@ -2671,14 +2671,15 @@ impl Database {
         Ok(affected_rows)
     }
 
-    /// Atomically appends bounded, one-column `JSONCompactEachRow` input.
+    /// Atomically appends bounded, narrow `JSONCompactEachRow` input.
     ///
-    /// Each physical line must be one JSON array containing exactly one JSON
-    /// integer. A `Nullable(Int64)` target also accepts JSON `null`; an
-    /// `Int64` target rejects it. The existing target must have exactly one
-    /// physical `Int64` or `Nullable(Int64)` column. JSON whitespace is
-    /// accepted around the array and value, and LF or CRLF records are
-    /// accepted. Empty input appends zero rows.
+    /// The existing target must have either one physical `Int64` or
+    /// `Nullable(Int64)` column, or exactly two non-nullable `Int64` columns.
+    /// Each physical line must be one JSON array with the same width and JSON
+    /// integers in schema order. A one-column `Nullable(Int64)` target also
+    /// accepts JSON `null`; every non-nullable column rejects it. JSON
+    /// whitespace is accepted around the array and values, and LF or CRLF
+    /// records are accepted. Empty input appends zero rows.
     ///
     /// UTF-8, JSON shape, every integer, all configured limits, and remaining
     /// table capacity are validated before the existing WAL and one atomic
