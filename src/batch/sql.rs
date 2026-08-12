@@ -34,6 +34,7 @@ pub const SUPPORTED_FUNCTION_NAMES: &[&str] = &[
     "empty",
     "FLOOR",
     "ifNull",
+    "isNull",
     "LENGTH",
     "lengthUTF8",
     "LOWER",
@@ -392,6 +393,11 @@ pub enum SelectItem {
     IfNullInt64 {
         name: String,
         fallback: i64,
+        alias: Option<String>,
+    },
+    /// Reports whether a physical column cell is absent.
+    IsNull {
+        name: String,
         alias: Option<String>,
     },
     Cast {
@@ -2389,6 +2395,13 @@ impl<'a> Parser<'a> {
                 });
             }
 
+            if name.eq_ignore_ascii_case("isNull") {
+                let name = self.expect_identifier("column in isNull")?;
+                self.expect(&TokenKind::RightParen, "')' after isNull expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::IsNull { name, alias });
+            }
+
             if name.eq_ignore_ascii_case("LENGTH") {
                 let name = self.expect_identifier("String column in LENGTH")?;
                 self.expect(&TokenKind::RightParen, "')' after LENGTH expression")?;
@@ -2570,6 +2583,13 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY ifNull expression",
             )?;
             Ok(if_null_int64_name(&argument, fallback))
+        } else if name.eq_ignore_ascii_case("isNull") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("column in ORDER BY isNull")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY isNull expression",
+            )?;
+            Ok(is_null_name(&argument))
         } else {
             Ok(name)
         }
@@ -3215,6 +3235,10 @@ pub(crate) fn int64_subtraction_name(column: &str, literal: i64) -> String {
 
 pub(crate) fn if_null_int64_name(column: &str, fallback: i64) -> String {
     format!("ifNull({column}, {fallback})")
+}
+
+pub(crate) fn is_null_name(column: &str) -> String {
+    format!("isNull({column})")
 }
 
 #[cfg(test)]

@@ -159,9 +159,9 @@ pub(crate) struct ParameterizedQueryLimits {
 /// A reusable in-memory SQL database.
 ///
 /// Checked `Int64` column-minus-literal expressions, `CAST`, `toString`,
-/// `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`, `ABS`, `ROUND`, `FLOOR`, `CEIL`,
-/// and the minimal unpartitioned `ROW_NUMBER` window forms provide bounded
-/// projections in ungrouped queries.
+/// `ifNull`, `isNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`, `ABS`,
+/// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window
+/// forms provide bounded projections in ungrouped queries.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
@@ -5209,6 +5209,9 @@ enum ResolvedItem {
         source: usize,
         fallback: i64,
     },
+    IsNull {
+        source: usize,
+    },
     CastNullableInt64ToInt64 {
         source: usize,
     },
@@ -5480,6 +5483,22 @@ fn resolve_select_items(
                         sql::if_null_int64_name(&table.schema()[source].name, *fallback)
                     }),
                     data_type: DataType::Int64,
+                });
+            }
+            SelectItem::IsNull { name, alias } => {
+                let source = table.column_index(name)?;
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "isNull projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::IsNull { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| sql::is_null_name(&table.schema()[source].name)),
+                    data_type: DataType::Bool,
                 });
             }
             SelectItem::Cast {
@@ -6012,6 +6031,9 @@ fn execute_projection(
                         ResolvedItem::IfNullInt64 { source, fallback } => {
                             Value::Int64(if_null_int64_at(table, *source, *row, *fallback))
                         }
+                        ResolvedItem::IsNull { source } => {
+                            Value::Bool(is_null_at(table, *source, *row))
+                        }
                         ResolvedItem::CastNullableInt64ToInt64 { source } => {
                             table.columns()[*source].value(*row)
                         }
@@ -6214,6 +6236,7 @@ fn validate_projection_result_limits(
                 } => Some(*source),
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::IfNullInt64 { .. }
+                | ResolvedItem::IsNull { .. }
                 | ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
@@ -6304,6 +6327,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::IfNullInt64 { .. } => {
                     unreachable!("ifNull projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::IsNull { .. } => {
+                    unreachable!("isNull projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
@@ -8099,6 +8125,9 @@ impl GroupedData<'_> {
                         ResolvedItem::IfNullInt64 { .. } => {
                             unreachable!("ifNull projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::IsNull { .. } => {
+                            unreachable!("isNull projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::CastNullableInt64ToInt64 { .. }
                         | ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastBoolToFloat64 { .. }
@@ -8496,6 +8525,7 @@ fn resolved_expression_name(
         ResolvedItem::IfNullInt64 { source, fallback } => {
             sql::if_null_int64_name(&table.schema()[*source].name, *fallback)
         }
+        ResolvedItem::IsNull { source } => sql::is_null_name(&table.schema()[*source].name),
         ResolvedItem::CastNullableInt64ToInt64 { source } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
@@ -8651,6 +8681,9 @@ fn order_source_rows(
                 ResolvedItem::IfNullInt64 { source, fallback } => {
                     if_null_int64_at(table, source, left, fallback)
                         .cmp(&if_null_int64_at(table, source, right, fallback))
+                }
+                ResolvedItem::IsNull { source } => {
+                    is_null_at(table, source, left).cmp(&is_null_at(table, source, right))
                 }
                 ResolvedItem::CastNullableInt64ToInt64 { source } => {
                     table.columns()[source].cmp_at(left, right)
@@ -8912,6 +8945,9 @@ fn order_grouped_rows(
                 ResolvedItem::IfNullInt64 { .. } => {
                     unreachable!("ifNull projections are restricted to ungrouped queries")
                 }
+                ResolvedItem::IsNull { .. } => {
+                    unreachable!("isNull projections are restricted to ungrouped queries")
+                }
                 ResolvedItem::CastNullableInt64ToInt64 { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
@@ -8985,6 +9021,13 @@ fn int64_to_float64_at(table: &Table, source: usize, row: usize) -> ValueRef<'_>
         ValueRef::Null(DataType::Int64) => ValueRef::Null(DataType::Float64),
         _ => unreachable!("CAST input type is resolved"),
     }
+}
+
+fn is_null_at(table: &Table, source: usize, row: usize) -> bool {
+    matches!(
+        table.columns()[source].value_ref(row),
+        ValueRef::Null(DataType::Int64)
+    )
 }
 
 fn int64_to_bool_at(table: &Table, source: usize, row: usize) -> ValueRef<'_> {
