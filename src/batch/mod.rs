@@ -5,6 +5,7 @@ mod global_scalar_extremum;
 mod grouped_bool_count;
 mod grouped_bool_max;
 mod grouped_bool_min;
+mod grouped_bool_sum_avg;
 mod scalar_cast;
 mod scalar_float64;
 mod scalar_nullable_int64;

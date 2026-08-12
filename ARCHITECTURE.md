@@ -54,17 +54,18 @@ cover complete query behavior.
 The private `batch::aggregate_scheduler` module owns process-wide aggregate-worker admission and
 deterministic contiguous partitioning. Its generic grouped-aggregate driver additionally owns
 scoped worker spawning, ordered partial collection, admission release, and complete-input fallback
-after a spawn failure or worker panic. The execution engine retains SQL shape recognition and the
-Bool-grouped `SUM`/`AVG` partial and reduction semantics, supplying only row-chunk work and a
-thread-name prefix to the scheduler. The scheduler has no SQL or aggregate-state policy. The private
+after a spawn failure or worker panic. The scheduler has no SQL or aggregate-state policy. The private
 `batch::grouped_bool_count` module owns the Bool-grouped `COUNT`/`countIf` partial, row-count,
 nullable-column and `countIf` chunk scans, checked ordered reduction, and fixed worker-name prefix;
 physical non-nullable `COUNT(column)` reuses its row-count scan without reading argument values. The
 private `batch::grouped_bool_min` module similarly owns the non-nullable `Int64` `MIN` partial, chunk
 scan, ordered reduction, and fixed worker-name prefix. The private `batch::grouped_bool_max` module
-owns the corresponding non-nullable `Int64` `MAX` reduction boundary. The engine retains SQL
-eligibility, physical column dispatch, grouped resource limits, and result construction, while the
-scheduler continues to own admission, worker lifecycle, and complete-input fallback.
+owns the corresponding non-nullable `Int64` `MAX` reduction boundary. The private
+`batch::grouped_bool_sum_avg` module owns the non-nullable `Int64` `SUM`/`AVG` per-key sum-and-count
+partial, chunk scan, first-seen ordering, mode-specific checked reduction and fixed worker-name
+prefixes. The engine retains SQL eligibility, physical column dispatch, grouped resource limits,
+and typed result construction, while the scheduler continues to own admission, worker lifecycle,
+and complete-input fallback.
 
 The initial engine remains single-process and single-node. Validated `Int64` range partitions are
 local table metadata used only to prune impossible physical row ranges before the existing exact
