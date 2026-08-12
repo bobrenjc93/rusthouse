@@ -396,6 +396,8 @@ pub struct Select {
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
+    /// Canonical group-key names. The parser stores the one supported
+    /// expression as `CAST(<column> AS Int64)` in this existing string shape.
     pub group_by: Vec<String>,
     pub having: Option<Having>,
     pub order_by: Vec<OrderBy>,
@@ -2222,7 +2224,7 @@ impl<'a> Parser<'a> {
             self.expect_keyword("BY")?;
             loop {
                 self.reserve_ast_list_item()?;
-                group_by.push(self.expect_identifier("GROUP BY column")?);
+                group_by.push(self.parse_group_by_expr()?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -2682,6 +2684,19 @@ impl<'a> Parser<'a> {
         } else {
             Ok(name)
         }
+    }
+
+    fn parse_group_by_expr(&mut self) -> Result<String> {
+        let expression = self.expect_identifier("GROUP BY column or CAST expression")?;
+        if !expression.eq_ignore_ascii_case("CAST") || !self.eat(&TokenKind::LeftParen) {
+            return Ok(expression);
+        }
+
+        let name = self.expect_identifier("column in GROUP BY CAST")?;
+        self.expect_keyword("AS")?;
+        let target_type = self.parse_column_cast_target_type()?;
+        self.expect(&TokenKind::RightParen, "')' after GROUP BY CAST expression")?;
+        Ok(format!("CAST({name} AS {target_type})"))
     }
 
     fn parse_column_cast_target_type(&mut self) -> Result<DataType> {

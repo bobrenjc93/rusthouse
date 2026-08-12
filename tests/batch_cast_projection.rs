@@ -149,6 +149,16 @@ fn parses_cast_as_a_bounded_select_item_with_an_optional_alias() {
     );
     assert_eq!(select.order_by[0].name, "CAST(reading AS String)");
 
+    let statements = parse(
+        "SELECT CAST(reading AS Int64), COUNT(*) FROM samples \
+         GROUP BY cast(reading as int64)",
+    )
+    .expect("valid bounded GROUP BY CAST expression");
+    let Statement::Select(select) = &statements[0] else {
+        panic!("expected SELECT");
+    };
+    assert_eq!(select.group_by, ["CAST(reading AS Int64)"]);
+
     let limits = BatchSqlLimits {
         max_ast_list_items: 1,
         ..BatchSqlLimits::default()
@@ -160,6 +170,24 @@ fn parses_cast_as_a_bounded_select_item_with_an_optional_alias() {
             "SELECT CAST(reading AS Float64), reading FROM samples",
             limits,
         ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SQL AST list items",
+            actual: 2,
+            max: 1,
+        })
+    );
+
+    let grouped_sql = "SELECT CAST(reading AS Int64) FROM samples GROUP BY CAST(reading AS Int64)";
+    parse_with_limits(
+        grouped_sql,
+        BatchSqlLimits {
+            max_ast_list_items: 2,
+            ..BatchSqlLimits::default()
+        },
+    )
+    .expect("one projection and one GROUP BY CAST fit the AST list bound");
+    assert_eq!(
+        parse_with_limits(grouped_sql, limits),
         Err(Error::ResourceLimitExceeded {
             resource: "SQL AST list items",
             actual: 2,
@@ -1016,7 +1044,8 @@ fn grouped_nullable_int64_identity_cast_projects_retained_keys() {
         &mut database,
         "SELECT CAST(value AS Int64) AS original, COUNT(*) AS rows, \
                 MIN(value) AS minimum, MAX(value) AS maximum \
-         FROM readings GROUP BY value HAVING rows >= 1 ORDER BY original",
+         FROM readings GROUP BY CAST(value AS Int64) \
+         HAVING rows >= 1 ORDER BY original",
     );
     assert_eq!(
         grouped.columns,
@@ -1079,7 +1108,7 @@ fn grouped_nullable_int64_identity_cast_projects_retained_keys() {
         query(
             &mut database,
             "SELECT COUNT(*) AS rows, CAST(value AS Int64) AS original \
-             FROM readings GROUP BY value HAVING rows >= 2 \
+             FROM readings GROUP BY CAST(value AS Int64) HAVING rows >= 2 \
              ORDER BY CAST(value AS Int64) DESC LIMIT 1 OFFSET 1",
         )
         .rows,
@@ -1088,7 +1117,8 @@ fn grouped_nullable_int64_identity_cast_projects_retained_keys() {
     assert_eq!(
         query(
             &mut database,
-            "SELECT CAST(value AS Int64), COUNT(*) FROM all_null GROUP BY value",
+            "SELECT CAST(value AS Int64), COUNT(*) FROM all_null \
+             GROUP BY CAST(value AS Int64)",
         )
         .rows,
         [vec![Value::Null(DataType::Int64), Value::Int64(3)]]
@@ -1113,7 +1143,7 @@ fn grouped_identity_casts_both_columns_of_an_all_nullable_table() {
             &mut database,
             "SELECT CAST(primary_value AS Int64) AS primary_key, \
                     CAST(backup_value AS Int64) AS backup_key, COUNT(*) AS rows \
-             FROM readings GROUP BY primary_value, backup_value \
+             FROM readings GROUP BY CAST(primary_value AS Int64), backup_value \
              ORDER BY primary_key, backup_key",
         )
         .rows,
@@ -1139,7 +1169,7 @@ fn grouped_identity_casts_both_columns_of_an_all_nullable_table() {
 }
 
 #[test]
-fn grouped_nullable_int64_identity_cast_rejects_ungrouped_sources_and_expression_grouping() {
+fn grouped_nullable_int64_identity_cast_rejects_unsupported_and_duplicate_group_keys() {
     let mut database = Database::new();
     database
         .execute(
@@ -1162,9 +1192,48 @@ fn grouped_nullable_int64_identity_cast_rejects_ungrouped_sources_and_expression
         );
     }
 
-    assert!(
-        parse("SELECT CAST(value AS Int64) FROM readings GROUP BY CAST(value AS Int64)").is_err()
-    );
+    for sql in [
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value AS Float64)",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value AS Bool)",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value AS String)",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(id AS Int64)",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::InvalidQuery(
+                "GROUP BY CAST only supports CAST(Nullable(Int64) AS Int64)".to_owned()
+            )),
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        "SELECT COUNT(*) FROM readings GROUP BY value, CAST(value AS Int64)",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value AS Int64), value",
+        "SELECT COUNT(*) FROM readings \
+         GROUP BY CAST(value AS Int64), CAST(value AS Int64)",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::InvalidQuery(
+                "GROUP BY column 'value' is listed more than once".to_owned()
+            )),
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        "SELECT COUNT(*) FROM readings GROUP BY CAST()",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value)",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value AS)",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value AS Int64",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value AS Int64, other)",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(value AS Int64) AS key",
+        "SELECT COUNT(*) FROM readings GROUP BY CAST(CAST(value AS Int64) AS Int64)",
+        "SELECT COUNT(*) FROM readings GROUP BY ifNull(value, 0)",
+    ] {
+        assert!(parse(sql).is_err(), "{sql}");
+    }
 }
 
 #[test]
@@ -1177,7 +1246,8 @@ fn grouped_nullable_int64_identity_cast_obeys_result_and_group_limits() {
         + std::mem::size_of::<Vec<Value>>()
         + std::mem::size_of::<Value>();
     let paginated = "SELECT CAST(value AS Int64) AS original FROM readings \
-                     GROUP BY value ORDER BY original DESC LIMIT 1";
+                     GROUP BY CAST(value AS Int64) \
+                     ORDER BY original DESC LIMIT 1";
     let exact_limits = QueryResultLimits {
         max_rows: 1,
         max_values: 1,
@@ -1188,7 +1258,10 @@ fn grouped_nullable_int64_identity_cast_obeys_result_and_group_limits() {
     exact.execute(setup).expect("setup");
     assert_eq!(query(&mut exact, paginated).rows, [vec![Value::Int64(1)]]);
     assert_eq!(
-        exact.execute("SELECT CAST(value AS Int64) AS original FROM readings GROUP BY value",),
+        exact.execute(
+            "SELECT CAST(value AS Int64) AS original FROM readings \
+             GROUP BY CAST(value AS Int64)",
+        ),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT result rows",
             actual: 3,
