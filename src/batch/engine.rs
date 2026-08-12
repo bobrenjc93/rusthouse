@@ -7246,6 +7246,7 @@ fn execute_grouped_bool_count<'a>(
                 group_values,
                 matching_rows,
                 parallelism,
+                spec.function,
                 grouped_bool_count_chunk,
             )?,
             (Some(argument), Some(input_type))
@@ -7261,6 +7262,7 @@ fn execute_grouped_bool_count<'a>(
                     group_values,
                     matching_rows,
                     parallelism,
+                    spec.function,
                     grouped_bool_count_chunk,
                 )?
             }
@@ -7272,8 +7274,14 @@ fn execute_grouped_bool_count<'a>(
                     group_values,
                     matching_rows,
                     parallelism,
-                    |group_values, rows| {
-                        grouped_bool_nullable_int64_count_chunk(group_values, count_values, rows)
+                    spec.function,
+                    |group_values, rows, function| {
+                        grouped_bool_nullable_int64_count_chunk(
+                            group_values,
+                            count_values,
+                            rows,
+                            function,
+                        )
                     },
                 )?
             }
@@ -7290,7 +7298,10 @@ fn execute_grouped_bool_count<'a>(
                 group_values,
                 matching_rows,
                 parallelism,
-                |group_values, rows| grouped_bool_count_if_chunk(group_values, count_values, rows),
+                spec.function,
+                |group_values, rows, function| {
+                    grouped_bool_count_if_chunk(group_values, count_values, rows, function)
+                },
             )?
         }
         _ => unreachable!("grouped Bool count shape is resolved"),
@@ -7467,7 +7478,11 @@ impl GroupedBoolCountPartial {
         }
     }
 
-    fn observe(&mut self, value: bool, counted: bool) -> Result<()> {
+    fn observe(&mut self, value: bool, counted: bool, function: AggregateFunction) -> Result<()> {
+        debug_assert!(matches!(
+            function,
+            AggregateFunction::Count | AggregateFunction::CountIf
+        ));
         self.first_seen.get_or_insert(value);
         let rows = if value {
             &mut self.true_rows
@@ -7476,7 +7491,7 @@ impl GroupedBoolCountPartial {
         };
         *rows = rows
             .checked_add(1)
-            .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+            .ok_or_else(|| Error::NumericOverflow(function.name().to_owned()))?;
         if counted {
             let count = if value {
                 &mut self.true_count
@@ -7485,7 +7500,7 @@ impl GroupedBoolCountPartial {
             };
             *count = count
                 .checked_add(1)
-                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+                .ok_or_else(|| Error::NumericOverflow(function.name().to_owned()))?;
         }
         Ok(())
     }
@@ -7495,18 +7510,23 @@ fn reduce_grouped_bool_count<C>(
     values: &[bool],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
+    function: AggregateFunction,
     chunk: C,
 ) -> Result<GroupedBoolCountPartial>
 where
-    C: Fn(&[bool], &[usize]) -> Result<GroupedBoolCountPartial> + Sync,
+    C: Fn(&[bool], &[usize], AggregateFunction) -> Result<GroupedBoolCountPartial> + Sync,
 {
+    debug_assert!(matches!(
+        function,
+        AggregateFunction::Count | AggregateFunction::CountIf
+    ));
     reduce_grouped_bool(
         values,
         matching_rows,
         parallelism,
         "rusthouse-group-bool-count",
-        chunk,
-        reduce_grouped_bool_count_partials,
+        |values, rows| chunk(values, rows, function),
+        |partials| reduce_grouped_bool_count_partials(partials, function),
     )
 }
 
@@ -7535,11 +7555,12 @@ where
 fn grouped_bool_count_chunk(
     values: &[bool],
     matching_rows: &[usize],
+    function: AggregateFunction,
 ) -> Result<GroupedBoolCountPartial> {
     let mut partial = GroupedBoolCountPartial::default();
     for row in matching_rows {
         let value = values[*row];
-        partial.observe(value, true)?;
+        partial.observe(value, true, function)?;
     }
     Ok(partial)
 }
@@ -7548,10 +7569,11 @@ fn grouped_bool_nullable_int64_count_chunk(
     group_values: &[bool],
     count_values: &[Option<i64>],
     matching_rows: &[usize],
+    function: AggregateFunction,
 ) -> Result<GroupedBoolCountPartial> {
     let mut partial = GroupedBoolCountPartial::default();
     for row in matching_rows {
-        partial.observe(group_values[*row], count_values[*row].is_some())?;
+        partial.observe(group_values[*row], count_values[*row].is_some(), function)?;
     }
     Ok(partial)
 }
@@ -7560,17 +7582,23 @@ fn grouped_bool_count_if_chunk(
     group_values: &[bool],
     count_values: &[bool],
     matching_rows: &[usize],
+    function: AggregateFunction,
 ) -> Result<GroupedBoolCountPartial> {
     let mut partial = GroupedBoolCountPartial::default();
     for row in matching_rows {
-        partial.observe(group_values[*row], count_values[*row])?;
+        partial.observe(group_values[*row], count_values[*row], function)?;
     }
     Ok(partial)
 }
 
 fn reduce_grouped_bool_count_partials(
     partials: Vec<GroupedBoolCountPartial>,
+    function: AggregateFunction,
 ) -> Result<GroupedBoolCountPartial> {
+    debug_assert!(matches!(
+        function,
+        AggregateFunction::Count | AggregateFunction::CountIf
+    ));
     partials
         .into_iter()
         .try_fold(GroupedBoolCountPartial::default(), |mut total, partial| {
@@ -7580,19 +7608,19 @@ fn reduce_grouped_bool_count_partials(
             total.false_rows = total
                 .false_rows
                 .checked_add(partial.false_rows)
-                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+                .ok_or_else(|| Error::NumericOverflow(function.name().to_owned()))?;
             total.true_rows = total
                 .true_rows
                 .checked_add(partial.true_rows)
-                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+                .ok_or_else(|| Error::NumericOverflow(function.name().to_owned()))?;
             total.false_count = total
                 .false_count
                 .checked_add(partial.false_count)
-                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+                .ok_or_else(|| Error::NumericOverflow(function.name().to_owned()))?;
             total.true_count = total
                 .true_count
                 .checked_add(partial.true_count)
-                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+                .ok_or_else(|| Error::NumericOverflow(function.name().to_owned()))?;
             Ok(total)
         })
 }
@@ -10855,8 +10883,9 @@ mod tests {
             &group_values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
-            |group_values, rows| {
-                grouped_bool_nullable_int64_count_chunk(group_values, &count_values, rows)
+            AggregateFunction::Count,
+            |group_values, rows, function| {
+                grouped_bool_nullable_int64_count_chunk(group_values, &count_values, rows, function)
             },
         )
         .expect("deterministic parallel grouped nullable COUNT succeeds");
@@ -10864,11 +10893,12 @@ mod tests {
             &group_values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
-            |group_values, rows| {
+            AggregateFunction::Count,
+            |group_values, rows, function| {
                 if std::thread::current().name() == Some("rusthouse-group-bool-count-1") {
                     panic!("injected grouped nullable COUNT worker failure");
                 }
-                grouped_bool_nullable_int64_count_chunk(group_values, &count_values, rows)
+                grouped_bool_nullable_int64_count_chunk(group_values, &count_values, rows, function)
             },
         )
         .expect("worker failure falls back to a complete local grouped nullable COUNT");
@@ -11890,6 +11920,7 @@ mod tests {
             &values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
+            AggregateFunction::Count,
             grouped_bool_count_chunk,
         )
         .expect("deterministic parallel grouping succeeds");
@@ -11898,11 +11929,12 @@ mod tests {
             &values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
-            |values, rows| {
+            AggregateFunction::Count,
+            |values, rows, function| {
                 if std::thread::current().name() == Some("rusthouse-group-bool-count-1") {
                     panic!("injected grouped Bool COUNT worker failure");
                 }
-                grouped_bool_count_chunk(values, rows)
+                grouped_bool_count_chunk(values, rows, function)
             },
         )
         .expect("worker failure falls back to complete local grouping");
@@ -12024,18 +12056,22 @@ mod tests {
             &group_values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
-            |group_values, rows| grouped_bool_count_if_chunk(group_values, &count_values, rows),
+            AggregateFunction::CountIf,
+            |group_values, rows, function| {
+                grouped_bool_count_if_chunk(group_values, &count_values, rows, function)
+            },
         )
         .expect("deterministic parallel grouped countIf succeeds");
         let failed_parallel = reduce_grouped_bool_count(
             &group_values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
-            |group_values, rows| {
+            AggregateFunction::CountIf,
+            |group_values, rows, function| {
                 if std::thread::current().name() == Some("rusthouse-group-bool-count-1") {
                     panic!("injected grouped countIf worker failure");
                 }
-                grouped_bool_count_if_chunk(group_values, &count_values, rows)
+                grouped_bool_count_if_chunk(group_values, &count_values, rows, function)
             },
         )
         .expect("worker failure falls back to a complete local grouped countIf");
@@ -12049,6 +12085,94 @@ mod tests {
         };
         assert_eq!(successful_parallel, expected);
         assert_eq!(failed_parallel, expected);
+    }
+
+    #[test]
+    fn grouped_bool_count_if_chunk_overflow_reports_count_if() {
+        let error = reduce_grouped_bool_count(
+            &[true],
+            &[0],
+            GlobalAggregateParallelism::fixed(1),
+            AggregateFunction::CountIf,
+            |_, _, function| {
+                let mut partial = GroupedBoolCountPartial {
+                    true_count: i64::MAX,
+                    ..GroupedBoolCountPartial::default()
+                };
+                partial.observe(true, true, function)?;
+                Ok(partial)
+            },
+        );
+
+        assert_eq!(
+            error,
+            Err(Error::NumericOverflow("countIf".to_owned())),
+            "a synthetic sequential chunk needs no enormous input allocation"
+        );
+    }
+
+    #[test]
+    fn grouped_bool_count_if_cross_partial_overflows_report_count_if() {
+        for partials in [
+            vec![
+                GroupedBoolCountPartial {
+                    false_rows: i64::MAX,
+                    first_seen: Some(false),
+                    ..GroupedBoolCountPartial::default()
+                },
+                GroupedBoolCountPartial {
+                    false_rows: 1,
+                    first_seen: Some(false),
+                    ..GroupedBoolCountPartial::default()
+                },
+            ],
+            vec![
+                GroupedBoolCountPartial {
+                    true_count: i64::MAX,
+                    first_seen: Some(true),
+                    ..GroupedBoolCountPartial::default()
+                },
+                GroupedBoolCountPartial {
+                    true_count: 1,
+                    first_seen: Some(true),
+                    ..GroupedBoolCountPartial::default()
+                },
+            ],
+        ] {
+            assert_eq!(
+                reduce_grouped_bool_count_partials(partials, AggregateFunction::CountIf),
+                Err(Error::NumericOverflow("countIf".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_bool_count_overflows_still_report_count() {
+        let mut partial = GroupedBoolCountPartial {
+            true_count: i64::MAX,
+            ..GroupedBoolCountPartial::default()
+        };
+        assert_eq!(
+            partial.observe(true, true, AggregateFunction::Count),
+            Err(Error::NumericOverflow("COUNT".to_owned()))
+        );
+
+        assert_eq!(
+            reduce_grouped_bool_count_partials(
+                vec![
+                    GroupedBoolCountPartial {
+                        false_count: i64::MAX,
+                        ..GroupedBoolCountPartial::default()
+                    },
+                    GroupedBoolCountPartial {
+                        false_count: 1,
+                        ..GroupedBoolCountPartial::default()
+                    },
+                ],
+                AggregateFunction::Count,
+            ),
+            Err(Error::NumericOverflow("COUNT".to_owned()))
+        );
     }
 
     #[test]
