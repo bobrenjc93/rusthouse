@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 #[cfg(test)]
 use crate::batch::aggregate_scheduler::TestGlobalAggregateWorkerBudget as GlobalAggregateWorkerBudget;
-use crate::batch::aggregate_scheduler::{GlobalAggregateParallelism, parallel_aggregate_partition};
+use crate::batch::aggregate_scheduler::{
+    GlobalAggregateParallelism, parallel_aggregate_partition, run_grouped_aggregate,
+};
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
@@ -7396,7 +7398,7 @@ where
         values,
         matching_rows,
         parallelism,
-        "count",
+        "rusthouse-group-bool-count",
         chunk,
         reduce_grouped_bool_count_partials,
     )
@@ -7406,7 +7408,7 @@ fn reduce_grouped_bool<P, C, R>(
     values: &[bool],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
+    worker_name_prefix: &'static str,
     chunk: C,
     reduce: R,
 ) -> Result<P>
@@ -7415,80 +7417,13 @@ where
     C: Fn(&[bool], &[usize]) -> Result<P> + Sync,
     R: Fn(Vec<P>) -> Result<P>,
 {
-    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return chunk(values, matching_rows);
-    };
-
-    // Lanes receive deterministic contiguous slices of the already-filtered
-    // row indices. Reducing them in partition order preserves the first-seen
-    // Bool key. A failed spawn or panic discards every partial and repeats the
-    // complete grouping locally after releasing shared admission.
-    let parallel_result = try_parallel_grouped_bool(
-        values,
+    run_grouped_aggregate(
         matching_rows,
-        admission.helper_threads(),
-        worker_label,
-        &chunk,
+        parallelism,
+        worker_name_prefix,
+        |rows| chunk(values, rows),
         reduce,
-    );
-    drop(admission);
-    parallel_result.unwrap_or_else(|| chunk(values, matching_rows))
-}
-
-fn try_parallel_grouped_bool<P, C, R>(
-    values: &[bool],
-    matching_rows: &[usize],
-    helper_threads: usize,
-    worker_label: &'static str,
-    chunk: &C,
-    reduce: R,
-) -> Option<Result<P>>
-where
-    P: Send,
-    C: Fn(&[bool], &[usize]) -> Result<P> + Sync,
-    R: Fn(Vec<P>) -> Result<P>,
-{
-    debug_assert!(helper_threads > 0);
-    let worker_count = helper_threads.saturating_add(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(helper_threads);
-        let mut worker_failed = false;
-        for chunk_index in 1..worker_count {
-            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
-            let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-group-bool-{worker_label}-{chunk_index}"))
-                .spawn_scoped(scope, move || chunk(values, rows));
-            match spawn {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    worker_failed = true;
-                    break;
-                }
-            }
-        }
-
-        let mut partials = Vec::with_capacity(worker_count);
-        partials.push(chunk(
-            values,
-            parallel_aggregate_partition(matching_rows, worker_count, 0),
-        ));
-        for handle in handles {
-            match handle.join() {
-                Ok(partial) => partials.push(partial),
-                Err(_) => worker_failed = true,
-            }
-        }
-        if worker_failed {
-            return None;
-        }
-
-        Some(
-            partials
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
-                .and_then(reduce),
-        )
-    })
+    )
 }
 
 fn grouped_bool_count_chunk(
@@ -7610,7 +7545,7 @@ where
         group_values,
         matching_rows,
         parallelism,
-        "sum-int64",
+        "rusthouse-group-bool-sum-int64",
         |group_values, rows| chunk(group_values, sum_values, rows),
         reduce_grouped_bool_sum_partials,
     )
