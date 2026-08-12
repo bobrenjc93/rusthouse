@@ -614,11 +614,14 @@ non-nullable `Int64`, `Float64`, `Bool`, and `String` columns return `false`.
 It accepts an optional `AS alias`; otherwise, the result is named
 `isNull(<column>)`. `WHERE` filters rows first, ordering by either the
 normalized expression or its alias uses the Boolean result with stable ties,
-and `LIMIT`/`OFFSET` pagination precedes materialization. The function is
-restricted to ungrouped scalar queries and cannot be combined with aggregates
-or `GROUP BY`. Its fixed-size `Bool` output adds no variable payload, while all
-normal scan, result row, value, byte, retained-result, and formatted-output
-bounds continue to apply.
+and `LIMIT`/`OFFSET` pagination precedes materialization. In a grouped query,
+the physical argument column must appear in `GROUP BY`; `isNull` may then be
+projected alongside that key and aggregates, with normal `HAVING` and group
+ordering semantics. Expression-based grouping such as `GROUP BY isNull(value)`
+remains unsupported, and source columns absent from `GROUP BY` are rejected.
+Its fixed-size `Bool` output adds no variable payload, while all normal scan,
+group working-state, result row, value, byte, retained-result, and
+formatted-output bounds continue to apply.
 `LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
