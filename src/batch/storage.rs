@@ -756,6 +756,27 @@ impl Table {
         Ok(table)
     }
 
+    /// Builds an empty, fully validated table with exactly two physical
+    /// nullable `Int64` columns.
+    pub(crate) fn with_two_nullable_int64_columns(
+        name: String,
+        column_names: [String; 2],
+        limits: TableLimits,
+    ) -> Result<Self> {
+        let schema = column_names
+            .map(|name| ColumnDef {
+                name,
+                data_type: DataType::Int64,
+            })
+            .into();
+        let mut table = Self::with_limits(name, schema, limits)?;
+        table.columns = vec![
+            Column::NullableInt64(Vec::new()),
+            Column::NullableInt64(Vec::new()),
+        ];
+        Ok(table)
+    }
+
     /// Builds a fully validated one-column table and its range-pruning metadata.
     pub(crate) fn with_int64_range_partitions(
         name: String,

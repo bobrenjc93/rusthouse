@@ -1457,10 +1457,19 @@ impl Database {
             };
         }
 
-        let mut table = Table::with_limits(name, columns, self.table_limits)?;
-        for nullable_column in nullable_columns {
-            table.add_nullable_int64_column(nullable_column)?;
-        }
+        let nullable_columns = nullable_columns.into_iter().collect::<Vec<_>>();
+        let table = if columns.is_empty() && nullable_columns.len() == 2 {
+            let nullable_columns = nullable_columns
+                .try_into()
+                .expect("the two-column nullable CREATE shape has exactly two columns");
+            Table::with_two_nullable_int64_columns(name, nullable_columns, self.table_limits)?
+        } else {
+            let mut table = Table::with_limits(name, columns, self.table_limits)?;
+            for nullable_column in nullable_columns {
+                table.add_nullable_int64_column(nullable_column)?;
+            }
+            table
+        };
         let measurements = TableMeasurements::read(&table);
         self.catalog.register_table(table)?;
         self.measurements.add(measurements);
@@ -4827,12 +4836,10 @@ fn show_create_column_count(table: &Table) -> usize {
         return table.schema().len();
     };
     let nullable_suffix = &table.columns()[first_nullable..];
-    let supported_nullable_shape = (first_nullable == 0 && table.schema().len() == 1)
-        || (first_nullable > 0
-            && nullable_suffix.len() <= 2
-            && nullable_suffix
-                .iter()
-                .all(|column| matches!(column, Column::NullableInt64(_))));
+    let supported_nullable_shape = nullable_suffix.len() <= 2
+        && nullable_suffix
+            .iter()
+            .all(|column| matches!(column, Column::NullableInt64(_)));
     if supported_nullable_shape && table.schema().len() <= sql::DEFAULT_MAX_AST_LIST_ITEMS {
         table.schema().len()
     } else {
@@ -4855,8 +4862,7 @@ fn show_create_statement_count_after_addition(table: &Table, added_nullable: boo
         .iter()
         .all(|column| matches!(column, Column::NullableInt64(_)));
     let resulting_suffix_is_nullable = existing_suffix_is_nullable && added_nullable;
-    let supported_nullable_shape = (first_nullable == 0 && resulting_columns == 1)
-        || (first_nullable > 0 && nullable_suffix_len <= 2 && resulting_suffix_is_nullable);
+    let supported_nullable_shape = nullable_suffix_len <= 2 && resulting_suffix_is_nullable;
     if supported_nullable_shape && resulting_columns <= sql::DEFAULT_MAX_AST_LIST_ITEMS {
         1
     } else {
