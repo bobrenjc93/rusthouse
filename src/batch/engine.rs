@@ -7444,7 +7444,7 @@ fn execute_grouped_bool_max<'a>(
         AggregateSpec {
             function: AggregateFunction::Max,
             argument: Some(value_column),
-            input_type: Some(DataType::Int64),
+            input_type: Some(input_type),
         },
     ] = aggregate_specs
     else {
@@ -7453,31 +7453,73 @@ fn execute_grouped_bool_max<'a>(
     let Column::Bool(group_values) = &table.columns()[*group_column] else {
         return Ok(None);
     };
-    let Column::Int64(values) = &table.columns()[*value_column] else {
-        return Ok(None);
+
+    let (first_seen, false_max, true_max) = match (&table.columns()[*value_column], input_type) {
+        (Column::Int64(values), DataType::Int64) => {
+            let partial =
+                grouped_bool_max::reduce(group_values, values, matching_rows, parallelism)?;
+            (
+                partial.first_seen(),
+                partial
+                    .present(false)
+                    .then(|| Value::Int64(partial.maximum(false))),
+                partial
+                    .present(true)
+                    .then(|| Value::Int64(partial.maximum(true))),
+            )
+        }
+        (Column::Float64(values), DataType::Float64) => {
+            let partial =
+                grouped_bool_max::reduce_float64(group_values, values, matching_rows, parallelism)?;
+            (
+                partial.first_seen(),
+                partial
+                    .present(false)
+                    .then(|| Value::Float64(partial.maximum(false))),
+                partial
+                    .present(true)
+                    .then(|| Value::Float64(partial.maximum(true))),
+            )
+        }
+        _ => return Ok(None),
     };
 
-    let partial = grouped_bool_max::reduce(group_values, values, matching_rows, parallelism)?;
-    let group_count = usize::from(partial.present(false)) + usize::from(partial.present(true));
+    Ok(Some(finish_grouped_bool_max(
+        first_seen, false_max, true_max, limits,
+    )?))
+}
+
+fn finish_grouped_bool_max<'a>(
+    first_seen: Option<bool>,
+    false_max: Option<Value>,
+    true_max: Option<Value>,
+    limits: QueryResultLimits,
+) -> Result<GroupedData<'a>> {
+    let group_count = usize::from(false_max.is_some()) + usize::from(true_max.is_some());
     enforce_grouped_bool_limits(group_count, limits)?;
 
+    let mut maxima = [false_max, true_max];
     let mut keys = Vec::with_capacity(group_count);
     let mut maximums = Vec::with_capacity(group_count);
-    if let Some(first) = partial.first_seen() {
+    if let Some(first) = first_seen {
         keys.push(GroupKey::One(ValueRef::Bool(first)));
-        maximums.push(Value::Int64(partial.maximum(first)));
+        maximums.push(
+            maxima[usize::from(first)]
+                .take()
+                .expect("the first-seen Bool MAX group has a value"),
+        );
         let second = !first;
-        if partial.present(second) {
+        if let Some(maximum) = maxima[usize::from(second)].take() {
             keys.push(GroupKey::One(ValueRef::Bool(second)));
-            maximums.push(Value::Int64(partial.maximum(second)));
+            maximums.push(maximum);
         }
     }
     debug_assert_eq!(keys.len(), group_count);
     debug_assert_eq!(maximums.len(), group_count);
-    Ok(Some(GroupedData {
+    Ok(GroupedData {
         keys,
         aggregates: vec![maximums],
-    }))
+    })
 }
 
 fn enforce_grouped_bool_limits(group_count: usize, limits: QueryResultLimits) -> Result<()> {
@@ -10181,6 +10223,36 @@ mod tests {
         database
     }
 
+    fn grouped_bool_float64_max_database(
+        row_count: usize,
+        row_values: impl Fn(usize) -> (f64, bool, bool),
+    ) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE bool_float_max_events \
+                 (id Int64, value Float64, active Bool, included Bool);",
+            )
+            .expect("grouped Bool Float64 MAX differential setup");
+        if row_count > 0 {
+            for first_id in (1..=row_count).step_by(50_000) {
+                let last_id = first_id.saturating_add(49_999).min(row_count);
+                let rows = (first_id..=last_id)
+                    .map(|id| {
+                        let (value, active, included) = row_values(id);
+                        let value = Value::Float64(value).as_display_string();
+                        format!("({id}, {value}, {active}, {included})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                database
+                    .execute(&format!("INSERT INTO bool_float_max_events VALUES {rows}"))
+                    .expect("grouped Bool Float64 MAX differential rows");
+            }
+        }
+        database
+    }
+
     fn sum_int64_database(row_count: usize, row_values: impl Fn(usize) -> (i64, bool)) -> Database {
         let mut database = Database::new();
         database
@@ -11860,6 +11932,184 @@ mod tests {
             let parallel = database.execute(sql);
             assert_eq!(parallel, sequential);
             assert_eq!(parallel, Err(expected_error));
+        }
+    }
+
+    #[test]
+    fn grouped_bool_float64_max_parallel_semantics_admission_and_fallback_are_differential() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 4;
+        let mut database = grouped_bool_float64_max_database(row_count, |id| {
+            if id == row_count - 1 {
+                (f64::MIN, false, false)
+            } else if id == row_count {
+                (f64::MAX, true, false)
+            } else if id % 2 == 1 {
+                (-0.0, true, true)
+            } else {
+                (0.0, false, true)
+            }
+        });
+
+        let empty = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT active, MAX(value) FROM bool_float_max_events \
+             WHERE id < 0 GROUP BY active",
+        );
+        assert!(empty.rows.is_empty());
+
+        let one_group = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT active, MAX(value) FROM bool_float_max_events \
+             WHERE included = false AND active = false GROUP BY active",
+        );
+        assert_eq!(
+            one_group.rows,
+            [vec![Value::Bool(false), Value::Float64(f64::MIN)]]
+        );
+
+        let extrema = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT active, MAX(value) FROM bool_float_max_events \
+             WHERE included = false GROUP BY active",
+        );
+        assert_eq!(
+            extrema.rows,
+            [
+                vec![Value::Bool(false), Value::Float64(f64::MIN)],
+                vec![Value::Bool(true), Value::Float64(f64::MAX)],
+            ]
+        );
+
+        let filtered_sql = "SELECT active AS enabled, MAX(value) AS maximum \
+                            FROM bool_float_max_events WHERE included = true GROUP BY active";
+        let signed_zero = assert_global_aggregate_worker_differential(&mut database, filtered_sql);
+        assert_eq!(signed_zero.rows.len(), 2);
+        assert_eq!(signed_zero.rows[0][0], Value::Bool(false));
+        assert_eq!(signed_zero.rows[1][0], Value::Bool(true));
+        let Value::Float64(false_max) = signed_zero.rows[0][1] else {
+            panic!("false Bool group has a Float64 MAX")
+        };
+        let Value::Float64(true_max) = signed_zero.rows[1][1] else {
+            panic!("true Bool group has a Float64 MAX")
+        };
+        assert_eq!(false_max.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(true_max.to_bits(), (-0.0_f64).to_bits());
+
+        let paged = assert_global_aggregate_worker_differential(
+            &mut database,
+            &format!(
+                "{filtered_sql} HAVING maximum >= 0.0 \
+                 ORDER BY maximum DESC, enabled ASC LIMIT 1 OFFSET 1"
+            ),
+        );
+        assert_eq!(paged.rows.len(), 1);
+        assert_eq!(paged.rows[0][0], Value::Bool(true));
+        let Value::Float64(paged_max) = paged.rows[0][1] else {
+            panic!("paged Bool group has a Float64 MAX")
+        };
+        assert_eq!(paged_max.to_bits(), (-0.0_f64).to_bits());
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+        BUDGET.reset_peak();
+        query(
+            &mut database,
+            &format!(
+                "SELECT active, MAX(value) FROM bool_float_max_events \
+                 WHERE id <= {} GROUP BY active",
+                GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+            ),
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "the exact matched-row threshold stays sequential"
+        );
+
+        BUDGET.reset_peak();
+        query(
+            &mut database,
+            &format!(
+                "SELECT active, MAX(value) FROM bool_float_max_events \
+                 WHERE id <= {} GROUP BY active",
+                GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1
+            ),
+        );
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "a sole Bool-grouped MAX(Float64) above the threshold uses shared helpers"
+        );
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        let sequential = force_global_aggregate_workers(&mut database, 1, filtered_sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts grouped Float64 MAX helper admission");
+        let exhausted = query(&mut database, filtered_sql);
+        assert_eq!(exhausted, sequential);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        for unsupported_sql in [
+            "SELECT active, MAX(value), COUNT(*) FROM bool_float_max_events GROUP BY active",
+            "SELECT active, included, MAX(value) FROM bool_float_max_events \
+             GROUP BY active, included",
+            "SELECT value, MAX(id) FROM bool_float_max_events GROUP BY value",
+            "SELECT active, MIN(value) FROM bool_float_max_events GROUP BY active",
+            "SELECT active, MAX(active) FROM bool_float_max_events GROUP BY active",
+        ] {
+            BUDGET.reset_peak();
+            query(&mut database, unsupported_sql);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use(),
+                0,
+                "unsupported grouped shape stays sequential: {unsupported_sql}"
+            );
+        }
+
+        let aggregate_state_bytes = 2_usize
+            .saturating_mul(std::mem::size_of::<AggregateState>())
+            .saturating_add(std::mem::size_of::<Vec<AggregateState>>());
+        let exact_limits = QueryResultLimits {
+            max_scan_rows: row_count,
+            max_rows: 2,
+            max_values: 4,
+            max_groups: 2,
+            max_group_key_cells: 2,
+            max_group_key_bytes: 2_usize.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES),
+            max_aggregate_state_cells: 2,
+            max_aggregate_state_bytes: aggregate_state_bytes,
+            ..QueryResultLimits::default()
+        };
+        database.query_result_limits = exact_limits;
+        assert_eq!(
+            force_global_aggregate_workers(&mut database, 4, filtered_sql),
+            sequential
+        );
+        for limits in [
+            QueryResultLimits {
+                max_groups: 1,
+                ..exact_limits
+            },
+            QueryResultLimits {
+                max_rows: 1,
+                ..exact_limits
+            },
+        ] {
+            database.query_result_limits = limits;
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+            let sequential_error = database.execute(filtered_sql);
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
+            assert_eq!(database.execute(filtered_sql), sequential_error);
+            assert!(matches!(
+                sequential_error,
+                Err(Error::ResourceLimitExceeded { .. })
+            ));
         }
     }
 
@@ -14895,10 +15145,9 @@ mod tests {
             .rows,
             [vec![Value::Bool(true), Value::Float64(7.25)]]
         );
-        assert_eq!(
-            OBSERVED_BUDGET.peak_helpers_in_use(),
-            0,
-            "grouped MAX(Float64) stays sequential"
+        assert!(
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
+            "sole Bool-grouped MAX(Float64) above the threshold uses the shared helper budget"
         );
     }
 

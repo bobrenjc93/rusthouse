@@ -85,16 +85,19 @@ grouping column and exactly one `COUNT(*)`, `COUNT()`, `COUNT(column)`, or
 `SUM(physical_non_nullable_int64_column)` or
 `MIN(physical_non_nullable_int64_column)` or
 `MAX(physical_non_nullable_int64_column)` or
-`AVG(physical_non_nullable_int64_column)` aggregate. The `countIf` argument may
+`AVG(physical_non_nullable_int64_column)` aggregate, or exactly one
+`MAX(physical_non_nullable_float64_column)` aggregate. The `countIf` argument may
 be the grouping column or a different physical Bool column.
 The `COUNT(column)` argument must be a physical nullable `Int64` column or a
 non-nullable `Int64`, `Float64`, `Bool`, or `String` column. Nullable grouped COUNT
 partials track group row presence separately from present values, so all-NULL
 groups remain visible with a zero count. Bool-grouped SUM/AVG partials maintain
 a checked i128 sum and checked row count for each key, then apply the normal
-checked Int64 SUM conversion or Float64 AVG finalization. Bool-grouped MIN and
-MAX partials retain one optional Int64 extremum per key. Ordered partition
-reduction preserves first-seen Bool grouping before the normal grouped HAVING,
+checked Int64 SUM conversion or Float64 AVG finalization. Bool-grouped MIN
+partials retain one optional Int64 extremum per key; Bool-grouped MAX partials
+retain one optional Int64 or Float64 extremum per key. Ordered partition
+reduction preserves first-seen Bool grouping and the first occurrence of equal
+Float64 maxima, including signed zero, before the normal grouped HAVING,
 ordering, and pagination stages. The paired
 shapes preserve either projection order. Row-count pairs derive `COUNT` with a
 checked conversion of the filtered cardinality; same-column nullable
