@@ -19,6 +19,7 @@ use crate::batch::scalar_cast::{
     checked_string_to_bool, checked_string_to_float64, checked_string_to_int64, decimal_text_cmp,
     ordering_string_to_float64, validate_string_to_float64_syntax, validate_string_to_int64_syntax,
 };
+use crate::batch::scalar_float64;
 use crate::batch::scalar_nullable_int64;
 use crate::batch::scalar_text;
 use crate::batch::sql::{
@@ -6376,16 +6377,16 @@ fn execute_projection(
                             table.columns()[*source].value_ref(*row),
                         )?,
                         ResolvedItem::Float64Abs { source } => {
-                            Value::Float64(float64_at(table, *source, *row).abs())
+                            Value::Float64(scalar_float64::abs(float64_at(table, *source, *row)))
                         }
                         ResolvedItem::Float64Round { source } => {
-                            Value::Float64(float64_at(table, *source, *row).round())
+                            Value::Float64(scalar_float64::round(float64_at(table, *source, *row)))
                         }
                         ResolvedItem::Float64Floor { source } => {
-                            Value::Float64(float64_at(table, *source, *row).floor())
+                            Value::Float64(scalar_float64::floor(float64_at(table, *source, *row)))
                         }
                         ResolvedItem::Float64Ceil { source } => {
-                            Value::Float64(float64_at(table, *source, *row).ceil())
+                            Value::Float64(scalar_float64::ceil(float64_at(table, *source, *row)))
                         }
                         ResolvedItem::RowNumber => Value::Int64(checked_row_number(row_number)?),
                         ResolvedItem::Aggregate { .. } => {
@@ -9096,26 +9097,22 @@ fn order_source_rows(
                     table.columns()[source].value_ref(left),
                     table.columns()[source].value_ref(right),
                 ),
-                ResolvedItem::Float64Abs { source } => {
-                    let left = ValueRef::Float64(float64_at(table, source, left).abs());
-                    let right = ValueRef::Float64(float64_at(table, source, right).abs());
-                    left.cmp(&right)
-                }
-                ResolvedItem::Float64Round { source } => {
-                    let left = ValueRef::Float64(float64_at(table, source, left).round());
-                    let right = ValueRef::Float64(float64_at(table, source, right).round());
-                    left.cmp(&right)
-                }
-                ResolvedItem::Float64Floor { source } => {
-                    let left = ValueRef::Float64(float64_at(table, source, left).floor());
-                    let right = ValueRef::Float64(float64_at(table, source, right).floor());
-                    left.cmp(&right)
-                }
-                ResolvedItem::Float64Ceil { source } => {
-                    let left = ValueRef::Float64(float64_at(table, source, left).ceil());
-                    let right = ValueRef::Float64(float64_at(table, source, right).ceil());
-                    left.cmp(&right)
-                }
+                ResolvedItem::Float64Abs { source } => scalar_float64::abs_cmp(
+                    float64_at(table, source, left),
+                    float64_at(table, source, right),
+                ),
+                ResolvedItem::Float64Round { source } => scalar_float64::round_cmp(
+                    float64_at(table, source, left),
+                    float64_at(table, source, right),
+                ),
+                ResolvedItem::Float64Floor { source } => scalar_float64::floor_cmp(
+                    float64_at(table, source, left),
+                    float64_at(table, source, right),
+                ),
+                ResolvedItem::Float64Ceil { source } => scalar_float64::ceil_cmp(
+                    float64_at(table, source, left),
+                    float64_at(table, source, right),
+                ),
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections cannot be ordered")
                 }
