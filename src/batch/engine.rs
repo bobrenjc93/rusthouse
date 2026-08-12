@@ -3186,6 +3186,19 @@ impl Database {
                 ),
                 query_result_limits,
             ),
+            Statement::DeleteNullness {
+                table,
+                column,
+                is_null,
+            } => self.execute_delete_statement(
+                table,
+                if is_null {
+                    Predicate::IsNull { column }
+                } else {
+                    Predicate::IsNotNull { column }
+                },
+                query_result_limits,
+            ),
             Statement::Insert { table, rows } => self.execute_insert_statement(table, None, rows),
             Statement::InsertWithColumns {
                 table,
@@ -3300,6 +3313,7 @@ impl Database {
             | Statement::Delete { .. }
             | Statement::DeleteComparison { .. }
             | Statement::DeleteConjunction { .. }
+            | Statement::DeleteNullness { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW DATABASES, SHOW SETTINGS, SHOW FUNCTIONS, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
@@ -4571,7 +4585,8 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Delete { .. }
         | Statement::DeleteComparison { .. }
-        | Statement::DeleteConjunction { .. } => "DELETE",
+        | Statement::DeleteConjunction { .. }
+        | Statement::DeleteNullness { .. } => "DELETE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)

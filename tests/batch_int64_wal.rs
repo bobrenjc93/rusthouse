@@ -349,6 +349,35 @@ fn active_wal_allows_add_column_no_ops_but_rejects_real_additions() {
 }
 
 #[test]
+fn active_wal_rejects_nullness_deletes_without_changing_data_or_log() {
+    let directory = TestDirectory::new();
+    let path = directory.join("reject-nullness-delete.wal");
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (Measurement Int64); INSERT INTO Readings VALUES (7), (9)")
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, Int64WriteAheadLogLimits::default())
+        .unwrap();
+    let wal_before = fs::read(&path).unwrap();
+
+    for sql in [
+        "DELETE FROM READINGS WHERE measurement IS NULL",
+        "ALTER TABLE READINGS DELETE WHERE measurement IS NOT NULL",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::InvalidQuery(
+                "DELETE is not supported while table 'READINGS' has an active Int64 WAL".to_owned()
+            )),
+            "{sql}"
+        );
+        assert_eq!(int64_values(&database, "readings"), [7, 9], "{sql}");
+        assert_eq!(fs::read(&path).unwrap(), wal_before, "{sql}");
+    }
+}
+
+#[test]
 fn recovered_all_null_wal_casts_to_typed_float64_nulls() {
     let directory = TestDirectory::new();
     let path = directory.join("all-null-cast.wal");
