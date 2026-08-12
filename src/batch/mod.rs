@@ -9,6 +9,7 @@ pub mod csv;
 pub mod engine;
 pub mod error;
 pub mod format;
+pub mod json_compact_each_row;
 pub mod shared_database;
 pub mod sql;
 pub mod storage;

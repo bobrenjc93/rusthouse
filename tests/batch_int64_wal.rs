@@ -15,6 +15,9 @@ use std::time::Duration;
 use rusthouse::batch::csv::{CsvIngestError, CsvIngestLimits};
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
+use rusthouse::batch::json_compact_each_row::{
+    JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
+};
 use rusthouse::batch::storage::Column;
 use rusthouse::batch::tsv::{TsvIngestError, TsvIngestLimits};
 use rusthouse::batch::value::{DataType, Value};
@@ -816,6 +819,84 @@ fn nullable_tsv_appends_are_wal_first_and_recover_in_input_order() {
         nullable_int64_values(&recovered, "readings"),
         [None, Some(-2), Some(i64::MAX), None]
     );
+}
+
+#[test]
+fn json_compact_each_row_appends_are_wal_first_and_recover_nullable_rows() {
+    let directory = TestDirectory::new();
+    let path = directory.join("nullable-json-compact-each-row.wal");
+    let limits = Int64WriteAheadLogLimits::default();
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (Measurement Nullable(Int64));")
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+
+    let input = b"[-9223372036854775808]\n[null]\n[9223372036854775807]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "READINGS",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 3, 3),
+        ),
+        Ok(3),
+    );
+    let malformed = b"[7]\n[false]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            malformed,
+            JsonCompactEachRowIngestLimits::new(malformed.len(), 2, 2),
+        ),
+        Err(JsonCompactEachRowIngestError::InvalidValue { line: 2, column: 2 }),
+    );
+    assert_eq!(
+        nullable_int64_values(&database, "readings"),
+        [Some(i64::MIN), None, Some(i64::MAX)]
+    );
+
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert_eq!(
+        nullable_int64_values(&recovered, "readings"),
+        [Some(i64::MIN), None, Some(i64::MAX)]
+    );
+}
+
+#[test]
+fn rejected_json_compact_each_row_wal_commit_does_not_publish_storage_rows() {
+    let directory = TestDirectory::new();
+    let path = directory.join("bounded-json-compact-each-row.wal");
+    let limits = Int64WriteAheadLogLimits::new(64 * 1024, 16 * 1024, 1);
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (Measurement Nullable(Int64));")
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+    let input = b"[null]\n";
+
+    assert!(matches!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 1, 1),
+        ),
+        Err(JsonCompactEachRowIngestError::Database(
+            Error::WriteAheadLog(Int64WriteAheadLogCommitError::Limit(
+                Int64WriteAheadLogLimitError::Records {
+                    records: 2,
+                    max_records: 1,
+                }
+            ))
+        ))
+    ));
+    assert!(nullable_int64_values(&database, "readings").is_empty());
+
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert!(nullable_int64_values(&recovered, "readings").is_empty());
 }
 
 #[test]
