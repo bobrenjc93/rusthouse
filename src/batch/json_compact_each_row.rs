@@ -1,10 +1,11 @@
 //! Bounded ingestion for one-column `JSONCompactEachRow` input.
 //!
 //! This intentionally small positional subset accepts one JSON array per
-//! physical line. Every array contains exactly one JSON integer, or `null` for
+//! physical line. Every array contains exactly one JSON number, or `null` for
 //! a `Nullable(Int64)` target. The target must be an existing one-column
-//! `Int64` or `Nullable(Int64)` table. Input is completely validated and
-//! prepared before the caller commits any row.
+//! `Int64`, `Nullable(Int64)`, or `Float64` table. `Int64` targets retain their
+//! integer-only syntax, while `Float64` targets accept every finite JSON number.
+//! Input is completely validated and prepared before the caller commits any row.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -66,7 +67,7 @@ pub enum JsonCompactEachRowIngestError {
     InvalidUtf8 { valid_up_to: usize },
     /// The target does not have exactly one physical column.
     UnsupportedColumnCount { actual: usize },
-    /// The sole target column is not `Int64` or `Nullable(Int64)`.
+    /// The sole target column is not `Int64`, `Nullable(Int64)`, or `Float64`.
     UnsupportedColumnType { column: String, actual: DataType },
     /// A physical row crosses the configured row bound.
     RowLimitExceeded {
@@ -88,7 +89,7 @@ pub enum JsonCompactEachRowIngestError {
         expected: usize,
         actual: usize,
     },
-    /// The sole value is valid JSON but is not an integer or `null`.
+    /// The sole value is valid JSON but cannot be stored in the target type.
     InvalidValue {
         line: usize,
         column: usize,
@@ -119,7 +120,7 @@ impl fmt::Display for JsonCompactEachRowIngestError {
             ),
             Self::UnsupportedColumnType { column, actual } => write!(
                 formatter,
-                "JSONCompactEachRow ingestion requires column '{column}' to be Int64 or Nullable(Int64); found {actual}"
+                "JSONCompactEachRow ingestion requires column '{column}' to be Int64, Nullable(Int64), or Float64; found {actual}"
             ),
             Self::RowLimitExceeded {
                 line,
@@ -233,32 +234,14 @@ pub(crate) fn parse_rows(
             });
         }
 
-        let value = match parsed
-            .first_value
-            .expect("a validated one-value array retains its first value")
-        {
-            ParsedJsonValue::Number {
-                start,
-                end,
-                is_integer: true,
-            } => physical_line[start..end]
-                .parse::<i64>()
-                .map(Value::Int64)
-                .map_err(|_| JsonCompactEachRowIngestError::IntegerOverflow { line, column: 1 })?,
-            ParsedJsonValue::Null if table.column_is_nullable_int64(0) => {
-                Value::Null(DataType::Int64)
-            }
-            ParsedJsonValue::Null => {
-                return Err(JsonCompactEachRowIngestError::NullNotAllowed { line, column: 1 });
-            }
-            ParsedJsonValue::Number { .. } | ParsedJsonValue::Other => {
-                return Err(JsonCompactEachRowIngestError::InvalidValue {
-                    line,
-                    column: 1,
-                    expected: DataType::Int64,
-                });
-            }
-        };
+        let value = parse_value(
+            physical_line,
+            parsed
+                .first_value
+                .expect("a validated one-value array retains its first value"),
+            table,
+            line,
+        )?;
         rows.push(vec![value]);
         value_count = next_value_count;
     }
@@ -275,13 +258,66 @@ fn validate_target(table: &Table) -> Result<(), JsonCompactEachRowIngestError> {
         });
     }
     let column = &table.schema()[0];
-    if column.data_type != DataType::Int64 {
+    if !matches!(column.data_type, DataType::Int64 | DataType::Float64) {
         return Err(JsonCompactEachRowIngestError::UnsupportedColumnType {
             column: column.name.clone(),
             actual: column.data_type,
         });
     }
     Ok(())
+}
+
+fn parse_value(
+    physical_line: &str,
+    parsed: ParsedJsonValue,
+    table: &Table,
+    line: usize,
+) -> Result<Value, JsonCompactEachRowIngestError> {
+    let expected = table.schema()[0].data_type;
+    match (expected, parsed) {
+        (
+            DataType::Int64,
+            ParsedJsonValue::Number {
+                start,
+                end,
+                is_integer: true,
+            },
+        ) => physical_line[start..end]
+            .parse::<i64>()
+            .map(Value::Int64)
+            .map_err(|_| JsonCompactEachRowIngestError::IntegerOverflow { line, column: 1 }),
+        (DataType::Int64, ParsedJsonValue::Null) if table.column_is_nullable_int64(0) => {
+            Ok(Value::Null(DataType::Int64))
+        }
+        (DataType::Int64, ParsedJsonValue::Null) => {
+            Err(JsonCompactEachRowIngestError::NullNotAllowed { line, column: 1 })
+        }
+        (DataType::Float64, ParsedJsonValue::Number { start, end, .. }) => {
+            let value = physical_line[start..end]
+                .parse::<f64>()
+                .map_err(|_| invalid_value(line, expected))?;
+            if value.is_finite() {
+                Ok(Value::Float64(value))
+            } else {
+                Err(invalid_value(line, expected))
+            }
+        }
+        (DataType::Int64 | DataType::Float64, ParsedJsonValue::Null | ParsedJsonValue::Other) => {
+            Err(invalid_value(line, expected))
+        }
+        (DataType::Bool | DataType::String, _) => {
+            unreachable!("target type was validated before values were parsed")
+        }
+        (DataType::Int64, ParsedJsonValue::Number { .. }) => Err(invalid_value(line, expected)),
+    }
+}
+
+fn invalid_value(line: usize, expected: DataType) -> JsonCompactEachRowIngestError {
+    JsonCompactEachRowIngestError::InvalidValue {
+        line,
+        column: 1,
+        expected,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
