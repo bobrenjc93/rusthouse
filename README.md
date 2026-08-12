@@ -1438,6 +1438,16 @@ complete write can commit beside a stalled connection while lock contention
 still returns `503 Service Unavailable` without waiting. A cap of one preserves
 sequential acceptance and exchange ordering.
 
+`serve_http_concurrently_with_clickhouse_key_until_cancelled` adds the graceful
+owned-listener lifecycle to that read-write handler. It stops admission when
+its `AtomicBool` is set, including while idle or waiting at the in-flight cap,
+then drains every previously accepted exchange. Inserts that were accepted
+before cancellation can therefore finish and commit atomically under their
+original deadline; cancellation does not interrupt them. Authentication,
+ingestion limits, nonblocking database admission, one-response shutdown, and
+acceptance-ordered failure reporting remain unchanged. Its explicit connection
+budget can also complete a finite run while the flag remains false.
+
 For both concurrent listener families, the total connection budget remains an
 inclusive finite run bound, independent of the concurrency cap, and zero still
 returns without accepting. Read and write deadlines start at each connection's
