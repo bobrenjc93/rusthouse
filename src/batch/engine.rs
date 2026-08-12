@@ -167,7 +167,8 @@ pub(crate) struct ParameterizedQueryLimits {
 /// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window
 /// forms provide bounded projections in ungrouped queries. `ifNull`, `isNull`,
 /// and the nullable `Int64` identity `CAST` may also derive fixed-size values
-/// from physical columns already admitted by `GROUP BY`.
+/// from physical columns admitted directly or by the exact matching identity
+/// `GROUP BY CAST(column AS Int64)` expression.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
@@ -5547,10 +5548,30 @@ impl ResolvedHaving {
     }
 }
 
-fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
-    let mut columns = Vec::with_capacity(names.len());
-    for name in names {
-        let column = table.column_index(name)?;
+fn resolve_group_columns(table: &Table, expressions: &[String]) -> Result<Vec<usize>> {
+    let mut columns = Vec::with_capacity(expressions.len());
+    for expression in expressions {
+        // GROUP BY expressions are parser-normalized before reaching the
+        // existing public string AST. Only this fixed CAST representation is
+        // interpreted as an expression; every other string remains a column.
+        let cast = expression
+            .strip_prefix("CAST(")
+            .and_then(|expression| expression.strip_suffix(')'))
+            .and_then(|expression| expression.split_once(" AS "));
+        let (name, column) = match cast {
+            Some((name, target_type)) => {
+                let column = table.column_index(name)?;
+                if DataType::parse(target_type) != Some(DataType::Int64)
+                    || !table.column_is_nullable_int64(column)
+                {
+                    return Err(Error::InvalidQuery(
+                        "GROUP BY CAST only supports CAST(Nullable(Int64) AS Int64)".to_owned(),
+                    ));
+                }
+                (name, column)
+            }
+            None => (expression.as_str(), table.column_index(expression)?),
+        };
         if columns.contains(&column) {
             return Err(Error::InvalidQuery(format!(
                 "GROUP BY column '{name}' is listed more than once"

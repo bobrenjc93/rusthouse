@@ -582,11 +582,13 @@ its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projection
 other than the `Nullable(Int64)` identity form are currently limited to
 ungrouped queries: they cannot be combined with aggregate projections or
 `GROUP BY`. The identity form may be projected beside aggregates when its
-physical source column appears in `GROUP BY`; it derives both present values
-and typed `NULL` from the retained group key and supports normal aliases,
-aggregate `HAVING`, result ordering, and pagination. Expression grouping such
-as `GROUP BY CAST(value AS Int64)` remains unsupported, and an identity-cast
-source absent from `GROUP BY` is rejected. Generated `String` payload
+physical source column or the exact identity expression `CAST(source AS
+Int64)` appears in `GROUP BY`; both forms retain that same physical nullable
+key, preserve its NULL group, and support matching CAST projections, normal
+aliases, aggregates, `HAVING`, result ordering, and pagination. No other
+GROUP BY expression or CAST source/target shape is accepted. Listing the
+physical column and its equivalent identity CAST (or repeating either form)
+is rejected as a duplicate group key. Generated `String` payload
 bytes—four or five for booleans, one through twenty for integers, and one
 through 327 for finite floats—are charged exactly against the result-byte
 limit before materialization. No other source/target type pairs are accepted.
