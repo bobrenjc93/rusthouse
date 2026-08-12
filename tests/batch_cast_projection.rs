@@ -1096,6 +1096,49 @@ fn grouped_nullable_int64_identity_cast_projects_retained_keys() {
 }
 
 #[test]
+fn grouped_identity_casts_both_columns_of_an_all_nullable_table() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings \
+                 (primary_value Nullable(Int64), backup_value Nullable(Int64)); \
+             INSERT INTO readings VALUES \
+                 (NULL, NULL), (NULL, NULL), (NULL, 2), \
+                 (1, NULL), (1, 2), (1, 2);",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(primary_value AS Int64) AS primary_key, \
+                    CAST(backup_value AS Int64) AS backup_key, COUNT(*) AS rows \
+             FROM readings GROUP BY primary_value, backup_value \
+             ORDER BY primary_key, backup_key",
+        )
+        .rows,
+        [
+            vec![
+                Value::Null(DataType::Int64),
+                Value::Null(DataType::Int64),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Null(DataType::Int64),
+                Value::Int64(2),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Null(DataType::Int64),
+                Value::Int64(1),
+            ],
+            vec![Value::Int64(1), Value::Int64(2), Value::Int64(2)],
+        ]
+    );
+}
+
+#[test]
 fn grouped_nullable_int64_identity_cast_rejects_ungrouped_sources_and_expression_grouping() {
     let mut database = Database::new();
     database

@@ -164,9 +164,9 @@ pub(crate) struct ParameterizedQueryLimits {
 /// Checked `Int64` column-minus-literal expressions, `CAST`, `toString`,
 /// `ifNull`, `isNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`, `ABS`,
 /// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window
-/// forms provide bounded projections in ungrouped queries. `ifNull` and
-/// `isNull` may also derive fixed-size values from physical columns already
-/// admitted by `GROUP BY`.
+/// forms provide bounded projections in ungrouped queries. `ifNull`, `isNull`,
+/// and the nullable `Int64` identity `CAST` may also derive fixed-size values
+/// from physical columns already admitted by `GROUP BY`.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:

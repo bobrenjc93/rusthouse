@@ -1734,7 +1734,7 @@ impl<'a> Parser<'a> {
             } else {
                 if !nullable_int64_columns.is_empty() {
                     return self.error(
-                        "Nullable(Int64) columns must form the final one- or two-column suffix after a non-nullable prefix",
+                        "Nullable(Int64) columns must form the final one- or two-column suffix",
                     );
                 }
                 let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
