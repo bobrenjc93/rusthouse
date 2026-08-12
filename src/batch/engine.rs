@@ -1162,7 +1162,7 @@ impl Database {
     /// Creates an empty database with an explicit nonzero computation-lane cap
     /// for supported parallel aggregates, including sole nullable `Int64`
     /// `COUNT`, Bool-grouped row count, and Bool-grouped nullable `Int64`
-    /// `COUNT`, plus sole non-nullable Int64 `SUM` grouped by Bool.
+    /// `COUNT`, plus sole non-nullable Int64 `SUM` or `AVG` grouped by Bool.
     ///
     /// A cap of one keeps those aggregates sequential. Higher caps remain
     /// subject to the process-wide worker budget, available hardware, and the
@@ -6927,7 +6927,7 @@ fn execute_grouped<'a>(
     )? {
         return Ok(grouped);
     }
-    if let Some(grouped) = execute_grouped_bool_sum(
+    if let Some(grouped) = execute_grouped_bool_sum_or_avg(
         table,
         matching_rows,
         group_columns,
@@ -7257,7 +7257,7 @@ fn execute_grouped_bool_count<'a>(
     }))
 }
 
-fn execute_grouped_bool_sum<'a>(
+fn execute_grouped_bool_sum_or_avg<'a>(
     table: &'a Table,
     matching_rows: &[usize],
     group_columns: &[usize],
@@ -7270,8 +7270,8 @@ fn execute_grouped_bool_sum<'a>(
     };
     let [
         spec @ AggregateSpec {
-            function: AggregateFunction::Sum,
-            argument: Some(sum_column),
+            function: function @ (AggregateFunction::Sum | AggregateFunction::Avg),
+            argument: Some(value_column),
             input_type: Some(DataType::Int64),
         },
     ] = aggregate_specs
@@ -7281,36 +7281,37 @@ fn execute_grouped_bool_sum<'a>(
     let Column::Bool(group_values) = &table.columns()[*group_column] else {
         return Ok(None);
     };
-    let Column::Int64(sum_values) = &table.columns()[*sum_column] else {
+    let Column::Int64(values) = &table.columns()[*value_column] else {
         return Ok(None);
     };
 
     let partial = reduce_grouped_bool_sum(
         group_values,
-        sum_values,
+        values,
         matching_rows,
         parallelism,
+        *function,
         grouped_bool_sum_chunk,
     )?;
     let group_count = usize::from(partial.present(false)) + usize::from(partial.present(true));
     enforce_grouped_bool_limits(group_count, limits)?;
 
     let mut keys = Vec::with_capacity(group_count);
-    let mut sums = Vec::with_capacity(group_count);
+    let mut aggregates = Vec::with_capacity(group_count);
     if let Some(first) = partial.first_seen {
         keys.push(GroupKey::One(ValueRef::Bool(first)));
-        sums.push(partial.finished_sum(first, spec)?);
+        aggregates.push(partial.finished_aggregate(first, spec)?);
         let second = !first;
         if partial.present(second) {
             keys.push(GroupKey::One(ValueRef::Bool(second)));
-            sums.push(partial.finished_sum(second, spec)?);
+            aggregates.push(partial.finished_aggregate(second, spec)?);
         }
     }
     debug_assert_eq!(keys.len(), group_count);
-    debug_assert_eq!(sums.len(), group_count);
+    debug_assert_eq!(aggregates.len(), group_count);
     Ok(Some(GroupedData {
         keys,
-        aggregates: vec![sums],
+        aggregates: vec![aggregates],
     }))
 }
 
@@ -7567,26 +7568,25 @@ impl GroupedBoolSumPartial {
         self.partial(value).count > 0
     }
 
-    fn observe(&mut self, group: bool, value: i64) -> Result<()> {
+    fn observe(&mut self, group: bool, value: i64, function: AggregateFunction) -> Result<()> {
         self.first_seen.get_or_insert(group);
         let partial = self.partial_mut(group);
-        partial.sum = partial
-            .sum
-            .checked_add(i128::from(value))
-            .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?;
-        partial.count = partial
-            .count
-            .checked_add(1)
-            .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?;
+        partial.sum = partial.sum.checked_add(i128::from(value)).ok_or_else(|| {
+            Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
+        })?;
+        partial.count = partial.count.checked_add(1).ok_or_else(|| {
+            Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
+        })?;
         Ok(())
     }
 
-    fn finished_sum(&self, value: bool, spec: &AggregateSpec) -> Result<Value> {
+    fn finished_aggregate(&self, value: bool, spec: &AggregateSpec) -> Result<Value> {
         let partial = self.partial(value);
-        AggregateState::SumInt {
+        SumIntPartial {
             sum: partial.sum,
             count: partial.count,
         }
+        .into_state(spec.function)
         .finish(spec)
     }
 }
@@ -7596,18 +7596,28 @@ fn reduce_grouped_bool_sum<C>(
     sum_values: &[i64],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
+    function: AggregateFunction,
     chunk: C,
 ) -> Result<GroupedBoolSumPartial>
 where
-    C: Fn(&[bool], &[i64], &[usize]) -> Result<GroupedBoolSumPartial> + Sync,
+    C: Fn(&[bool], &[i64], &[usize], AggregateFunction) -> Result<GroupedBoolSumPartial> + Sync,
 {
+    debug_assert!(matches!(
+        function,
+        AggregateFunction::Sum | AggregateFunction::Avg
+    ));
+    let worker_label = match function {
+        AggregateFunction::Sum => "sum-int64",
+        AggregateFunction::Avg => "avg-int64",
+        _ => unreachable!("only SUM and AVG share grouped Int64 sum/count workers"),
+    };
     reduce_grouped_bool(
         group_values,
         matching_rows,
         parallelism,
-        "sum-int64",
-        |group_values, rows| chunk(group_values, sum_values, rows),
-        reduce_grouped_bool_sum_partials,
+        worker_label,
+        |group_values, rows| chunk(group_values, sum_values, rows, function),
+        |partials| reduce_grouped_bool_sum_partials(partials, function),
     )
 }
 
@@ -7615,16 +7625,18 @@ fn grouped_bool_sum_chunk(
     group_values: &[bool],
     sum_values: &[i64],
     matching_rows: &[usize],
+    function: AggregateFunction,
 ) -> Result<GroupedBoolSumPartial> {
     let mut partial = GroupedBoolSumPartial::default();
     for row in matching_rows {
-        partial.observe(group_values[*row], sum_values[*row])?;
+        partial.observe(group_values[*row], sum_values[*row], function)?;
     }
     Ok(partial)
 }
 
 fn reduce_grouped_bool_sum_partials(
     partials: Vec<GroupedBoolSumPartial>,
+    function: AggregateFunction,
 ) -> Result<GroupedBoolSumPartial> {
     partials
         .into_iter()
@@ -7636,22 +7648,30 @@ fn reduce_grouped_bool_sum_partials(
                 .false_sum
                 .sum
                 .checked_add(partial.false_sum.sum)
-                .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?;
+                .ok_or_else(|| {
+                    Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
+                })?;
             total.false_sum.count = total
                 .false_sum
                 .count
                 .checked_add(partial.false_sum.count)
-                .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?;
+                .ok_or_else(|| {
+                    Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
+                })?;
             total.true_sum.sum = total
                 .true_sum
                 .sum
                 .checked_add(partial.true_sum.sum)
-                .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?;
+                .ok_or_else(|| {
+                    Error::NumericOverflow(int64_sum_overflow_context(function).to_owned())
+                })?;
             total.true_sum.count = total
                 .true_sum
                 .count
                 .checked_add(partial.true_sum.count)
-                .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?;
+                .ok_or_else(|| {
+                    Error::NumericOverflow(int64_count_overflow_context(function).to_owned())
+                })?;
             Ok(total)
         })
 }
@@ -11240,6 +11260,136 @@ mod tests {
     }
 
     #[test]
+    fn grouped_bool_avg_threshold_extrema_admission_and_fallback_are_differential() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 4;
+        let included_rows = row_count - 2;
+        let mut database = grouped_bool_sum_database(row_count, |id| {
+            let value = match id {
+                1 | 4 => i64::MAX,
+                2 | 3 => i64::MIN,
+                _ => 0,
+            };
+            let active = match id {
+                1 | 2 => true,
+                3 | 4 => false,
+                _ => id % 2 == 1,
+            };
+            (value, active, id <= included_rows)
+        });
+        let values_per_group = included_rows / 2;
+        let expected_average = -1.0 / values_per_group as f64;
+
+        let empty = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT active, AVG(value) FROM bool_sum_events \
+             WHERE id < 0 GROUP BY active",
+        );
+        assert!(empty.rows.is_empty());
+
+        let filtered_sql = "SELECT active AS enabled, AVG(value) AS mean \
+                            FROM bool_sum_events WHERE included = true GROUP BY active \
+                            HAVING mean < 0.0";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, filtered_sql).rows,
+            [
+                vec![Value::Bool(false), Value::Float64(expected_average)],
+                vec![Value::Bool(true), Value::Float64(expected_average)],
+            ],
+            "checked extrema cancellation and first-seen group order match sequential AVG"
+        );
+        assert_eq!(
+            assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!("{filtered_sql} ORDER BY mean DESC, enabled ASC LIMIT 1 OFFSET 1"),
+            )
+            .rows,
+            [vec![Value::Bool(true), Value::Float64(expected_average)]],
+            "HAVING, ordering, limits, and pagination remain downstream of AVG finalization"
+        );
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+        BUDGET.reset_peak();
+        query(
+            &mut database,
+            &format!(
+                "SELECT active, AVG(value) FROM bool_sum_events WHERE id <= {} GROUP BY active",
+                GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+            ),
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "the exact matched-row threshold remains sequential"
+        );
+
+        BUDGET.reset_peak();
+        query(
+            &mut database,
+            &format!(
+                "SELECT active, AVG(value) FROM bool_sum_events WHERE id <= {} GROUP BY active",
+                GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1
+            ),
+        );
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "sole Bool-grouped non-nullable Int64 AVG uses helpers above the threshold"
+        );
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        let sequential = force_global_aggregate_workers(&mut database, 1, filtered_sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts grouped AVG helper admission");
+        let exhausted = query(&mut database, filtered_sql);
+        assert_eq!(exhausted, sequential);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        database
+            .execute(
+                "ALTER TABLE bool_sum_events ADD COLUMN nullable_value Nullable(Int64); \
+                 ALTER TABLE bool_sum_events ADD COLUMN float_value Float64",
+            )
+            .expect("unsupported grouped AVG shape setup");
+        for unsupported_sql in [
+            "SELECT active, AVG(value), COUNT(*) FROM bool_sum_events GROUP BY active",
+            "SELECT active, included, AVG(value) FROM bool_sum_events GROUP BY active, included",
+            "SELECT value, AVG(id) FROM bool_sum_events GROUP BY value",
+            "SELECT active, AVG(nullable_value) FROM bool_sum_events GROUP BY active",
+            "SELECT active, AVG(float_value) FROM bool_sum_events GROUP BY active",
+        ] {
+            BUDGET.reset_peak();
+            query(&mut database, unsupported_sql);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use(),
+                0,
+                "unsupported grouped shape stays sequential: {unsupported_sql}"
+            );
+        }
+
+        database.query_result_limits.max_groups = 1;
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+        let sequential_limit = database.execute(filtered_sql);
+        database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
+        let parallel_limit = database.execute(filtered_sql);
+        assert_eq!(parallel_limit, sequential_limit);
+        assert_eq!(
+            parallel_limit,
+            Err(Error::ResourceLimitExceeded {
+                resource: "SELECT groups",
+                actual: 2,
+                max: 1,
+            })
+        );
+    }
+
+    #[test]
     fn grouped_bool_sum_worker_failure_discards_partials_and_checks_reduction() {
         let group_values = [true, false, true];
         let sum_values = [1, -5, 9];
@@ -11254,6 +11404,7 @@ mod tests {
             &sum_values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
+            AggregateFunction::Sum,
             grouped_bool_sum_chunk,
         )
         .expect("deterministic parallel grouped SUM succeeds");
@@ -11262,11 +11413,12 @@ mod tests {
             &sum_values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
-            |group_values, sum_values, rows| {
+            AggregateFunction::Sum,
+            |group_values, sum_values, rows, function| {
                 if std::thread::current().name() == Some("rusthouse-group-bool-sum-int64-1") {
                     panic!("injected grouped SUM worker failure");
                 }
-                grouped_bool_sum_chunk(group_values, sum_values, rows)
+                grouped_bool_sum_chunk(group_values, sum_values, rows, function)
             },
         )
         .expect("worker failure falls back to the complete grouped SUM locally");
@@ -11283,36 +11435,80 @@ mod tests {
         assert_eq!(failed_parallel, expected);
 
         assert_eq!(
-            reduce_grouped_bool_sum_partials(vec![
-                GroupedBoolSumPartial {
-                    false_sum: SumIntPartial {
-                        sum: i128::MAX,
-                        count: 0,
+            reduce_grouped_bool_sum_partials(
+                vec![
+                    GroupedBoolSumPartial {
+                        false_sum: SumIntPartial {
+                            sum: i128::MAX,
+                            count: 0,
+                        },
+                        ..GroupedBoolSumPartial::default()
                     },
-                    ..GroupedBoolSumPartial::default()
-                },
-                GroupedBoolSumPartial {
-                    false_sum: SumIntPartial { sum: 1, count: 0 },
-                    ..GroupedBoolSumPartial::default()
-                },
-            ]),
+                    GroupedBoolSumPartial {
+                        false_sum: SumIntPartial { sum: 1, count: 0 },
+                        ..GroupedBoolSumPartial::default()
+                    },
+                ],
+                AggregateFunction::Sum,
+            ),
             Err(Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))
         );
         assert_eq!(
-            reduce_grouped_bool_sum_partials(vec![
-                GroupedBoolSumPartial {
-                    true_sum: SumIntPartial {
-                        sum: 0,
-                        count: u64::MAX,
+            reduce_grouped_bool_sum_partials(
+                vec![
+                    GroupedBoolSumPartial {
+                        true_sum: SumIntPartial {
+                            sum: 0,
+                            count: u64::MAX,
+                        },
+                        ..GroupedBoolSumPartial::default()
                     },
-                    ..GroupedBoolSumPartial::default()
-                },
-                GroupedBoolSumPartial {
-                    true_sum: SumIntPartial { sum: 0, count: 1 },
-                    ..GroupedBoolSumPartial::default()
-                },
-            ]),
+                    GroupedBoolSumPartial {
+                        true_sum: SumIntPartial { sum: 0, count: 1 },
+                        ..GroupedBoolSumPartial::default()
+                    },
+                ],
+                AggregateFunction::Sum,
+            ),
             Err(Error::NumericOverflow("SUM count".to_owned()))
+        );
+        assert_eq!(
+            reduce_grouped_bool_sum_partials(
+                vec![
+                    GroupedBoolSumPartial {
+                        false_sum: SumIntPartial {
+                            sum: i128::MAX,
+                            count: 0,
+                        },
+                        ..GroupedBoolSumPartial::default()
+                    },
+                    GroupedBoolSumPartial {
+                        false_sum: SumIntPartial { sum: 1, count: 0 },
+                        ..GroupedBoolSumPartial::default()
+                    },
+                ],
+                AggregateFunction::Avg,
+            ),
+            Err(Error::NumericOverflow("AVG(Int64) sum".to_owned()))
+        );
+        assert_eq!(
+            reduce_grouped_bool_sum_partials(
+                vec![
+                    GroupedBoolSumPartial {
+                        true_sum: SumIntPartial {
+                            sum: 0,
+                            count: u64::MAX,
+                        },
+                        ..GroupedBoolSumPartial::default()
+                    },
+                    GroupedBoolSumPartial {
+                        true_sum: SumIntPartial { sum: 0, count: 1 },
+                        ..GroupedBoolSumPartial::default()
+                    },
+                ],
+                AggregateFunction::Avg,
+            ),
+            Err(Error::NumericOverflow("AVG count".to_owned()))
         );
     }
 
@@ -13663,10 +13859,9 @@ mod tests {
             .rows,
             [vec![Value::Bool(true), Value::Float64(7.0)]]
         );
-        assert_eq!(
-            OBSERVED_BUDGET.peak_helpers_in_use(),
-            0,
-            "grouped AVG(Int64) stays sequential"
+        assert!(
+            OBSERVED_BUDGET.peak_helpers_in_use() > 0,
+            "sole AVG(Int64) grouped by a physical Bool key uses the shared helper budget"
         );
     }
 
