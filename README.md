@@ -610,12 +610,20 @@ or `-`, including both extrema. An optional `AS alias` is preserved; otherwise,
 the result name is normalized to `ifNull(<column>, <literal>)` with canonical
 integer spelling. `WHERE` filters source rows first, then ordering by that
 normalized expression or its alias evaluates replacement values with stable
-ties before `LIMIT`/`OFFSET` pagination and materialization. The projection is
-restricted to ungrouped queries. Non-nullable or non-`Int64` columns, nonliteral
-fallbacks, extra or missing arguments, aggregate combinations, and `GROUP BY`
-are rejected with typed errors. Because it produces fixed-size `Int64` values,
-it adds no variable payload; all normal scan, result row, value, byte,
-retained-result, and formatted-output bounds still apply.
+ties before `LIMIT`/`OFFSET` pagination and materialization. The bounded grouped
+form is `SELECT ifNull(value, 0) AS filled, COUNT(*) FROM readings GROUP BY
+value`: the physical nullable argument must appear in `GROUP BY`, after which
+the replacement may be projected beside aggregates and used for group-result
+ordering with normal aliases, `HAVING`, and pagination. Group identity is still
+the retained physical key, so a NULL group and a present value equal to the
+fallback remain distinct even though they project and order equally.
+Expression-based grouping such as `GROUP BY ifNull(value, 0)` remains
+unsupported, and source columns absent from `GROUP BY` are rejected.
+Non-nullable or non-`Int64` columns, nonliteral fallbacks, and extra or missing
+arguments are also rejected with typed errors. Because it produces fixed-size
+`Int64` values, it adds no variable payload; all normal scan, group
+working-state, result row, value, byte, retained-result, and formatted-output
+bounds still apply.
 `isNull(column)` is the case-insensitive scalar nullness projection for every
 physical column. It returns `Bool` `true` only for an absent value in a
 physical `Nullable(Int64)` column; present nullable values and all values in

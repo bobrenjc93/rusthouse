@@ -3473,6 +3473,22 @@
         "eval_c88a7f3d": 95,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:846",
+      "recordedAt": "2026-08-12T06:42:21.544Z",
+      "label": "PR #846",
+      "kind": "leaf",
+      "prNumber": 846,
+      "title": "Project ifNull over grouped Nullable Int64 keys",
+      "scores": {
+        "eval_9fbdfec0": 95,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 95,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }

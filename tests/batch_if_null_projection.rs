@@ -186,14 +186,204 @@ fn orders_by_if_null_alias_using_replaced_values_and_stable_ties() {
 }
 
 #[test]
-fn rejects_non_nullable_non_int64_grouped_and_malformed_shapes() {
+fn projects_grouped_keys_with_aggregates_extrema_collisions_and_pagination() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (value Nullable(Int64)); \
+             INSERT INTO readings VALUES \
+             (NULL), (0), (-9223372036854775808), (NULL), (0), \
+             (9223372036854775807), (-5); \
+             CREATE TABLE all_null (value Nullable(Int64)); \
+             INSERT INTO all_null VALUES (NULL), (NULL), (NULL);",
+        )
+        .expect("setup");
+
+    let grouped = query(
+        &mut database,
+        "SELECT ifNull(value, 0) AS filled, COUNT(*) AS rows, \
+                MIN(value) AS minimum, MAX(value) AS maximum \
+         FROM readings GROUP BY value HAVING rows >= 1 \
+         ORDER BY filled",
+    );
+    assert_eq!(
+        grouped.columns,
+        [
+            ResultColumn {
+                name: "filled".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "rows".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "minimum".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "maximum".to_owned(),
+                data_type: DataType::Int64,
+            },
+        ]
+    );
+    assert_eq!(
+        grouped.rows,
+        [
+            vec![
+                Value::Int64(i64::MIN),
+                Value::Int64(1),
+                Value::Int64(i64::MIN),
+                Value::Int64(i64::MIN),
+            ],
+            vec![
+                Value::Int64(-5),
+                Value::Int64(1),
+                Value::Int64(-5),
+                Value::Int64(-5),
+            ],
+            vec![
+                Value::Int64(0),
+                Value::Int64(2),
+                Value::Null(DataType::Int64),
+                Value::Null(DataType::Int64),
+            ],
+            vec![
+                Value::Int64(0),
+                Value::Int64(2),
+                Value::Int64(0),
+                Value::Int64(0),
+            ],
+            vec![
+                Value::Int64(i64::MAX),
+                Value::Int64(1),
+                Value::Int64(i64::MAX),
+                Value::Int64(i64::MAX),
+            ],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT COUNT(*) AS rows, ifNull(value, 0) AS filled, MIN(value) AS minimum \
+             FROM readings GROUP BY value HAVING rows >= 2 \
+             ORDER BY ifNull(value, 0) LIMIT 1 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Int64(2), Value::Int64(0), Value::Int64(0),]]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT ifNull(value, 0) AS filled FROM readings \
+             GROUP BY value ORDER BY filled LIMIT 4 OFFSET 1",
+        )
+        .rows,
+        [
+            vec![Value::Int64(-5)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(0)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT ifNull(value, 9223372036854775807), COUNT(*) \
+             FROM all_null GROUP BY value",
+        )
+        .rows,
+        [vec![Value::Int64(i64::MAX), Value::Int64(3)]]
+    );
+}
+
+#[test]
+fn grouped_if_null_obeys_result_and_group_bounds() {
+    let setup = "CREATE TABLE readings (value Nullable(Int64)); \
+                 INSERT INTO readings VALUES (NULL), (0), (1);";
+    let result_name = "filled";
+    let exact_bytes = size_of::<ResultColumn>()
+        + result_name.len()
+        + size_of::<Vec<Value>>()
+        + size_of::<Value>();
+    let paginated = "SELECT ifNull(value, 0) AS filled FROM readings \
+                     GROUP BY value ORDER BY filled LIMIT 1";
+    let exact_limits = QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    };
+    let mut exact = Database::with_query_result_limits(exact_limits);
+    exact.execute(setup).expect("setup");
+    assert_eq!(query(&mut exact, paginated).rows, [vec![Value::Int64(0)]]);
+    assert_eq!(
+        exact.execute(
+            "SELECT ifNull(value, 0) AS filled FROM readings GROUP BY value ORDER BY filled",
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 1,
+        })
+    );
+    exact
+        .execute_with_result_limit(paginated, exact_bytes)
+        .expect("exact retained-result bound succeeds");
+    assert_eq!(
+        exact.execute_with_result_limit(paginated, exact_bytes - 1),
+        Err(Error::ResultLimitExceeded {
+            bytes: exact_bytes,
+            max_bytes: exact_bytes - 1,
+        })
+    );
+
+    let mut group_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_groups: 2,
+        ..QueryResultLimits::default()
+    });
+    group_limited.execute(setup).expect("setup");
+    assert_eq!(
+        group_limited.execute(paginated),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT groups",
+            actual: 3,
+            max: 2,
+        })
+    );
+
+    let mut value_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 3,
+        max_values: 5,
+        max_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    });
+    value_limited.execute(setup).expect("setup");
+    assert_eq!(
+        value_limited.execute("SELECT ifNull(value, 0), COUNT(*) FROM readings GROUP BY value",),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result values",
+            actual: 6,
+            max: 5,
+        })
+    );
+}
+
+#[test]
+fn rejects_non_nullable_non_int64_ungrouped_sources_and_malformed_shapes() {
     let mut database = Database::new();
     database
         .execute(
             "CREATE TABLE samples (i Int64, f Float64, b Bool, s String); \
              INSERT INTO samples VALUES (1, 1.5, true, 'one'); \
              CREATE TABLE nullable (n Nullable(Int64)); \
-             INSERT INTO nullable VALUES (NULL);",
+             INSERT INTO nullable VALUES (NULL); \
+             CREATE TABLE grouped_nullable \
+                 (id Int64, n Nullable(Int64), other Nullable(Int64)); \
+             INSERT INTO grouped_nullable VALUES (1, NULL, 1), (2, 2, 1);",
         )
         .expect("setup");
 
@@ -222,19 +412,20 @@ fn rejects_non_nullable_non_int64_grouped_and_malformed_shapes() {
     }
 
     for sql in [
-        "SELECT ifNull(n, 0) FROM nullable GROUP BY n",
         "SELECT ifNull(n, 0), COUNT(*) FROM nullable",
+        "SELECT ifNull(n, 0), COUNT(*) FROM grouped_nullable GROUP BY other",
     ] {
         assert_eq!(
             database.execute(sql),
             Err(Error::InvalidQuery(
-                "ifNull projections are only supported in ungrouped SELECT queries".to_owned()
+                "column 'n' must appear in GROUP BY".to_owned()
             )),
             "{sql}"
         );
     }
 
     for sql in [
+        "SELECT ifNull(n, 0) FROM nullable GROUP BY ifNull(n, 0)",
         "SELECT ifNull() FROM nullable",
         "SELECT ifNull(n) FROM nullable",
         "SELECT ifNull(n,) FROM nullable",
