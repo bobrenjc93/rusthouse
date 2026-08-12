@@ -1,23 +1,35 @@
-//! Private partial-state reduction for non-nullable `Int64` `MAX` grouped by `Bool`.
+//! Private partial-state reduction for supported non-nullable `MAX` values grouped by `Bool`.
 
 use super::aggregate_scheduler::{GlobalAggregateParallelism, run_grouped_aggregate};
 use super::error::Result;
+use super::global_scalar_extremum::first_float64_maximum;
 
-const WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-max-int64";
+const INT64_WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-max-int64";
+const FLOAT64_WORKER_NAME_PREFIX: &str = "rusthouse-group-bool-max-float64";
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Partial {
-    false_max: Option<i64>,
-    true_max: Option<i64>,
+#[derive(Debug, PartialEq)]
+pub(super) struct Partial<T> {
+    false_max: Option<T>,
+    true_max: Option<T>,
     first_seen: Option<bool>,
 }
 
-impl Partial {
-    fn slot(&self, group: bool) -> Option<i64> {
+impl<T> Default for Partial<T> {
+    fn default() -> Self {
+        Self {
+            false_max: None,
+            true_max: None,
+            first_seen: None,
+        }
+    }
+}
+
+impl<T: Copy> Partial<T> {
+    fn slot(&self, group: bool) -> Option<T> {
         if group { self.true_max } else { self.false_max }
     }
 
-    fn slot_mut(&mut self, group: bool) -> &mut Option<i64> {
+    fn slot_mut(&mut self, group: bool) -> &mut Option<T> {
         if group {
             &mut self.true_max
         } else {
@@ -33,65 +45,104 @@ impl Partial {
         self.slot(group).is_some()
     }
 
-    pub(super) fn maximum(&self, group: bool) -> i64 {
+    pub(super) fn maximum(&self, group: bool) -> T {
         self.slot(group)
-            .expect("a present non-nullable Int64 group has a maximum")
+            .expect("a present non-nullable group has a maximum")
     }
 
-    fn observe(&mut self, group: bool, value: i64) {
+    fn observe<C>(&mut self, group: bool, value: T, first_maximum: &C)
+    where
+        C: Fn(T, T) -> T,
+    {
         self.first_seen.get_or_insert(group);
         let maximum = self.slot_mut(group);
-        *maximum = Some(maximum.map_or(value, |current| current.max(value)));
+        *maximum = Some(maximum.map_or(value, |current| first_maximum(current, value)));
     }
 }
 
-pub(super) fn reduce(
+pub(super) fn reduce_int64(
     group_values: &[bool],
     max_values: &[i64],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
-) -> Result<Partial> {
+) -> Result<Partial<i64>> {
     reduce_with_chunk(
         group_values,
         max_values,
         matching_rows,
         parallelism,
+        INT64_WORKER_NAME_PREFIX,
+        first_i64_maximum,
         scan_chunk,
     )
 }
 
-fn reduce_with_chunk<C>(
+pub(super) fn reduce_float64(
     group_values: &[bool],
-    max_values: &[i64],
+    max_values: &[f64],
     matching_rows: &[usize],
     parallelism: GlobalAggregateParallelism,
+) -> Result<Partial<f64>> {
+    reduce_with_chunk(
+        group_values,
+        max_values,
+        matching_rows,
+        parallelism,
+        FLOAT64_WORKER_NAME_PREFIX,
+        first_float64_maximum,
+        scan_chunk,
+    )
+}
+
+fn first_i64_maximum(left: i64, right: i64) -> i64 {
+    if right > left { right } else { left }
+}
+
+fn reduce_with_chunk<T, M, C>(
+    group_values: &[bool],
+    max_values: &[T],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    worker_name_prefix: &str,
+    first_maximum: M,
     chunk: C,
-) -> Result<Partial>
+) -> Result<Partial<T>>
 where
-    C: Fn(&[bool], &[i64], &[usize]) -> Result<Partial> + Sync,
+    T: Copy + Send + Sync,
+    M: Fn(T, T) -> T + Sync,
+    C: Fn(&[bool], &[T], &[usize], &M) -> Result<Partial<T>> + Sync,
 {
     run_grouped_aggregate(
         matching_rows,
         parallelism,
-        WORKER_NAME_PREFIX,
-        |rows| chunk(group_values, max_values, rows),
-        reduce_ordered,
+        worker_name_prefix,
+        |rows| chunk(group_values, max_values, rows, &first_maximum),
+        |partials| reduce_ordered(partials, &first_maximum),
     )
 }
 
-fn scan_chunk(
+fn scan_chunk<T, C>(
     group_values: &[bool],
-    max_values: &[i64],
+    max_values: &[T],
     matching_rows: &[usize],
-) -> Result<Partial> {
+    first_maximum: &C,
+) -> Result<Partial<T>>
+where
+    T: Copy,
+    C: Fn(T, T) -> T,
+{
     let mut partial = Partial::default();
     for row in matching_rows {
-        partial.observe(group_values[*row], max_values[*row]);
+        partial.observe(group_values[*row], max_values[*row], first_maximum);
     }
     Ok(partial)
 }
 
-fn reduce_ordered(partials: Vec<Partial>) -> Result<Partial> {
+fn reduce_ordered<T, C>(partials: Vec<Partial<T>>, first_maximum: &C) -> Result<Partial<T>>
+where
+    T: Copy,
+    C: Fn(T, T) -> T,
+{
     Ok(partials
         .into_iter()
         .fold(Partial::default(), |mut total, partial| {
@@ -99,10 +150,10 @@ fn reduce_ordered(partials: Vec<Partial>) -> Result<Partial> {
                 total.first_seen = partial.first_seen;
             }
             if let Some(maximum) = partial.false_max {
-                total.observe(false, maximum);
+                total.observe(false, maximum, first_maximum);
             }
             if let Some(maximum) = partial.true_max {
-                total.observe(true, maximum);
+                total.observe(true, maximum, first_maximum);
             }
             total
         }))
@@ -125,7 +176,7 @@ mod tests {
         matching_rows[second_partition] = 1;
         matching_rows[row_count - 1] = 2;
 
-        let successful_parallel = reduce(
+        let successful_parallel = reduce_int64(
             &group_values,
             &max_values,
             &matching_rows,
@@ -137,11 +188,13 @@ mod tests {
             &max_values,
             &matching_rows,
             GlobalAggregateParallelism::fixed(2),
-            |group_values, max_values, rows| {
+            INT64_WORKER_NAME_PREFIX,
+            first_i64_maximum,
+            |group_values, max_values, rows, first_maximum| {
                 if std::thread::current().name() == Some("rusthouse-group-bool-max-int64-1") {
                     panic!("injected grouped MAX worker failure");
                 }
-                scan_chunk(group_values, max_values, rows)
+                scan_chunk(group_values, max_values, rows, first_maximum)
             },
         )
         .expect("worker failure falls back to the complete grouped MAX locally");
@@ -153,5 +206,45 @@ mod tests {
         };
         assert_eq!(successful_parallel, expected);
         assert_eq!(failed_parallel, expected);
+    }
+
+    #[test]
+    fn float64_worker_failure_repeats_complete_input_with_first_ties_and_group_order() {
+        let group_values = [true, true, false];
+        let max_values = [-0.0, 0.0, f64::MAX];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_float64(
+            &group_values,
+            &max_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+        )
+        .expect("deterministic parallel grouped Float64 MAX succeeds");
+        let failed_parallel = reduce_with_chunk(
+            &group_values,
+            &max_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            FLOAT64_WORKER_NAME_PREFIX,
+            first_float64_maximum,
+            |group_values, max_values, rows, first_maximum| {
+                if std::thread::current().name() == Some("rusthouse-group-bool-max-float64-1") {
+                    panic!("injected grouped Float64 MAX worker failure");
+                }
+                scan_chunk(group_values, max_values, rows, first_maximum)
+            },
+        )
+        .expect("worker failure falls back to the complete grouped Float64 MAX locally");
+
+        for partial in [&successful_parallel, &failed_parallel] {
+            assert_eq!(partial.first_seen(), Some(true));
+            assert_eq!(partial.maximum(false), f64::MAX);
+            assert_eq!(partial.maximum(true).to_bits(), (-0.0_f64).to_bits());
+        }
     }
 }
