@@ -9373,14 +9373,19 @@ impl CompiledPredicate {
     }
 
     fn int64_inclusive_range_filter(&self) -> Option<(usize, Int64Filter)> {
-        let Self::And(lower, upper) = self else {
+        let Self::And(first, second) = self else {
             return None;
         };
-        let (lower_column, Int64Filter::GreaterOrEqual(lower)) = lower.int64_filter()? else {
-            return None;
-        };
-        let (upper_column, Int64Filter::LessOrEqual(upper)) = upper.int64_filter()? else {
-            return None;
+        let (first_column, first_filter) = first.int64_filter()?;
+        let (second_column, second_filter) = second.int64_filter()?;
+        let (lower_column, lower, upper_column, upper) = match (first_filter, second_filter) {
+            (Int64Filter::GreaterOrEqual(lower), Int64Filter::LessOrEqual(upper)) => {
+                (first_column, lower, second_column, upper)
+            }
+            (Int64Filter::LessOrEqual(upper), Int64Filter::GreaterOrEqual(lower)) => {
+                (second_column, lower, first_column, upper)
+            }
+            _ => return None,
         };
         if lower_column != upper_column {
             return None;

@@ -169,9 +169,11 @@ their documented nullable restrictions.
 An admitted, current index can reject blocks for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
 order), and for an exact positive inclusive range on one column with `Int64`
-literal bounds. `column BETWEEN lower AND upper`, the equivalent `column >=
-lower AND column <= upper`, and forms normalized to that conjunction such as
-`NOT (column < lower OR column > upper)` share this indexed range path. Both
+literal bounds. `column BETWEEN lower AND upper`, the equivalent two
+comparisons `column >= lower` and `column <= upper` in either conjunction
+order (with either comparison's operands reversed), and forms normalized to
+that conjunction such as `NOT (column < lower OR column > upper)` share this
+indexed range path. Both
 `Int64` and physical `Nullable(Int64)` index columns are supported; all-null
 blocks cannot satisfy these shapes. Every row in a surviving block still
 follows the normal exact predicate evaluator. Other compound shapes, `NOT
@@ -848,7 +850,9 @@ For a direct comparison between that `Int64` key and an `Int64` literal using
 whose inclusive bounds make a match impossible. The exact positive `column
 BETWEEN lower AND upper` form with `Int64` literal bounds uses the same path,
 as do equivalent predicates normalized to `column >= lower AND column <=
-upper`. Reversed bounds prune every partition. The normal compiled predicate
+upper` or the upper-bound-first `column <= upper AND column >= lower`; either
+comparison may also reverse its operands. Reversed bounds prune every
+partition. The normal compiled predicate
 still checks every row in the admitted ranges, and physical rows retain source
 order through the existing projection, aliases, aggregation, ordering, `LIMIT`,
 and `OFFSET` paths. The SELECT scan-row limit is charged to admitted physical
