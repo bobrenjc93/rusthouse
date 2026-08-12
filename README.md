@@ -82,13 +82,14 @@ deterministic contiguous chunks when more than 262,144 rows match. A grouped
 query also uses those chunks when it has exactly one non-nullable `Bool`
 grouping column and exactly one `COUNT(*)`, `COUNT()`, or
 `COUNT(physical_nullable_int64_column)` aggregate, or exactly one
-`SUM(physical_non_nullable_int64_column)` aggregate. Nullable grouped COUNT
+`SUM(physical_non_nullable_int64_column)` or
+`AVG(physical_non_nullable_int64_column)` aggregate. Nullable grouped COUNT
 partials track group row presence separately from present values, so all-NULL
-groups remain visible with a zero count. Bool-grouped SUM partials maintain a
-checked i128 sum and checked row count for each key, then apply the normal
-checked Int64 final conversion. Ordered partition reduction preserves
-first-seen Bool grouping before the normal grouped HAVING, ordering, and
-pagination stages. The paired
+groups remain visible with a zero count. Bool-grouped SUM/AVG partials maintain
+a checked i128 sum and checked row count for each key, then apply the normal
+checked Int64 SUM conversion or Float64 AVG finalization. Ordered partition
+reduction preserves first-seen Bool grouping before the normal grouped HAVING,
+ordering, and pagination stages. The paired
 shapes preserve either projection order. Row-count pairs derive `COUNT` with a
 checked conversion of the filtered cardinality; same-column nullable
 `COUNT`/`SUM` and `COUNT`/`AVG` pairs derive their NULL-ignoring count from the
@@ -878,7 +879,7 @@ constructor configure the scan and output limits.
 `Database::with_global_aggregate_worker_cap` and the matching `SharedDatabase`
 constructor accept a `NonZeroUsize` computation-lane cap for the supported
 parallel global aggregates and the narrow Bool-grouped row count, nullable
-integer `COUNT`, or non-nullable Int64 `SUM` shapes. The
+integer `COUNT`, or non-nullable Int64 `SUM`/`AVG` shapes. The
 configured cap is an upper bound: the
 process-wide admission budget, available parallelism, useful input chunks, and
 the fixed 16-lane ceiling may reduce the effective lane count. The matching
@@ -1091,8 +1092,8 @@ persistent database configuration.
 `max_threads` has the same decimal syntax. Zero retains the database's
 `global_aggregate_worker_cap`; a nonzero value is combined with that cap using
 the smaller value. It applies only to supported parallel aggregates in that
-request, including supported Bool-grouped `COUNT` and `SUM`, and never changes
-`SHOW SETTINGS` or `system.settings`. The
+request, including supported Bool-grouped `COUNT`, `SUM`, and `AVG`, and never
+changes `SHOW SETTINGS` or `system.settings`. The
 available-hardware and fixed 16-lane ceilings still apply, and simultaneous
 requests continue to share the process-wide nonblocking helper admission
 budget.
