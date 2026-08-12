@@ -999,6 +999,229 @@ fn nullable_int64_identity_cast_preserves_values_aliases_and_row_selection() {
 }
 
 #[test]
+fn grouped_nullable_int64_identity_cast_projects_retained_keys() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (value Nullable(Int64)); \
+             INSERT INTO readings VALUES \
+             (NULL), (-9223372036854775808), (-5), (0), (NULL), (0), \
+             (9223372036854775807); \
+             CREATE TABLE all_null (value Nullable(Int64)); \
+             INSERT INTO all_null VALUES (NULL), (NULL), (NULL);",
+        )
+        .expect("setup");
+
+    let grouped = query(
+        &mut database,
+        "SELECT CAST(value AS Int64) AS original, COUNT(*) AS rows, \
+                MIN(value) AS minimum, MAX(value) AS maximum \
+         FROM readings GROUP BY value HAVING rows >= 1 ORDER BY original",
+    );
+    assert_eq!(
+        grouped.columns,
+        [
+            ResultColumn {
+                name: "original".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "rows".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "minimum".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "maximum".to_owned(),
+                data_type: DataType::Int64,
+            },
+        ]
+    );
+    assert_eq!(
+        grouped.rows,
+        [
+            vec![
+                Value::Null(DataType::Int64),
+                Value::Int64(2),
+                Value::Null(DataType::Int64),
+                Value::Null(DataType::Int64),
+            ],
+            vec![
+                Value::Int64(i64::MIN),
+                Value::Int64(1),
+                Value::Int64(i64::MIN),
+                Value::Int64(i64::MIN),
+            ],
+            vec![
+                Value::Int64(-5),
+                Value::Int64(1),
+                Value::Int64(-5),
+                Value::Int64(-5),
+            ],
+            vec![
+                Value::Int64(0),
+                Value::Int64(2),
+                Value::Int64(0),
+                Value::Int64(0),
+            ],
+            vec![
+                Value::Int64(i64::MAX),
+                Value::Int64(1),
+                Value::Int64(i64::MAX),
+                Value::Int64(i64::MAX),
+            ],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT COUNT(*) AS rows, CAST(value AS Int64) AS original \
+             FROM readings GROUP BY value HAVING rows >= 2 \
+             ORDER BY CAST(value AS Int64) DESC LIMIT 1 OFFSET 1",
+        )
+        .rows,
+        [vec![Value::Int64(2), Value::Null(DataType::Int64)]]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(value AS Int64), COUNT(*) FROM all_null GROUP BY value",
+        )
+        .rows,
+        [vec![Value::Null(DataType::Int64), Value::Int64(3)]]
+    );
+}
+
+#[test]
+fn grouped_identity_casts_both_columns_of_an_all_nullable_table() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings \
+                 (primary_value Nullable(Int64), backup_value Nullable(Int64)); \
+             INSERT INTO readings VALUES \
+                 (NULL, NULL), (NULL, NULL), (NULL, 2), \
+                 (1, NULL), (1, 2), (1, 2);",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT CAST(primary_value AS Int64) AS primary_key, \
+                    CAST(backup_value AS Int64) AS backup_key, COUNT(*) AS rows \
+             FROM readings GROUP BY primary_value, backup_value \
+             ORDER BY primary_key, backup_key",
+        )
+        .rows,
+        [
+            vec![
+                Value::Null(DataType::Int64),
+                Value::Null(DataType::Int64),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Null(DataType::Int64),
+                Value::Int64(2),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Null(DataType::Int64),
+                Value::Int64(1),
+            ],
+            vec![Value::Int64(1), Value::Int64(2), Value::Int64(2)],
+        ]
+    );
+}
+
+#[test]
+fn grouped_nullable_int64_identity_cast_rejects_ungrouped_sources_and_expression_grouping() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings \
+                 (id Int64, value Nullable(Int64), other Nullable(Int64)); \
+             INSERT INTO readings VALUES (1, NULL, 1), (2, 2, 1);",
+        )
+        .expect("setup");
+
+    for sql in [
+        "SELECT CAST(value AS Int64), COUNT(*) FROM readings",
+        "SELECT CAST(value AS Int64), COUNT(*) FROM readings GROUP BY other",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::InvalidQuery(
+                "column 'value' must appear in GROUP BY".to_owned()
+            )),
+            "{sql}"
+        );
+    }
+
+    assert!(
+        parse("SELECT CAST(value AS Int64) FROM readings GROUP BY CAST(value AS Int64)").is_err()
+    );
+}
+
+#[test]
+fn grouped_nullable_int64_identity_cast_obeys_result_and_group_limits() {
+    let setup = "CREATE TABLE readings (value Nullable(Int64)); \
+                 INSERT INTO readings VALUES (NULL), (0), (1);";
+    let result_name = "original";
+    let exact_bytes = std::mem::size_of::<ResultColumn>()
+        + result_name.len()
+        + std::mem::size_of::<Vec<Value>>()
+        + std::mem::size_of::<Value>();
+    let paginated = "SELECT CAST(value AS Int64) AS original FROM readings \
+                     GROUP BY value ORDER BY original DESC LIMIT 1";
+    let exact_limits = QueryResultLimits {
+        max_rows: 1,
+        max_values: 1,
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    };
+    let mut exact = Database::with_query_result_limits(exact_limits);
+    exact.execute(setup).expect("setup");
+    assert_eq!(query(&mut exact, paginated).rows, [vec![Value::Int64(1)]]);
+    assert_eq!(
+        exact.execute("SELECT CAST(value AS Int64) AS original FROM readings GROUP BY value",),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 3,
+            max: 1,
+        })
+    );
+    exact
+        .execute_with_result_limit(paginated, exact_bytes)
+        .expect("exact retained-result bound succeeds");
+    assert_eq!(
+        exact.execute_with_result_limit(paginated, exact_bytes - 1),
+        Err(Error::ResultLimitExceeded {
+            bytes: exact_bytes,
+            max_bytes: exact_bytes - 1,
+        })
+    );
+
+    let mut group_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_groups: 2,
+        ..QueryResultLimits::default()
+    });
+    group_limited.execute(setup).expect("setup");
+    assert_eq!(
+        group_limited.execute(paginated),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT groups",
+            actual: 3,
+            max: 2,
+        })
+    );
+}
+
+#[test]
 fn nullable_int64_identity_cast_obeys_result_caps() {
     let setup = "CREATE TABLE samples (reading Nullable(Int64)); \
                  INSERT INTO samples VALUES (NULL), (1), (2);";

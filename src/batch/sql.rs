@@ -101,13 +101,13 @@ pub enum Statement {
         columns: Vec<ColumnDef>,
         nullable_column: String,
     },
-    /// A non-nullable prefix followed by exactly two `Nullable(Int64)` columns.
+    /// An optional non-nullable prefix followed by exactly two `Nullable(Int64)` columns.
     CreateTableWithTwoTrailingNullableInt64 {
         name: String,
         columns: Vec<ColumnDef>,
         nullable_columns: [String; 2],
     },
-    /// Conditional form of the bounded two-trailing-nullable CREATE shape.
+    /// Conditional form of the bounded two-nullable CREATE shape.
     CreateTableWithTwoTrailingNullableInt64IfNotExists {
         name: String,
         columns: Vec<ColumnDef>,
@@ -1734,7 +1734,7 @@ impl<'a> Parser<'a> {
             } else {
                 if !nullable_int64_columns.is_empty() {
                     return self.error(
-                        "Nullable(Int64) columns must form the final one- or two-column suffix after a non-nullable prefix",
+                        "Nullable(Int64) columns must form the final one- or two-column suffix",
                     );
                 }
                 let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
@@ -1772,10 +1772,6 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after CREATE TABLE");
         }
         if nullable_int64_columns.len() == 2 {
-            if columns.is_empty() {
-                return self
-                    .error("two trailing Nullable(Int64) columns require a non-nullable prefix");
-            }
             let second = nullable_int64_columns
                 .pop()
                 .expect("two nullable columns were parsed");

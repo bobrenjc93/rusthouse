@@ -141,11 +141,11 @@ cap is an admission rejection and leaves existing state unchanged. Each block
 records its first row, row count, non-null minimum/maximum, and null count;
 all-null blocks therefore have no extrema. Physical column vectors support
 `Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL accepts
-either a sole `Nullable(Int64)` column or a non-nullable prefix followed by one
-or two trailing `Nullable(Int64)` columns in `CREATE TABLE`, case-insensitively.
-Leading nullable columns in a multi-column schema, more than two nullable
-columns, interleaved nullable columns, and other nullable types remain outside
-the bounded grammar.
+one or two all-nullable `Nullable(Int64)` columns, or a non-nullable prefix
+followed by one or two trailing `Nullable(Int64)` columns in `CREATE TABLE`,
+case-insensitively. Leading nullable columns before a non-nullable column, more
+than two nullable columns, interleaved nullable columns, and other nullable
+types remain outside the bounded grammar.
 Library APIs and WAL recovery can also create this physical storage. The index
 metadata has explicit nullable-block semantics for both `Int64` storage forms.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` accept physical `Nullable(Int64)`
@@ -448,12 +448,12 @@ values and is available through the normal `Database`, `SharedDatabase`, CLI,
 and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns canonical, replayable DDL as a bounded
 `String`, preserving the stored table and column display names and schema order
-while normalizing type spellings. Schemas with no nullable columns, a sole
-`Nullable(Int64)` column, or a non-nullable prefix followed by one or two
-trailing `Nullable(Int64)` columns use one `CREATE TABLE` statement. Other mixed
-schemas created through `ALTER TABLE` or library APIs use the non-nullable
-prefix before the first nullable column (or a first nullable column by itself),
-then emit ordered
+while normalizing type spellings. Schemas with no nullable columns, one or two
+all-nullable `Nullable(Int64)` columns, or a non-nullable prefix followed by one
+or two trailing `Nullable(Int64)` columns use one `CREATE TABLE` statement.
+Other mixed schemas created through `ALTER TABLE` or library APIs use the
+non-nullable prefix before the first nullable column (or a first nullable column
+by itself), then emit ordered
 `ALTER TABLE ... ADD COLUMN` statements for the remainder so the output stays
 inside the bounded grammar.
 Because the normal executor accepts at most 4,096 statements, additions that
@@ -579,11 +579,17 @@ only when the corresponding row survives pagination and is converted.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
-are currently limited to ungrouped queries: they cannot be combined with
-aggregate projections or `GROUP BY`. Generated `String` payload bytes—four or
-five for booleans, one through twenty for integers, and one through 327 for
-finite floats—are charged exactly against the result-byte limit before
-materialization. No other source/target type pairs are accepted.
+other than the `Nullable(Int64)` identity form are currently limited to
+ungrouped queries: they cannot be combined with aggregate projections or
+`GROUP BY`. The identity form may be projected beside aggregates when its
+physical source column appears in `GROUP BY`; it derives both present values
+and typed `NULL` from the retained group key and supports normal aliases,
+aggregate `HAVING`, result ordering, and pagination. Expression grouping such
+as `GROUP BY CAST(value AS Int64)` remains unsupported, and an identity-cast
+source absent from `GROUP BY` is rejected. Generated `String` payload
+bytes—four or five for booleans, one through twenty for integers, and one
+through 327 for finite floats—are charged exactly against the result-byte
+limit before materialization. No other source/target type pairs are accepted.
 `toString(column)` is the case-insensitive ClickHouse-style String conversion
 for every physical type. `Int64`, `Float64`, and `Bool` inputs use exactly the
 same canonical formatting, lexicographic expression ordering, and generated

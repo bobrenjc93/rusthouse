@@ -164,9 +164,9 @@ pub(crate) struct ParameterizedQueryLimits {
 /// Checked `Int64` column-minus-literal expressions, `CAST`, `toString`,
 /// `ifNull`, `isNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`, `ABS`,
 /// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window
-/// forms provide bounded projections in ungrouped queries. `ifNull` and
-/// `isNull` may also derive fixed-size values from physical columns already
-/// admitted by `GROUP BY`.
+/// forms provide bounded projections in ungrouped queries. `ifNull`, `isNull`,
+/// and the nullable `Int64` identity `CAST` may also derive fixed-size values
+/// from physical columns already admitted by `GROUP BY`.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
@@ -1458,7 +1458,21 @@ impl Database {
             };
         }
 
-        let mut table = Table::with_limits(name, columns, self.table_limits)?;
+        let mut nullable_columns = nullable_columns.into_iter();
+        let mut table = if columns.is_empty() {
+            let first = nullable_columns.next().ok_or_else(|| {
+                Error::InvalidQuery("a table must contain at least one column".to_owned())
+            })?;
+            let second = nullable_columns.next().ok_or_else(|| {
+                Error::InvalidQuery("a table must contain at least one column".to_owned())
+            })?;
+            let mut table =
+                Table::with_nullable_int64_values(name, first, Vec::new(), self.table_limits)?;
+            table.add_nullable_int64_column(second)?;
+            table
+        } else {
+            Table::with_limits(name, columns, self.table_limits)?
+        };
         for nullable_column in nullable_columns {
             table.add_nullable_int64_column(nullable_column)?;
         }
@@ -4828,12 +4842,10 @@ fn show_create_column_count(table: &Table) -> usize {
         return table.schema().len();
     };
     let nullable_suffix = &table.columns()[first_nullable..];
-    let supported_nullable_shape = (first_nullable == 0 && table.schema().len() == 1)
-        || (first_nullable > 0
-            && nullable_suffix.len() <= 2
-            && nullable_suffix
-                .iter()
-                .all(|column| matches!(column, Column::NullableInt64(_))));
+    let supported_nullable_shape = nullable_suffix.len() <= 2
+        && nullable_suffix
+            .iter()
+            .all(|column| matches!(column, Column::NullableInt64(_)));
     if supported_nullable_shape && table.schema().len() <= sql::DEFAULT_MAX_AST_LIST_ITEMS {
         table.schema().len()
     } else {
@@ -4856,8 +4868,7 @@ fn show_create_statement_count_after_addition(table: &Table, added_nullable: boo
         .iter()
         .all(|column| matches!(column, Column::NullableInt64(_)));
     let resulting_suffix_is_nullable = existing_suffix_is_nullable && added_nullable;
-    let supported_nullable_shape = (first_nullable == 0 && resulting_columns == 1)
-        || (first_nullable > 0 && nullable_suffix_len <= 2 && resulting_suffix_is_nullable);
+    let supported_nullable_shape = nullable_suffix_len <= 2 && resulting_suffix_is_nullable;
     if supported_nullable_shape && resulting_columns <= sql::DEFAULT_MAX_AST_LIST_ITEMS {
         1
     } else {
@@ -5408,6 +5419,7 @@ enum ResolvedItem {
     },
     CastNullableInt64ToInt64 {
         source: usize,
+        group_position: Option<usize>,
     },
     CastInt64ToFloat64 {
         source: usize,
@@ -5706,11 +5718,15 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
+                let group_position = group_columns.iter().position(|column| *column == source);
                 let resolved = match (actual, *target_type) {
                     (DataType::Int64, DataType::Int64)
                         if table.column_is_nullable_int64(source) =>
                     {
-                        Some(ResolvedItem::CastNullableInt64ToInt64 { source })
+                        Some(ResolvedItem::CastNullableInt64ToInt64 {
+                            source,
+                            group_position,
+                        })
                     }
                     (DataType::Int64, DataType::Float64) => {
                         Some(ResolvedItem::CastInt64ToFloat64 { source })
@@ -5764,10 +5780,26 @@ fn resolve_select_items(
                     });
                 };
                 if has_aggregate || !group_columns.is_empty() {
-                    return Err(Error::InvalidQuery(
-                        "CAST projections are only supported in ungrouped SELECT queries"
-                            .to_owned(),
-                    ));
+                    match &resolved {
+                        ResolvedItem::CastNullableInt64ToInt64 {
+                            group_position: Some(_),
+                            ..
+                        } => {}
+                        ResolvedItem::CastNullableInt64ToInt64 {
+                            group_position: None,
+                            ..
+                        } => {
+                            return Err(Error::InvalidQuery(format!(
+                                "column '{name}' must appear in GROUP BY"
+                            )));
+                        }
+                        _ => {
+                            return Err(Error::InvalidQuery(
+                                "CAST projections are only supported in ungrouped SELECT queries"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
                 }
                 items.push(resolved);
                 result_columns.push(ResultColumn {
@@ -6232,7 +6264,7 @@ fn execute_projection(
                         ResolvedItem::IsNull { source, .. } => {
                             Value::Bool(is_null_at(table, *source, *row))
                         }
-                        ResolvedItem::CastNullableInt64ToInt64 { source } => {
+                        ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
                             table.columns()[*source].value(*row)
                         }
                         ResolvedItem::CastInt64ToFloat64 { source } => {
@@ -6539,8 +6571,15 @@ fn validate_grouped_result_limits(
                     group_position: None,
                     ..
                 } => unreachable!("grouped isNull arguments are validated"),
-                ResolvedItem::CastNullableInt64ToInt64 { .. }
-                | ResolvedItem::CastInt64ToFloat64 { .. }
+                ResolvedItem::CastNullableInt64ToInt64 {
+                    group_position: Some(_),
+                    ..
+                } => 0,
+                ResolvedItem::CastNullableInt64ToInt64 {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped Nullable(Int64) CAST arguments are validated"),
+                ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
@@ -8353,8 +8392,15 @@ impl GroupedData<'_> {
                             group_position: None,
                             ..
                         } => unreachable!("grouped isNull arguments are validated"),
-                        ResolvedItem::CastNullableInt64ToInt64 { .. }
-                        | ResolvedItem::CastInt64ToFloat64 { .. }
+                        ResolvedItem::CastNullableInt64ToInt64 {
+                            group_position: Some(position),
+                            ..
+                        } => self.keys[*group].value(*position).to_owned(),
+                        ResolvedItem::CastNullableInt64ToInt64 {
+                            group_position: None,
+                            ..
+                        } => unreachable!("grouped Nullable(Int64) CAST arguments are validated"),
+                        ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastBoolToFloat64 { .. }
                         | ResolvedItem::CastStringToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. }
@@ -8751,7 +8797,7 @@ fn resolved_expression_name(
             source, fallback, ..
         } => sql::if_null_int64_name(&table.schema()[*source].name, *fallback),
         ResolvedItem::IsNull { source, .. } => sql::is_null_name(&table.schema()[*source].name),
-        ResolvedItem::CastNullableInt64ToInt64 { source } => {
+        ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
         ResolvedItem::CastInt64ToFloat64 { source } => {
@@ -8910,7 +8956,7 @@ fn order_source_rows(
                 ResolvedItem::IsNull { source, .. } => {
                     is_null_at(table, source, left).cmp(&is_null_at(table, source, right))
                 }
-                ResolvedItem::CastNullableInt64ToInt64 { source } => {
+                ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
                     table.columns()[source].cmp_at(left, right)
                 }
                 ResolvedItem::CastInt64ToFloat64 { source } => {
@@ -9189,8 +9235,17 @@ fn order_grouped_rows(
                     group_position: None,
                     ..
                 } => unreachable!("grouped isNull arguments are validated"),
-                ResolvedItem::CastNullableInt64ToInt64 { .. }
-                | ResolvedItem::CastInt64ToFloat64 { .. }
+                ResolvedItem::CastNullableInt64ToInt64 {
+                    group_position: Some(position),
+                    ..
+                } => data.keys[left]
+                    .value(position)
+                    .cmp(&data.keys[right].value(position)),
+                ResolvedItem::CastNullableInt64ToInt64 {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped Nullable(Int64) CAST arguments are validated"),
+                ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastBoolToFloat64 { .. }
                 | ResolvedItem::CastStringToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
