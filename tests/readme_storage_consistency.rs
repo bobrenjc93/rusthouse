@@ -9,14 +9,16 @@ fn readme_documents_the_bounded_nullable_int64_sql_ddl_shape() {
     let readme = normalized_readme();
     let expected = "Physical column vectors support `Int64`, `Nullable(Int64)`, `Bool`, \
                     `Float64`, and `String` storage. SQL accepts the exact one-column \
-                    `CREATE TABLE <name> (<column> Nullable(Int64))` shape case-insensitively; \
-                    other nullable types and nullable multi-column declarations remain outside \
-                    the bounded grammar.";
+                    `CREATE TABLE <name> (<column> Nullable(Int64))` shape and a nonempty \
+                    non-nullable prefix followed by exactly one trailing `Nullable(Int64)` \
+                    column, case-insensitively. Other nullable types, leading nullable columns \
+                    in multi-column declarations, and multiple or non-trailing nullable \
+                    columns remain outside the bounded grammar.";
     let expected = expected.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
         readme.contains(&expected),
-        "README must document the exact SQL Nullable(Int64) declaration boundary"
+        "README must document the bounded SQL Nullable(Int64) declaration forms"
     );
 
     for stale_claim in [

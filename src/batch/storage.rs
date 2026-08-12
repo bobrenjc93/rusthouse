@@ -756,6 +756,34 @@ impl Table {
         Ok(table)
     }
 
+    /// Builds an empty table with a non-nullable prefix and one trailing
+    /// physical `Nullable(Int64)` column. The complete schema is validated
+    /// before the physical column is changed, so callers can stage the table
+    /// before publishing it to a catalog.
+    pub(crate) fn with_trailing_nullable_int64(
+        name: String,
+        mut schema: Vec<ColumnDef>,
+        nullable_column: String,
+        limits: TableLimits,
+    ) -> Result<Self> {
+        if schema.is_empty() {
+            return Err(Error::InvalidQuery(
+                "a trailing Nullable(Int64) column requires a non-nullable prefix".to_owned(),
+            ));
+        }
+        schema.push(ColumnDef {
+            name: nullable_column,
+            data_type: DataType::Int64,
+        });
+        let mut table = Self::with_limits(name, schema, limits)?;
+        let trailing = table
+            .columns
+            .last_mut()
+            .expect("the validated mixed schema contains a trailing column");
+        *trailing = Column::NullableInt64(Vec::new());
+        Ok(table)
+    }
+
     /// Builds a fully validated one-column table and its range-pruning metadata.
     pub(crate) fn with_int64_range_partitions(
         name: String,

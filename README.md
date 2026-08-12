@@ -141,11 +141,13 @@ cap is an admission rejection and leaves existing state unchanged. Each block
 records its first row, row count, non-null minimum/maximum, and null count;
 all-null blocks therefore have no extrema. Physical column vectors support
 `Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL accepts
-the exact one-column `CREATE TABLE <name> (<column> Nullable(Int64))` shape
-case-insensitively; other nullable types and nullable multi-column declarations
-remain outside the bounded grammar. Library APIs and WAL recovery can also
-create this physical storage. The index metadata has explicit nullable-block
-semantics for both `Int64` storage forms.
+the exact one-column `CREATE TABLE <name> (<column> Nullable(Int64))` shape and
+a nonempty non-nullable prefix followed by exactly one trailing
+`Nullable(Int64)` column, case-insensitively. Other nullable types, leading
+nullable columns in multi-column declarations, and multiple or non-trailing
+nullable columns remain outside the bounded grammar. Library APIs and WAL
+recovery can also create this physical storage. The index metadata has explicit
+nullable-block semantics for both `Int64` storage forms.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` accept physical `Nullable(Int64)`
 arguments. `SUM`, `MIN`, `MAX`, and `AVG` ignore absent values. `SUM`, `MIN`,
 and `MAX` return typed `Int64` `NULL` for empty or all-`NULL` inputs, while
@@ -441,11 +443,11 @@ values and is available through the normal `Database`, `SharedDatabase`, CLI,
 and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns canonical, replayable DDL as a bounded
 `String`, preserving the stored table and column display names and schema order
-while normalizing type spellings. Schemas with no nullable columns and
-sole-column `Nullable(Int64)` tables use one `CREATE TABLE` statement. For a
-mixed schema, the result creates the non-nullable prefix before the first
-nullable column (or creates a first nullable column by itself), then emits
-ordered `ALTER TABLE ... ADD COLUMN` statements for the remainder so it stays
+while normalizing type spellings. Schemas with no nullable columns,
+sole-column `Nullable(Int64)` tables, and a non-nullable prefix with exactly one
+trailing nullable column use one `CREATE TABLE` statement. Other mixed schemas
+create the supported prefix (or a first nullable column by itself), then emit
+ordered `ALTER TABLE ... ADD COLUMN` statements for the remainder so they stay
 inside the bounded grammar. Because the normal executor accepts at most 4,096
 statements, additions that would require a 4,097th replay statement are
 rejected without changing the table, even when a larger custom column limit is

@@ -89,6 +89,18 @@ pub enum Statement {
         name: String,
         column: String,
     },
+    /// A non-nullable prefix followed by exactly one `Nullable(Int64)` column.
+    CreateTableWithTrailingNullableInt64 {
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_column: String,
+    },
+    /// Conditional form of the bounded trailing-nullable CREATE shape.
+    CreateTableWithTrailingNullableInt64IfNotExists {
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_column: String,
+    },
     DropTable {
         name: String,
     },
@@ -1688,13 +1700,6 @@ impl<'a> Parser<'a> {
             let position = self.position();
             let type_name = self.expect_identifier("column type")?;
             if type_name.eq_ignore_ascii_case("Nullable") {
-                if !columns.is_empty() {
-                    return Err(Error::Sql {
-                        position,
-                        message: "Nullable(Int64) is supported only as the sole table column"
-                            .to_owned(),
-                    });
-                }
                 self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
                 let nested_position = self.position();
                 let nested_type = self.expect_identifier("type inside Nullable")?;
@@ -1708,8 +1713,9 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(&TokenKind::RightParen, "')' after Nullable(Int64)")?;
                 if self.at(&TokenKind::Comma) {
-                    return self
-                        .error("Nullable(Int64) is supported only as the sole table column");
+                    return self.error(
+                        "Nullable(Int64) is supported only as the sole column or one trailing column after a non-nullable prefix",
+                    );
                 }
                 nullable_int64_column = Some(column_name);
                 break;
@@ -1744,10 +1750,24 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after CREATE TABLE");
         }
         if let Some(column) = nullable_int64_column {
-            return if if_not_exists {
-                Ok(Statement::CreateNullableInt64TableIfNotExists { name, column })
+            return if columns.is_empty() {
+                if if_not_exists {
+                    Ok(Statement::CreateNullableInt64TableIfNotExists { name, column })
+                } else {
+                    Ok(Statement::CreateNullableInt64Table { name, column })
+                }
+            } else if if_not_exists {
+                Ok(Statement::CreateTableWithTrailingNullableInt64IfNotExists {
+                    name,
+                    columns,
+                    nullable_column: column,
+                })
             } else {
-                Ok(Statement::CreateNullableInt64Table { name, column })
+                Ok(Statement::CreateTableWithTrailingNullableInt64 {
+                    name,
+                    columns,
+                    nullable_column: column,
+                })
             };
         }
         if if_not_exists {

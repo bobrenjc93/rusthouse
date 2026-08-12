@@ -776,8 +776,7 @@ fn conditional_nullable_add_backfills_populated_rows_and_show_create_replays() {
         Column::NullableInt64(values) if values == &[None, None]
     ));
 
-    let ddl = "CREATE TABLE Events (id Int64); \
-               ALTER TABLE Events ADD COLUMN measurement Nullable(Int64)";
+    let ddl = "CREATE TABLE Events (id Int64, measurement Nullable(Int64))";
     assert_eq!(
         query(&mut database, "SHOW CREATE TABLE Events").rows,
         [vec![Value::String(ddl.to_owned())]]
