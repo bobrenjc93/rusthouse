@@ -4266,14 +4266,16 @@ impl Database {
         // Validated range partitions can reduce the source rows charged to
         // the scan limit. A sparse index can then narrow physical candidates,
         // but does not reduce that charge for an ordinary table.
-        let int64_filter = predicate.as_ref().and_then(CompiledPredicate::int64_filter);
+        let int64_partition_filter = predicate
+            .as_ref()
+            .and_then(CompiledPredicate::int64_partition_filter);
         let int64_index_filter = predicate
             .as_ref()
             .and_then(CompiledPredicate::int64_index_filter);
         let int64_nullness = predicate
             .as_ref()
             .and_then(CompiledPredicate::int64_nullness);
-        let source_rows = int64_filter
+        let source_rows = int64_partition_filter
             .and_then(|(column, filter)| table.int64_range_partition_rows(column, filter))
             .unwrap_or(0..table.row_count());
         enforce_select_scan_rows(source_rows.len(), query_result_limits)?;
@@ -9472,9 +9474,7 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    /// Returns a direct comparison suitable for range-partition routing.
-    /// Compound predicates deliberately remain on that path's full-scan
-    /// fallback so adding sparse-index shapes cannot change scan-limit charges.
+    /// Returns a direct comparison suitable for metadata pruning.
     fn int64_filter(&self) -> Option<(usize, Int64Filter)> {
         let Self::Comparison {
             left,
@@ -9513,13 +9513,20 @@ impl CompiledPredicate {
         Some((column, filter))
     }
 
+    /// Returns an exact comparison or positive inclusive range suitable for
+    /// validated range-partition routing. Every admitted row is still checked
+    /// by the complete predicate evaluator.
+    fn int64_partition_filter(&self) -> Option<(usize, Int64Filter)> {
+        self.int64_filter()
+            .or_else(|| self.int64_inclusive_range_filter())
+    }
+
     /// Returns the shapes that an `Int64` min/max index can reject safely.
     /// This includes any exact positive inclusive-range conjunction after
     /// predicate normalization. Every surviving row is still evaluated by
     /// `self`.
     fn int64_index_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_filter()
-            .or_else(|| self.int64_inclusive_range_filter())
+        self.int64_partition_filter()
     }
 
     fn int64_inclusive_range_filter(&self) -> Option<(usize, Int64Filter)> {
