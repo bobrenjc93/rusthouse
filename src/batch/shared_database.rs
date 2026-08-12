@@ -417,7 +417,7 @@ impl SharedDatabase {
     /// Creates an empty shared database with an explicit nonzero computation-lane
     /// cap for supported parallel aggregates, including Bool-grouped row and
     /// nullable `Int64` or physical non-nullable column counts, and non-nullable
-    /// Int64 `SUM` or `AVG`.
+    /// Int64 `SUM`, `MIN`, or `AVG`.
     #[must_use]
     pub fn with_global_aggregate_worker_cap(global_aggregate_worker_cap: NonZeroUsize) -> Self {
         Self::new(Database::with_global_aggregate_worker_cap(

@@ -1165,7 +1165,8 @@ impl Database {
     /// Creates an empty database with an explicit nonzero computation-lane cap
     /// for supported parallel aggregates, including sole nullable `Int64`
     /// `COUNT`, Bool-grouped row count, nullable `Int64` or physical non-nullable
-    /// column count, and sole non-nullable Int64 `SUM` or `AVG` grouped by Bool.
+    /// column count, and sole non-nullable Int64 `SUM`, `MIN`, or `AVG` grouped
+    /// by Bool.
     ///
     /// A cap of one keeps those aggregates sequential. Higher caps remain
     /// subject to the process-wide worker budget, available hardware, and the
@@ -6944,6 +6945,16 @@ fn execute_grouped<'a>(
     )? {
         return Ok(grouped);
     }
+    if let Some(grouped) = execute_grouped_bool_min(
+        table,
+        matching_rows,
+        group_columns,
+        aggregate_specs,
+        limits,
+        parallelism,
+    )? {
+        return Ok(grouped);
+    }
 
     let mut groups = GroupIndex::new(group_columns.len());
     let mut group_count = usize::from(group_columns.is_empty());
@@ -7333,6 +7344,63 @@ fn execute_grouped_bool_sum_or_avg<'a>(
     }))
 }
 
+fn execute_grouped_bool_min<'a>(
+    table: &'a Table,
+    matching_rows: &[usize],
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+    limits: QueryResultLimits,
+    parallelism: GlobalAggregateParallelism,
+) -> Result<Option<GroupedData<'a>>> {
+    let [group_column] = group_columns else {
+        return Ok(None);
+    };
+    let [
+        AggregateSpec {
+            function: AggregateFunction::Min,
+            argument: Some(value_column),
+            input_type: Some(DataType::Int64),
+        },
+    ] = aggregate_specs
+    else {
+        return Ok(None);
+    };
+    let Column::Bool(group_values) = &table.columns()[*group_column] else {
+        return Ok(None);
+    };
+    let Column::Int64(values) = &table.columns()[*value_column] else {
+        return Ok(None);
+    };
+
+    let partial = reduce_grouped_bool_min(
+        group_values,
+        values,
+        matching_rows,
+        parallelism,
+        grouped_bool_min_chunk,
+    )?;
+    let group_count = usize::from(partial.present(false)) + usize::from(partial.present(true));
+    enforce_grouped_bool_limits(group_count, limits)?;
+
+    let mut keys = Vec::with_capacity(group_count);
+    let mut minimums = Vec::with_capacity(group_count);
+    if let Some(first) = partial.first_seen {
+        keys.push(GroupKey::One(ValueRef::Bool(first)));
+        minimums.push(Value::Int64(partial.minimum(first)));
+        let second = !first;
+        if partial.present(second) {
+            keys.push(GroupKey::One(ValueRef::Bool(second)));
+            minimums.push(Value::Int64(partial.minimum(second)));
+        }
+    }
+    debug_assert_eq!(keys.len(), group_count);
+    debug_assert_eq!(minimums.len(), group_count);
+    Ok(Some(GroupedData {
+        keys,
+        aggregates: vec![minimums],
+    }))
+}
+
 fn enforce_grouped_bool_limits(group_count: usize, limits: QueryResultLimits) -> Result<()> {
     enforce_resource_limit("SELECT groups", group_count, limits.max_groups)?;
     enforce_resource_limit(
@@ -7625,6 +7693,93 @@ fn reduce_grouped_bool_sum_partials(
                 })?;
             Ok(total)
         })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GroupedBoolMinPartial {
+    false_min: Option<i64>,
+    true_min: Option<i64>,
+    first_seen: Option<bool>,
+}
+
+impl GroupedBoolMinPartial {
+    fn slot(&self, group: bool) -> Option<i64> {
+        if group { self.true_min } else { self.false_min }
+    }
+
+    fn slot_mut(&mut self, group: bool) -> &mut Option<i64> {
+        if group {
+            &mut self.true_min
+        } else {
+            &mut self.false_min
+        }
+    }
+
+    fn present(&self, group: bool) -> bool {
+        self.slot(group).is_some()
+    }
+
+    fn minimum(&self, group: bool) -> i64 {
+        self.slot(group)
+            .expect("a present non-nullable Int64 group has a minimum")
+    }
+
+    fn observe(&mut self, group: bool, value: i64) {
+        self.first_seen.get_or_insert(group);
+        let minimum = self.slot_mut(group);
+        *minimum = Some(minimum.map_or(value, |current| current.min(value)));
+    }
+}
+
+fn reduce_grouped_bool_min<C>(
+    group_values: &[bool],
+    min_values: &[i64],
+    matching_rows: &[usize],
+    parallelism: GlobalAggregateParallelism,
+    chunk: C,
+) -> Result<GroupedBoolMinPartial>
+where
+    C: Fn(&[bool], &[i64], &[usize]) -> Result<GroupedBoolMinPartial> + Sync,
+{
+    reduce_grouped_bool(
+        group_values,
+        matching_rows,
+        parallelism,
+        "rusthouse-group-bool-min-int64",
+        |group_values, rows| chunk(group_values, min_values, rows),
+        reduce_grouped_bool_min_partials,
+    )
+}
+
+fn grouped_bool_min_chunk(
+    group_values: &[bool],
+    min_values: &[i64],
+    matching_rows: &[usize],
+) -> Result<GroupedBoolMinPartial> {
+    let mut partial = GroupedBoolMinPartial::default();
+    for row in matching_rows {
+        partial.observe(group_values[*row], min_values[*row]);
+    }
+    Ok(partial)
+}
+
+fn reduce_grouped_bool_min_partials(
+    partials: Vec<GroupedBoolMinPartial>,
+) -> Result<GroupedBoolMinPartial> {
+    Ok(partials
+        .into_iter()
+        .fold(GroupedBoolMinPartial::default(), |mut total, partial| {
+            if total.first_seen.is_none() {
+                total.first_seen = partial.first_seen;
+            }
+            if let Some(minimum) = partial.false_min {
+                total.observe(false, minimum);
+            }
+            if let Some(minimum) = partial.true_min {
+                total.observe(true, minimum);
+            }
+            total
+        }))
 }
 
 fn paired_global_count_aggregate(
@@ -10300,6 +10455,35 @@ mod tests {
         database
     }
 
+    fn grouped_bool_min_database(
+        row_count: usize,
+        row_values: impl Fn(usize) -> (i64, bool, bool),
+    ) -> Database {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE bool_min_events \
+                 (id Int64, value Int64, active Bool, included Bool);",
+            )
+            .expect("grouped Bool MIN differential setup");
+        if row_count > 0 {
+            for first_id in (1..=row_count).step_by(50_000) {
+                let last_id = first_id.saturating_add(49_999).min(row_count);
+                let rows = (first_id..=last_id)
+                    .map(|id| {
+                        let (value, active, included) = row_values(id);
+                        format!("({id}, {value}, {active}, {included})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                database
+                    .execute(&format!("INSERT INTO bool_min_events VALUES {rows}"))
+                    .expect("grouped Bool MIN differential rows");
+            }
+        }
+        database
+    }
+
     fn sum_int64_database(row_count: usize, row_values: impl Fn(usize) -> (i64, bool)) -> Database {
         let mut database = Database::new();
         database
@@ -11513,6 +11697,301 @@ mod tests {
                 assert_eq!(parallel, sequential);
                 assert_eq!(parallel, Err(expected_error.clone()));
             }
+        }
+    }
+
+    #[test]
+    fn grouped_bool_min_threshold_semantics_admission_and_shape_are_differential() {
+        static BUDGET: GlobalAggregateWorkerBudget = GlobalAggregateWorkerBudget::for_test(3);
+
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 4;
+        let mut database = grouped_bool_min_database(row_count, |id| {
+            let active = id == 1 || id == row_count;
+            let value = if id == 2 || id == row_count {
+                i64::MIN
+            } else {
+                i64::MAX
+            };
+            (value, active, id != 2)
+        });
+
+        let empty = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT active, MIN(value) FROM bool_min_events \
+             WHERE id < 0 GROUP BY active",
+        );
+        assert!(empty.rows.is_empty());
+
+        let single_group = assert_global_aggregate_worker_differential(
+            &mut database,
+            "SELECT active, MIN(value) FROM bool_min_events \
+             WHERE active = false AND included = true GROUP BY active",
+        );
+        assert_eq!(
+            single_group.rows,
+            [vec![Value::Bool(false), Value::Int64(i64::MAX)]]
+        );
+
+        let filtered_sql = "SELECT active AS enabled, MIN(value) AS minimum \
+                            FROM bool_min_events WHERE included = true GROUP BY active";
+        assert_eq!(
+            assert_global_aggregate_worker_differential(&mut database, filtered_sql).rows,
+            [
+                vec![Value::Bool(false), Value::Int64(i64::MAX)],
+                vec![Value::Bool(true), Value::Int64(i64::MIN)],
+            ],
+            "ordered partition reduction retains Int64 extrema and normal Bool tie-breaking"
+        );
+        assert_eq!(
+            assert_global_aggregate_worker_differential(
+                &mut database,
+                &format!(
+                    "{filtered_sql} HAVING minimum <= 9223372036854775807 \
+                     ORDER BY minimum ASC, enabled DESC LIMIT 1 OFFSET 1"
+                ),
+            )
+            .rows,
+            [vec![Value::Bool(false), Value::Int64(i64::MAX)]],
+            "filtering, HAVING, ordering, and pagination remain downstream of reduction"
+        );
+
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+        BUDGET.reset_peak();
+        query(
+            &mut database,
+            &format!(
+                "SELECT active, MIN(value) FROM bool_min_events \
+                 WHERE id <= {} GROUP BY active",
+                GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD
+            ),
+        );
+        assert_eq!(
+            BUDGET.peak_helpers_in_use(),
+            0,
+            "the exact matched-row threshold stays sequential"
+        );
+
+        BUDGET.reset_peak();
+        query(
+            &mut database,
+            &format!(
+                "SELECT active, MIN(value) FROM bool_min_events \
+                 WHERE id <= {} GROUP BY active",
+                GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1
+            ),
+        );
+        assert!(
+            BUDGET.peak_helpers_in_use() > 0,
+            "a sole Bool-grouped MIN(Int64) above the threshold uses shared helpers"
+        );
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        let sequential = force_global_aggregate_workers(&mut database, 1, filtered_sql);
+        database.global_aggregate_parallelism =
+            GlobalAggregateParallelism::budgeted(NonZeroUsize::new(4).unwrap(), &BUDGET);
+        let held = BUDGET
+            .acquire_for_test(BUDGET.helper_limit())
+            .expect("test exhausts grouped MIN helper admission");
+        let exhausted = query(&mut database, filtered_sql);
+        assert_eq!(exhausted, sequential);
+        assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
+        drop(held);
+        assert_eq!(BUDGET.helpers_in_use(), 0);
+
+        database
+            .execute("ALTER TABLE bool_min_events ADD COLUMN nullable_value Nullable(Int64)")
+            .expect("nullable grouped MIN exclusion setup");
+        for unsupported_sql in [
+            "SELECT active, MIN(value), COUNT(*) FROM bool_min_events GROUP BY active",
+            "SELECT active, included, MIN(value) FROM bool_min_events GROUP BY active, included",
+            "SELECT value, MIN(id) FROM bool_min_events GROUP BY value",
+            "SELECT active, MIN(nullable_value) FROM bool_min_events GROUP BY active",
+            "SELECT active, MIN(active) FROM bool_min_events GROUP BY active",
+            "SELECT active, MAX(value) FROM bool_min_events GROUP BY active",
+        ] {
+            BUDGET.reset_peak();
+            query(&mut database, unsupported_sql);
+            assert_eq!(
+                BUDGET.peak_helpers_in_use(),
+                0,
+                "unsupported grouped shape stays sequential: {unsupported_sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_bool_min_worker_failure_repeats_complete_input_locally() {
+        let group_values = [true, false, true];
+        let min_values = [i64::MAX, 7, i64::MIN];
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut matching_rows = vec![0; row_count];
+        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
+        matching_rows[second_partition] = 1;
+        matching_rows[row_count - 1] = 2;
+
+        let successful_parallel = reduce_grouped_bool_min(
+            &group_values,
+            &min_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            grouped_bool_min_chunk,
+        )
+        .expect("deterministic parallel grouped MIN succeeds");
+        let failed_parallel = reduce_grouped_bool_min(
+            &group_values,
+            &min_values,
+            &matching_rows,
+            GlobalAggregateParallelism::fixed(2),
+            |group_values, min_values, rows| {
+                if std::thread::current().name() == Some("rusthouse-group-bool-min-int64-1") {
+                    panic!("injected grouped MIN worker failure");
+                }
+                grouped_bool_min_chunk(group_values, min_values, rows)
+            },
+        )
+        .expect("worker failure falls back to the complete grouped MIN locally");
+
+        let expected = GroupedBoolMinPartial {
+            false_min: Some(7),
+            true_min: Some(i64::MIN),
+            first_seen: Some(true),
+        };
+        assert_eq!(successful_parallel, expected);
+        assert_eq!(failed_parallel, expected);
+    }
+
+    #[test]
+    fn grouped_bool_min_forced_workers_preserve_resource_boundaries() {
+        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
+        let mut database =
+            grouped_bool_min_database(row_count, |id| (i64::try_from(id).unwrap(), id == 1, true));
+        let aggregate_state_bytes = 2_usize
+            .saturating_mul(std::mem::size_of::<AggregateState>())
+            .saturating_add(std::mem::size_of::<Vec<AggregateState>>());
+        let group_key_bytes = 2_usize.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES);
+        let exact_limits = QueryResultLimits {
+            max_scan_rows: row_count,
+            max_rows: 2,
+            max_values: 4,
+            max_groups: 2,
+            max_group_key_cells: 2,
+            max_group_key_bytes: group_key_bytes,
+            max_aggregate_state_cells: 2,
+            max_aggregate_state_bytes: aggregate_state_bytes,
+            ..QueryResultLimits::default()
+        };
+        database.query_result_limits = exact_limits;
+        let sql = "SELECT active, MIN(value) FROM bool_min_events GROUP BY active";
+
+        let sequential = force_global_aggregate_workers(&mut database, 1, sql);
+        let parallel = force_global_aggregate_workers(&mut database, 4, sql);
+        assert_eq!(parallel, sequential);
+        assert_eq!(
+            parallel.rows,
+            [
+                vec![Value::Bool(false), Value::Int64(2)],
+                vec![Value::Bool(true), Value::Int64(1)],
+            ]
+        );
+
+        for (limits, expected_error) in [
+            (
+                QueryResultLimits {
+                    max_scan_rows: row_count - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT scanned rows",
+                    actual: row_count,
+                    max: row_count - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_groups: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT groups",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_group_key_cells: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT group key cells",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_group_key_bytes: group_key_bytes - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT group key bytes",
+                    actual: group_key_bytes,
+                    max: group_key_bytes - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_aggregate_state_cells: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state cells",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_aggregate_state_bytes: aggregate_state_bytes - 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT aggregate state bytes",
+                    actual: aggregate_state_bytes,
+                    max: aggregate_state_bytes - 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_rows: 1,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result rows",
+                    actual: 2,
+                    max: 1,
+                },
+            ),
+            (
+                QueryResultLimits {
+                    max_values: 3,
+                    ..exact_limits
+                },
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result values",
+                    actual: 4,
+                    max: 3,
+                },
+            ),
+        ] {
+            database.query_result_limits = limits;
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(1);
+            let sequential = database.execute(sql);
+            database.global_aggregate_parallelism = GlobalAggregateParallelism::fixed(4);
+            let parallel = database.execute(sql);
+            assert_eq!(parallel, sequential);
+            assert_eq!(parallel, Err(expected_error));
         }
     }
 
