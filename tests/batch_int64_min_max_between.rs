@@ -209,7 +209,104 @@ fn equivalent_positive_range_conjunctions_use_the_documented_index_path() {
 }
 
 #[test]
-fn nullable_between_prunes_all_null_blocks_and_preserves_null_semantics() {
+fn strict_range_conjunctions_prune_in_every_conjunction_and_operand_order() {
+    let mut indexed = int64_database(true);
+    let mut unindexed = int64_database(false);
+
+    for (lower_forms, upper_forms) in [
+        (["key > -8", "-8 < key"], ["key <= 1", "1 >= key"]),
+        (["key >= -7", "-7 <= key"], ["key < 2", "2 > key"]),
+        (["key > -8", "-8 < key"], ["key < 2", "2 > key"]),
+    ] {
+        for lower in lower_forms {
+            for upper in upper_forms {
+                for upper_first in [false, true] {
+                    let conjunction = if upper_first {
+                        format!("{upper} AND {lower}")
+                    } else {
+                        format!("{lower} AND {upper}")
+                    };
+                    let sql = format!("SELECT id FROM events WHERE {conjunction}");
+                    assert_indexed_range(
+                        &mut indexed,
+                        &mut unindexed,
+                        &sql,
+                        &[3, 4, 5],
+                        IndexPruningMetrics {
+                            scanned_blocks: 2,
+                            pruned_blocks: 1,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn strict_range_normalization_handles_equal_empty_reversed_and_extreme_bounds() {
+    let mut indexed = int64_database(true);
+    let mut unindexed = int64_database(false);
+
+    for (sql, expected, expected_delta) in [
+        (
+            "SELECT id FROM events WHERE key > 0 AND key <= 1",
+            vec![5],
+            IndexPruningMetrics {
+                scanned_blocks: 1,
+                pruned_blocks: 2,
+            },
+        ),
+        (
+            "SELECT id FROM events WHERE key > 1 AND key <= 1",
+            vec![],
+            IndexPruningMetrics {
+                scanned_blocks: 0,
+                pruned_blocks: 3,
+            },
+        ),
+        (
+            "SELECT id FROM events WHERE key >= 100 AND key < -100",
+            vec![],
+            IndexPruningMetrics {
+                scanned_blocks: 0,
+                pruned_blocks: 3,
+            },
+        ),
+        (
+            "SELECT id FROM events WHERE key > 9223372036854775807 AND \
+             key <= 9223372036854775807",
+            vec![],
+            IndexPruningMetrics {
+                scanned_blocks: 0,
+                pruned_blocks: 3,
+            },
+        ),
+        (
+            "SELECT id FROM events WHERE key >= -9223372036854775808 AND \
+             key < -9223372036854775808",
+            vec![],
+            IndexPruningMetrics {
+                scanned_blocks: 0,
+                pruned_blocks: 3,
+            },
+        ),
+        (
+            "SELECT id FROM events WHERE key > -9223372036854775808 AND \
+             key < 9223372036854775807",
+            (1..=10).collect(),
+            IndexPruningMetrics {
+                scanned_blocks: 3,
+                pruned_blocks: 0,
+            },
+        ),
+    ] {
+        assert_indexed_range(&mut indexed, &mut unindexed, sql, &expected, expected_delta);
+    }
+}
+
+#[test]
+fn nullable_ranges_prune_all_null_blocks_and_preserve_null_semantics() {
     const SETUP: &str = "\
         CREATE TABLE readings (value Nullable(Int64)); \
         INSERT INTO readings VALUES \
@@ -232,7 +329,7 @@ fn nullable_between_prunes_all_null_blocks_and_preserves_null_semantics() {
     assert_indexed_range(
         &mut indexed,
         &mut unindexed,
-        "SELECT value FROM readings WHERE value <= 6 AND value >= -1",
+        "SELECT value FROM readings WHERE value < 6 AND value > -1",
         &[0, 5],
         IndexPruningMetrics {
             scanned_blocks: 2,
@@ -359,7 +456,7 @@ fn mutations_refresh_between_bounds_and_over_budget_growth_invalidates_them() {
     assert_eq!(
         query(
             &mut database,
-            "SELECT value FROM changing WHERE 75 >= value AND 75 <= value",
+            "SELECT value FROM changing WHERE 75 >= value AND 74 < value",
         )
         .rows,
         rows(&[75]),
@@ -389,7 +486,7 @@ fn between_cannot_bypass_the_complete_source_scan_limit() {
         .expect("valid index request");
 
     assert_eq!(
-        database.execute("SELECT id FROM events WHERE key <= 99 AND key >= 4 LIMIT 0"),
+        database.execute("SELECT id FROM events WHERE key < 100 AND key > 3 LIMIT 0"),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 12,
