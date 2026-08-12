@@ -2,6 +2,7 @@
 
 mod aggregate_scheduler;
 mod scalar_cast;
+mod scalar_float64;
 mod scalar_nullable_int64;
 mod scalar_text;
 
