@@ -101,6 +101,18 @@ pub enum Statement {
         columns: Vec<ColumnDef>,
         nullable_column: String,
     },
+    /// A non-nullable prefix followed by exactly two `Nullable(Int64)` columns.
+    CreateTableWithTwoTrailingNullableInt64 {
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_columns: [String; 2],
+    },
+    /// Conditional form of the bounded two-trailing-nullable CREATE shape.
+    CreateTableWithTwoTrailingNullableInt64IfNotExists {
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_columns: [String; 2],
+    },
     DropTable {
         name: String,
     },
@@ -1693,7 +1705,7 @@ impl<'a> Parser<'a> {
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
-        let mut nullable_int64_column = None;
+        let mut nullable_int64_columns = Vec::new();
         loop {
             self.reserve_ast_list_item()?;
             let column_name = self.expect_identifier("column name")?;
@@ -1718,26 +1730,30 @@ impl<'a> Parser<'a> {
                     });
                 }
                 self.expect(&TokenKind::RightParen, "')' after Nullable(Int64)")?;
-                if self.at(&TokenKind::Comma) {
+                nullable_int64_columns.push(column_name);
+            } else {
+                if !nullable_int64_columns.is_empty() {
                     return self.error(
-                        "Nullable(Int64) is supported only as the sole column or the final column after a non-nullable prefix",
+                        "Nullable(Int64) columns must form the final one- or two-column suffix after a non-nullable prefix",
                     );
                 }
-                nullable_int64_column = Some(column_name);
-                break;
+                let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+                    position,
+                    message: format!(
+                        "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(Int64)"
+                    ),
+                })?;
+                columns.push(ColumnDef {
+                    name: column_name,
+                    data_type,
+                });
             }
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(Int64)"
-                ),
-            })?;
-            columns.push(ColumnDef {
-                name: column_name,
-                data_type,
-            });
             if !self.eat(&TokenKind::Comma) {
                 break;
+            }
+            if nullable_int64_columns.len() == 2 {
+                return self
+                    .error("CREATE TABLE supports at most two final Nullable(Int64) columns");
             }
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
@@ -1755,26 +1771,52 @@ impl<'a> Parser<'a> {
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error("unexpected trailing input after CREATE TABLE");
         }
-        if let Some(column) = nullable_int64_column {
-            if !columns.is_empty() {
-                return if if_not_exists {
-                    Ok(Statement::CreateTableWithTrailingNullableInt64IfNotExists {
-                        name,
-                        columns,
-                        nullable_column: column,
-                    })
-                } else {
-                    Ok(Statement::CreateTableWithTrailingNullableInt64 {
-                        name,
-                        columns,
-                        nullable_column: column,
-                    })
-                };
+        if nullable_int64_columns.len() == 2 {
+            if columns.is_empty() {
+                return self
+                    .error("two trailing Nullable(Int64) columns require a non-nullable prefix");
             }
+            let second = nullable_int64_columns
+                .pop()
+                .expect("two nullable columns were parsed");
+            let first = nullable_int64_columns
+                .pop()
+                .expect("two nullable columns were parsed");
             return if if_not_exists {
-                Ok(Statement::CreateNullableInt64TableIfNotExists { name, column })
+                Ok(
+                    Statement::CreateTableWithTwoTrailingNullableInt64IfNotExists {
+                        name,
+                        columns,
+                        nullable_columns: [first, second],
+                    },
+                )
             } else {
-                Ok(Statement::CreateNullableInt64Table { name, column })
+                Ok(Statement::CreateTableWithTwoTrailingNullableInt64 {
+                    name,
+                    columns,
+                    nullable_columns: [first, second],
+                })
+            };
+        }
+        if let Some(column) = nullable_int64_columns.pop() {
+            return if columns.is_empty() {
+                if if_not_exists {
+                    Ok(Statement::CreateNullableInt64TableIfNotExists { name, column })
+                } else {
+                    Ok(Statement::CreateNullableInt64Table { name, column })
+                }
+            } else if if_not_exists {
+                Ok(Statement::CreateTableWithTrailingNullableInt64IfNotExists {
+                    name,
+                    columns,
+                    nullable_column: column,
+                })
+            } else {
+                Ok(Statement::CreateTableWithTrailingNullableInt64 {
+                    name,
+                    columns,
+                    nullable_column: column,
+                })
             };
         }
         if if_not_exists {
