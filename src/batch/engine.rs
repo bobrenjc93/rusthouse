@@ -2675,15 +2675,18 @@ impl Database {
     /// Atomically appends bounded, one-column `JSONCompactEachRow` input.
     ///
     /// Each physical line must be one JSON array containing exactly one JSON
-    /// integer. A `Nullable(Int64)` target also accepts JSON `null`; an
-    /// `Int64` target rejects it. The existing target must have exactly one
-    /// physical `Int64` or `Nullable(Int64)` column. JSON whitespace is
-    /// accepted around the array and value, and LF or CRLF records are
-    /// accepted. Empty input appends zero rows.
+    /// number. `Int64` and `Nullable(Int64)` targets require integer syntax and
+    /// range; a `Float64` target accepts integer, decimal, and exponent forms
+    /// that parse to a finite value. A `Nullable(Int64)` target also accepts
+    /// JSON `null`; the non-nullable targets reject it. The existing target
+    /// must have exactly one physical `Int64`, `Nullable(Int64)`, or `Float64`
+    /// column. JSON whitespace is accepted around the array and value, and LF
+    /// or CRLF records are accepted. Empty input appends zero rows.
     ///
-    /// UTF-8, JSON shape, every integer, all configured limits, and remaining
-    /// table capacity are validated before the existing WAL and one atomic
-    /// prepared-row append path runs. Every error leaves the table unchanged.
+    /// UTF-8, JSON shape, every number, all configured limits, and remaining
+    /// table capacity are validated before the applicable Int64 WAL and one
+    /// atomic prepared-row append path run. Every error leaves the table
+    /// unchanged.
     ///
     /// # Examples
     ///

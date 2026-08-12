@@ -1022,11 +1022,12 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
-    /// Atomically ingests bounded one-column `JSONCompactEachRow` bytes under one write lock.
+    /// Atomically ingests bounded one-column numeric `JSONCompactEachRow` bytes under one write lock.
     ///
     /// The lock is retained through table lookup, complete UTF-8 and JSON
-    /// validation, limit and capacity preflight, WAL commit, and the one final
-    /// append. Empty input is a zero-row no-op after target validation.
+    /// validation, limit and capacity preflight, any applicable Int64 WAL
+    /// commit, and the one final append. Empty input is a zero-row no-op after
+    /// target validation.
     pub fn ingest_json_compact_each_row(
         &self,
         table: &str,

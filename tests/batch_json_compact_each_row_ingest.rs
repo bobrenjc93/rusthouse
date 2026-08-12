@@ -24,6 +24,16 @@ fn values(database: &mut Database, table: &str) -> Vec<Vec<Value>> {
     query(database, &format!("SELECT value FROM {table};")).rows
 }
 
+fn float_bits(database: &mut Database, table: &str) -> Vec<u64> {
+    values(database, table)
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [Value::Float64(value)] => value.to_bits(),
+            _ => panic!("expected one Float64 value"),
+        })
+        .collect()
+}
+
 #[test]
 fn writer_output_round_trips_signed_int64_extremes() {
     let mut source = Database::new();
@@ -55,6 +65,114 @@ fn writer_output_round_trips_signed_int64_extremes() {
         Ok(4),
     );
     assert_eq!(values(&mut target, "target"), result.rows);
+}
+
+#[test]
+fn writer_output_round_trips_float64_extrema_subnormals_and_signed_zero_exactly() {
+    let expected = [
+        f64::MIN,
+        -7.25,
+        -0.0,
+        0.0,
+        f64::from_bits(1),
+        -f64::from_bits(1),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+    ];
+    let sql_values = expected
+        .iter()
+        .map(|value| format!("({})", Value::Float64(*value).as_display_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut source = Database::new();
+    source
+        .execute(&format!(
+            "CREATE TABLE source (value Float64); INSERT INTO source VALUES {sql_values};"
+        ))
+        .unwrap();
+    assert_eq!(
+        float_bits(&mut source, "source"),
+        expected
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+
+    let result = query(&mut source, "SELECT value FROM source;");
+    let mut input = Vec::new();
+    write_json_compact_each_row(&mut input, &result).unwrap();
+
+    let mut target = Database::with_max_rows_per_table(expected.len());
+    target
+        .execute("CREATE TABLE target (value Float64);")
+        .unwrap();
+    assert_eq!(
+        target.ingest_json_compact_each_row(
+            "target",
+            &input,
+            JsonCompactEachRowIngestLimits::new(input.len(), expected.len(), expected.len()),
+        ),
+        Ok(expected.len()),
+    );
+    assert_eq!(
+        float_bits(&mut target, "target"),
+        expected
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn float64_accepts_every_finite_json_number_form() {
+    let input = concat!(
+        "[42]\n",
+        "[-7.25]\n",
+        "[6.022e23]\n",
+        "[1.7976931348623157e308]\n",
+        "[-1.7976931348623157E+308]\n",
+        "[5e-324]\n",
+        "[0]\n",
+        "[-0]\n",
+        "[0.0]\n",
+        "[-0.0]\n",
+        "[0e0]\n",
+        "[-0E+7]\n",
+    );
+    let expected = [
+        42.0,
+        -7.25,
+        6.022e23,
+        f64::MAX,
+        f64::MIN,
+        f64::from_bits(1),
+        0.0,
+        -0.0,
+        0.0,
+        -0.0,
+        0.0,
+        -0.0,
+    ];
+    let mut database = Database::with_max_rows_per_table(expected.len());
+    database
+        .execute("CREATE TABLE readings (value Float64);")
+        .unwrap();
+
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), expected.len(), expected.len()),
+        ),
+        Ok(expected.len()),
+    );
+    assert_eq!(
+        float_bits(&mut database, "readings"),
+        expected
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -213,6 +331,21 @@ fn late_malformed_rows_overflow_and_invalid_utf8_roll_back_every_prepared_row() 
         }),
     );
 
+    for floating_number in [b"[1]\n[2.0]\n".as_slice(), b"[1]\n[2e0]\n".as_slice()] {
+        assert_eq!(
+            database.ingest_json_compact_each_row(
+                "readings",
+                floating_number,
+                JsonCompactEachRowIngestLimits::new(floating_number.len(), 2, 2),
+            ),
+            Err(JsonCompactEachRowIngestError::InvalidValue {
+                line: 2,
+                column: 1,
+                expected: DataType::Int64,
+            }),
+        );
+    }
+
     for valid_but_unsupported in [
         b"[true]\n".as_slice(),
         b"[{\"nested\":[1,null,false]}]\n".as_slice(),
@@ -252,6 +385,56 @@ fn late_malformed_rows_overflow_and_invalid_utf8_roll_back_every_prepared_row() 
         Err(JsonCompactEachRowIngestError::InvalidUtf8 { valid_up_to: 5 }),
     );
     assert_eq!(values(&mut database, "readings"), [vec![Value::Int64(9)]],);
+}
+
+#[test]
+fn float64_late_overflow_null_and_nonnumeric_values_roll_back_every_prepared_row() {
+    let mut database = Database::with_max_rows_per_table(3);
+    database
+        .execute("CREATE TABLE readings (value Float64); INSERT INTO readings VALUES (9.5);")
+        .unwrap();
+
+    let overflow = b"[1.25]\n[1e309]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            overflow,
+            JsonCompactEachRowIngestLimits::new(overflow.len(), 2, 2),
+        ),
+        Err(JsonCompactEachRowIngestError::FloatOverflow { line: 2, column: 1 }),
+    );
+
+    let null = b"[1.25]\n[null]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            null,
+            JsonCompactEachRowIngestLimits::new(null.len(), 2, 2),
+        ),
+        Err(JsonCompactEachRowIngestError::NullNotAllowed { line: 2, column: 1 }),
+    );
+
+    for input in [
+        b"[1.25]\n[\"2.5\"]\n".as_slice(),
+        b"[1.25]\n[true]\n".as_slice(),
+        b"[1.25]\n[{\"number\":2.5}]\n".as_slice(),
+        b"[1.25]\n[[2.5]]\n".as_slice(),
+    ] {
+        assert_eq!(
+            database.ingest_json_compact_each_row(
+                "readings",
+                input,
+                JsonCompactEachRowIngestLimits::new(input.len(), 2, 2),
+            ),
+            Err(JsonCompactEachRowIngestError::InvalidValue {
+                line: 2,
+                column: 1,
+                expected: DataType::Float64,
+            }),
+        );
+    }
+
+    assert_eq!(float_bits(&mut database, "readings"), [9.5_f64.to_bits()]);
 }
 
 #[test]
@@ -332,7 +515,84 @@ fn exact_input_and_table_limits_succeed_and_every_exceeded_limit_is_atomic() {
 }
 
 #[test]
-fn rejects_targets_outside_the_one_column_int64_subset_without_mutation() {
+fn float64_exact_input_and_table_limits_succeed_and_excess_is_atomic() {
+    let mut database = Database::with_table_limits(TableLimits::new(3, 1, 3));
+    database
+        .execute("CREATE TABLE readings (value Float64); INSERT INTO readings VALUES (9.5);")
+        .unwrap();
+    let input = b"[-0]\n[5e-324]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 2, 2),
+        ),
+        Ok(2),
+    );
+
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len() - 1, 2, 2),
+        ),
+        Err(JsonCompactEachRowIngestError::ByteLimitExceeded {
+            bytes: input.len(),
+            max_bytes: input.len() - 1,
+        }),
+    );
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 1, 2),
+        ),
+        Err(JsonCompactEachRowIngestError::RowLimitExceeded {
+            line: 2,
+            rows: 2,
+            max_rows: 1,
+        }),
+    );
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 2, 1),
+        ),
+        Err(JsonCompactEachRowIngestError::ValueLimitExceeded {
+            line: 2,
+            values: 2,
+            max_values: 1,
+        }),
+    );
+
+    let one_more = b"[3.5]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            one_more,
+            JsonCompactEachRowIngestLimits::new(one_more.len(), 1, 1),
+        ),
+        Err(JsonCompactEachRowIngestError::Database(
+            Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 4,
+                max: 3,
+            }
+        )),
+    );
+    assert_eq!(
+        float_bits(&mut database, "readings"),
+        [
+            9.5_f64.to_bits(),
+            (-0.0_f64).to_bits(),
+            f64::from_bits(1).to_bits()
+        ]
+    );
+}
+
+#[test]
+fn rejects_targets_outside_the_one_column_numeric_subset_without_mutation() {
     let input = b"[1]\n";
     let limits = JsonCompactEachRowIngestLimits::new(input.len(), 1, 1);
     let mut database = Database::new();
@@ -438,5 +698,89 @@ fn shared_blocking_and_nonblocking_apis_preserve_contention_and_rollback_semanti
     assert_eq!(
         database.query("SELECT value FROM readings;").unwrap().rows,
         [vec![Value::Int64(1)], vec![Value::Int64(-2)]],
+    );
+}
+
+#[test]
+fn float64_shared_apis_retain_the_lock_through_validation_and_atomic_append() {
+    let mut initial = Database::with_max_rows_per_table(3);
+    initial
+        .execute("CREATE TABLE readings (value Float64);")
+        .unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+
+    let reader = inner.read().unwrap();
+    assert_eq!(
+        database.try_ingest_json_compact_each_row(
+            "missing",
+            InaccessibleInput,
+            JsonCompactEachRowIngestLimits::new(0, 0, 0),
+        ),
+        Err(SharedDatabaseError::DatabaseBusy),
+    );
+
+    let blocking_database = database.clone();
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let input = b"[1]\n";
+        sender
+            .send(blocking_database.ingest_json_compact_each_row(
+                "readings",
+                input,
+                JsonCompactEachRowIngestLimits::new(input.len(), 1, 1),
+            ))
+            .unwrap();
+    });
+    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(reader);
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Ok(1),
+    );
+    worker.join().unwrap();
+
+    let writer = inner.write().unwrap();
+    assert_eq!(
+        database.try_ingest_json_compact_each_row(
+            "missing",
+            InaccessibleInput,
+            JsonCompactEachRowIngestLimits::new(0, 0, 0),
+        ),
+        Err(SharedDatabaseError::DatabaseBusy),
+    );
+    drop(writer);
+
+    let subnormal = b"[5e-324]\n";
+    assert_eq!(
+        database.try_ingest_json_compact_each_row(
+            "readings",
+            subnormal,
+            JsonCompactEachRowIngestLimits::new(subnormal.len(), 1, 1),
+        ),
+        Ok(1),
+    );
+    let late_null = b"[3.5]\n[null]\n";
+    assert_eq!(
+        database.try_ingest_json_compact_each_row(
+            "readings",
+            late_null,
+            JsonCompactEachRowIngestLimits::new(late_null.len(), 2, 2),
+        ),
+        Err(SharedDatabaseError::JsonCompactEachRowIngest(
+            JsonCompactEachRowIngestError::NullNotAllowed { line: 2, column: 1 }
+        )),
+    );
+    let result = database.query("SELECT value FROM readings;").unwrap();
+    assert_eq!(
+        result
+            .rows
+            .iter()
+            .map(|row| match row.as_slice() {
+                [Value::Float64(value)] => value.to_bits(),
+                _ => panic!("expected one Float64 value"),
+            })
+            .collect::<Vec<_>>(),
+        [1.0_f64.to_bits(), f64::from_bits(1).to_bits()],
     );
 }
