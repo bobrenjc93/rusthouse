@@ -2710,7 +2710,9 @@ impl Database {
             json_compact_each_row::parse_rows(target, input.as_ref(), limits)?
         };
         let affected_rows = rows.len();
-        self.log_prepared_int64_append(table, &rows)?;
+        if affected_rows != 0 {
+            self.log_prepared_int64_append(table, &rows)?;
+        }
         self.table_mut(table)?.append_prepared_insert_rows(rows);
         Ok(affected_rows)
     }

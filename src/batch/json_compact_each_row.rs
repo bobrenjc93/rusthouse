@@ -214,7 +214,10 @@ pub(crate) fn parse_rows(
                 max_rows: limits.max_rows,
             });
         }
-        let next_value_count = value_count.saturating_add(1);
+
+        let physical_line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let parsed = parse_array(physical_line, line)?;
+        let next_value_count = value_count.saturating_add(parsed.value_count);
         if next_value_count > limits.max_values {
             return Err(JsonCompactEachRowIngestError::ValueLimitExceeded {
                 line,
@@ -222,14 +225,38 @@ pub(crate) fn parse_rows(
                 max_values: limits.max_values,
             });
         }
+        if parsed.value_count != 1 {
+            return Err(JsonCompactEachRowIngestError::WrongColumnCount {
+                line,
+                expected: 1,
+                actual: parsed.value_count,
+            });
+        }
 
-        let physical_line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let parsed = parse_row(physical_line, line)?;
-        let value = match parsed {
-            ParsedValue::Integer(value) => Value::Int64(value),
-            ParsedValue::Null if table.column_is_nullable_int64(0) => Value::Null(DataType::Int64),
-            ParsedValue::Null => {
+        let value = match parsed
+            .first_value
+            .expect("a validated one-value array retains its first value")
+        {
+            ParsedJsonValue::Number {
+                start,
+                end,
+                is_integer: true,
+            } => physical_line[start..end]
+                .parse::<i64>()
+                .map(Value::Int64)
+                .map_err(|_| JsonCompactEachRowIngestError::IntegerOverflow { line, column: 1 })?,
+            ParsedJsonValue::Null if table.column_is_nullable_int64(0) => {
+                Value::Null(DataType::Int64)
+            }
+            ParsedJsonValue::Null => {
                 return Err(JsonCompactEachRowIngestError::NullNotAllowed { line, column: 1 });
+            }
+            ParsedJsonValue::Number { .. } | ParsedJsonValue::Other => {
+                return Err(JsonCompactEachRowIngestError::InvalidValue {
+                    line,
+                    column: 1,
+                    expected: DataType::Int64,
+                });
             }
         };
         rows.push(vec![value]);
@@ -258,133 +285,356 @@ fn validate_target(table: &Table) -> Result<(), JsonCompactEachRowIngestError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParsedValue {
-    Integer(i64),
+enum ParsedJsonValue {
+    Null,
+    Number {
+        start: usize,
+        end: usize,
+        is_integer: bool,
+    },
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedJsonArray {
+    value_count: usize,
+    first_value: Option<ParsedJsonValue>,
+}
+
+fn parse_array(
+    line_contents: &str,
+    line: usize,
+) -> Result<ParsedJsonArray, JsonCompactEachRowIngestError> {
+    let mut lexer = JsonLexer::new(line_contents.as_bytes(), line);
+    let Some(root) = lexer.next_token()? else {
+        return Err(invalid_json(line, 0));
+    };
+    if root.kind != JsonTokenKind::LeftBracket {
+        return Err(invalid_json(line, root.start));
+    }
+
+    let mut frames = vec![JsonFrame::Array(JsonArrayState::ValueOrEnd)];
+    let mut parsed = ParsedJsonArray {
+        value_count: 0,
+        first_value: None,
+    };
+    while let Some(frame) = frames.last().copied() {
+        let Some(token) = lexer.next_token()? else {
+            return Err(invalid_json(line, line_contents.len()));
+        };
+        match frame {
+            JsonFrame::Array(JsonArrayState::ValueOrEnd) => {
+                if token.kind == JsonTokenKind::RightBracket {
+                    close_json_frame(&mut frames);
+                } else {
+                    record_root_array_value(&frames, token, &mut parsed);
+                    begin_json_value(token, &mut frames, line)?;
+                }
+            }
+            JsonFrame::Array(JsonArrayState::Value) => {
+                record_root_array_value(&frames, token, &mut parsed);
+                begin_json_value(token, &mut frames, line)?;
+            }
+            JsonFrame::Array(JsonArrayState::CommaOrEnd) => match token.kind {
+                JsonTokenKind::Comma => {
+                    *frames.last_mut().expect("the copied frame still exists") =
+                        JsonFrame::Array(JsonArrayState::Value);
+                }
+                JsonTokenKind::RightBracket => close_json_frame(&mut frames),
+                _ => return Err(invalid_json(line, token.start)),
+            },
+            JsonFrame::Object(JsonObjectState::KeyOrEnd) => match token.kind {
+                JsonTokenKind::String => {
+                    *frames.last_mut().expect("the copied frame still exists") =
+                        JsonFrame::Object(JsonObjectState::Colon);
+                }
+                JsonTokenKind::RightBrace => close_json_frame(&mut frames),
+                _ => return Err(invalid_json(line, token.start)),
+            },
+            JsonFrame::Object(JsonObjectState::Key) => {
+                if token.kind != JsonTokenKind::String {
+                    return Err(invalid_json(line, token.start));
+                }
+                *frames.last_mut().expect("the copied frame still exists") =
+                    JsonFrame::Object(JsonObjectState::Colon);
+            }
+            JsonFrame::Object(JsonObjectState::Colon) => {
+                if token.kind != JsonTokenKind::Colon {
+                    return Err(invalid_json(line, token.start));
+                }
+                *frames.last_mut().expect("the copied frame still exists") =
+                    JsonFrame::Object(JsonObjectState::Value);
+            }
+            JsonFrame::Object(JsonObjectState::Value) => {
+                begin_json_value(token, &mut frames, line)?;
+            }
+            JsonFrame::Object(JsonObjectState::CommaOrEnd) => match token.kind {
+                JsonTokenKind::Comma => {
+                    *frames.last_mut().expect("the copied frame still exists") =
+                        JsonFrame::Object(JsonObjectState::Key);
+                }
+                JsonTokenKind::RightBrace => close_json_frame(&mut frames),
+                _ => return Err(invalid_json(line, token.start)),
+            },
+        }
+    }
+
+    if let Some(trailing) = lexer.next_token()? {
+        return Err(invalid_json(line, trailing.start));
+    }
+    Ok(parsed)
+}
+
+fn record_root_array_value(frames: &[JsonFrame], token: JsonToken, parsed: &mut ParsedJsonArray) {
+    if frames.len() != 1 {
+        return;
+    }
+    parsed.value_count = parsed.value_count.saturating_add(1);
+    if parsed.first_value.is_none() {
+        parsed.first_value = Some(match token.kind {
+            JsonTokenKind::Null => ParsedJsonValue::Null,
+            JsonTokenKind::Number { is_integer } => ParsedJsonValue::Number {
+                start: token.start,
+                end: token.end,
+                is_integer,
+            },
+            _ => ParsedJsonValue::Other,
+        });
+    }
+}
+
+fn begin_json_value(
+    token: JsonToken,
+    frames: &mut Vec<JsonFrame>,
+    line: usize,
+) -> Result<(), JsonCompactEachRowIngestError> {
+    match frames
+        .last_mut()
+        .expect("a JSON value always has a parent frame")
+    {
+        JsonFrame::Array(state) => *state = JsonArrayState::CommaOrEnd,
+        JsonFrame::Object(state) => *state = JsonObjectState::CommaOrEnd,
+    }
+    match token.kind {
+        JsonTokenKind::LeftBracket => {
+            frames.push(JsonFrame::Array(JsonArrayState::ValueOrEnd));
+        }
+        JsonTokenKind::LeftBrace => {
+            frames.push(JsonFrame::Object(JsonObjectState::KeyOrEnd));
+        }
+        JsonTokenKind::String
+        | JsonTokenKind::Number { .. }
+        | JsonTokenKind::True
+        | JsonTokenKind::False
+        | JsonTokenKind::Null => {}
+        _ => return Err(invalid_json(line, token.start)),
+    }
+    Ok(())
+}
+
+fn close_json_frame(frames: &mut Vec<JsonFrame>) {
+    frames.pop().expect("a closing token has a matching frame");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonFrame {
+    Array(JsonArrayState),
+    Object(JsonObjectState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonArrayState {
+    ValueOrEnd,
+    Value,
+    CommaOrEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonObjectState {
+    KeyOrEnd,
+    Key,
+    Colon,
+    Value,
+    CommaOrEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JsonToken {
+    kind: JsonTokenKind,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonTokenKind {
+    LeftBracket,
+    RightBracket,
+    LeftBrace,
+    RightBrace,
+    Colon,
+    Comma,
+    String,
+    Number { is_integer: bool },
+    True,
+    False,
     Null,
 }
 
-fn parse_row(
-    line_contents: &str,
+struct JsonLexer<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
     line: usize,
-) -> Result<ParsedValue, JsonCompactEachRowIngestError> {
-    let bytes = line_contents.as_bytes();
-    let mut cursor = skip_json_whitespace(bytes, 0);
-    if bytes.get(cursor) != Some(&b'[') {
-        return Err(invalid_json(line, cursor));
-    }
-    cursor += 1;
-    cursor = skip_json_whitespace(bytes, cursor);
-    if bytes.get(cursor) == Some(&b']') {
-        cursor += 1;
-        cursor = skip_json_whitespace(bytes, cursor);
-        if cursor != bytes.len() {
-            return Err(invalid_json(line, cursor));
-        }
-        return Err(JsonCompactEachRowIngestError::WrongColumnCount {
-            line,
-            expected: 1,
-            actual: 0,
-        });
-    }
-
-    let value = parse_value(bytes, &mut cursor, line)?;
-    cursor = skip_json_whitespace(bytes, cursor);
-    if bytes.get(cursor) == Some(&b',') {
-        let second_value = skip_json_whitespace(bytes, cursor.saturating_add(1));
-        if matches!(bytes.get(second_value), None | Some(b']')) {
-            return Err(invalid_json(line, second_value));
-        }
-        return Err(JsonCompactEachRowIngestError::WrongColumnCount {
-            line,
-            expected: 1,
-            actual: 2,
-        });
-    }
-    if bytes.get(cursor) != Some(&b']') {
-        return Err(invalid_json(line, cursor));
-    }
-    cursor += 1;
-    cursor = skip_json_whitespace(bytes, cursor);
-    if cursor != bytes.len() {
-        return Err(invalid_json(line, cursor));
-    }
-    Ok(value)
 }
 
-fn parse_value(
-    bytes: &[u8],
-    cursor: &mut usize,
-    line: usize,
-) -> Result<ParsedValue, JsonCompactEachRowIngestError> {
-    let start = *cursor;
-    if bytes.get(start..start.saturating_add(4)) == Some(b"null") {
-        *cursor += 4;
-        return Ok(ParsedValue::Null);
-    }
-
-    if !matches!(bytes.get(*cursor), Some(b'-' | b'0'..=b'9')) {
-        return Err(JsonCompactEachRowIngestError::InvalidValue {
+impl<'a> JsonLexer<'a> {
+    fn new(bytes: &'a [u8], line: usize) -> Self {
+        Self {
+            bytes,
+            cursor: 0,
             line,
-            column: 1,
-            expected: DataType::Int64,
-        });
+        }
     }
 
-    if bytes.get(*cursor) == Some(&b'-') {
-        *cursor += 1;
+    fn next_token(&mut self) -> Result<Option<JsonToken>, JsonCompactEachRowIngestError> {
+        self.cursor = skip_json_whitespace(self.bytes, self.cursor);
+        let start = self.cursor;
+        let Some(&byte) = self.bytes.get(start) else {
+            return Ok(None);
+        };
+        let kind = match byte {
+            b'[' => JsonTokenKind::LeftBracket,
+            b']' => JsonTokenKind::RightBracket,
+            b'{' => JsonTokenKind::LeftBrace,
+            b'}' => JsonTokenKind::RightBrace,
+            b':' => JsonTokenKind::Colon,
+            b',' => JsonTokenKind::Comma,
+            b'"' => return self.lex_string().map(Some),
+            b'-' | b'0'..=b'9' => return self.lex_number().map(Some),
+            b't' => return self.lex_keyword(b"true", JsonTokenKind::True).map(Some),
+            b'f' => return self.lex_keyword(b"false", JsonTokenKind::False).map(Some),
+            b'n' => return self.lex_keyword(b"null", JsonTokenKind::Null).map(Some),
+            _ => return Err(invalid_json(self.line, start)),
+        };
+        self.cursor += 1;
+        Ok(Some(JsonToken {
+            kind,
+            start,
+            end: self.cursor,
+        }))
     }
-    match bytes.get(*cursor) {
-        Some(b'0') => *cursor += 1,
-        Some(b'1'..=b'9') => {
-            *cursor += 1;
-            while matches!(bytes.get(*cursor), Some(b'0'..=b'9')) {
-                *cursor += 1;
+
+    fn lex_keyword(
+        &mut self,
+        keyword: &[u8],
+        kind: JsonTokenKind,
+    ) -> Result<JsonToken, JsonCompactEachRowIngestError> {
+        let start = self.cursor;
+        let end = start.saturating_add(keyword.len());
+        if self.bytes.get(start..end) != Some(keyword) {
+            return Err(invalid_json(self.line, start));
+        }
+        self.cursor = end;
+        Ok(JsonToken { kind, start, end })
+    }
+
+    fn lex_string(&mut self) -> Result<JsonToken, JsonCompactEachRowIngestError> {
+        let start = self.cursor;
+        self.cursor += 1;
+        while let Some(&byte) = self.bytes.get(self.cursor) {
+            match byte {
+                b'"' => {
+                    self.cursor += 1;
+                    return Ok(JsonToken {
+                        kind: JsonTokenKind::String,
+                        start,
+                        end: self.cursor,
+                    });
+                }
+                b'\\' => {
+                    self.cursor += 1;
+                    let Some(&escaped) = self.bytes.get(self.cursor) else {
+                        return Err(invalid_json(self.line, self.cursor));
+                    };
+                    match escaped {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                            self.cursor += 1;
+                        }
+                        b'u' => {
+                            self.cursor += 1;
+                            let unicode_end = self.cursor.saturating_add(4);
+                            let Some(hex) = self.bytes.get(self.cursor..unicode_end) else {
+                                return Err(invalid_json(self.line, self.cursor));
+                            };
+                            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                                return Err(invalid_json(self.line, self.cursor));
+                            }
+                            self.cursor = unicode_end;
+                        }
+                        _ => return Err(invalid_json(self.line, self.cursor)),
+                    }
+                }
+                0x00..=0x1f => return Err(invalid_json(self.line, self.cursor)),
+                _ => self.cursor += 1,
             }
         }
-        _ => return Err(invalid_json(line, *cursor)),
+        Err(invalid_json(self.line, self.cursor))
     }
 
-    let integer_end = *cursor;
-    let mut has_non_integer_component = false;
-    if bytes.get(*cursor) == Some(&b'.') {
-        has_non_integer_component = true;
-        *cursor += 1;
-        let fraction_start = *cursor;
-        while matches!(bytes.get(*cursor), Some(b'0'..=b'9')) {
-            *cursor += 1;
+    fn lex_number(&mut self) -> Result<JsonToken, JsonCompactEachRowIngestError> {
+        let start = self.cursor;
+        if self.bytes.get(self.cursor) == Some(&b'-') {
+            self.cursor += 1;
         }
-        if *cursor == fraction_start {
-            return Err(invalid_json(line, *cursor));
-        }
-    }
-    if matches!(bytes.get(*cursor), Some(b'e' | b'E')) {
-        has_non_integer_component = true;
-        *cursor += 1;
-        if matches!(bytes.get(*cursor), Some(b'+' | b'-')) {
-            *cursor += 1;
-        }
-        let exponent_start = *cursor;
-        while matches!(bytes.get(*cursor), Some(b'0'..=b'9')) {
-            *cursor += 1;
-        }
-        if *cursor == exponent_start {
-            return Err(invalid_json(line, *cursor));
-        }
-    }
-    if has_non_integer_component {
-        return Err(JsonCompactEachRowIngestError::InvalidValue {
-            line,
-            column: 1,
-            expected: DataType::Int64,
-        });
-    }
 
-    let integer = std::str::from_utf8(&bytes[start..integer_end])
-        .expect("integer token is ASCII and therefore UTF-8");
-    integer
-        .parse::<i64>()
-        .map(ParsedValue::Integer)
-        .map_err(|_| JsonCompactEachRowIngestError::IntegerOverflow { line, column: 1 })
+        match self.bytes.get(self.cursor) {
+            Some(b'0') => {
+                self.cursor += 1;
+                if matches!(self.bytes.get(self.cursor), Some(b'0'..=b'9')) {
+                    return Err(invalid_json(self.line, self.cursor));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.cursor += 1;
+                while matches!(self.bytes.get(self.cursor), Some(b'0'..=b'9')) {
+                    self.cursor += 1;
+                }
+            }
+            _ => return Err(invalid_json(self.line, self.cursor)),
+        }
+
+        let mut is_integer = true;
+        if self.bytes.get(self.cursor) == Some(&b'.') {
+            is_integer = false;
+            self.cursor += 1;
+            let fraction_start = self.cursor;
+            while matches!(self.bytes.get(self.cursor), Some(b'0'..=b'9')) {
+                self.cursor += 1;
+            }
+            if self.cursor == fraction_start {
+                return Err(invalid_json(self.line, self.cursor));
+            }
+        }
+        if matches!(self.bytes.get(self.cursor), Some(b'e' | b'E')) {
+            is_integer = false;
+            self.cursor += 1;
+            if matches!(self.bytes.get(self.cursor), Some(b'+' | b'-')) {
+                self.cursor += 1;
+            }
+            let exponent_start = self.cursor;
+            while matches!(self.bytes.get(self.cursor), Some(b'0'..=b'9')) {
+                self.cursor += 1;
+            }
+            if self.cursor == exponent_start {
+                return Err(invalid_json(self.line, self.cursor));
+            }
+        }
+
+        Ok(JsonToken {
+            kind: JsonTokenKind::Number { is_integer },
+            start,
+            end: self.cursor,
+        })
+    }
 }
 
 fn skip_json_whitespace(bytes: &[u8], mut cursor: usize) -> usize {

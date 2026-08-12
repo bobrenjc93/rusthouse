@@ -584,6 +584,43 @@ fn json_compact_each_row_appends_recover_and_failed_commits_do_not_publish_rows(
 }
 
 #[test]
+fn empty_json_compact_each_row_ingestions_do_not_consume_wal_records() {
+    let directory = TestDirectory::new();
+    let path = directory.join("empty-json-compact-each-row.wal");
+    let limits = Int64WriteAheadLogLimits::new(64 * 1024, 16 * 1024, 2);
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Readings (Measurement Int64);")
+        .unwrap();
+    database
+        .enable_int64_write_ahead_log("readings", &path, limits)
+        .unwrap();
+
+    for _ in 0..3 {
+        assert_eq!(
+            database.ingest_json_compact_each_row(
+                "readings",
+                b"",
+                JsonCompactEachRowIngestLimits::new(0, 0, 0),
+            ),
+            Ok(0),
+        );
+    }
+    let input = b"[7]\n";
+    assert_eq!(
+        database.ingest_json_compact_each_row(
+            "readings",
+            input,
+            JsonCompactEachRowIngestLimits::new(input.len(), 1, 1),
+        ),
+        Ok(1),
+    );
+
+    let recovered = Database::recover_int64_write_ahead_log(&path, limits).unwrap();
+    assert_eq!(int64_values(&recovered, "readings"), [7]);
+}
+
+#[test]
 fn recovered_mixed_and_all_null_wal_rows_support_nullable_abs() {
     let directory = TestDirectory::new();
     let path = directory.join("nullable-abs.wal");
