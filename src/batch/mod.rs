@@ -1,6 +1,7 @@
 //! Bounded, semicolon-delimited SQL batch execution for CLI export formats.
 
 mod aggregate_scheduler;
+mod scalar_cast;
 
 pub mod catalog;
 pub mod csv;
