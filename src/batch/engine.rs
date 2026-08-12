@@ -167,9 +167,9 @@ pub(crate) struct ParameterizedQueryLimits {
 /// `ifNull`, `isNull`, `isNotNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `UPPER`,
 /// `ABS`, `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER`
 /// window forms provide bounded projections in ungrouped queries. `ifNull`,
-/// `isNull`, and the nullable `Int64` identity `CAST` may also derive fixed-size
-/// values from physical columns admitted directly or by the exact matching
-/// identity `GROUP BY CAST(column AS Int64)` expression.
+/// `isNull`, `isNotNull`, and the nullable `Int64` identity `CAST` may also
+/// derive fixed-size values from physical columns admitted directly or by the
+/// exact matching identity `GROUP BY CAST(column AS Int64)` expression.
 /// An optional `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
@@ -5425,6 +5425,7 @@ enum ResolvedItem {
     },
     IsNotNull {
         source: usize,
+        group_position: Option<usize>,
     },
     CastNullableInt64ToInt64 {
         source: usize,
@@ -5742,13 +5743,16 @@ fn resolve_select_items(
             }
             SelectItem::IsNotNull { name, alias } => {
                 let source = table.column_index(name)?;
-                if has_aggregate || !group_columns.is_empty() {
-                    return Err(Error::InvalidQuery(
-                        "isNotNull projections are only supported in ungrouped SELECT queries"
-                            .to_owned(),
-                    ));
+                let group_position = group_columns.iter().position(|column| *column == source);
+                if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
+                    return Err(Error::InvalidQuery(format!(
+                        "column '{name}' must appear in GROUP BY"
+                    )));
                 }
-                items.push(ResolvedItem::IsNotNull { source });
+                items.push(ResolvedItem::IsNotNull {
+                    source,
+                    group_position,
+                });
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
@@ -6309,7 +6313,7 @@ fn execute_projection(
                         ResolvedItem::IsNull { source, .. } => {
                             Value::Bool(is_null_at(table, *source, *row))
                         }
-                        ResolvedItem::IsNotNull { source } => {
+                        ResolvedItem::IsNotNull { source, .. } => {
                             Value::Bool(!is_null_at(table, *source, *row))
                         }
                         ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
@@ -6620,9 +6624,14 @@ fn validate_grouped_result_limits(
                     group_position: None,
                     ..
                 } => unreachable!("grouped isNull arguments are validated"),
-                ResolvedItem::IsNotNull { .. } => {
-                    unreachable!("isNotNull projections are restricted to ungrouped queries")
-                }
+                ResolvedItem::IsNotNull {
+                    group_position: Some(_),
+                    ..
+                } => 0,
+                ResolvedItem::IsNotNull {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped isNotNull arguments are validated"),
                 ResolvedItem::CastNullableInt64ToInt64 {
                     group_position: Some(_),
                     ..
@@ -8444,11 +8453,17 @@ impl GroupedData<'_> {
                             group_position: None,
                             ..
                         } => unreachable!("grouped isNull arguments are validated"),
-                        ResolvedItem::IsNotNull { .. } => {
-                            unreachable!(
-                                "isNotNull projections are restricted to ungrouped queries"
-                            )
-                        }
+                        ResolvedItem::IsNotNull {
+                            group_position: Some(position),
+                            ..
+                        } => Value::Bool(!matches!(
+                            self.keys[*group].value(*position),
+                            ValueRef::Null(_)
+                        )),
+                        ResolvedItem::IsNotNull {
+                            group_position: None,
+                            ..
+                        } => unreachable!("grouped isNotNull arguments are validated"),
                         ResolvedItem::CastNullableInt64ToInt64 {
                             group_position: Some(position),
                             ..
@@ -8854,7 +8869,9 @@ fn resolved_expression_name(
             source, fallback, ..
         } => sql::if_null_int64_name(&table.schema()[*source].name, *fallback),
         ResolvedItem::IsNull { source, .. } => sql::is_null_name(&table.schema()[*source].name),
-        ResolvedItem::IsNotNull { source } => sql::is_not_null_name(&table.schema()[*source].name),
+        ResolvedItem::IsNotNull { source, .. } => {
+            sql::is_not_null_name(&table.schema()[*source].name)
+        }
         ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
             format!("CAST({} AS Int64)", table.schema()[*source].name)
         }
@@ -9014,7 +9031,7 @@ fn order_source_rows(
                 ResolvedItem::IsNull { source, .. } => {
                     is_null_at(table, source, left).cmp(&is_null_at(table, source, right))
                 }
-                ResolvedItem::IsNotNull { source } => {
+                ResolvedItem::IsNotNull { source, .. } => {
                     (!is_null_at(table, source, left)).cmp(&!is_null_at(table, source, right))
                 }
                 ResolvedItem::CastNullableInt64ToInt64 { source, .. } => {
@@ -9292,9 +9309,16 @@ fn order_grouped_rows(
                     group_position: None,
                     ..
                 } => unreachable!("grouped isNull arguments are validated"),
-                ResolvedItem::IsNotNull { .. } => {
-                    unreachable!("isNotNull projections are restricted to ungrouped queries")
-                }
+                ResolvedItem::IsNotNull {
+                    group_position: Some(position),
+                    ..
+                } => (!matches!(data.keys[left].value(position), ValueRef::Null(_))).cmp(
+                    &!matches!(data.keys[right].value(position), ValueRef::Null(_)),
+                ),
+                ResolvedItem::IsNotNull {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped isNotNull arguments are validated"),
                 ResolvedItem::CastNullableInt64ToInt64 {
                     group_position: Some(position),
                     ..

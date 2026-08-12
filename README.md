@@ -647,18 +647,24 @@ remains unsupported, and source columns absent from `GROUP BY` are rejected.
 Its fixed-size `Bool` output adds no variable payload, while all normal scan,
 group working-state, result row, value, byte, retained-result, and
 formatted-output bounds continue to apply.
-`isNotNull(column)` is the case-insensitive, ungrouped complement to `isNull`.
+`isNotNull(column)` is the case-insensitive complement to `isNull`.
 It returns `Bool` `false` only for an absent cell in a physical
 `Nullable(Int64)` column. Present nullable values and every value in
 non-nullable `Int64`, `Float64`, `Bool`, and `String` columns return `true`.
 It accepts an optional `AS alias`; otherwise, the result is named
 `isNotNull(<column>)`. `WHERE` filtering happens first, ordering by either the
 normalized expression or its alias uses the Boolean result with stable ties,
-and `LIMIT`/`OFFSET` pagination precedes materialization. Aggregate projections,
-all `GROUP BY` forms, nested calls, non-column arguments, and extra or missing
-arguments are rejected. Its fixed-size `Bool` output adds no variable payload,
-and all normal scan, result row, value, byte, retained-result, and
-formatted-output bounds apply.
+and `LIMIT`/`OFFSET` pagination precedes materialization. In a grouped query,
+the physical argument column must appear in `GROUP BY`; `isNotNull` may then be
+projected alongside that key and aggregates, with normal aliases, `HAVING`,
+group ordering, and pagination. The retained physical key remains the group
+identity, so distinct present values do not collapse merely because they all
+project as `true`. Expression-based grouping such as `GROUP BY
+isNotNull(value)` remains unsupported, and source columns absent from `GROUP
+BY` are rejected. Nested calls, non-column arguments, and extra or missing
+arguments are also rejected. Its fixed-size `Bool` output adds no variable
+payload, and all normal scan, group working-state, result row, value, byte,
+retained-result, and formatted-output bounds apply.
 `LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
