@@ -14,6 +14,8 @@ use crate::batch::aggregate_scheduler::{
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
+use crate::batch::global_scalar_extremum;
+use crate::batch::grouped_bool_min;
 use crate::batch::json_compact_each_row::{
     self, JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
 };
@@ -7402,19 +7404,13 @@ fn execute_grouped_bool_min<'a>(
         return Ok(None);
     };
 
-    let partial = reduce_grouped_bool_min(
-        group_values,
-        values,
-        matching_rows,
-        parallelism,
-        grouped_bool_min_chunk,
-    )?;
+    let partial = grouped_bool_min::reduce(group_values, values, matching_rows, parallelism)?;
     let group_count = usize::from(partial.present(false)) + usize::from(partial.present(true));
     enforce_grouped_bool_limits(group_count, limits)?;
 
     let mut keys = Vec::with_capacity(group_count);
     let mut minimums = Vec::with_capacity(group_count);
-    if let Some(first) = partial.first_seen {
+    if let Some(first) = partial.first_seen() {
         keys.push(GroupKey::One(ValueRef::Bool(first)));
         minimums.push(Value::Int64(partial.minimum(first)));
         let second = !first;
@@ -7735,93 +7731,6 @@ fn reduce_grouped_bool_sum_partials(
                 })?;
             Ok(total)
         })
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct GroupedBoolMinPartial {
-    false_min: Option<i64>,
-    true_min: Option<i64>,
-    first_seen: Option<bool>,
-}
-
-impl GroupedBoolMinPartial {
-    fn slot(&self, group: bool) -> Option<i64> {
-        if group { self.true_min } else { self.false_min }
-    }
-
-    fn slot_mut(&mut self, group: bool) -> &mut Option<i64> {
-        if group {
-            &mut self.true_min
-        } else {
-            &mut self.false_min
-        }
-    }
-
-    fn present(&self, group: bool) -> bool {
-        self.slot(group).is_some()
-    }
-
-    fn minimum(&self, group: bool) -> i64 {
-        self.slot(group)
-            .expect("a present non-nullable Int64 group has a minimum")
-    }
-
-    fn observe(&mut self, group: bool, value: i64) {
-        self.first_seen.get_or_insert(group);
-        let minimum = self.slot_mut(group);
-        *minimum = Some(minimum.map_or(value, |current| current.min(value)));
-    }
-}
-
-fn reduce_grouped_bool_min<C>(
-    group_values: &[bool],
-    min_values: &[i64],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    chunk: C,
-) -> Result<GroupedBoolMinPartial>
-where
-    C: Fn(&[bool], &[i64], &[usize]) -> Result<GroupedBoolMinPartial> + Sync,
-{
-    reduce_grouped_bool(
-        group_values,
-        matching_rows,
-        parallelism,
-        "rusthouse-group-bool-min-int64",
-        |group_values, rows| chunk(group_values, min_values, rows),
-        reduce_grouped_bool_min_partials,
-    )
-}
-
-fn grouped_bool_min_chunk(
-    group_values: &[bool],
-    min_values: &[i64],
-    matching_rows: &[usize],
-) -> Result<GroupedBoolMinPartial> {
-    let mut partial = GroupedBoolMinPartial::default();
-    for row in matching_rows {
-        partial.observe(group_values[*row], min_values[*row]);
-    }
-    Ok(partial)
-}
-
-fn reduce_grouped_bool_min_partials(
-    partials: Vec<GroupedBoolMinPartial>,
-) -> Result<GroupedBoolMinPartial> {
-    Ok(partials
-        .into_iter()
-        .fold(GroupedBoolMinPartial::default(), |mut total, partial| {
-            if total.first_seen.is_none() {
-                total.first_seen = partial.first_seen;
-            }
-            if let Some(minimum) = partial.false_min {
-                total.observe(false, minimum);
-            }
-            if let Some(minimum) = partial.true_min {
-                total.observe(true, minimum);
-            }
-            total
-        }))
 }
 
 fn paired_global_count_aggregate(
@@ -8385,161 +8294,14 @@ fn min_global_int64(
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
     let minimum = match &table.columns()[spec.argument.expect("MIN argument")] {
         Column::Int64(values) => {
-            reduce_global_int64_extremum(values, matching_rows, parallelism, "min", i64::min)
+            global_scalar_extremum::min_int64(values, matching_rows, parallelism)
         }
-        Column::NullableInt64(values) => reduce_global_nullable_int64_extremum(
-            values,
-            matching_rows,
-            parallelism,
-            "min",
-            i64::min,
-        ),
+        Column::NullableInt64(values) => {
+            global_scalar_extremum::min_nullable_int64(values, matching_rows, parallelism)
+        }
         _ => unreachable!("MIN input type is resolved"),
     };
     min_int64_state(minimum)
-}
-
-fn reduce_global_int64_extremum<C>(
-    values: &[i64],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
-    compare: C,
-) -> Option<i64>
-where
-    C: Fn(i64, i64) -> i64 + Sync,
-{
-    reduce_global_scalar_extremum(
-        values,
-        matching_rows,
-        parallelism,
-        worker_label,
-        "int64",
-        |value| Some(*value),
-        compare,
-    )
-}
-
-fn reduce_global_nullable_int64_extremum<C>(
-    values: &[Option<i64>],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
-    compare: C,
-) -> Option<i64>
-where
-    C: Fn(i64, i64) -> i64 + Sync,
-{
-    reduce_global_scalar_extremum(
-        values,
-        matching_rows,
-        parallelism,
-        worker_label,
-        "nullable-int64",
-        |value| *value,
-        compare,
-    )
-}
-
-fn reduce_global_scalar_extremum<T, E, M, C>(
-    values: &[T],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
-    worker_type_label: &'static str,
-    map: M,
-    compare: C,
-) -> Option<E>
-where
-    T: Sync,
-    E: Copy + Send,
-    M: Fn(&T) -> Option<E> + Sync,
-    C: Fn(E, E) -> E + Sync,
-{
-    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return scalar_extremum_chunk(values, matching_rows, &map, &compare);
-    };
-
-    // Each lane receives the same deterministic contiguous partition used by
-    // the other global aggregates. Optional scalar partials are combined in
-    // place, without allocating a partial-results collection. A failed spawn
-    // or panic discards every partial and repeats the complete extremum on the
-    // query thread after releasing process-wide admission.
-    let helper_threads = admission.helper_threads();
-    debug_assert!(helper_threads > 0);
-    let worker_count = helper_threads.saturating_add(1);
-    let map = &map;
-    let compare = &compare;
-    let parallel_result = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(helper_threads);
-        let mut worker_failed = false;
-        for chunk_index in 1..worker_count {
-            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
-            let spawn = std::thread::Builder::new()
-                .name(format!(
-                    "rusthouse-{worker_label}-{worker_type_label}-{chunk_index}"
-                ))
-                .spawn_scoped(scope, move || {
-                    scalar_extremum_chunk(values, rows, map, compare)
-                });
-            match spawn {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    worker_failed = true;
-                    break;
-                }
-            }
-        }
-
-        let mut extremum = scalar_extremum_chunk(
-            values,
-            parallel_aggregate_partition(matching_rows, worker_count, 0),
-            map,
-            compare,
-        );
-        for handle in handles {
-            match handle.join() {
-                Ok(partial) => {
-                    extremum = reduce_scalar_extremum_partials(extremum, partial, compare);
-                }
-                Err(_) => worker_failed = true,
-            }
-        }
-        (!worker_failed).then_some(extremum)
-    });
-    drop(admission);
-    parallel_result.unwrap_or_else(|| scalar_extremum_chunk(values, matching_rows, map, compare))
-}
-
-fn scalar_extremum_chunk<T, E, M, C>(
-    values: &[T],
-    matching_rows: &[usize],
-    map: &M,
-    compare: &C,
-) -> Option<E>
-where
-    M: Fn(&T) -> Option<E>,
-    C: Fn(E, E) -> E,
-{
-    matching_rows
-        .iter()
-        .filter_map(|row| map(&values[*row]))
-        .reduce(compare)
-}
-
-fn reduce_scalar_extremum_partials<T, C>(
-    left: Option<T>,
-    right: Option<T>,
-    compare: &C,
-) -> Option<T>
-where
-    C: Fn(T, T) -> T,
-{
-    match (left, right) {
-        (Some(left), Some(right)) => Some(compare(left, right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
 }
 
 fn min_int64_state(minimum: Option<i64>) -> AggregateState {
@@ -8558,44 +8320,8 @@ fn min_global_float64(
         unreachable!("MIN input type is resolved")
     };
     AggregateState::Min(
-        reduce_global_float64_extremum(
-            values,
-            matching_rows,
-            parallelism,
-            "min",
-            first_float64_minimum,
-        )
-        .map(Value::Float64),
+        global_scalar_extremum::min_float64(values, matching_rows, parallelism).map(Value::Float64),
     )
-}
-
-fn reduce_global_float64_extremum<C>(
-    values: &[f64],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
-    compare: C,
-) -> Option<f64>
-where
-    C: Fn(f64, f64) -> f64 + Sync,
-{
-    reduce_global_scalar_extremum(
-        values,
-        matching_rows,
-        parallelism,
-        worker_label,
-        "float64",
-        |value| Some(*value),
-        compare,
-    )
-}
-
-fn first_float64_minimum(left: f64, right: f64) -> f64 {
-    if ValueRef::Float64(right) < ValueRef::Float64(left) {
-        right
-    } else {
-        left
-    }
 }
 
 fn max_global_int64(
@@ -8608,15 +8334,11 @@ fn max_global_int64(
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
     let maximum = match &table.columns()[spec.argument.expect("MAX argument")] {
         Column::Int64(values) => {
-            reduce_global_int64_extremum(values, matching_rows, parallelism, "max", i64::max)
+            global_scalar_extremum::max_int64(values, matching_rows, parallelism)
         }
-        Column::NullableInt64(values) => reduce_global_nullable_int64_extremum(
-            values,
-            matching_rows,
-            parallelism,
-            "max",
-            i64::max,
-        ),
+        Column::NullableInt64(values) => {
+            global_scalar_extremum::max_nullable_int64(values, matching_rows, parallelism)
+        }
         _ => unreachable!("MAX input type is resolved"),
     };
     max_int64_state(maximum)
@@ -8638,23 +8360,8 @@ fn max_global_float64(
         unreachable!("MAX input type is resolved")
     };
     AggregateState::Max(
-        reduce_global_float64_extremum(
-            values,
-            matching_rows,
-            parallelism,
-            "max",
-            first_float64_maximum,
-        )
-        .map(Value::Float64),
+        global_scalar_extremum::max_float64(values, matching_rows, parallelism).map(Value::Float64),
     )
-}
-
-fn first_float64_maximum(left: f64, right: f64) -> f64 {
-    if ValueRef::Float64(right) > ValueRef::Float64(left) {
-        right
-    } else {
-        left
-    }
 }
 
 #[derive(Debug)]
@@ -11863,47 +11570,6 @@ mod tests {
     }
 
     #[test]
-    fn grouped_bool_min_worker_failure_repeats_complete_input_locally() {
-        let group_values = [true, false, true];
-        let min_values = [i64::MAX, 7, i64::MIN];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        matching_rows[row_count - 1] = 2;
-
-        let successful_parallel = reduce_grouped_bool_min(
-            &group_values,
-            &min_values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            grouped_bool_min_chunk,
-        )
-        .expect("deterministic parallel grouped MIN succeeds");
-        let failed_parallel = reduce_grouped_bool_min(
-            &group_values,
-            &min_values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            |group_values, min_values, rows| {
-                if std::thread::current().name() == Some("rusthouse-group-bool-min-int64-1") {
-                    panic!("injected grouped MIN worker failure");
-                }
-                grouped_bool_min_chunk(group_values, min_values, rows)
-            },
-        )
-        .expect("worker failure falls back to the complete grouped MIN locally");
-
-        let expected = GroupedBoolMinPartial {
-            false_min: Some(7),
-            true_min: Some(i64::MIN),
-            first_seen: Some(true),
-        };
-        assert_eq!(successful_parallel, expected);
-        assert_eq!(failed_parallel, expected);
-    }
-
-    #[test]
     fn grouped_bool_min_forced_workers_preserve_resource_boundaries() {
         let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
         let mut database =
@@ -14691,33 +14357,6 @@ mod tests {
     }
 
     #[test]
-    fn global_count_min_int64_worker_failure_repeats_the_complete_pair_locally() {
-        let values = [9, 7, 5, 3, 1, -1, -3, -5, i64::MIN, i64::MAX];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 8;
-        let minimum = reduce_global_int64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            "min",
-            |left, right| {
-                if std::thread::current().name() == Some("rusthouse-min-int64-1") {
-                    panic!("injected MIN worker failure");
-                }
-                left.min(right)
-            },
-        );
-
-        assert_eq!(minimum, Some(i64::MIN));
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
-        );
-    }
-
-    #[test]
     fn global_count_min_float64_forced_workers_match_empty_null_having_and_pagination() {
         let mut database = min_float64_database(0, |_| unreachable!("empty input"));
         let first_page = assert_global_aggregate_worker_differential(
@@ -14957,33 +14596,6 @@ mod tests {
     }
 
     #[test]
-    fn global_count_min_float64_worker_failure_repeats_the_complete_pair_locally() {
-        let values = [9.0, 7.0, 5.0, 3.0, 1.0, 0.0, -0.0, -5.0, f64::MIN];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 8;
-        let minimum = reduce_global_float64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            "min",
-            |left, right| {
-                if std::thread::current().name() == Some("rusthouse-min-float64-1") {
-                    panic!("injected MIN(Float64) worker failure");
-                }
-                first_float64_minimum(left, right)
-            },
-        );
-
-        assert_eq!(minimum, Some(f64::MIN));
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
-        );
-    }
-
-    #[test]
     fn global_count_max_float64_forced_workers_match_empty_null_having_and_pagination() {
         let mut database = max_float64_database(0, |_| unreachable!("empty input"));
         let first_page = assert_global_aggregate_worker_differential(
@@ -15214,33 +14826,6 @@ mod tests {
     }
 
     #[test]
-    fn global_count_max_float64_worker_failure_repeats_the_complete_pair_locally() {
-        let values = [-9.0, -7.0, -5.0, -3.0, -1.0, -0.0, 0.0, 5.0, f64::MAX];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 8;
-        let maximum = reduce_global_float64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            "max",
-            |left, right| {
-                if std::thread::current().name() == Some("rusthouse-max-float64-1") {
-                    panic!("injected MAX(Float64) worker failure");
-                }
-                first_float64_maximum(left, right)
-            },
-        );
-
-        assert_eq!(maximum, Some(f64::MAX));
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
-        );
-    }
-
-    #[test]
     fn global_count_max_int64_forced_workers_preserve_empty_results_and_pagination() {
         let mut database = max_int64_database(0, |_| unreachable!("empty input"));
         let first_page = assert_global_aggregate_worker_differential(
@@ -15457,41 +15042,6 @@ mod tests {
     }
 
     #[test]
-    fn global_count_max_int64_worker_failure_repeats_the_complete_pair_locally() {
-        let values = [-9, -7, -5, -3, -1, 1, 3, 5, i64::MAX, i64::MIN];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 8;
-        let sequential_maximum = reduce_global_int64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(1),
-            "max",
-            i64::max,
-        );
-        let failed_parallel_maximum = reduce_global_int64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            "max",
-            |left, right| {
-                if std::thread::current().name() == Some("rusthouse-max-int64-1") {
-                    panic!("injected MAX worker failure");
-                }
-                left.max(right)
-            },
-        );
-
-        assert_eq!(failed_parallel_maximum, sequential_maximum);
-        assert_eq!(failed_parallel_maximum, Some(i64::MAX));
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
-        );
-    }
-
-    #[test]
     fn global_aggregate_reduction_overflows_are_checked() {
         assert_eq!(
             reduce_count_if_counts(vec![i64::MAX, 1]),
@@ -15544,32 +15094,6 @@ mod tests {
         assert_eq!(
             count_present_values(u64::try_from(i64::MAX).unwrap() + 1),
             Err(Error::NumericOverflow("COUNT".to_owned()))
-        );
-        assert_eq!(reduce_scalar_extremum_partials(None, None, &i64::min), None);
-        assert_eq!(
-            reduce_scalar_extremum_partials(Some(4), None, &i64::min),
-            Some(4)
-        );
-        assert_eq!(
-            reduce_scalar_extremum_partials(None, Some(-7), &i64::min),
-            Some(-7)
-        );
-        assert_eq!(
-            reduce_scalar_extremum_partials(Some(4), Some(-7), &i64::min),
-            Some(-7)
-        );
-        assert_eq!(reduce_scalar_extremum_partials(None, None, &i64::max), None);
-        assert_eq!(
-            reduce_scalar_extremum_partials(Some(4), None, &i64::max),
-            Some(4)
-        );
-        assert_eq!(
-            reduce_scalar_extremum_partials(None, Some(-7), &i64::max),
-            Some(-7)
-        );
-        assert_eq!(
-            reduce_scalar_extremum_partials(Some(4), Some(-7), &i64::max),
-            Some(4)
         );
     }
 
@@ -15831,43 +15355,6 @@ mod tests {
         assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
         drop(held);
         assert_eq!(BUDGET.helpers_in_use(), 0);
-    }
-
-    #[test]
-    fn paired_nullable_int64_min_worker_failure_repeats_the_complete_pair_locally() {
-        let values = [Some(9), None, Some(i64::MIN)];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        matching_rows[row_count - 1] = 2;
-
-        let successful_parallel = reduce_global_nullable_int64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            "min",
-            i64::min,
-        );
-        let minimum = reduce_global_nullable_int64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            "min",
-            |left, right| {
-                if std::thread::current().name() == Some("rusthouse-min-nullable-int64-1") {
-                    panic!("injected nullable MIN worker failure");
-                }
-                left.min(right)
-            },
-        );
-
-        assert_eq!(successful_parallel, Some(i64::MIN));
-        assert_eq!(minimum, successful_parallel);
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
-        );
     }
 
     #[test]
@@ -16202,43 +15689,6 @@ mod tests {
         assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
         drop(held);
         assert_eq!(BUDGET.helpers_in_use(), 0);
-    }
-
-    #[test]
-    fn paired_nullable_int64_max_worker_failure_repeats_the_complete_pair_locally() {
-        let values = [Some(-9), None, Some(i64::MAX)];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        matching_rows[row_count - 1] = 2;
-
-        let successful_parallel = reduce_global_nullable_int64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            "max",
-            i64::max,
-        );
-        let maximum = reduce_global_nullable_int64_extremum(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            "max",
-            |left, right| {
-                if std::thread::current().name() == Some("rusthouse-max-nullable-int64-1") {
-                    panic!("injected nullable MAX worker failure");
-                }
-                left.max(right)
-            },
-        );
-
-        assert_eq!(successful_parallel, Some(i64::MAX));
-        assert_eq!(maximum, successful_parallel);
-        assert_eq!(
-            count_matched_rows(matching_rows.len()),
-            Ok(i64::try_from(row_count).unwrap())
-        );
     }
 
     #[test]
