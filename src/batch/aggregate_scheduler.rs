@@ -322,7 +322,7 @@ pub(super) fn parallel_aggregate_partition(
     &matching_rows[start..start + partition_len]
 }
 
-/// Runs one grouped aggregate over admitted, deterministically ordered lanes.
+/// Runs one aggregate reducer over admitted, deterministically ordered lanes.
 ///
 /// SQL shape recognition, partial construction, and partial reduction remain
 /// caller policy. This driver owns only worker admission and lifecycle. If a

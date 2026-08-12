@@ -64,9 +64,11 @@ partials, chunk scans, ordered reduction, and fixed worker-name prefixes. The pr
 reduction boundary. The private
 `batch::grouped_bool_sum_avg` module owns the non-nullable `Int64` `SUM`/`AVG` per-key sum-and-count
 partial, chunk scan, first-seen ordering, mode-specific checked reduction and fixed worker-name
-prefixes. The engine retains SQL eligibility, physical column dispatch, grouped resource limits,
-and typed result construction, while the scheduler continues to own admission, worker lifecycle,
-and complete-input fallback.
+prefixes. The private `batch::global_int64_sum_avg` module owns the corresponding global nullable
+and non-nullable raw-slice scans, sum-and-count partial, mode-specific overflow contexts, ordered
+reduction, and scheduler integration. The engine retains SQL eligibility, physical column dispatch,
+grouped resource limits, and typed result construction, while the scheduler continues to own
+admission, worker lifecycle, and complete-input fallback.
 
 The initial engine remains single-process and single-node. Validated `Int64` range partitions are
 local table metadata used only to prune impossible physical row ranges before the existing exact
