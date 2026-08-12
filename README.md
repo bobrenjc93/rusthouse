@@ -168,12 +168,15 @@ their documented nullable restrictions.
 
 An admitted, current index can reject blocks for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
-order), and for an exact positive inclusive range on one column with `Int64`
-literal bounds. `column BETWEEN lower AND upper`, the equivalent two
-comparisons `column >= lower` and `column <= upper` in either conjunction
-order (with either comparison's operands reversed), and forms normalized to
-that conjunction such as `NOT (column < lower OR column > upper)` share this
-indexed range path. Both
+order), and for an exact positive two-sided range on one column with `Int64`
+literal bounds. The lower comparison may be `>` or `>=`, the upper comparison
+may be `<` or `<=`, and either conjunction or comparison operand order is
+accepted. `column BETWEEN lower AND upper`, its inclusive two-comparison
+equivalent, and forms normalized to that conjunction such as `NOT (column <
+lower OR column > upper)` share this indexed range path. Strict endpoints are
+converted with checked `Int64` successor/predecessor operations; an impossible
+endpoint at an `Int64` extreme or reversed/equal strict bounds safely prune
+every block. Both
 `Int64` and physical `Nullable(Int64)` index columns are supported; all-null
 blocks cannot satisfy these shapes. Every row in a surviving block still
 follows the normal exact predicate evaluator. Other compound shapes, `NOT
@@ -792,7 +795,7 @@ TABLE DELETE`), or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
 by default. This scanned-row limit is checked against the full source table
 before matching-row indices or replacement values are allocated, so `WHERE`
 selectivity and `LIMIT` do not reduce it for ordinary tables. A supported
-direct comparison or exact positive inclusive range on validated `Int64` range
+direct comparison or exact positive two-sided range on validated `Int64` range
 partitions instead charges only physical ranges that remain possible; each
 `UNION` operand and each `CROSS JOIN` input has its own source scan. String
 assignments additionally bound
@@ -861,16 +864,17 @@ For a direct comparison between that `Int64` key and an `Int64` literal using
 `=`, `<`, `<=`, `>`, or `>=` (in either operand order), SELECT discards ranges
 whose inclusive bounds make a match impossible. The exact positive `column
 BETWEEN lower AND upper` form with `Int64` literal bounds uses the same path,
-as do equivalent predicates normalized to `column >= lower AND column <=
-upper` or the upper-bound-first `column <= upper AND column >= lower`; either
-comparison may also reverse its operands. Reversed bounds prune every
-partition. The normal compiled predicate
-still checks every row in the admitted ranges, and physical rows retain source
-order through the existing projection, aliases, aggregation, ordering, `LIMIT`,
-and `OFFSET` paths. The SELECT scan-row limit is charged to admitted physical
-ranges. Compound predicates outside that exact normalized shape, `NOT BETWEEN`,
-`!=`, cross-type, other-column, and unpartitioned predicates use the complete
-existing scan path.
+as do exact same-column conjunctions with a `>` or `>=` lower bound and a `<`
+or `<=` upper bound. Either conjunction order and either comparison's operand
+order are accepted. Strict endpoints use checked successor/predecessor
+normalization, so equal or reversed strict ranges and impossible bounds at
+`Int64` extrema prune every partition without overflow. The normal compiled
+predicate still checks every row in the admitted ranges, and physical rows
+retain source order through the existing projection, aliases, aggregation,
+ordering, `LIMIT`, and `OFFSET` paths. The SELECT scan-row limit is charged to
+admitted physical ranges. Compound predicates outside that exact normalized
+shape, `NOT BETWEEN`, `!=`, cross-type, other-column, and unpartitioned
+predicates use the complete existing scan path.
 Empty matches therefore preserve typed aggregate `NULL` results, while the
 batch engine's existing typed nullable/non-nullable column and NULL-predicate
 behavior is unchanged. Any successful row or schema mutation that could stale
