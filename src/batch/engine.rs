@@ -19,6 +19,7 @@ use crate::batch::scalar_cast::{
     checked_string_to_bool, checked_string_to_float64, checked_string_to_int64, decimal_text_cmp,
     ordering_string_to_float64, validate_string_to_float64_syntax, validate_string_to_int64_syntax,
 };
+use crate::batch::scalar_nullable_int64;
 use crate::batch::scalar_text;
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, AlterUpdateLiteral, AlterUpdateValue,
@@ -6253,7 +6254,7 @@ fn execute_projection(
                     Ok(match item {
                         ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
                         ResolvedItem::Int64Subtract { source, literal } => {
-                            checked_nullable_int64_subtract(
+                            scalar_nullable_int64::checked_subtract(
                                 table.columns()[*source].value_ref(*row),
                                 *literal,
                             )?
@@ -6325,9 +6326,9 @@ fn execute_projection(
                         ResolvedItem::StringUpper { source } => {
                             Value::String(string_at(table, *source, *row).to_ascii_uppercase())
                         }
-                        ResolvedItem::Int64Abs { source } => {
-                            checked_nullable_int64_abs(table.columns()[*source].value_ref(*row))?
-                        }
+                        ResolvedItem::Int64Abs { source } => scalar_nullable_int64::checked_abs(
+                            table.columns()[*source].value_ref(*row),
+                        )?,
                         ResolvedItem::Float64Abs { source } => {
                             Value::Float64(float64_at(table, *source, *row).abs())
                         }
@@ -8373,7 +8374,7 @@ impl GroupedData<'_> {
                             fallback,
                             group_position: Some(position),
                             ..
-                        } => Value::Int64(if_null_int64_value(
+                        } => Value::Int64(scalar_nullable_int64::if_null(
                             self.keys[*group].value(*position),
                             *fallback,
                         )),
@@ -9032,7 +9033,7 @@ fn order_source_rows(
                 // Comparing unsigned magnitudes preserves checked overflow as
                 // a projection-time error. NULL follows the engine's normal
                 // ordering without attempting to evaluate ABS.
-                ResolvedItem::Int64Abs { source } => int64_abs_cmp(
+                ResolvedItem::Int64Abs { source } => scalar_nullable_int64::abs_cmp(
                     table.columns()[source].value_ref(left),
                     table.columns()[source].value_ref(right),
                 ),
@@ -9217,8 +9218,8 @@ fn order_grouped_rows(
                     fallback,
                     group_position: Some(position),
                     ..
-                } => if_null_int64_value(data.keys[left].value(position), fallback).cmp(
-                    &if_null_int64_value(data.keys[right].value(position), fallback),
+                } => scalar_nullable_int64::if_null(data.keys[left].value(position), fallback).cmp(
+                    &scalar_nullable_int64::if_null(data.keys[right].value(position), fallback),
                 ),
                 ResolvedItem::IfNullInt64 {
                     group_position: None,
@@ -9463,62 +9464,8 @@ fn string_length_utf8_to_i64(value: &str) -> Result<i64> {
         .map_err(|_| Error::NumericOverflow("lengthUTF8(String)".to_owned()))
 }
 
-fn checked_int64_abs(value: i64) -> Result<i64> {
-    value
-        .checked_abs()
-        .ok_or_else(|| Error::NumericOverflow("ABS(Int64)".to_owned()))
-}
-
-fn checked_nullable_int64_abs(value: ValueRef<'_>) -> Result<Value> {
-    match value {
-        ValueRef::Null(DataType::Int64) => Ok(Value::Null(DataType::Int64)),
-        ValueRef::Int64(value) => Ok(Value::Int64(checked_int64_abs(value)?)),
-        ValueRef::Null(_) | ValueRef::Float64(_) | ValueRef::Bool(_) | ValueRef::String(_) => {
-            unreachable!("ABS(Int64) input type is resolved")
-        }
-    }
-}
-
-fn int64_abs_cmp(left: ValueRef<'_>, right: ValueRef<'_>) -> Ordering {
-    match (left, right) {
-        (ValueRef::Null(DataType::Int64), ValueRef::Null(DataType::Int64)) => Ordering::Equal,
-        (ValueRef::Null(DataType::Int64), ValueRef::Int64(_)) => Ordering::Less,
-        (ValueRef::Int64(_), ValueRef::Null(DataType::Int64)) => Ordering::Greater,
-        (ValueRef::Int64(left), ValueRef::Int64(right)) => {
-            left.unsigned_abs().cmp(&right.unsigned_abs())
-        }
-        _ => unreachable!("ABS(Int64) input type is resolved"),
-    }
-}
-
-fn checked_int64_subtract(value: i64, literal: i64) -> Result<i64> {
-    value
-        .checked_sub(literal)
-        .ok_or_else(|| Error::NumericOverflow("Int64 subtraction".to_owned()))
-}
-
-fn checked_nullable_int64_subtract(value: ValueRef<'_>, literal: i64) -> Result<Value> {
-    match value {
-        ValueRef::Null(DataType::Int64) => Ok(Value::Null(DataType::Int64)),
-        ValueRef::Int64(value) => Ok(Value::Int64(checked_int64_subtract(value, literal)?)),
-        ValueRef::Null(_) | ValueRef::Float64(_) | ValueRef::Bool(_) | ValueRef::String(_) => {
-            unreachable!("Int64 subtraction input type is resolved")
-        }
-    }
-}
-
 fn if_null_int64_at(table: &Table, source: usize, row: usize, fallback: i64) -> i64 {
-    if_null_int64_value(table.columns()[source].value_ref(row), fallback)
-}
-
-fn if_null_int64_value(value: ValueRef<'_>, fallback: i64) -> i64 {
-    match value {
-        ValueRef::Null(DataType::Int64) => fallback,
-        ValueRef::Int64(value) => value,
-        ValueRef::Null(_) | ValueRef::Float64(_) | ValueRef::Bool(_) | ValueRef::String(_) => {
-            unreachable!("ifNull first argument is resolved as Nullable(Int64)")
-        }
-    }
+    scalar_nullable_int64::if_null(table.columns()[source].value_ref(row), fallback)
 }
 
 fn sort_and_limit(
