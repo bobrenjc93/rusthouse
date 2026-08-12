@@ -1,4 +1,4 @@
-//! Bounded HTTP exchanges and finite TCP serving.
+//! Bounded HTTP exchanges and finite or cancellable TCP serving.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
@@ -719,6 +719,76 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
     max_in_flight_connections: NonZeroUsize,
     stop_requested: &AtomicBool,
 ) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_concurrently_until_cancelled(
+        listener,
+        database,
+        limits,
+        max_in_flight_connections,
+        stop_requested,
+        HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
+    )
+}
+
+/// Concurrently serves cancellable, bounded, read-write,
+/// `X-ClickHouse-Key`-authenticated HTTP connections.
+///
+/// This is the insertion-capable counterpart to
+/// [`serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled`].
+/// It owns `listener`, stops dispatching new connections when `stop_requested`
+/// is true, closes admission, and drains every already accepted exchange.
+/// Idle and full-capacity waits observe cancellation within
+/// [`DEFAULT_HTTP_ACCEPT_POLL_INTERVAL`], and an accept racing with
+/// cancellation is closed without consuming the connection budget.
+///
+/// Accepted connections use the existing authenticated read-write handler, so
+/// SQL, CSV, and TabSeparated inserts retain their bounded, atomic,
+/// nonblocking behavior. They also retain acceptance-based absolute read and
+/// write deadlines, one-response shutdown, failure isolation, and
+/// acceptance-ordered final reporting while they drain. Cancellation never
+/// interrupts an accepted exchange.
+///
+/// `limits.max_connections` remains a finite upper bound and can complete the
+/// run before cancellation. Passing zero or an initially set cancellation flag
+/// returns without accepting. A cap of one preserves sequential acceptance.
+/// The caller may use a very large connection budget when cancellation is the
+/// ordinary lifecycle boundary.
+///
+/// This function does not provide TLS. Callers must arrange transport security
+/// before sending a key, query, or insertion payload over an untrusted network.
+///
+/// # Errors
+///
+/// Returns [`HttpListenerError::Accept`] with the partial report when enabling
+/// nonblocking mode or accepting a connection fails. Interrupted accepts are
+/// retried. Connections accepted before an accept failure or cancellation are
+/// allowed to finish and are included in that report. Connection-local
+/// failures are returned in [`HttpListenerReport::connection_failures`].
+pub fn serve_http_concurrently_with_clickhouse_key_until_cancelled(
+    listener: TcpListener,
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+    stop_requested: &AtomicBool,
+) -> Result<HttpListenerReport, HttpListenerError> {
+    serve_http_concurrently_until_cancelled(
+        listener,
+        database,
+        limits,
+        max_in_flight_connections,
+        stop_requested,
+        HttpListenerHandler::ClickHouseKeyReadWrite(expected_clickhouse_key),
+    )
+}
+
+fn serve_http_concurrently_until_cancelled(
+    listener: TcpListener,
+    database: &SharedDatabase,
+    limits: HttpListenerLimits,
+    max_in_flight_connections: NonZeroUsize,
+    stop_requested: &AtomicBool,
+    handler: HttpListenerHandler<'_>,
+) -> Result<HttpListenerReport, HttpListenerError> {
     let mut report = HttpListenerReport::default();
     if limits.max_connections == 0 || stop_requested.load(Ordering::Acquire) {
         return Ok(report);
@@ -794,7 +864,7 @@ pub fn serve_http_read_only_concurrently_with_clickhouse_key_until_cancelled(
                                 &stream,
                                 accepted_at,
                                 limits,
-                                HttpListenerHandler::ClickHouseKeyReadOnly(expected_clickhouse_key),
+                                handler,
                             )
                         });
 
