@@ -226,7 +226,7 @@ where
     }
 }
 
-fn first_float64_minimum(left: f64, right: f64) -> f64 {
+pub(super) fn first_float64_minimum(left: f64, right: f64) -> f64 {
     if ValueRef::Float64(right) < ValueRef::Float64(left) {
         right
     } else {
