@@ -141,10 +141,11 @@ cap is an admission rejection and leaves existing state unchanged. Each block
 records its first row, row count, non-null minimum/maximum, and null count;
 all-null blocks therefore have no extrema. Physical column vectors support
 `Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL accepts
-either a sole `Nullable(Int64)` column or a non-nullable prefix followed by
-exactly one trailing `Nullable(Int64)` column in `CREATE TABLE`,
-case-insensitively. Leading nullable columns in a multi-column schema, multiple
-nullable columns, and other nullable types remain outside the bounded grammar.
+either a sole `Nullable(Int64)` column or a non-nullable prefix followed by one
+or two trailing `Nullable(Int64)` columns in `CREATE TABLE`, case-insensitively.
+Leading nullable columns in a multi-column schema, more than two nullable
+columns, interleaved nullable columns, and other nullable types remain outside
+the bounded grammar.
 Library APIs and WAL recovery can also create this physical storage. The index
 metadata has explicit nullable-block semantics for both `Int64` storage forms.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` accept physical `Nullable(Int64)`
@@ -447,11 +448,12 @@ values and is available through the normal `Database`, `SharedDatabase`, CLI,
 and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns canonical, replayable DDL as a bounded
 `String`, preserving the stored table and column display names and schema order
-while normalizing type spellings. Schemas with no nullable columns and
-schemas with exactly one trailing `Nullable(Int64)` column use one
-`CREATE TABLE` statement. Other mixed schemas created through `ALTER TABLE` or
-library APIs use the non-nullable prefix before the first nullable column (or a
-first nullable column by itself), then emit ordered
+while normalizing type spellings. Schemas with no nullable columns, a sole
+`Nullable(Int64)` column, or a non-nullable prefix followed by one or two
+trailing `Nullable(Int64)` columns use one `CREATE TABLE` statement. Other mixed
+schemas created through `ALTER TABLE` or library APIs use the non-nullable
+prefix before the first nullable column (or a first nullable column by itself),
+then emit ordered
 `ALTER TABLE ... ADD COLUMN` statements for the remainder so the output stays
 inside the bounded grammar.
 Because the normal executor accepts at most 4,096 statements, additions that
@@ -1595,6 +1597,27 @@ sequences emitted by RustHouse's TSV writer: `\\`, `\t`, `\r`, `\n`, `\0`,
 limits. Invalid UTF-8, line endings, escapes, headers, field counts, typed
 values, configured limits, or remaining table capacity are rejected before any
 row is appended.
+
+`Database::ingest_json_compact_each_row` adds a deliberately narrow,
+dependency-free positional JSON importer for existing one-column `Int64` and
+`Nullable(Int64)` tables. Each physical LF or CRLF record must be a complete
+one-element JSON array such as `[-7]` or `[null]`; JSON whitespace around the
+array and value is accepted. The value must use JSON integer syntax and fit
+exactly in `Int64`. Only nullable targets accept `null`. Empty input appends no
+rows, while empty arrays, wider arrays, floating-point numbers, booleans,
+strings, objects, nested arrays, trailing content, malformed JSON, invalid
+UTF-8, and out-of-range integers are rejected.
+
+Callers provide complete-input byte, physical-row, and total-value limits.
+RustHouse validates the target shape, the entire input, those limits, and the
+table's remaining row and cell capacity before using the existing Int64 WAL
+commit and one prepared-row append. Thus a malformed late row, capacity error,
+or WAL failure publishes none of the batch. Output from
+`write_json_compact_each_row` round-trips directly when its result has one
+compatible column. `SharedDatabase::ingest_json_compact_each_row` holds one
+write lock from lookup through commit; the nonblocking
+`try_ingest_json_compact_each_row` makes one immediate lock attempt and returns
+`DatabaseBusy` before table lookup or input access when contended.
 
 ## Snapshot envelope
 

@@ -12,6 +12,9 @@ use crate::batch::aggregate_scheduler::{GlobalAggregateParallelism, parallel_agg
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
+use crate::batch::json_compact_each_row::{
+    self, JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
+};
 use crate::batch::scalar_cast::{
     checked_string_to_bool, checked_string_to_float64, checked_string_to_int64, decimal_text_cmp,
     ordering_string_to_float64, validate_string_to_float64_syntax, validate_string_to_int64_syntax,
@@ -1443,7 +1446,7 @@ impl Database {
         &mut self,
         name: String,
         columns: Vec<ColumnDef>,
-        nullable_column: String,
+        nullable_columns: impl IntoIterator<Item = String>,
         if_not_exists: bool,
     ) -> Result<()> {
         if self.catalog.table_exists(&name) {
@@ -1455,7 +1458,9 @@ impl Database {
         }
 
         let mut table = Table::with_limits(name, columns, self.table_limits)?;
-        table.add_nullable_int64_column(nullable_column)?;
+        for nullable_column in nullable_columns {
+            table.add_nullable_int64_column(nullable_column)?;
+        }
         let measurements = TableMeasurements::read(&table);
         self.catalog.register_table(table)?;
         self.measurements.add(measurements);
@@ -2666,6 +2671,54 @@ impl Database {
         Ok(affected_rows)
     }
 
+    /// Atomically appends bounded, one-column `JSONCompactEachRow` input.
+    ///
+    /// Each physical line must be one JSON array containing exactly one JSON
+    /// integer. A `Nullable(Int64)` target also accepts JSON `null`; an
+    /// `Int64` target rejects it. The existing target must have exactly one
+    /// physical `Int64` or `Nullable(Int64)` column. JSON whitespace is
+    /// accepted around the array and value, and LF or CRLF records are
+    /// accepted. Empty input appends zero rows.
+    ///
+    /// UTF-8, JSON shape, every integer, all configured limits, and remaining
+    /// table capacity are validated before the existing WAL and one atomic
+    /// prepared-row append path runs. Every error leaves the table unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::engine::Database;
+    /// use rusthouse::batch::json_compact_each_row::JsonCompactEachRowIngestLimits;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute("CREATE TABLE readings (value Nullable(Int64));")?;
+    /// let input = b"[-7]\n[null]\n";
+    /// let rows = database.ingest_json_compact_each_row(
+    ///     "readings",
+    ///     input,
+    ///     JsonCompactEachRowIngestLimits::new(input.len(), 2, 2),
+    /// )?;
+    /// assert_eq!(rows, 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_json_compact_each_row(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: JsonCompactEachRowIngestLimits,
+    ) -> std::result::Result<usize, JsonCompactEachRowIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            json_compact_each_row::parse_rows(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        if affected_rows != 0 {
+            self.log_prepared_int64_append(table, &rows)?;
+        }
+        self.table_mut(table)?.append_prepared_insert_rows(rows);
+        Ok(affected_rows)
+    }
+
     /// Execute one or more semicolon-separated statements in order.
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
@@ -3044,7 +3097,7 @@ impl Database {
                 self.create_table_with_trailing_nullable_int64(
                     name,
                     columns,
-                    nullable_column,
+                    [nullable_column],
                     false,
                 )?;
                 Ok(StatementResult::Command {
@@ -3060,7 +3113,39 @@ impl Database {
                 self.create_table_with_trailing_nullable_int64(
                     name,
                     columns,
-                    nullable_column,
+                    [nullable_column],
+                    true,
+                )?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::CreateTableWithTwoTrailingNullableInt64 {
+                name,
+                columns,
+                nullable_columns,
+            } => {
+                self.create_table_with_trailing_nullable_int64(
+                    name,
+                    columns,
+                    nullable_columns,
+                    false,
+                )?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::CreateTableWithTwoTrailingNullableInt64IfNotExists {
+                name,
+                columns,
+                nullable_columns,
+            } => {
+                self.create_table_with_trailing_nullable_int64(
+                    name,
+                    columns,
+                    nullable_columns,
                     true,
                 )?;
                 Ok(StatementResult::Command {
@@ -3355,6 +3440,8 @@ impl Database {
             | Statement::CreateNullableInt64TableIfNotExists { .. }
             | Statement::CreateTableWithTrailingNullableInt64 { .. }
             | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. }
+            | Statement::CreateTableWithTwoTrailingNullableInt64 { .. }
+            | Statement::CreateTableWithTwoTrailingNullableInt64IfNotExists { .. }
             | Statement::DropTable { .. }
             | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
@@ -4630,7 +4717,9 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::CreateNullableInt64Table { .. }
         | Statement::CreateNullableInt64TableIfNotExists { .. }
         | Statement::CreateTableWithTrailingNullableInt64 { .. }
-        | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. } => "CREATE TABLE",
+        | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. }
+        | Statement::CreateTableWithTwoTrailingNullableInt64 { .. }
+        | Statement::CreateTableWithTwoTrailingNullableInt64IfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. }
@@ -4730,37 +4819,50 @@ fn create_table_ddl_len(table: &Table) -> usize {
 }
 
 fn show_create_column_count(table: &Table) -> usize {
-    table
+    let Some(first_nullable) = table
         .columns()
         .iter()
         .position(|column| matches!(column, Column::NullableInt64(_)))
-        .map_or(table.schema().len(), |index| {
-            if index.saturating_add(1) == table.schema().len()
-                && table.schema().len() <= sql::DEFAULT_MAX_AST_LIST_ITEMS
-            {
-                table.schema().len()
-            } else {
-                index.max(1)
-            }
-        })
+    else {
+        return table.schema().len();
+    };
+    let nullable_suffix = &table.columns()[first_nullable..];
+    let supported_nullable_shape = (first_nullable == 0 && table.schema().len() == 1)
+        || (first_nullable > 0
+            && nullable_suffix.len() <= 2
+            && nullable_suffix
+                .iter()
+                .all(|column| matches!(column, Column::NullableInt64(_))));
+    if supported_nullable_shape && table.schema().len() <= sql::DEFAULT_MAX_AST_LIST_ITEMS {
+        table.schema().len()
+    } else {
+        first_nullable.max(1)
+    }
 }
 
 fn show_create_statement_count_after_addition(table: &Table, added_nullable: bool) -> usize {
-    match table
+    let resulting_columns = table.schema().len().saturating_add(1);
+    let Some(first_nullable) = table
         .columns()
         .iter()
         .position(|column| matches!(column, Column::NullableInt64(_)))
-    {
-        Some(index) => 1_usize
-            .saturating_add(table.schema().len().saturating_add(1))
-            .saturating_sub(index.max(1)),
-        None if added_nullable
-            && table.schema().len().saturating_add(1) <= sql::DEFAULT_MAX_AST_LIST_ITEMS =>
-        {
-            1
-        }
-        None if added_nullable => 2,
-        None => 1,
+        .or_else(|| added_nullable.then_some(table.schema().len()))
+    else {
+        return 1;
+    };
+    let nullable_suffix_len = resulting_columns.saturating_sub(first_nullable);
+    let existing_suffix_is_nullable = table.columns()[first_nullable.min(table.schema().len())..]
+        .iter()
+        .all(|column| matches!(column, Column::NullableInt64(_)));
+    let resulting_suffix_is_nullable = existing_suffix_is_nullable && added_nullable;
+    let supported_nullable_shape = (first_nullable == 0 && resulting_columns == 1)
+        || (first_nullable > 0 && nullable_suffix_len <= 2 && resulting_suffix_is_nullable);
+    if supported_nullable_shape && resulting_columns <= sql::DEFAULT_MAX_AST_LIST_ITEMS {
+        1
+    } else {
+        1_usize
+            .saturating_add(resulting_columns)
+            .saturating_sub(first_nullable.max(1))
     }
 }
 
