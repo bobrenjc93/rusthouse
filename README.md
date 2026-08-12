@@ -142,9 +142,10 @@ records its first row, row count, non-null minimum/maximum, and null count;
 all-null blocks therefore have no extrema. Physical column vectors support
 `Int64`, `Nullable(Int64)`, `Bool`, `Float64`, and `String` storage. SQL accepts
 either a sole `Nullable(Int64)` column or a non-nullable prefix followed by
-exactly one trailing `Nullable(Int64)` column in `CREATE TABLE`,
-case-insensitively. Leading nullable columns in a multi-column schema, multiple
-nullable columns, and other nullable types remain outside the bounded grammar.
+one or exactly two trailing `Nullable(Int64)` columns in `CREATE TABLE`,
+case-insensitively. Leading nullable columns in a multi-column schema,
+interleaved nullable columns, a third nullable column, and other nullable types
+remain outside the bounded grammar.
 Library APIs and WAL recovery can also create this physical storage. The index
 metadata has explicit nullable-block semantics for both `Int64` storage forms.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` accept physical `Nullable(Int64)`
@@ -448,10 +449,11 @@ and HTTP paths in every supported format.
 `SHOW CREATE TABLE <name>` returns canonical, replayable DDL as a bounded
 `String`, preserving the stored table and column display names and schema order
 while normalizing type spellings. Schemas with no nullable columns and
-schemas with exactly one trailing `Nullable(Int64)` column use one
-`CREATE TABLE` statement. Other mixed schemas created through `ALTER TABLE` or
-library APIs use the non-nullable prefix before the first nullable column (or a
-first nullable column by itself), then emit ordered
+schemas with a supported trailing suffix of one or two `Nullable(Int64)`
+columns use one `CREATE TABLE` statement. The two-column form requires a
+non-nullable prefix. Other mixed schemas created through `ALTER TABLE` or
+library APIs use the non-nullable prefix before the first nullable column (or
+a first nullable column by itself), then emit ordered
 `ALTER TABLE ... ADD COLUMN` statements for the remainder so the output stays
 inside the bounded grammar.
 Because the normal executor accepts at most 4,096 statements, additions that
