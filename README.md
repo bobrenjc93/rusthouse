@@ -445,7 +445,8 @@ and HTTP paths in every supported format.
 `String`, preserving the stored table and column display names and schema order
 while normalizing type spellings. Schemas with no nullable columns,
 sole-column `Nullable(Int64)` tables, and a non-nullable prefix with exactly one
-trailing nullable column use one `CREATE TABLE` statement. Other mixed schemas
+trailing nullable column use one `CREATE TABLE` statement when the complete
+schema fits the 100,000-item SQL AST-list limit. Larger and other mixed schemas
 create the supported prefix (or a first nullable column by itself), then emit
 ordered `ALTER TABLE ... ADD COLUMN` statements for the remainder so they stay
 inside the bounded grammar. Because the normal executor accepts at most 4,096

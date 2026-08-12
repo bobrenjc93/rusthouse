@@ -6,8 +6,10 @@ use rusthouse::batch::engine::{
     Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
 };
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{DEFAULT_MAX_BATCH_STATEMENTS, Statement, parse};
-use rusthouse::batch::storage::{ColumnDef, TableLimits};
+use rusthouse::batch::sql::{
+    DEFAULT_MAX_AST_LIST_ITEMS, DEFAULT_MAX_BATCH_STATEMENTS, Statement, parse,
+};
+use rusthouse::batch::storage::{Column, ColumnDef, TableLimits};
 use rusthouse::batch::value::{DataType, Value};
 
 const CREATE: &str =
@@ -297,6 +299,89 @@ fn nullable_show_create_replay_accepts_4096_and_rejects_4097_statements() {
         database.catalog().table("boundary").unwrap().schema().len(),
         DEFAULT_MAX_BATCH_STATEMENTS
     );
+}
+
+#[test]
+fn trailing_nullable_show_create_coalesces_only_within_the_ast_list_boundary() {
+    fn int64_columns(count: usize) -> Vec<ColumnDef> {
+        (0..count)
+            .map(|index| ColumnDef {
+                name: format!("c{index}"),
+                data_type: DataType::Int64,
+            })
+            .collect()
+    }
+
+    {
+        let limits = TableLimits::new(0, DEFAULT_MAX_AST_LIST_ITEMS, 0);
+        let mut database = Database::with_table_limits(limits);
+        database
+            .execute_statement(Statement::CreateTable {
+                name: "Exact".to_owned(),
+                columns: int64_columns(DEFAULT_MAX_AST_LIST_ITEMS - 1),
+            })
+            .expect("the non-nullable prefix is valid");
+        database
+            .execute("ALTER TABLE Exact ADD COLUMN trailing Nullable(Int64)")
+            .expect("the trailing nullable column reaches the exact AST-list boundary");
+
+        let shown = query(&mut database, "SHOW CREATE TABLE Exact");
+        let [Value::String(ddl)] = shown.rows[0].as_slice() else {
+            panic!("SHOW CREATE returns one DDL string")
+        };
+        assert_eq!(
+            parse(ddl)
+                .expect("the exact-boundary DDL is parseable")
+                .len(),
+            1
+        );
+
+        let mut replayed = Database::with_table_limits(limits);
+        replayed
+            .execute(ddl)
+            .expect("the exact-boundary coalesced CREATE replays");
+        assert!(matches!(
+            replayed.catalog().table("exact").unwrap().columns().last(),
+            Some(Column::NullableInt64(values)) if values.is_empty()
+        ));
+    }
+
+    let limits = TableLimits::new(0, DEFAULT_MAX_AST_LIST_ITEMS + 1, 0);
+    let mut database = Database::with_table_limits(limits);
+    database
+        .execute_statement(Statement::CreateTable {
+            name: "Overflow".to_owned(),
+            columns: int64_columns(DEFAULT_MAX_AST_LIST_ITEMS),
+        })
+        .expect("the exact-boundary non-nullable prefix is valid");
+    database
+        .execute("ALTER TABLE Overflow ADD COLUMN trailing Nullable(Int64)")
+        .expect("the trailing nullable column may exceed the CREATE AST-list boundary");
+
+    let shown = query(&mut database, "SHOW CREATE TABLE Overflow");
+    let [Value::String(ddl)] = shown.rows[0].as_slice() else {
+        panic!("SHOW CREATE returns one DDL string")
+    };
+    let statements = parse(ddl).expect("the split DDL remains parseable at the boundary");
+    assert_eq!(statements.len(), 2);
+    assert!(matches!(
+        statements.as_slice(),
+        [
+            Statement::CreateTable { columns, .. },
+            Statement::AddNullableInt64Column { column, .. },
+        ] if columns.len() == DEFAULT_MAX_AST_LIST_ITEMS && column == "trailing"
+    ));
+
+    let mut replayed = Database::with_table_limits(limits);
+    replayed
+        .execute(ddl)
+        .expect("the exact-boundary CREATE plus nullable ALTER replays");
+    let replayed = replayed.catalog().table("overflow").unwrap();
+    assert_eq!(replayed.schema().len(), DEFAULT_MAX_AST_LIST_ITEMS + 1);
+    assert!(matches!(
+        replayed.columns().last(),
+        Some(Column::NullableInt64(values)) if values.is_empty()
+    ));
 }
 
 #[test]

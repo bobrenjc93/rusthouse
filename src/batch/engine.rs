@@ -4706,7 +4706,17 @@ fn show_create_column_count(table: &Table) -> usize {
 fn show_create_column_count_for_shape(column_count: usize, first_nullable: Option<usize>) -> usize {
     match first_nullable {
         Some(0) => 1,
-        Some(index) if index.saturating_add(1) == column_count => column_count,
+        // Coalescing a trailing nullable column into CREATE is replayable only
+        // while the complete schema fits the parser's cumulative AST-list
+        // bound. At one item over the bound, retain the exact-boundary
+        // non-nullable prefix in CREATE and replay the nullable column through
+        // ALTER, which does not consume an AST list item.
+        Some(index)
+            if index.saturating_add(1) == column_count
+                && column_count <= sql::DEFAULT_MAX_AST_LIST_ITEMS =>
+        {
+            column_count
+        }
         Some(index) => index,
         None => column_count,
     }
