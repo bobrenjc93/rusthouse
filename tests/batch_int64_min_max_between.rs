@@ -160,6 +160,9 @@ fn equivalent_positive_range_conjunctions_use_the_documented_index_path() {
 
     for sql in [
         "SELECT id FROM events WHERE key >= -8 AND key <= 1",
+        "SELECT id FROM events WHERE key <= 1 AND key >= -8",
+        "SELECT id FROM events WHERE -8 <= key AND 1 >= key",
+        "SELECT id FROM events WHERE 1 >= key AND -8 <= key",
         "SELECT id FROM events WHERE NOT (key < -8 OR key > 1)",
     ] {
         assert_indexed_range(
@@ -172,6 +175,36 @@ fn equivalent_positive_range_conjunctions_use_the_documented_index_path() {
                 pruned_blocks: 1,
             },
         );
+    }
+
+    for (sql, expected, expected_delta) in [
+        (
+            "SELECT id FROM events WHERE key <= 1 AND key >= 1",
+            vec![5],
+            IndexPruningMetrics {
+                scanned_blocks: 1,
+                pruned_blocks: 2,
+            },
+        ),
+        (
+            "SELECT id FROM events WHERE key <= -100 AND key >= 100",
+            vec![],
+            IndexPruningMetrics {
+                scanned_blocks: 0,
+                pruned_blocks: 3,
+            },
+        ),
+        (
+            "SELECT id FROM events WHERE 9223372036854775807 >= key AND \
+             -9223372036854775808 <= key",
+            (0..=11).collect(),
+            IndexPruningMetrics {
+                scanned_blocks: 3,
+                pruned_blocks: 0,
+            },
+        ),
+    ] {
+        assert_indexed_range(&mut indexed, &mut unindexed, sql, &expected, expected_delta);
     }
 }
 
@@ -199,7 +232,7 @@ fn nullable_between_prunes_all_null_blocks_and_preserves_null_semantics() {
     assert_indexed_range(
         &mut indexed,
         &mut unindexed,
-        "SELECT value FROM readings WHERE value BETWEEN -1 AND 6",
+        "SELECT value FROM readings WHERE value <= 6 AND value >= -1",
         &[0, 5],
         IndexPruningMetrics {
             scanned_blocks: 2,
@@ -209,7 +242,8 @@ fn nullable_between_prunes_all_null_blocks_and_preserves_null_semantics() {
     assert_indexed_range(
         &mut indexed,
         &mut unindexed,
-        "SELECT value FROM readings WHERE value BETWEEN -9223372036854775808 AND 9223372036854775807",
+        "SELECT value FROM readings WHERE 9223372036854775807 >= value AND \
+         -9223372036854775808 <= value",
         &[-5, 0, 5, 10, i64::MAX],
         IndexPruningMetrics {
             scanned_blocks: 3,
@@ -234,7 +268,8 @@ fn nullable_between_prunes_all_null_blocks_and_preserves_null_semantics() {
     assert!(
         query(
             &mut all_null,
-            "SELECT value FROM missing WHERE value BETWEEN -9223372036854775808 AND 9223372036854775807",
+            "SELECT value FROM missing WHERE value <= 9223372036854775807 AND \
+             value >= -9223372036854775808",
         )
         .rows
         .is_empty()
@@ -295,7 +330,7 @@ fn mutations_refresh_between_bounds_and_over_budget_growth_invalidates_them() {
     assert_eq!(
         query(
             &mut database,
-            "SELECT value FROM changing WHERE value BETWEEN 50 AND 50",
+            "SELECT value FROM changing WHERE value <= 50 AND value >= 50",
         )
         .rows,
         rows(&[50]),
@@ -324,7 +359,7 @@ fn mutations_refresh_between_bounds_and_over_budget_growth_invalidates_them() {
     assert_eq!(
         query(
             &mut database,
-            "SELECT value FROM changing WHERE value BETWEEN 75 AND 75",
+            "SELECT value FROM changing WHERE 75 >= value AND 75 <= value",
         )
         .rows,
         rows(&[75]),
@@ -354,7 +389,7 @@ fn between_cannot_bypass_the_complete_source_scan_limit() {
         .expect("valid index request");
 
     assert_eq!(
-        database.execute("SELECT id FROM events WHERE key BETWEEN 4 AND 99 LIMIT 0"),
+        database.execute("SELECT id FROM events WHERE key <= 99 AND key >= 4 LIMIT 0"),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 12,

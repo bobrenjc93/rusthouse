@@ -210,6 +210,36 @@ fn between_prunes_disjoint_ranges_and_rechecks_overlaps_in_source_order() {
         ],
         "the equivalent normalized inclusive range shares the routing path",
     );
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM events WHERE id <= 15 AND id >= 5",
+            vec![8, 5, 9, 10, 15],
+        ),
+        (
+            "SELECT id FROM events WHERE 15 >= id AND 5 <= id",
+            vec![8, 5, 9, 10, 15],
+        ),
+        (
+            "SELECT id FROM events WHERE id <= 10 AND id >= 10",
+            vec![10],
+        ),
+        ("SELECT id FROM events WHERE id <= 5 AND id >= 15", vec![]),
+        (
+            "SELECT id FROM events WHERE 9223372036854775807 >= id AND \
+             -9223372036854775808 <= id",
+            vec![-2, i64::MIN, -9, -1, 8, 0, 5, 9, 20, 10, 15, i64::MAX, 30],
+        ),
+    ] {
+        assert_eq!(
+            query(&mut database, sql).rows,
+            expected
+                .into_iter()
+                .map(|value| vec![Value::Int64(value)])
+                .collect::<Vec<_>>(),
+            "upper-bound-first range result for {sql}",
+        );
+    }
 }
 
 #[test]
@@ -226,7 +256,7 @@ fn between_reduces_scan_charges_at_the_boundary_and_falls_back_safely() {
     assert_eq!(
         query(
             &mut database,
-            "SELECT id FROM events WHERE id BETWEEN 5 AND 15",
+            "SELECT id FROM events WHERE id <= 15 AND id >= 5",
         )
         .rows,
         vec![
@@ -237,6 +267,21 @@ fn between_reduces_scan_charges_at_the_boundary_and_falls_back_safely() {
             vec![Value::Int64(15)],
         ],
         "two overlapping partitions charge exactly seven physical rows",
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id FROM events WHERE 5 <= id AND 15 >= id",
+        )
+        .rows,
+        vec![
+            vec![Value::Int64(8)],
+            vec![Value::Int64(5)],
+            vec![Value::Int64(9)],
+            vec![Value::Int64(10)],
+            vec![Value::Int64(15)],
+        ],
+        "reversed operands retain the same exact-boundary scan charge",
     );
 
     for sql in [
@@ -267,7 +312,7 @@ fn between_reduces_scan_charges_at_the_boundary_and_falls_back_safely() {
         None,
     );
     assert_eq!(
-        database.execute("SELECT id FROM events WHERE id BETWEEN 5 AND 15"),
+        database.execute("SELECT id FROM events WHERE id <= 15 AND id >= 5"),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 14,
@@ -284,7 +329,7 @@ fn between_reduces_scan_charges_at_the_boundary_and_falls_back_safely() {
         .create_int64_range_partitioned_table("events", "id", between_partitions())
         .expect("partitioned table is valid");
     assert_eq!(
-        below_boundary.execute("SELECT id FROM events WHERE id BETWEEN 5 AND 15"),
+        below_boundary.execute("SELECT id FROM events WHERE id <= 15 AND id >= 5"),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 7,

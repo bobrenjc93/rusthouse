@@ -2,6 +2,7 @@
 
 mod aggregate_scheduler;
 mod scalar_cast;
+mod scalar_text;
 
 pub mod catalog;
 pub mod csv;
