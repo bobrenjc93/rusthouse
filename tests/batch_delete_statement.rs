@@ -1,6 +1,8 @@
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{ComparisonOperator, DeleteComparisonPredicate, Statement, parse};
+use rusthouse::batch::sql::{
+    ComparisonOperator, DeleteComparisonPredicate, DeleteNullnessPredicate, Statement, parse,
+};
 use rusthouse::batch::storage::Column;
 use rusthouse::batch::value::{DataType, Value};
 use rusthouse::{
@@ -150,15 +152,40 @@ fn parses_exact_single_nullness_delete_for_both_spellings() {
 }
 
 #[test]
-fn rejects_malformed_or_compound_delete_nullness_shapes() {
+fn parses_one_nullness_and_one_comparison_in_either_order_for_both_spellings() {
+    let expected = Ok(vec![Statement::DeleteNullnessConjunction {
+        table: "Readings".to_owned(),
+        nullness: DeleteNullnessPredicate {
+            column: "value".to_owned(),
+            is_null: false,
+        },
+        comparison: DeleteComparisonPredicate {
+            column: "id".to_owned(),
+            operator: ComparisonOperator::GreaterOrEqual,
+            literal: Value::Int64(2),
+        },
+    }]);
+
+    for sql in [
+        "DELETE FROM Readings WHERE value IS NOT NULL AND id >= 2",
+        "DELETE FROM Readings WHERE id >= 2 AND value IS NOT NULL",
+        "ALTER TABLE Readings DELETE WHERE value IS NOT NULL AND id >= 2",
+        "ALTER TABLE Readings DELETE WHERE id >= 2 AND value IS NOT NULL",
+    ] {
+        assert_eq!(parse(sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn rejects_malformed_or_unsupported_delete_nullness_shapes() {
     for sql in [
         "DELETE FROM readings WHERE value IS",
         "DELETE FROM readings WHERE value IS NOT",
         "DELETE FROM readings WHERE value IS TRUE",
         "DELETE FROM readings WHERE value IS NOT FALSE",
-        "DELETE FROM readings WHERE value IS NULL AND id = 1",
         "DELETE FROM readings WHERE value IS NOT NULL OR id = 1",
-        "DELETE FROM readings WHERE id = 1 AND value IS NULL",
+        "DELETE FROM readings WHERE value IS NULL AND id = 1 AND id < 3",
+        "DELETE FROM readings WHERE id = 1 AND value IS NULL AND id < 3",
         "DELETE FROM readings WHERE (value IS NULL)",
         "DELETE FROM readings WHERE NOT value IS NULL",
         "DELETE FROM readings WHERE value IS NULL LIMIT 1",
@@ -277,6 +304,124 @@ fn alter_table_delete_executes_equivalently_to_delete_from() {
         alter_database.execute("SELECT id, active, label FROM events;"),
         delete_database.execute("SELECT id, active, label FROM events;")
     );
+}
+
+#[test]
+fn mixed_nullness_comparison_delete_handles_same_and_cross_column_predicates() {
+    let setup = "CREATE TABLE Readings (id Int64, value Nullable(Int64)); \
+                 INSERT INTO Readings VALUES (1, NULL), (2, 2), (3, NULL), (4, 4);";
+    let mut nullness_first = Database::new();
+    let mut comparison_first = Database::new();
+    nullness_first.execute(setup).expect("setup succeeds");
+    comparison_first.execute(setup).expect("setup succeeds");
+
+    let delete_result = nullness_first
+        .execute("DELETE FROM readings WHERE value IS NULL AND id >= 2")
+        .expect("nullness-first mixed DELETE succeeds");
+    let alter_result = comparison_first
+        .execute("ALTER TABLE readings DELETE WHERE id >= 2 AND value IS NULL")
+        .expect("comparison-first mixed DELETE succeeds");
+    assert_eq!(delete_result, alter_result);
+    assert_eq!(
+        delete_result,
+        [StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 1,
+        }]
+    );
+    assert_eq!(ids(&nullness_first, "readings"), [1, 2, 4]);
+    assert_eq!(ids(&comparison_first, "readings"), [1, 2, 4]);
+
+    let mut same_column = Database::new();
+    same_column.execute(setup).expect("setup succeeds");
+    assert_eq!(
+        same_column.execute("DELETE FROM readings WHERE value IS NOT NULL AND value >= 2"),
+        Ok(vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 2,
+        }])
+    );
+    assert_eq!(ids(&same_column, "readings"), [1, 3]);
+}
+
+#[test]
+fn mixed_nullness_comparison_delete_has_zero_and_all_non_nullable_matches() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2), (3);")
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database.execute("DELETE FROM events WHERE id IS NULL AND id >= 1"),
+        Ok(vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 0,
+        }])
+    );
+    assert_eq!(ids(&database, "events"), [1, 2, 3]);
+    assert_eq!(
+        database.execute("ALTER TABLE events DELETE WHERE id >= 1 AND id IS NOT NULL"),
+        Ok(vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 3,
+        }])
+    );
+    assert!(ids(&database, "events").is_empty());
+}
+
+#[test]
+fn mixed_nullness_comparison_delete_updates_metrics_and_rebuilds_index() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE Readings (id Int64, value Nullable(Int64)); \
+             INSERT INTO Readings VALUES (1, NULL), (2, 2), (3, NULL), (4, 4);",
+        )
+        .expect("setup succeeds");
+    assert_eq!(
+        database.execute("DELETE FROM readings WHERE value IS NOT NULL AND id >= 3"),
+        Ok(vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 1,
+        }])
+    );
+    assert_eq!(
+        database.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 1,
+            column_count: 2,
+            retained_row_count: 3,
+            retained_value_bytes: 51,
+        })
+    );
+
+    let mut indexed = Database::new();
+    indexed
+        .execute(
+            "CREATE TABLE Readings (id Int64, value Nullable(Int64)); \
+             INSERT INTO Readings VALUES (1, NULL), (2, 2), (3, NULL), (4, 4);",
+        )
+        .expect("indexed setup succeeds");
+    assert!(matches!(
+        indexed
+            .create_int64_min_max_index(
+                "readings",
+                "value",
+                Int64MinMaxIndexLimits::new(2, 2, usize::MAX),
+            )
+            .expect("index admission succeeds"),
+        Int64MinMaxIndexAdmission::Created(_)
+    ));
+    indexed
+        .execute("ALTER TABLE readings DELETE WHERE id >= 3 AND value IS NOT NULL")
+        .expect("indexed mixed DELETE succeeds");
+    let index = indexed
+        .catalog()
+        .table("readings")
+        .expect("indexed table remains")
+        .int64_min_max_index_info()
+        .expect("the admitted index is rebuilt");
+    assert_eq!(index.indexed_rows, 3);
 }
 
 #[test]
@@ -706,6 +851,56 @@ fn nullness_delete_missing_column_and_scan_limit_failures_leave_rows_unchanged()
         &table.columns()[0],
         Column::NullableInt64(values) if values == &[None, Some(7), None]
     ));
+}
+
+#[test]
+fn mixed_nullness_comparison_validation_and_scan_failures_are_atomic() {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_scan_rows: 2,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE Readings (id Int64, value Nullable(Int64)); \
+             INSERT INTO Readings VALUES (1, NULL), (2, 2), (3, NULL);",
+        )
+        .expect("setup succeeds");
+
+    let failures = [
+        (
+            "DELETE FROM readings WHERE missing IS NULL AND id >= 2",
+            Error::ColumnNotFound {
+                table: "Readings".to_owned(),
+                column: "missing".to_owned(),
+            },
+        ),
+        (
+            "DELETE FROM readings WHERE value IS NULL AND id >= true",
+            Error::TypeMismatch {
+                context: "WHERE comparison".to_owned(),
+                expected: "Int64".to_owned(),
+                actual: "Bool".to_owned(),
+            },
+        ),
+        (
+            "ALTER TABLE readings DELETE WHERE id >= 2 AND value IS NULL",
+            Error::ResourceLimitExceeded {
+                resource: "DELETE scanned rows",
+                actual: 3,
+                max: 2,
+            },
+        ),
+    ];
+
+    for (sql, error) in failures {
+        assert_eq!(database.execute(sql), Err(error), "{sql}");
+        assert_eq!(ids(&database, "readings"), [1, 2, 3], "{sql}");
+        let table = database.catalog().table("readings").unwrap();
+        assert!(matches!(
+            &table.columns()[1],
+            Column::NullableInt64(values) if values == &[None, Some(2), None]
+        ));
+    }
 }
 
 #[test]

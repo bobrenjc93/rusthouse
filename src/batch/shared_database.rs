@@ -1256,6 +1256,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         Statement::Delete { .. }
         | Statement::DeleteComparison { .. }
         | Statement::DeleteConjunction { .. }
+        | Statement::DeleteNullnessConjunction { .. }
         | Statement::DeleteNullness { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "DELETE",
         }),

@@ -367,6 +367,8 @@ fn active_wal_rejects_nullness_deletes_without_changing_data_or_log() {
     for sql in [
         "DELETE FROM READINGS WHERE measurement IS NULL",
         "ALTER TABLE READINGS DELETE WHERE measurement IS NOT NULL",
+        "DELETE FROM READINGS WHERE measurement IS NULL AND measurement >= 7",
+        "ALTER TABLE READINGS DELETE WHERE measurement >= 7 AND measurement IS NOT NULL",
     ] {
         assert_eq!(
             database.execute(sql),

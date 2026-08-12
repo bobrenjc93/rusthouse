@@ -3327,6 +3327,26 @@ impl Database {
                 ),
                 query_result_limits,
             ),
+            Statement::DeleteNullnessConjunction {
+                table,
+                nullness,
+                comparison,
+            } => self.execute_delete_statement(
+                table,
+                Predicate::And(
+                    Box::new(if nullness.is_null {
+                        Predicate::IsNull {
+                            column: nullness.column,
+                        }
+                    } else {
+                        Predicate::IsNotNull {
+                            column: nullness.column,
+                        }
+                    }),
+                    Box::new(delete_comparison_predicate(comparison)),
+                ),
+                query_result_limits,
+            ),
             Statement::DeleteNullness {
                 table,
                 column,
@@ -3458,6 +3478,7 @@ impl Database {
             | Statement::Delete { .. }
             | Statement::DeleteComparison { .. }
             | Statement::DeleteConjunction { .. }
+            | Statement::DeleteNullnessConjunction { .. }
             | Statement::DeleteNullness { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
@@ -4735,6 +4756,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::Delete { .. }
         | Statement::DeleteComparison { .. }
         | Statement::DeleteConjunction { .. }
+        | Statement::DeleteNullnessConjunction { .. }
         | Statement::DeleteNullness { .. } => "DELETE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)

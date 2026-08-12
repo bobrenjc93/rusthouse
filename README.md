@@ -197,7 +197,9 @@ unindexed fallbacks and errors before pruning do not increment either counter.
 `DELETE FROM <table> WHERE <predicate>` and its ClickHouse mutation spelling,
 `ALTER TABLE <table> DELETE WHERE <predicate>`, remove rows matching either one
 typed column-to-literal comparison, the conjunction of exactly two such
-comparisons, or one exact `<column> IS NULL` or `<column> IS NOT NULL` atom.
+comparisons, one exact `<column> IS NULL` or `<column> IS NOT NULL` atom, or
+exactly one such nullness atom conjoined with one typed column-to-literal
+comparison in either order.
 Both spellings lower to the same bounded atomic deletion path and nullness uses
 the same typed evaluator as `SELECT WHERE`. Each comparison has the form `<column>
 <operator> <literal>`. Supported operators are `=`, `!=`, `<>`, `<`, `<=`,
@@ -210,9 +212,9 @@ row count is checked against the configured scan limit before any row is
 inspected or changed. Missing names, type errors, malformed or extra
 predicates, and scan-limit failures leave the table unchanged; after
 validation and the bounded scan, all matching row indexes are passed to one
-atomic deletion. A nullness atom cannot be combined with another predicate.
-`OR`, a third comparison, other predicate forms or clauses, and bare `NULL`
-comparisons are not supported by this narrow form. A successful command
+atomic deletion. `OR`, a third atom, two nullness atoms, other predicate forms
+or clauses, and bare `NULL` comparisons are not supported by this narrow form.
+A successful command
 reports its deleted-row count through the library API and is silent in
 formatted CLI output.
 
