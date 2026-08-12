@@ -1438,6 +1438,30 @@ impl Database {
         Ok(())
     }
 
+    /// Stages a bounded mixed table completely before publishing it in the catalog.
+    fn create_table_with_trailing_nullable_int64(
+        &mut self,
+        name: String,
+        columns: Vec<ColumnDef>,
+        nullable_column: String,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if self.catalog.table_exists(&name) {
+            return if if_not_exists {
+                Ok(())
+            } else {
+                Err(Error::TableAlreadyExists(name))
+            };
+        }
+
+        let mut table = Table::with_limits(name, columns, self.table_limits)?;
+        table.add_nullable_int64_column(nullable_column)?;
+        let measurements = TableMeasurements::read(&table);
+        self.catalog.register_table(table)?;
+        self.measurements.add(measurements);
+        Ok(())
+    }
+
     /// Appends validated nullable values, committing an attached table WAL
     /// before publishing any row in memory.
     pub fn append_nullable_int64_values(
@@ -3012,6 +3036,38 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::CreateTableWithTrailingNullableInt64 {
+                name,
+                columns,
+                nullable_column,
+            } => {
+                self.create_table_with_trailing_nullable_int64(
+                    name,
+                    columns,
+                    nullable_column,
+                    false,
+                )?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::CreateTableWithTrailingNullableInt64IfNotExists {
+                name,
+                columns,
+                nullable_column,
+            } => {
+                self.create_table_with_trailing_nullable_int64(
+                    name,
+                    columns,
+                    nullable_column,
+                    true,
+                )?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::DropTable { name } => {
                 self.reject_unlogged_wal_mutation(&name, "DROP TABLE")?;
                 let measurements = TableMeasurements::read(self.catalog.table(&name)?);
@@ -3284,6 +3340,8 @@ impl Database {
             | Statement::CreateTableIfNotExists { .. }
             | Statement::CreateNullableInt64Table { .. }
             | Statement::CreateNullableInt64TableIfNotExists { .. }
+            | Statement::CreateTableWithTrailingNullableInt64 { .. }
+            | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. }
             | Statement::DropTable { .. }
             | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
@@ -4556,7 +4614,9 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::CreateTable { .. }
         | Statement::CreateTableIfNotExists { .. }
         | Statement::CreateNullableInt64Table { .. }
-        | Statement::CreateNullableInt64TableIfNotExists { .. } => "CREATE TABLE",
+        | Statement::CreateNullableInt64TableIfNotExists { .. }
+        | Statement::CreateTableWithTrailingNullableInt64 { .. }
+        | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::RenameColumn { .. }
@@ -4659,7 +4719,15 @@ fn show_create_column_count(table: &Table) -> usize {
         .columns()
         .iter()
         .position(|column| matches!(column, Column::NullableInt64(_)))
-        .map_or(table.schema().len(), |index| index.max(1))
+        .map_or(table.schema().len(), |index| {
+            if index.saturating_add(1) == table.schema().len()
+                && table.schema().len() <= sql::DEFAULT_MAX_AST_LIST_ITEMS
+            {
+                table.schema().len()
+            } else {
+                index.max(1)
+            }
+        })
 }
 
 fn show_create_statement_count_after_addition(table: &Table, added_nullable: bool) -> usize {
@@ -4671,6 +4739,11 @@ fn show_create_statement_count_after_addition(table: &Table, added_nullable: boo
         Some(index) => 1_usize
             .saturating_add(table.schema().len().saturating_add(1))
             .saturating_sub(index.max(1)),
+        None if added_nullable
+            && table.schema().len().saturating_add(1) <= sql::DEFAULT_MAX_AST_LIST_ITEMS =>
+        {
+            1
+        }
         None if added_nullable => 2,
         None => 1,
     }

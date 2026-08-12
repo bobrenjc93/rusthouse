@@ -1,7 +1,7 @@
 use rusthouse::batch::engine::{Database, QueryResult, ResultColumn, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{BatchSqlLimits, Statement, parse, parse_with_limits};
-use rusthouse::batch::storage::{Column, TableLimits};
+use rusthouse::batch::storage::{Column, ColumnDef, TableLimits};
 use rusthouse::batch::value::{DataType, Value};
 
 fn query(database: &mut Database, sql: &str) -> QueryResult {
@@ -36,6 +36,34 @@ fn parser_lowers_case_insensitive_nullable_int64_to_a_bounded_ast_shape() {
                 column: "Measurement".to_owned(),
             },
         ),
+        (
+            "CREATE TABLE readings (id Int64, measurement Nullable(Int64))",
+            Statement::CreateTableWithTrailingNullableInt64 {
+                name: "readings".to_owned(),
+                columns: vec![ColumnDef {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                }],
+                nullable_column: "measurement".to_owned(),
+            },
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS Readings (ID Int64, Label String, Measurement nUlLaBlE(iNt64)) ENGINE = Memory",
+            Statement::CreateTableWithTrailingNullableInt64IfNotExists {
+                name: "Readings".to_owned(),
+                columns: vec![
+                    ColumnDef {
+                        name: "ID".to_owned(),
+                        data_type: DataType::Int64,
+                    },
+                    ColumnDef {
+                        name: "Label".to_owned(),
+                        data_type: DataType::String,
+                    },
+                ],
+                nullable_column: "Measurement".to_owned(),
+            },
+        ),
     ] {
         assert_eq!(parse(sql), Ok(vec![expected]), "{sql:?}");
     }
@@ -59,10 +87,35 @@ fn parser_lowers_case_insensitive_nullable_int64_to_a_bounded_ast_shape() {
             max: 0,
         })
     );
+
+    assert!(
+        parse_with_limits(
+            "CREATE TABLE t (id Int64, value Nullable(Int64))",
+            BatchSqlLimits {
+                max_ast_list_items: 2,
+                ..BatchSqlLimits::default()
+            },
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        parse_with_limits(
+            "CREATE TABLE t (id Int64, value Nullable(Int64))",
+            BatchSqlLimits {
+                max_ast_list_items: 1,
+                ..BatchSqlLimits::default()
+            },
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SQL AST list items",
+            actual: 2,
+            max: 1,
+        })
+    );
 }
 
 #[test]
-fn parser_rejects_every_shape_outside_one_nullable_int64_column() {
+fn parser_rejects_nullable_shapes_outside_the_bounded_trailing_form() {
     for sql in [
         "CREATE TABLE t (c Nullable(Float64))",
         "CREATE TABLE t (c Nullable(Bool))",
@@ -72,13 +125,92 @@ fn parser_rejects_every_shape_outside_one_nullable_int64_column() {
         "CREATE TABLE t (c Nullable Int64)",
         "CREATE TABLE t (c Nullable(Int64) NULL)",
         "CREATE TABLE t (c Nullable(Int64), d Int64)",
-        "CREATE TABLE t (d Int64, c Nullable(Int64))",
+        "CREATE TABLE t (a Int64, c Nullable(Int64), d Int64)",
+        "CREATE TABLE t (a Int64, c Nullable(Int64), d Nullable(Int64))",
     ] {
         assert!(
             parse(sql).is_err(),
             "out-of-shape CREATE was accepted: {sql:?}"
         );
     }
+}
+
+#[test]
+fn mixed_create_inserts_defaults_and_round_trips_storage_and_metadata() {
+    const DDL: &str = "CREATE TABLE Readings (DeviceID Int64, Measurement Nullable(Int64))";
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Readings (DeviceID Int64, Measurement Nullable(Int64)); \
+             INSERT INTO readings VALUES (1, 7), (2, NULL); \
+             INSERT INTO readings (DeviceID) VALUES (3);",
+        )
+        .unwrap();
+
+    let table = database.catalog().table("READINGS").unwrap();
+    let [
+        Column::Int64(device_ids),
+        Column::NullableInt64(measurements),
+    ] = table.columns()
+    else {
+        panic!("mixed CREATE must use aligned Int64 and NullableInt64 storage")
+    };
+    assert_eq!(device_ids, &[1, 2, 3]);
+    assert_eq!(measurements, &[Some(7), None, None]);
+
+    assert_eq!(
+        query(&mut database, "DESCRIBE TABLE readings").rows,
+        [
+            vec![
+                Value::String("DeviceID".to_owned()),
+                Value::String("Int64".to_owned()),
+            ],
+            vec![
+                Value::String("Measurement".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+            ],
+        ]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT database, table, name, type, position FROM system.columns",
+        )
+        .rows,
+        [
+            vec![
+                Value::String("default".to_owned()),
+                Value::String("Readings".to_owned()),
+                Value::String("DeviceID".to_owned()),
+                Value::String("Int64".to_owned()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("default".to_owned()),
+                Value::String("Readings".to_owned()),
+                Value::String("Measurement".to_owned()),
+                Value::String("Nullable(Int64)".to_owned()),
+                Value::Int64(2),
+            ],
+        ]
+    );
+    assert_eq!(
+        query(&mut database, "SHOW CREATE TABLE readings").rows,
+        [vec![Value::String(DDL.to_owned())]]
+    );
+    assert_eq!(parse(DDL).unwrap().len(), 1);
+
+    let mut recreated = Database::new();
+    recreated.execute(DDL).unwrap();
+    recreated
+        .execute("INSERT INTO readings (DeviceID) VALUES (9)")
+        .unwrap();
+    let Column::NullableInt64(values) =
+        &recreated.catalog().table("readings").unwrap().columns()[1]
+    else {
+        panic!("SHOW CREATE output must recreate trailing nullable storage")
+    };
+    assert_eq!(values, &[None]);
 }
 
 #[test]
@@ -164,20 +296,114 @@ fn nullable_create_obeys_the_exact_one_column_table_limit() {
 }
 
 #[test]
+fn mixed_create_obeys_exact_table_limits_without_partial_registration() {
+    let ddl = "CREATE TABLE readings (id Int64, measurement Nullable(Int64))";
+    let mut exact = Database::with_table_limits(TableLimits::new(1, 2, 2));
+    exact.execute(ddl).unwrap();
+    exact
+        .execute("INSERT INTO readings VALUES (1, NULL)")
+        .unwrap();
+    assert_eq!(exact.catalog().table("readings").unwrap().row_count(), 1);
+
+    let mut one_column_short = Database::with_table_limits(TableLimits::new(1, 1, 2));
+    assert_eq!(
+        one_column_short.execute(ddl),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table columns",
+            actual: 2,
+            max: 1,
+        })
+    );
+    assert_eq!(one_column_short.catalog().table_count(), 0);
+
+    let mut one_cell_short = Database::with_table_limits(TableLimits::new(1, 2, 1));
+    one_cell_short.execute(ddl).unwrap();
+    assert_eq!(
+        one_cell_short.execute("INSERT INTO readings VALUES (1, NULL)"),
+        Err(Error::ResourceLimitExceeded {
+            resource: "table cells",
+            actual: 2,
+            max: 1,
+        })
+    );
+    assert_eq!(
+        one_cell_short
+            .catalog()
+            .table("readings")
+            .unwrap()
+            .row_count(),
+        0
+    );
+}
+
+#[test]
+fn mixed_create_rejects_duplicate_names_without_publishing_or_replacing() {
+    let mut invalid = Database::new();
+    assert_eq!(
+        invalid.execute("CREATE TABLE readings (Value Int64, value Nullable(Int64))"),
+        Err(Error::DuplicateColumn("value".to_owned()))
+    );
+    assert_eq!(invalid.catalog().table_count(), 0);
+
+    let mut duplicate_table = Database::new();
+    duplicate_table
+        .execute(
+            "CREATE TABLE Readings (id Int64, measurement Nullable(Int64)); \
+             INSERT INTO readings VALUES (1, NULL);",
+        )
+        .unwrap();
+    assert_eq!(
+        duplicate_table
+            .execute("CREATE TABLE READINGS (replacement String, value Nullable(Int64))"),
+        Err(Error::TableAlreadyExists("READINGS".to_owned()))
+    );
+    let table = duplicate_table.catalog().table("readings").unwrap();
+    assert_eq!(table.name(), "Readings");
+    assert_eq!(table.schema()[0].name, "id");
+    assert_eq!(table.row_count(), 1);
+}
+
+#[test]
+fn direct_mixed_create_ast_rejects_an_empty_non_nullable_prefix_without_panicking() {
+    for statement in [
+        Statement::CreateTableWithTrailingNullableInt64 {
+            name: "plain".to_owned(),
+            columns: Vec::new(),
+            nullable_column: "value".to_owned(),
+        },
+        Statement::CreateTableWithTrailingNullableInt64IfNotExists {
+            name: "conditional".to_owned(),
+            columns: Vec::new(),
+            nullable_column: "value".to_owned(),
+        },
+    ] {
+        let mut database = Database::new();
+        assert_eq!(
+            database.execute_statement(statement),
+            Err(Error::InvalidQuery(
+                "a table must contain at least one column".to_owned()
+            ))
+        );
+        assert_eq!(database.catalog().table_count(), 0);
+    }
+}
+
+#[test]
 fn conditional_nullable_create_preserves_the_existing_table() {
     let mut database = Database::new();
     database
         .execute(
-            "CREATE TABLE Readings (Measurement Nullable(Int64)); \
-             INSERT INTO readings VALUES (NULL); \
-             CREATE TABLE IF NOT EXISTS READINGS (Replacement Nullable(Int64));",
+            "CREATE TABLE IF NOT EXISTS Readings (ID Int64, Measurement Nullable(Int64)); \
+             INSERT INTO readings VALUES (1, NULL); \
+             CREATE TABLE IF NOT EXISTS READINGS (Replacement String, Other Nullable(Int64));",
         )
         .unwrap();
 
     let table = database.catalog().table("readings").unwrap();
     assert_eq!(table.name(), "Readings");
-    assert_eq!(table.schema()[0].name, "Measurement");
-    let Column::NullableInt64(values) = &table.columns()[0] else {
+    assert_eq!(table.schema()[0].name, "ID");
+    assert_eq!(table.schema()[1].name, "Measurement");
+    let Column::NullableInt64(values) = &table.columns()[1] else {
         panic!("existing nullable table must remain physical nullable storage")
     };
     assert_eq!(values, &[None]);

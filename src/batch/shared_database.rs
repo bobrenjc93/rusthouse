@@ -1170,7 +1170,9 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         Statement::CreateTable { .. }
         | Statement::CreateTableIfNotExists { .. }
         | Statement::CreateNullableInt64Table { .. }
-        | Statement::CreateNullableInt64TableIfNotExists { .. } => {
+        | Statement::CreateNullableInt64TableIfNotExists { .. }
+        | Statement::CreateTableWithTrailingNullableInt64 { .. }
+        | Statement::CreateTableWithTrailingNullableInt64IfNotExists { .. } => {
             Err(SharedDatabaseError::ReadOnlyStatementRequired {
                 statement: "CREATE TABLE",
             })

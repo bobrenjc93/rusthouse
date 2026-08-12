@@ -6,7 +6,9 @@ use rusthouse::batch::engine::{
     Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
 };
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{DEFAULT_MAX_BATCH_STATEMENTS, Statement, parse};
+use rusthouse::batch::sql::{
+    DEFAULT_MAX_AST_LIST_ITEMS, DEFAULT_MAX_BATCH_STATEMENTS, Statement, parse,
+};
 use rusthouse::batch::storage::{ColumnDef, TableLimits};
 use rusthouse::batch::value::{DataType, Value};
 
@@ -297,6 +299,55 @@ fn nullable_show_create_replay_accepts_4096_and_rejects_4097_statements() {
         database.catalog().table("boundary").unwrap().schema().len(),
         DEFAULT_MAX_BATCH_STATEMENTS
     );
+}
+
+#[test]
+fn trailing_nullable_show_create_splits_at_one_over_the_ast_list_limit() {
+    let limits = TableLimits::new(0, DEFAULT_MAX_AST_LIST_ITEMS + 1, 0);
+    let columns = (0..DEFAULT_MAX_AST_LIST_ITEMS)
+        .map(|index| ColumnDef {
+            name: format!("c{index}"),
+            data_type: DataType::Int64,
+        })
+        .collect();
+    let mut database = Database::with_table_limits(limits);
+    database
+        .execute_statement(Statement::CreateTable {
+            name: "Boundary".to_owned(),
+            columns,
+        })
+        .expect("the exact AST-list-width non-nullable table is valid");
+    database
+        .execute("ALTER TABLE Boundary ADD COLUMN optional Nullable(Int64)")
+        .expect("the trailing nullable column fits the configured table limit");
+
+    let shown = query(&mut database, "SHOW CREATE TABLE boundary");
+    let [Value::String(ddl)] = shown.rows[0].as_slice() else {
+        panic!("SHOW CREATE returns one DDL string")
+    };
+    let statements = parse(ddl).expect("SHOW CREATE stays within the AST-list budget");
+    let [
+        Statement::CreateTable { name, columns },
+        Statement::AddNullableInt64Column { table, column },
+    ] = statements.as_slice()
+    else {
+        panic!("one-over-limit trailing nullable schema must replay as CREATE plus ALTER")
+    };
+    assert_eq!(name, "Boundary");
+    assert_eq!(columns.len(), DEFAULT_MAX_AST_LIST_ITEMS);
+    assert_eq!(table, "Boundary");
+    assert_eq!(column, "optional");
+
+    let mut replayed = Database::with_table_limits(limits);
+    replayed
+        .execute(ddl)
+        .expect("the bounded SHOW CREATE output is executable");
+    let table = replayed.catalog().table("boundary").unwrap();
+    assert_eq!(table.schema().len(), DEFAULT_MAX_AST_LIST_ITEMS + 1);
+    assert!(matches!(
+        table.columns().last(),
+        Some(rusthouse::batch::storage::Column::NullableInt64(values)) if values.is_empty()
+    ));
 }
 
 #[test]
