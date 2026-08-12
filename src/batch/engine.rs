@@ -14,6 +14,15 @@ use crate::batch::aggregate_scheduler::{
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
+use crate::batch::global_extremum::{self, Extremum};
+#[cfg(test)]
+use crate::batch::global_extremum::{
+    first_float64_maximum, first_float64_minimum,
+    reduce_float64_with as reduce_global_float64_extremum,
+    reduce_int64_with as reduce_global_int64_extremum,
+    reduce_nullable_int64_with as reduce_global_nullable_int64_extremum,
+    reduce_partials as reduce_scalar_extremum_partials,
+};
 use crate::batch::json_compact_each_row::{
     self, JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
 };
@@ -8188,161 +8197,17 @@ fn min_global_int64(
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
     let minimum = match &table.columns()[spec.argument.expect("MIN argument")] {
         Column::Int64(values) => {
-            reduce_global_int64_extremum(values, matching_rows, parallelism, "min", i64::min)
+            global_extremum::reduce_int64(values, matching_rows, parallelism, Extremum::Minimum)
         }
-        Column::NullableInt64(values) => reduce_global_nullable_int64_extremum(
+        Column::NullableInt64(values) => global_extremum::reduce_nullable_int64(
             values,
             matching_rows,
             parallelism,
-            "min",
-            i64::min,
+            Extremum::Minimum,
         ),
         _ => unreachable!("MIN input type is resolved"),
     };
     min_int64_state(minimum)
-}
-
-fn reduce_global_int64_extremum<C>(
-    values: &[i64],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
-    compare: C,
-) -> Option<i64>
-where
-    C: Fn(i64, i64) -> i64 + Sync,
-{
-    reduce_global_scalar_extremum(
-        values,
-        matching_rows,
-        parallelism,
-        worker_label,
-        "int64",
-        |value| Some(*value),
-        compare,
-    )
-}
-
-fn reduce_global_nullable_int64_extremum<C>(
-    values: &[Option<i64>],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
-    compare: C,
-) -> Option<i64>
-where
-    C: Fn(i64, i64) -> i64 + Sync,
-{
-    reduce_global_scalar_extremum(
-        values,
-        matching_rows,
-        parallelism,
-        worker_label,
-        "nullable-int64",
-        |value| *value,
-        compare,
-    )
-}
-
-fn reduce_global_scalar_extremum<T, E, M, C>(
-    values: &[T],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
-    worker_type_label: &'static str,
-    map: M,
-    compare: C,
-) -> Option<E>
-where
-    T: Sync,
-    E: Copy + Send,
-    M: Fn(&T) -> Option<E> + Sync,
-    C: Fn(E, E) -> E + Sync,
-{
-    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return scalar_extremum_chunk(values, matching_rows, &map, &compare);
-    };
-
-    // Each lane receives the same deterministic contiguous partition used by
-    // the other global aggregates. Optional scalar partials are combined in
-    // place, without allocating a partial-results collection. A failed spawn
-    // or panic discards every partial and repeats the complete extremum on the
-    // query thread after releasing process-wide admission.
-    let helper_threads = admission.helper_threads();
-    debug_assert!(helper_threads > 0);
-    let worker_count = helper_threads.saturating_add(1);
-    let map = &map;
-    let compare = &compare;
-    let parallel_result = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(helper_threads);
-        let mut worker_failed = false;
-        for chunk_index in 1..worker_count {
-            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
-            let spawn = std::thread::Builder::new()
-                .name(format!(
-                    "rusthouse-{worker_label}-{worker_type_label}-{chunk_index}"
-                ))
-                .spawn_scoped(scope, move || {
-                    scalar_extremum_chunk(values, rows, map, compare)
-                });
-            match spawn {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    worker_failed = true;
-                    break;
-                }
-            }
-        }
-
-        let mut extremum = scalar_extremum_chunk(
-            values,
-            parallel_aggregate_partition(matching_rows, worker_count, 0),
-            map,
-            compare,
-        );
-        for handle in handles {
-            match handle.join() {
-                Ok(partial) => {
-                    extremum = reduce_scalar_extremum_partials(extremum, partial, compare);
-                }
-                Err(_) => worker_failed = true,
-            }
-        }
-        (!worker_failed).then_some(extremum)
-    });
-    drop(admission);
-    parallel_result.unwrap_or_else(|| scalar_extremum_chunk(values, matching_rows, map, compare))
-}
-
-fn scalar_extremum_chunk<T, E, M, C>(
-    values: &[T],
-    matching_rows: &[usize],
-    map: &M,
-    compare: &C,
-) -> Option<E>
-where
-    M: Fn(&T) -> Option<E>,
-    C: Fn(E, E) -> E,
-{
-    matching_rows
-        .iter()
-        .filter_map(|row| map(&values[*row]))
-        .reduce(compare)
-}
-
-fn reduce_scalar_extremum_partials<T, C>(
-    left: Option<T>,
-    right: Option<T>,
-    compare: &C,
-) -> Option<T>
-where
-    C: Fn(T, T) -> T,
-{
-    match (left, right) {
-        (Some(left), Some(right)) => Some(compare(left, right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
 }
 
 fn min_int64_state(minimum: Option<i64>) -> AggregateState {
@@ -8361,44 +8226,9 @@ fn min_global_float64(
         unreachable!("MIN input type is resolved")
     };
     AggregateState::Min(
-        reduce_global_float64_extremum(
-            values,
-            matching_rows,
-            parallelism,
-            "min",
-            first_float64_minimum,
-        )
-        .map(Value::Float64),
+        global_extremum::reduce_float64(values, matching_rows, parallelism, Extremum::Minimum)
+            .map(Value::Float64),
     )
-}
-
-fn reduce_global_float64_extremum<C>(
-    values: &[f64],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    worker_label: &'static str,
-    compare: C,
-) -> Option<f64>
-where
-    C: Fn(f64, f64) -> f64 + Sync,
-{
-    reduce_global_scalar_extremum(
-        values,
-        matching_rows,
-        parallelism,
-        worker_label,
-        "float64",
-        |value| Some(*value),
-        compare,
-    )
-}
-
-fn first_float64_minimum(left: f64, right: f64) -> f64 {
-    if ValueRef::Float64(right) < ValueRef::Float64(left) {
-        right
-    } else {
-        left
-    }
 }
 
 fn max_global_int64(
@@ -8411,14 +8241,13 @@ fn max_global_int64(
     debug_assert_eq!(spec.input_type, Some(DataType::Int64));
     let maximum = match &table.columns()[spec.argument.expect("MAX argument")] {
         Column::Int64(values) => {
-            reduce_global_int64_extremum(values, matching_rows, parallelism, "max", i64::max)
+            global_extremum::reduce_int64(values, matching_rows, parallelism, Extremum::Maximum)
         }
-        Column::NullableInt64(values) => reduce_global_nullable_int64_extremum(
+        Column::NullableInt64(values) => global_extremum::reduce_nullable_int64(
             values,
             matching_rows,
             parallelism,
-            "max",
-            i64::max,
+            Extremum::Maximum,
         ),
         _ => unreachable!("MAX input type is resolved"),
     };
@@ -8441,23 +8270,9 @@ fn max_global_float64(
         unreachable!("MAX input type is resolved")
     };
     AggregateState::Max(
-        reduce_global_float64_extremum(
-            values,
-            matching_rows,
-            parallelism,
-            "max",
-            first_float64_maximum,
-        )
-        .map(Value::Float64),
+        global_extremum::reduce_float64(values, matching_rows, parallelism, Extremum::Maximum)
+            .map(Value::Float64),
     )
-}
-
-fn first_float64_maximum(left: f64, right: f64) -> f64 {
-    if ValueRef::Float64(right) > ValueRef::Float64(left) {
-        right
-    } else {
-        left
-    }
 }
 
 #[derive(Debug)]

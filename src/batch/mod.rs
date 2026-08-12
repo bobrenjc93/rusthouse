@@ -1,6 +1,7 @@
 //! Bounded, semicolon-delimited SQL batch execution for CLI export formats.
 
 mod aggregate_scheduler;
+mod global_extremum;
 mod scalar_cast;
 mod scalar_float64;
 mod scalar_nullable_int64;
