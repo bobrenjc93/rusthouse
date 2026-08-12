@@ -607,6 +607,18 @@ fallbacks, extra or missing arguments, aggregate combinations, and `GROUP BY`
 are rejected with typed errors. Because it produces fixed-size `Int64` values,
 it adds no variable payload; all normal scan, result row, value, byte,
 retained-result, and formatted-output bounds still apply.
+`isNull(column)` is the case-insensitive scalar nullness projection for every
+physical column. It returns `Bool` `true` only for an absent value in a
+physical `Nullable(Int64)` column; present nullable values and all values in
+non-nullable `Int64`, `Float64`, `Bool`, and `String` columns return `false`.
+It accepts an optional `AS alias`; otherwise, the result is named
+`isNull(<column>)`. `WHERE` filters rows first, ordering by either the
+normalized expression or its alias uses the Boolean result with stable ties,
+and `LIMIT`/`OFFSET` pagination precedes materialization. The function is
+restricted to ungrouped scalar queries and cannot be combined with aggregates
+or `GROUP BY`. Its fixed-size `Bool` output adds no variable payload, while all
+normal scan, result row, value, byte, retained-result, and formatted-output
+bounds continue to apply.
 `LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
