@@ -168,12 +168,14 @@ their documented nullable restrictions.
 
 An admitted, current index can reject blocks for a simple `Int64`
 column-to-literal `=`, `<`, `<=`, `>`, or `>=` predicate (in either operand
-order), and for an exact positive inclusive range on one column with `Int64`
-literal bounds. `column BETWEEN lower AND upper`, the equivalent two
-comparisons `column >= lower` and `column <= upper` in either conjunction
-order (with either comparison's operands reversed), and forms normalized to
-that conjunction such as `NOT (column < lower OR column > upper)` share this
-indexed range path. Both
+order), and for an exact positive bounded range on one column with `Int64`
+literal bounds. `column BETWEEN lower AND upper` and every lower/upper
+conjunction formed from `column > lower` or `column >= lower` with `column <
+upper` or `column <= upper` share this indexed range path. The comparisons may
+appear in either conjunction order, either comparison may reverse its
+operands, and normalized forms such as `NOT (column <= lower OR column >=
+upper)` are recognized. Strict bounds are converted to the exact closed
+`Int64` successor/predecessor interval without wrapping at either extreme. Both
 `Int64` and physical `Nullable(Int64)` index columns are supported; all-null
 blocks cannot satisfy these shapes. Every row in a surviving block still
 follows the normal exact predicate evaluator. Other compound shapes, `NOT
@@ -780,7 +782,7 @@ TABLE DELETE`), or `ALTER TABLE UPDATE` inspects at most 1,000,000 source rows
 by default. This scanned-row limit is checked against the full source table
 before matching-row indices or replacement values are allocated, so `WHERE`
 selectivity and `LIMIT` do not reduce it for ordinary tables. A supported
-direct comparison or exact positive inclusive range on validated `Int64` range
+direct comparison or exact positive bounded range on validated `Int64` range
 partitions instead charges only physical ranges that remain possible; each
 `UNION` operand and each `CROSS JOIN` input has its own source scan. String
 assignments additionally bound
@@ -849,10 +851,11 @@ For a direct comparison between that `Int64` key and an `Int64` literal using
 `=`, `<`, `<=`, `>`, or `>=` (in either operand order), SELECT discards ranges
 whose inclusive bounds make a match impossible. The exact positive `column
 BETWEEN lower AND upper` form with `Int64` literal bounds uses the same path,
-as do equivalent predicates normalized to `column >= lower AND column <=
-upper` or the upper-bound-first `column <= upper AND column >= lower`; either
-comparison may also reverse its operands. Reversed bounds prune every
-partition. The normal compiled predicate
+as does any same-column lower/upper conjunction using `>` or `>=` with `<` or
+`<=`. Either comparison may come first or reverse its operands. Strict bounds
+use the exact `Int64` successor or predecessor; equal, adjacent-exclusive,
+reversed, and strict-extreme bounds therefore prune every partition when their
+integer interval is empty. The normal compiled predicate
 still checks every row in the admitted ranges, and physical rows retain source
 order through the existing projection, aliases, aggregation, ordering, `LIMIT`,
 and `OFFSET` paths. The SELECT scan-row limit is charged to admitted physical

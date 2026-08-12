@@ -96,6 +96,87 @@ fn indexed_and_unindexed_results_match_at_boundaries_order_pagination_and_having
 }
 
 #[test]
+fn strict_range_conjunctions_prune_in_every_order_and_preserve_exact_results() {
+    let mut indexed = test_database(true);
+    let mut unindexed = test_database(false);
+    let cases = [
+        "SELECT id FROM events WHERE key > -9 AND key < 0",
+        "SELECT id FROM events WHERE key >= -9 AND key < 0",
+        "SELECT id FROM events WHERE key > -9 AND key <= 0",
+        "SELECT id FROM events WHERE key < 0 AND key > -9",
+        "SELECT id FROM events WHERE 0 > key AND -9 < key",
+        "SELECT id FROM events WHERE -9 <= key AND 0 > key",
+        "SELECT id FROM events WHERE NOT (key <= -9 OR key >= 0)",
+        "SELECT id FROM events WHERE key > 0 AND key <= 0",
+        "SELECT id FROM events WHERE key > 0 AND key < 1",
+        "SELECT id FROM events WHERE key > 100 AND key < -100",
+        "SELECT id FROM events WHERE key > 9223372036854775807 AND key <= 9223372036854775807",
+        "SELECT id FROM events WHERE key >= -9223372036854775808 AND key < -9223372036854775808",
+        "SELECT id FROM events WHERE key > -9223372036854775808 AND key <= 9223372036854775807",
+    ];
+
+    for sql in cases {
+        assert_eq!(
+            query(&mut indexed, sql),
+            query(&mut unindexed, sql),
+            "strict range result for {sql}",
+        );
+    }
+
+    let metrics = indexed.index_pruning_metrics();
+    assert_eq!(
+        metrics.scanned_blocks + metrics.pruned_blocks,
+        cases.len() * 3
+    );
+    assert!(metrics.scanned_blocks > 0);
+    assert!(metrics.pruned_blocks > 0);
+    assert_eq!(unindexed.index_pruning_metrics().scanned_blocks, 0);
+    assert_eq!(unindexed.index_pruning_metrics().pruned_blocks, 0);
+}
+
+#[test]
+fn strict_range_pruning_keeps_nullable_null_semantics_and_all_null_blocks() {
+    const NULLABLE_SETUP: &str = "\
+        CREATE TABLE readings (reading Nullable(Int64)); \
+        INSERT INTO readings VALUES (NULL), (NULL), (-1), (0), (NULL), (1), (2), (NULL);";
+
+    let mut indexed = Database::new();
+    indexed.execute(NULLABLE_SETUP).expect("setup succeeds");
+    indexed
+        .create_int64_min_max_index(
+            "readings",
+            "reading",
+            Int64MinMaxIndexLimits::new(2, 4, usize::MAX),
+        )
+        .expect("nullable index is valid");
+    let mut unindexed = Database::new();
+    unindexed.execute(NULLABLE_SETUP).expect("setup succeeds");
+
+    let sql = "SELECT reading FROM readings WHERE reading > -1 AND reading < 2";
+    let result = query(&mut indexed, sql);
+    assert_eq!(result, query(&mut unindexed, sql));
+    let StatementResult::Query(result) = result else {
+        panic!("SELECT returns a query result")
+    };
+    assert_eq!(
+        result
+            .rows
+            .iter()
+            .map(|row| row[0].as_display_string())
+            .collect::<Vec<_>>(),
+        ["0", "1"],
+    );
+    assert_eq!(indexed.index_pruning_metrics().scanned_blocks, 2);
+    assert_eq!(indexed.index_pruning_metrics().pruned_blocks, 2);
+
+    let empty = "SELECT reading FROM readings WHERE \
+                 reading > 9223372036854775807 AND reading <= 9223372036854775807";
+    assert_eq!(query(&mut indexed, empty), query(&mut unindexed, empty));
+    assert_eq!(indexed.index_pruning_metrics().scanned_blocks, 2);
+    assert_eq!(indexed.index_pruning_metrics().pruned_blocks, 6);
+}
+
+#[test]
 fn scan_row_limit_still_charges_the_complete_source_before_pruning() {
     let mut database = Database::with_query_result_limits(QueryResultLimits {
         max_scan_rows: 11,
@@ -111,7 +192,7 @@ fn scan_row_limit_still_charges_the_complete_source_before_pruning() {
         .expect("valid index request");
 
     assert_eq!(
-        database.execute("SELECT id FROM events WHERE key = 9223372036854775807"),
+        database.execute("SELECT id FROM events WHERE key > 102 AND key <= 9223372036854775807",),
         Err(Error::ResourceLimitExceeded {
             resource: "SELECT scanned rows",
             actual: 12,
@@ -299,7 +380,10 @@ fn mutations_refresh_the_index_and_over_budget_or_schema_changes_invalidate_it()
             .is_none()
     );
     assert_eq!(
-        query(&mut capped, "SELECT value FROM t WHERE value = 5"),
+        query(
+            &mut capped,
+            "SELECT value FROM t WHERE value > 4 AND value <= 5",
+        ),
         query(
             &mut {
                 let mut expected = Database::new();
@@ -311,7 +395,9 @@ fn mutations_refresh_the_index_and_over_budget_or_schema_changes_invalidate_it()
                     .unwrap();
                 expected
             },
-            "SELECT value FROM t WHERE value = 5",
+            "SELECT value FROM t WHERE value > 4 AND value <= 5",
         )
     );
+    assert_eq!(capped.index_pruning_metrics().scanned_blocks, 0);
+    assert_eq!(capped.index_pruning_metrics().pruned_blocks, 0);
 }

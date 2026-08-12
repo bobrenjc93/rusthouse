@@ -9272,40 +9272,73 @@ impl CompiledPredicate {
         Some((column, filter))
     }
 
-    /// Returns an exact comparison or positive inclusive range suitable for
+    /// Returns an exact comparison or positive bounded range suitable for
     /// validated range-partition routing. Every admitted row is still checked
     /// by the complete predicate evaluator.
     fn int64_partition_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_filter()
-            .or_else(|| self.int64_inclusive_range_filter())
+        self.int64_filter().or_else(|| self.int64_range_filter())
     }
 
     /// Returns the shapes that an `Int64` min/max index can reject safely.
-    /// This includes any exact positive inclusive-range conjunction after
+    /// This includes any exact positive bounded-range conjunction after
     /// predicate normalization. Every surviving row is still evaluated by
     /// `self`.
     fn int64_index_filter(&self) -> Option<(usize, Int64Filter)> {
         self.int64_partition_filter()
     }
 
-    fn int64_inclusive_range_filter(&self) -> Option<(usize, Int64Filter)> {
+    fn int64_range_filter(&self) -> Option<(usize, Int64Filter)> {
         let Self::And(first, second) = self else {
             return None;
         };
         let (first_column, first_filter) = first.int64_filter()?;
         let (second_column, second_filter) = second.int64_filter()?;
-        let (lower_column, lower, upper_column, upper) = match (first_filter, second_filter) {
-            (Int64Filter::GreaterOrEqual(lower), Int64Filter::LessOrEqual(upper)) => {
-                (first_column, lower, second_column, upper)
-            }
-            (Int64Filter::LessOrEqual(upper), Int64Filter::GreaterOrEqual(lower)) => {
-                (second_column, lower, first_column, upper)
-            }
-            _ => return None,
-        };
+        let (lower_column, lower, lower_strict, upper_column, upper, upper_strict) =
+            match (first_filter, second_filter) {
+                (Int64Filter::Greater(lower), Int64Filter::Less(upper)) => {
+                    (first_column, lower, true, second_column, upper, true)
+                }
+                (Int64Filter::Greater(lower), Int64Filter::LessOrEqual(upper)) => {
+                    (first_column, lower, true, second_column, upper, false)
+                }
+                (Int64Filter::GreaterOrEqual(lower), Int64Filter::Less(upper)) => {
+                    (first_column, lower, false, second_column, upper, true)
+                }
+                (Int64Filter::GreaterOrEqual(lower), Int64Filter::LessOrEqual(upper)) => {
+                    (first_column, lower, false, second_column, upper, false)
+                }
+                (Int64Filter::Less(upper), Int64Filter::Greater(lower)) => {
+                    (second_column, lower, true, first_column, upper, true)
+                }
+                (Int64Filter::LessOrEqual(upper), Int64Filter::Greater(lower)) => {
+                    (second_column, lower, true, first_column, upper, false)
+                }
+                (Int64Filter::Less(upper), Int64Filter::GreaterOrEqual(lower)) => {
+                    (second_column, lower, false, first_column, upper, true)
+                }
+                (Int64Filter::LessOrEqual(upper), Int64Filter::GreaterOrEqual(lower)) => {
+                    (second_column, lower, false, first_column, upper, false)
+                }
+                _ => return None,
+            };
         if lower_column != upper_column {
             return None;
         }
+
+        // Int64 is discrete, so strict bounds can be represented exactly as
+        // an inclusive successor/predecessor interval. A missing successor or
+        // predecessor is a recognized empty range, not a full-scan fallback.
+        let lower = if lower_strict {
+            lower.checked_add(1)
+        } else {
+            Some(lower)
+        };
+        let upper = if upper_strict {
+            upper.checked_sub(1)
+        } else {
+            Some(upper)
+        };
+        let (lower, upper) = lower.zip(upper).unwrap_or((i64::MAX, i64::MIN));
         Some((lower_column, Int64Filter::InclusiveRange { lower, upper }))
     }
 
