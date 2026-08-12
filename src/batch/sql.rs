@@ -193,6 +193,12 @@ pub enum Statement {
         first: DeleteComparisonPredicate,
         second: DeleteComparisonPredicate,
     },
+    /// Exact nullness deletion: `DELETE FROM <table> WHERE <column> IS [NOT] NULL`.
+    DeleteNullness {
+        table: String,
+        column: String,
+        is_null: bool,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -1995,7 +2001,24 @@ impl<'a> Parser<'a> {
         self.expect_keyword("WHERE")?;
         self.predicate_depth = 0;
         self.predicate_nodes = 0;
-        let first = self.parse_delete_comparison()?;
+        let first_column = self.expect_identifier("column name")?;
+        if self.eat_keyword("IS") {
+            let is_null = !self.eat_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            self.record_predicate_node()?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error(
+                    "DELETE nullness predicate supports exactly one column IS NULL or column IS NOT NULL atom",
+                );
+            }
+            return Ok(Statement::DeleteNullness {
+                table,
+                column: first_column,
+                is_null,
+            });
+        }
+
+        let first = self.parse_delete_comparison_after_column(first_column)?;
         if self.eat_keyword("AND") {
             let second = self.parse_delete_comparison()?;
             self.record_predicate_node()?;
@@ -2031,6 +2054,13 @@ impl<'a> Parser<'a> {
 
     fn parse_delete_comparison(&mut self) -> Result<DeleteComparisonPredicate> {
         let column = self.expect_identifier("column name")?;
+        self.parse_delete_comparison_after_column(column)
+    }
+
+    fn parse_delete_comparison_after_column(
+        &mut self,
+        column: String,
+    ) -> Result<DeleteComparisonPredicate> {
         let operator = self.parse_comparison_operator()?;
         let literal = self.parse_literal()?;
         self.record_predicate_node()?;
