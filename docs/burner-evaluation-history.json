@@ -3665,6 +3665,22 @@
         "eval_c88a7f3d": 95,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:889",
+      "recordedAt": "2026-08-12T16:24:41.924Z",
+      "label": "PR #889",
+      "kind": "composite",
+      "prNumber": 889,
+      "title": "YOLO generation 148: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 100,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 95,
+        "eval_c88a7f3d": 95,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
