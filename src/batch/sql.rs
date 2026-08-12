@@ -34,6 +34,7 @@ pub const SUPPORTED_FUNCTION_NAMES: &[&str] = &[
     "empty",
     "FLOOR",
     "ifNull",
+    "isNotNull",
     "isNull",
     "LENGTH",
     "lengthUTF8",
@@ -429,6 +430,11 @@ pub enum SelectItem {
     },
     /// Reports whether a physical column cell is absent.
     IsNull {
+        name: String,
+        alias: Option<String>,
+    },
+    /// Reports whether a physical column cell is present.
+    IsNotNull {
         name: String,
         alias: Option<String>,
     },
@@ -2493,6 +2499,13 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::IsNull { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("isNotNull") {
+                let name = self.expect_identifier("column in isNotNull")?;
+                self.expect(&TokenKind::RightParen, "')' after isNotNull expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::IsNotNull { name, alias });
+            }
+
             if name.eq_ignore_ascii_case("LENGTH") {
                 let name = self.expect_identifier("String column in LENGTH")?;
                 self.expect(&TokenKind::RightParen, "')' after LENGTH expression")?;
@@ -2681,6 +2694,13 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY isNull expression",
             )?;
             Ok(is_null_name(&argument))
+        } else if name.eq_ignore_ascii_case("isNotNull") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("column in ORDER BY isNotNull")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY isNotNull expression",
+            )?;
+            Ok(is_not_null_name(&argument))
         } else {
             Ok(name)
         }
@@ -3343,6 +3363,10 @@ pub(crate) fn if_null_int64_name(column: &str, fallback: i64) -> String {
 
 pub(crate) fn is_null_name(column: &str) -> String {
     format!("isNull({column})")
+}
+
+pub(crate) fn is_not_null_name(column: &str) -> String {
+    format!("isNotNull({column})")
 }
 
 #[cfg(test)]

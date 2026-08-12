@@ -386,9 +386,9 @@ The exact case-insensitive `SHOW FUNCTIONS` returns every executable scalar,
 aggregate, compatibility-probe, and window function as one `String` column
 named `name`. Canonical names are ordered by ASCII case-insensitive spelling:
 `ABS`, `AVG`, `CAST`, `CEIL`, `COUNT`, `countIf`, `currentDatabase`, `empty`,
-`FLOOR`, `ifNull`, `isNull`, `LENGTH`, `lengthUTF8`, `LOWER`, `MAX`, `MIN`,
-`ROUND`, `ROW_NUMBER`, `SUM`, `toString`, `UPPER`, and `version`. Arguments and
-trailing clauses are rejected.
+`FLOOR`, `ifNull`, `isNotNull`, `isNull`, `LENGTH`, `lengthUTF8`, `LOWER`,
+`MAX`, `MIN`, `ROUND`, `ROW_NUMBER`, `SUM`, `toString`, `UPPER`, and `version`.
+Arguments and trailing clauses are rejected.
 The result uses the normal query row, value, byte, retained-result, and
 formatted-output limits.
 The exact case-insensitive query `SELECT name FROM system.functions` returns
@@ -647,6 +647,18 @@ remains unsupported, and source columns absent from `GROUP BY` are rejected.
 Its fixed-size `Bool` output adds no variable payload, while all normal scan,
 group working-state, result row, value, byte, retained-result, and
 formatted-output bounds continue to apply.
+`isNotNull(column)` is the case-insensitive, ungrouped complement to `isNull`.
+It returns `Bool` `false` only for an absent cell in a physical
+`Nullable(Int64)` column. Present nullable values and every value in
+non-nullable `Int64`, `Float64`, `Bool`, and `String` columns return `true`.
+It accepts an optional `AS alias`; otherwise, the result is named
+`isNotNull(<column>)`. `WHERE` filtering happens first, ordering by either the
+normalized expression or its alias uses the Boolean result with stable ties,
+and `LIMIT`/`OFFSET` pagination precedes materialization. Aggregate projections,
+all `GROUP BY` forms, nested calls, non-column arguments, and extra or missing
+arguments are rejected. Its fixed-size `Bool` output adds no variable payload,
+and all normal scan, result row, value, byte, retained-result, and
+formatted-output bounds apply.
 `LENGTH(string_column)` is an ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
