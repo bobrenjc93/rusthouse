@@ -176,7 +176,7 @@ struct Int64MinMaxIndex {
     blocks: Vec<Int64MinMaxBlockMetadata>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Int64Filter {
     Equal(i64),
     Less(i64),

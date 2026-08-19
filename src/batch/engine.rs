@@ -19,6 +19,9 @@ use crate::batch::grouped_bool_count;
 use crate::batch::grouped_bool_max;
 use crate::batch::grouped_bool_min;
 use crate::batch::grouped_bool_sum_avg;
+use crate::batch::int64_metadata_filter::{
+    Int64MetadataComparison, normalize_int64_metadata_filter,
+};
 use crate::batch::json_compact_each_row::{
     self, JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
 };
@@ -4461,20 +4464,17 @@ impl Database {
         // Validated range partitions can reduce the source rows charged to
         // the scan limit. A sparse index can then narrow physical candidates,
         // but does not reduce that charge for an ordinary table.
-        let int64_partition_filter = predicate
+        let int64_metadata_filter = predicate
             .as_ref()
-            .and_then(CompiledPredicate::int64_partition_filter);
-        let int64_index_filter = predicate
-            .as_ref()
-            .and_then(CompiledPredicate::int64_index_filter);
+            .and_then(CompiledPredicate::int64_metadata_filter);
         let int64_nullness = predicate
             .as_ref()
             .and_then(CompiledPredicate::int64_nullness);
-        let source_rows = int64_partition_filter
+        let source_rows = int64_metadata_filter
             .and_then(|(column, filter)| table.int64_range_partition_rows(column, filter))
             .unwrap_or(0..table.row_count());
         enforce_select_scan_rows(source_rows.len(), query_result_limits)?;
-        let indexed_scan = int64_index_filter
+        let indexed_scan = int64_metadata_filter
             .and_then(|(column, filter)| {
                 table.int64_min_max_index_scan(column, filter, source_rows.clone())
             })
@@ -9120,8 +9120,7 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    /// Returns a direct comparison suitable for metadata pruning.
-    fn int64_filter(&self) -> Option<(usize, Int64Filter)> {
+    fn int64_metadata_comparison(&self) -> Option<Int64MetadataComparison> {
         let Self::Comparison {
             left,
             operator,
@@ -9131,90 +9130,43 @@ impl CompiledPredicate {
             return None;
         };
 
-        let (column, value, operator) = match (left, right) {
+        match (left, right) {
             (
                 CompiledOperand::Column {
                     index,
                     data_type: DataType::Int64,
                 },
                 CompiledOperand::Literal(Value::Int64(value)),
-            ) => (*index, *value, *operator),
+            ) => Some(Int64MetadataComparison::column_on_left(
+                *index, *operator, *value,
+            )),
             (
                 CompiledOperand::Literal(Value::Int64(value)),
                 CompiledOperand::Column {
                     index,
                     data_type: DataType::Int64,
                 },
-            ) => (*index, *value, reverse_comparison(*operator)),
-            _ => return None,
-        };
-        let filter = match operator {
-            ComparisonOperator::Equal => Int64Filter::Equal(value),
-            ComparisonOperator::Less => Int64Filter::Less(value),
-            ComparisonOperator::LessOrEqual => Int64Filter::LessOrEqual(value),
-            ComparisonOperator::Greater => Int64Filter::Greater(value),
-            ComparisonOperator::GreaterOrEqual => Int64Filter::GreaterOrEqual(value),
-            ComparisonOperator::NotEqual => return None,
-        };
-        Some((column, filter))
+            ) => Some(Int64MetadataComparison::literal_on_left(
+                *value, *operator, *index,
+            )),
+            _ => None,
+        }
     }
 
-    /// Returns an exact comparison or positive two-sided range suitable for
-    /// validated range-partition routing. Every admitted row is still checked
-    /// by the complete predicate evaluator.
-    fn int64_partition_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_filter().or_else(|| self.int64_range_filter())
-    }
-
-    /// Returns the shapes that an `Int64` min/max index can reject safely.
-    /// This includes any exact positive two-sided range conjunction after
-    /// predicate normalization. Every surviving row is still evaluated by
-    /// `self`.
-    fn int64_index_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_partition_filter()
-    }
-
-    fn int64_range_filter(&self) -> Option<(usize, Int64Filter)> {
+    /// Returns the exact comparison or positive two-sided range that both
+    /// `Int64` metadata consumers can reject safely. Every surviving row is
+    /// still checked by the complete predicate evaluator.
+    fn int64_metadata_filter(&self) -> Option<(usize, Int64Filter)> {
+        if let Some(comparison) = self.int64_metadata_comparison() {
+            return normalize_int64_metadata_filter(comparison, None);
+        }
         let Self::And(first, second) = self else {
             return None;
         };
-        let (first_column, first_filter) = first.int64_filter()?;
-        let (second_column, second_filter) = second.int64_filter()?;
-        let (lower_column, lower, lower_strict, upper_column, upper, upper_strict) =
-            match (first_filter, second_filter) {
-                (Int64Filter::GreaterOrEqual(lower), Int64Filter::LessOrEqual(upper)) => {
-                    (first_column, lower, false, second_column, upper, false)
-                }
-                (Int64Filter::LessOrEqual(upper), Int64Filter::GreaterOrEqual(lower)) => {
-                    (second_column, lower, false, first_column, upper, false)
-                }
-                (Int64Filter::Greater(lower), Int64Filter::LessOrEqual(upper)) => {
-                    (first_column, lower, true, second_column, upper, false)
-                }
-                (Int64Filter::LessOrEqual(upper), Int64Filter::Greater(lower)) => {
-                    (second_column, lower, true, first_column, upper, false)
-                }
-                (Int64Filter::GreaterOrEqual(lower), Int64Filter::Less(upper)) => {
-                    (first_column, lower, false, second_column, upper, true)
-                }
-                (Int64Filter::Less(upper), Int64Filter::GreaterOrEqual(lower)) => {
-                    (second_column, lower, false, first_column, upper, true)
-                }
-                (Int64Filter::Greater(lower), Int64Filter::Less(upper)) => {
-                    (first_column, lower, true, second_column, upper, true)
-                }
-                (Int64Filter::Less(upper), Int64Filter::Greater(lower)) => {
-                    (second_column, lower, true, first_column, upper, true)
-                }
-                _ => return None,
-            };
-        if lower_column != upper_column {
-            return None;
-        }
-        Some((
-            lower_column,
-            normalized_int64_range(lower, lower_strict, upper, upper_strict),
-        ))
+        normalize_int64_metadata_filter(
+            first.int64_metadata_comparison()?,
+            Some(second.int64_metadata_comparison()?),
+        )
     }
 
     fn int64_nullness(&self) -> Option<(usize, bool)> {
@@ -9266,39 +9218,6 @@ impl CompiledPredicate {
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
-    }
-}
-
-fn normalized_int64_range(
-    lower: i64,
-    lower_strict: bool,
-    upper: i64,
-    upper_strict: bool,
-) -> Int64Filter {
-    let lower = if lower_strict {
-        let Some(lower) = lower.checked_add(1) else {
-            return empty_int64_range();
-        };
-        lower
-    } else {
-        lower
-    };
-    let upper = if upper_strict {
-        let Some(upper) = upper.checked_sub(1) else {
-            return empty_int64_range();
-        };
-        upper
-    } else {
-        upper
-    };
-    Int64Filter::InclusiveRange { lower, upper }
-}
-
-const fn empty_int64_range() -> Int64Filter {
-    // Both metadata paths already treat lower > upper as an empty range.
-    Int64Filter::InclusiveRange {
-        lower: i64::MAX,
-        upper: i64::MIN,
     }
 }
 
@@ -9442,17 +9361,6 @@ const fn invert_comparison(operator: ComparisonOperator) -> ComparisonOperator {
         ComparisonOperator::LessOrEqual => ComparisonOperator::Greater,
         ComparisonOperator::Greater => ComparisonOperator::LessOrEqual,
         ComparisonOperator::GreaterOrEqual => ComparisonOperator::Less,
-    }
-}
-
-const fn reverse_comparison(operator: ComparisonOperator) -> ComparisonOperator {
-    match operator {
-        ComparisonOperator::Equal => ComparisonOperator::Equal,
-        ComparisonOperator::NotEqual => ComparisonOperator::NotEqual,
-        ComparisonOperator::Less => ComparisonOperator::Greater,
-        ComparisonOperator::LessOrEqual => ComparisonOperator::GreaterOrEqual,
-        ComparisonOperator::Greater => ComparisonOperator::Less,
-        ComparisonOperator::GreaterOrEqual => ComparisonOperator::LessOrEqual,
     }
 }
 
