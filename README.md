@@ -141,7 +141,10 @@ row-count/`MAX(Float64)` pairs or same-column nullable `COUNT`/`SUM` and `COUNT`
 (including all other `COUNT(column)` pairs), `SUM(Float64)`, Bool/String extrema, `AVG(Float64)`,
 grouped nullable SUM, MIN, MAX, or AVG, and
 other aggregate functions remain sequential.
-Internally, the private global Int64 SUM/AVG reducer owns nullable and
+Internally, the private global COUNT/countIf reducer owns checked row-count
+conversion, nullable Int64 and Bool raw-slice scans, operation-specific
+overflow reporting, scheduler integration, and ordered reduction. The private
+global Int64 SUM/AVG reducer owns nullable and
 non-nullable raw-slice scans, checked sum-and-count partials, scheduler
 integration, and ordered reduction. The engine retains eligibility, physical
 column dispatch, and typed finalization. The private global scalar-extremum
