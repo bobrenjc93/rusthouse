@@ -6,18 +6,22 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+use crate::batch::aggregate_scheduler::GlobalAggregateParallelism;
 #[cfg(test)]
 use crate::batch::aggregate_scheduler::TestGlobalAggregateWorkerBudget as GlobalAggregateWorkerBudget;
-use crate::batch::aggregate_scheduler::{GlobalAggregateParallelism, parallel_aggregate_partition};
 use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
+use crate::batch::global_count;
 use crate::batch::global_int64_sum_avg;
 use crate::batch::global_scalar_extremum;
 use crate::batch::grouped_bool_count;
 use crate::batch::grouped_bool_max;
 use crate::batch::grouped_bool_min;
 use crate::batch::grouped_bool_sum_avg;
+use crate::batch::int64_metadata_filter::{
+    Int64MetadataComparison, normalize_int64_metadata_filter,
+};
 use crate::batch::json_compact_each_row::{
     self, JsonCompactEachRowIngestError, JsonCompactEachRowIngestLimits,
 };
@@ -4460,20 +4464,17 @@ impl Database {
         // Validated range partitions can reduce the source rows charged to
         // the scan limit. A sparse index can then narrow physical candidates,
         // but does not reduce that charge for an ordinary table.
-        let int64_partition_filter = predicate
+        let int64_metadata_filter = predicate
             .as_ref()
-            .and_then(CompiledPredicate::int64_partition_filter);
-        let int64_index_filter = predicate
-            .as_ref()
-            .and_then(CompiledPredicate::int64_index_filter);
+            .and_then(CompiledPredicate::int64_metadata_filter);
         let int64_nullness = predicate
             .as_ref()
             .and_then(CompiledPredicate::int64_nullness);
-        let source_rows = int64_partition_filter
+        let source_rows = int64_metadata_filter
             .and_then(|(column, filter)| table.int64_range_partition_rows(column, filter))
             .unwrap_or(0..table.row_count());
         enforce_select_scan_rows(source_rows.len(), query_result_limits)?;
-        let indexed_scan = int64_index_filter
+        let indexed_scan = int64_metadata_filter
             .and_then(|(column, filter)| {
                 table.int64_min_max_index_scan(column, filter, source_rows.clone())
             })
@@ -7120,10 +7121,15 @@ fn execute_grouped<'a>(
                 _ => unreachable!("paired aggregate shape is resolved"),
             };
             let count = match count_source {
-                PairedGlobalCountSource::MatchedRows => count_matched_rows(matching_rows.len())?,
-                PairedGlobalCountSource::AggregatePresentValues => count_present_values(
-                    present_count.expect("same-column nullable SUM or AVG exposes a present count"),
-                )?,
+                PairedGlobalCountSource::MatchedRows => {
+                    global_count::count_matched_rows(matching_rows.len())?
+                }
+                PairedGlobalCountSource::AggregatePresentValues => {
+                    global_count::count_present_values(
+                        present_count
+                            .expect("same-column nullable SUM or AVG exposes a present count"),
+                    )?
+                }
             };
             aggregate_states[count_state][0] = AggregateState::Count(count);
             aggregate_states[aggregate_state][0] = aggregate;
@@ -7623,14 +7629,6 @@ fn aggregate_argument_is_physical_int64(table: &Table, spec: &AggregateSpec) -> 
     })
 }
 
-fn count_matched_rows(matched_rows: usize) -> Result<i64> {
-    i64::try_from(matched_rows).map_err(|_| Error::NumericOverflow("COUNT".to_owned()))
-}
-
-fn count_present_values(present_count: u64) -> Result<i64> {
-    i64::try_from(present_count).map_err(|_| Error::NumericOverflow("COUNT".to_owned()))
-}
-
 fn count_global_nullable_int64(
     table: &Table,
     matching_rows: &[usize],
@@ -7644,111 +7642,7 @@ fn count_global_nullable_int64(
     else {
         unreachable!("sole nullable Int64 COUNT shape is resolved")
     };
-    reduce_global_nullable_int64_count(
-        values,
-        matching_rows,
-        parallelism,
-        nullable_int64_count_chunk,
-    )
-}
-
-fn reduce_global_nullable_int64_count<C>(
-    values: &[Option<i64>],
-    matching_rows: &[usize],
-    parallelism: GlobalAggregateParallelism,
-    chunk: C,
-) -> Result<i64>
-where
-    C: Fn(&[Option<i64>], &[usize]) -> Result<i64> + Sync,
-{
-    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return chunk(values, matching_rows);
-    };
-
-    // Each lane receives one deterministic contiguous slice of the filtered
-    // row indices, and checked partials are reduced in partition order. A
-    // spawn failure or panic discards every partial and repeats the complete
-    // NULL-aware count locally after releasing shared admission.
-    let parallel_result = try_parallel_nullable_int64_count(
-        values,
-        matching_rows,
-        admission.helper_threads(),
-        &chunk,
-    );
-    drop(admission);
-    parallel_result.unwrap_or_else(|| chunk(values, matching_rows))
-}
-
-fn try_parallel_nullable_int64_count<C>(
-    values: &[Option<i64>],
-    matching_rows: &[usize],
-    helper_threads: usize,
-    chunk: &C,
-) -> Option<Result<i64>>
-where
-    C: Fn(&[Option<i64>], &[usize]) -> Result<i64> + Sync,
-{
-    debug_assert!(helper_threads > 0);
-    let worker_count = helper_threads.saturating_add(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(helper_threads);
-        let mut worker_failed = false;
-        for chunk_index in 1..worker_count {
-            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
-            let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-count-nullable-int64-{chunk_index}"))
-                .spawn_scoped(scope, move || chunk(values, rows));
-            match spawn {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    worker_failed = true;
-                    break;
-                }
-            }
-        }
-
-        let mut partial_results = Vec::with_capacity(worker_count);
-        partial_results.push(chunk(
-            values,
-            parallel_aggregate_partition(matching_rows, worker_count, 0),
-        ));
-        for handle in handles {
-            match handle.join() {
-                Ok(result) => partial_results.push(result),
-                Err(_) => worker_failed = true,
-            }
-        }
-        if worker_failed {
-            return None;
-        }
-
-        Some(
-            partial_results
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
-                .and_then(reduce_nullable_int64_count_partials),
-        )
-    })
-}
-
-fn nullable_int64_count_chunk(values: &[Option<i64>], matching_rows: &[usize]) -> Result<i64> {
-    matching_rows.iter().try_fold(0_i64, |count, row| {
-        if values[*row].is_some() {
-            count
-                .checked_add(1)
-                .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))
-        } else {
-            Ok(count)
-        }
-    })
-}
-
-fn reduce_nullable_int64_count_partials(partial_counts: Vec<i64>) -> Result<i64> {
-    partial_counts.into_iter().try_fold(0_i64, |total, count| {
-        total
-            .checked_add(count)
-            .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))
-    })
+    global_count::reduce_nullable_int64(values, matching_rows, parallelism)
 }
 
 fn count_global_count_if(
@@ -7761,85 +7655,7 @@ fn count_global_count_if(
     let Column::Bool(values) = &table.columns()[spec.argument.expect("countIf argument")] else {
         unreachable!("countIf input type is resolved")
     };
-    let Some(admission) = parallelism.try_admit(matching_rows.len()) else {
-        return count_if_chunk(values, matching_rows);
-    };
-
-    // Helper threads and the query thread each receive one deterministic,
-    // contiguous slice of the already-filtered row index vector. If a helper
-    // cannot be spawned or panics, discard every partial and repeat the
-    // complete count locally after releasing the process-wide admission.
-    let parallel_result = try_parallel_count_if(values, matching_rows, admission.helper_threads());
-    drop(admission);
-    parallel_result.unwrap_or_else(|| count_if_chunk(values, matching_rows))
-}
-
-fn try_parallel_count_if(
-    values: &[bool],
-    matching_rows: &[usize],
-    helper_threads: usize,
-) -> Option<Result<i64>> {
-    debug_assert!(helper_threads > 0);
-    let worker_count = helper_threads.saturating_add(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(helper_threads);
-        let mut worker_failed = false;
-        for chunk_index in 1..worker_count {
-            let rows = parallel_aggregate_partition(matching_rows, worker_count, chunk_index);
-            let spawn = std::thread::Builder::new()
-                .name(format!("rusthouse-count-if-{chunk_index}"))
-                .spawn_scoped(scope, move || count_if_chunk(values, rows));
-            match spawn {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    worker_failed = true;
-                    break;
-                }
-            }
-        }
-
-        let mut partial_results = Vec::with_capacity(worker_count);
-        partial_results.push(count_if_chunk(
-            values,
-            parallel_aggregate_partition(matching_rows, worker_count, 0),
-        ));
-        for handle in handles {
-            match handle.join() {
-                Ok(result) => partial_results.push(result),
-                Err(_) => worker_failed = true,
-            }
-        }
-        if worker_failed {
-            return None;
-        }
-
-        Some(
-            partial_results
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
-                .and_then(reduce_count_if_counts),
-        )
-    })
-}
-
-fn count_if_chunk(values: &[bool], matching_rows: &[usize]) -> Result<i64> {
-    matching_rows.iter().try_fold(0_i64, |count, row| {
-        if values[*row] {
-            count
-                .checked_add(1)
-                .ok_or_else(|| Error::NumericOverflow("countIf".to_owned()))
-        } else {
-            Ok(count)
-        }
-    })
-}
-
-fn reduce_count_if_counts(partial_counts: Vec<i64>) -> Result<i64> {
-    partial_counts.into_iter().try_fold(0_i64, |total, count| {
-        total
-            .checked_add(count)
-            .ok_or_else(|| Error::NumericOverflow("countIf".to_owned()))
-    })
+    global_count::reduce_count_if(values, matching_rows, parallelism)
 }
 
 fn sum_or_avg_global_int64(
@@ -9304,8 +9120,7 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    /// Returns a direct comparison suitable for metadata pruning.
-    fn int64_filter(&self) -> Option<(usize, Int64Filter)> {
+    fn int64_metadata_comparison(&self) -> Option<Int64MetadataComparison> {
         let Self::Comparison {
             left,
             operator,
@@ -9315,90 +9130,43 @@ impl CompiledPredicate {
             return None;
         };
 
-        let (column, value, operator) = match (left, right) {
+        match (left, right) {
             (
                 CompiledOperand::Column {
                     index,
                     data_type: DataType::Int64,
                 },
                 CompiledOperand::Literal(Value::Int64(value)),
-            ) => (*index, *value, *operator),
+            ) => Some(Int64MetadataComparison::column_on_left(
+                *index, *operator, *value,
+            )),
             (
                 CompiledOperand::Literal(Value::Int64(value)),
                 CompiledOperand::Column {
                     index,
                     data_type: DataType::Int64,
                 },
-            ) => (*index, *value, reverse_comparison(*operator)),
-            _ => return None,
-        };
-        let filter = match operator {
-            ComparisonOperator::Equal => Int64Filter::Equal(value),
-            ComparisonOperator::Less => Int64Filter::Less(value),
-            ComparisonOperator::LessOrEqual => Int64Filter::LessOrEqual(value),
-            ComparisonOperator::Greater => Int64Filter::Greater(value),
-            ComparisonOperator::GreaterOrEqual => Int64Filter::GreaterOrEqual(value),
-            ComparisonOperator::NotEqual => return None,
-        };
-        Some((column, filter))
+            ) => Some(Int64MetadataComparison::literal_on_left(
+                *value, *operator, *index,
+            )),
+            _ => None,
+        }
     }
 
-    /// Returns an exact comparison or positive two-sided range suitable for
-    /// validated range-partition routing. Every admitted row is still checked
-    /// by the complete predicate evaluator.
-    fn int64_partition_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_filter().or_else(|| self.int64_range_filter())
-    }
-
-    /// Returns the shapes that an `Int64` min/max index can reject safely.
-    /// This includes any exact positive two-sided range conjunction after
-    /// predicate normalization. Every surviving row is still evaluated by
-    /// `self`.
-    fn int64_index_filter(&self) -> Option<(usize, Int64Filter)> {
-        self.int64_partition_filter()
-    }
-
-    fn int64_range_filter(&self) -> Option<(usize, Int64Filter)> {
+    /// Returns the exact comparison or positive two-sided range that both
+    /// `Int64` metadata consumers can reject safely. Every surviving row is
+    /// still checked by the complete predicate evaluator.
+    fn int64_metadata_filter(&self) -> Option<(usize, Int64Filter)> {
+        if let Some(comparison) = self.int64_metadata_comparison() {
+            return normalize_int64_metadata_filter(comparison, None);
+        }
         let Self::And(first, second) = self else {
             return None;
         };
-        let (first_column, first_filter) = first.int64_filter()?;
-        let (second_column, second_filter) = second.int64_filter()?;
-        let (lower_column, lower, lower_strict, upper_column, upper, upper_strict) =
-            match (first_filter, second_filter) {
-                (Int64Filter::GreaterOrEqual(lower), Int64Filter::LessOrEqual(upper)) => {
-                    (first_column, lower, false, second_column, upper, false)
-                }
-                (Int64Filter::LessOrEqual(upper), Int64Filter::GreaterOrEqual(lower)) => {
-                    (second_column, lower, false, first_column, upper, false)
-                }
-                (Int64Filter::Greater(lower), Int64Filter::LessOrEqual(upper)) => {
-                    (first_column, lower, true, second_column, upper, false)
-                }
-                (Int64Filter::LessOrEqual(upper), Int64Filter::Greater(lower)) => {
-                    (second_column, lower, true, first_column, upper, false)
-                }
-                (Int64Filter::GreaterOrEqual(lower), Int64Filter::Less(upper)) => {
-                    (first_column, lower, false, second_column, upper, true)
-                }
-                (Int64Filter::Less(upper), Int64Filter::GreaterOrEqual(lower)) => {
-                    (second_column, lower, false, first_column, upper, true)
-                }
-                (Int64Filter::Greater(lower), Int64Filter::Less(upper)) => {
-                    (first_column, lower, true, second_column, upper, true)
-                }
-                (Int64Filter::Less(upper), Int64Filter::Greater(lower)) => {
-                    (second_column, lower, true, first_column, upper, true)
-                }
-                _ => return None,
-            };
-        if lower_column != upper_column {
-            return None;
-        }
-        Some((
-            lower_column,
-            normalized_int64_range(lower, lower_strict, upper, upper_strict),
-        ))
+        normalize_int64_metadata_filter(
+            first.int64_metadata_comparison()?,
+            Some(second.int64_metadata_comparison()?),
+        )
     }
 
     fn int64_nullness(&self) -> Option<(usize, bool)> {
@@ -9450,39 +9218,6 @@ impl CompiledPredicate {
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
-    }
-}
-
-fn normalized_int64_range(
-    lower: i64,
-    lower_strict: bool,
-    upper: i64,
-    upper_strict: bool,
-) -> Int64Filter {
-    let lower = if lower_strict {
-        let Some(lower) = lower.checked_add(1) else {
-            return empty_int64_range();
-        };
-        lower
-    } else {
-        lower
-    };
-    let upper = if upper_strict {
-        let Some(upper) = upper.checked_sub(1) else {
-            return empty_int64_range();
-        };
-        upper
-    } else {
-        upper
-    };
-    Int64Filter::InclusiveRange { lower, upper }
-}
-
-const fn empty_int64_range() -> Int64Filter {
-    // Both metadata paths already treat lower > upper as an empty range.
-    Int64Filter::InclusiveRange {
-        lower: i64::MAX,
-        upper: i64::MIN,
     }
 }
 
@@ -9626,17 +9361,6 @@ const fn invert_comparison(operator: ComparisonOperator) -> ComparisonOperator {
         ComparisonOperator::LessOrEqual => ComparisonOperator::Greater,
         ComparisonOperator::Greater => ComparisonOperator::LessOrEqual,
         ComparisonOperator::GreaterOrEqual => ComparisonOperator::Less,
-    }
-}
-
-const fn reverse_comparison(operator: ComparisonOperator) -> ComparisonOperator {
-    match operator {
-        ComparisonOperator::Equal => ComparisonOperator::Equal,
-        ComparisonOperator::NotEqual => ComparisonOperator::NotEqual,
-        ComparisonOperator::Less => ComparisonOperator::Greater,
-        ComparisonOperator::LessOrEqual => ComparisonOperator::GreaterOrEqual,
-        ComparisonOperator::Greater => ComparisonOperator::Less,
-        ComparisonOperator::GreaterOrEqual => ComparisonOperator::LessOrEqual,
     }
 }
 
@@ -10295,43 +10019,6 @@ mod tests {
         assert_eq!(BUDGET.helpers_in_use(), BUDGET.helper_limit());
         drop(held);
         assert_eq!(BUDGET.helpers_in_use(), 0);
-    }
-
-    #[test]
-    fn sole_nullable_int64_count_worker_failure_repeats_complete_input_locally() {
-        let values = [Some(1), None, Some(17)];
-        let row_count = GLOBAL_AGGREGATE_PARALLEL_ROW_THRESHOLD + 1;
-        let mut matching_rows = vec![0; row_count];
-        let second_partition = parallel_aggregate_partition(&matching_rows, 2, 0).len();
-        matching_rows[second_partition] = 1;
-        matching_rows[row_count - 1] = 2;
-
-        let successful_parallel = reduce_global_nullable_int64_count(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            nullable_int64_count_chunk,
-        )
-        .expect("deterministic parallel nullable COUNT succeeds");
-        let failed_parallel = reduce_global_nullable_int64_count(
-            &values,
-            &matching_rows,
-            GlobalAggregateParallelism::fixed(2),
-            |values, rows| {
-                if std::thread::current().name() == Some("rusthouse-count-nullable-int64-1") {
-                    panic!("injected nullable COUNT worker failure");
-                }
-                nullable_int64_count_chunk(values, rows)
-            },
-        )
-        .expect("worker failure falls back to a complete local nullable COUNT");
-
-        assert_eq!(failed_parallel, successful_parallel);
-        assert_eq!(failed_parallel, i64::try_from(row_count - 1).unwrap());
-        assert_eq!(
-            reduce_nullable_int64_count_partials(vec![i64::MAX, 1]),
-            Err(Error::NumericOverflow("COUNT".to_owned()))
-        );
     }
 
     #[test]
@@ -14859,23 +14546,6 @@ mod tests {
             "SELECT MAX(value) FROM values_to_max WHERE included = true",
         );
         assert_eq!(result.rows, [vec![Value::Int64(i64::MAX)]]);
-    }
-
-    #[test]
-    fn global_aggregate_reduction_overflows_are_checked() {
-        assert_eq!(
-            reduce_count_if_counts(vec![i64::MAX, 1]),
-            Err(Error::NumericOverflow("countIf".to_owned()))
-        );
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(
-            count_matched_rows(usize::try_from(i64::MAX).unwrap() + 1),
-            Err(Error::NumericOverflow("COUNT".to_owned()))
-        );
-        assert_eq!(
-            count_present_values(u64::try_from(i64::MAX).unwrap() + 1),
-            Err(Error::NumericOverflow("COUNT".to_owned()))
-        );
     }
 
     #[test]

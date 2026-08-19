@@ -58,7 +58,11 @@ after a spawn failure or worker panic. The scheduler has no SQL or aggregate-sta
 `batch::grouped_bool_count` module owns the Bool-grouped `COUNT`/`countIf` partial, row-count,
 nullable-column and `countIf` chunk scans, checked ordered reduction, and fixed worker-name prefix;
 physical non-nullable `COUNT(column)` reuses its row-count scan without reading argument values. The
-private `batch::grouped_bool_min` module similarly owns the non-nullable `Int64` and `Float64` `MIN`
+private `batch::global_count` module owns checked global row-count conversion, nullable `Int64`
+`COUNT` and Bool `countIf` raw-slice scans, operation-specific overflow reporting, ordered
+reduction, and scheduler integration. The engine retains global COUNT eligibility and physical
+column dispatch. The private `batch::grouped_bool_min` module similarly owns the non-nullable
+`Int64` and `Float64` `MIN`
 partials, chunk scans, ordered reduction, and fixed worker-name prefixes. The private
 `batch::grouped_bool_max` module owns the corresponding non-nullable `Int64` and `Float64` `MAX`
 reduction boundary. The private

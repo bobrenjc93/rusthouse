@@ -1,12 +1,14 @@
 //! Bounded, semicolon-delimited SQL batch execution for CLI export formats.
 
 mod aggregate_scheduler;
+mod global_count;
 mod global_int64_sum_avg;
 mod global_scalar_extremum;
 mod grouped_bool_count;
 mod grouped_bool_max;
 mod grouped_bool_min;
 mod grouped_bool_sum_avg;
+mod int64_metadata_filter;
 mod scalar_cast;
 mod scalar_float64;
 mod scalar_nullable_int64;
