@@ -761,10 +761,11 @@ and `LIMIT`; non-`Float64` arguments are rejected with a typed error.
 
 `ROW_NUMBER() OVER ()` adds a one-based `Int64` sequence to an ungrouped,
 non-`DISTINCT` projection and accepts an optional `AS alias`. The ordered form
-`ROW_NUMBER() OVER (ORDER BY int64_column ASC|DESC)` accepts a physical `Int64`
-or `Nullable(Int64)` key, filters with `WHERE`, then orders equal keys by stable
-source position and numbers rows before `LIMIT`. Like ordinary `ORDER BY`,
-`NULL` sorts first ascending and last descending.
+`ROW_NUMBER() OVER (ORDER BY column ASC|DESC)` accepts one physical `Int64`,
+`Nullable(Int64)`, or `Float64` key, filters with `WHERE`, then orders equal keys
+by stable source position and numbers rows before `LIMIT`. Float64 positive and
+negative zero compare equal and retain source order in either direction. Like
+ordinary `ORDER BY`, `NULL` sorts first ascending and last descending.
 It charges one `usize` row index for every filtered row against the 16 MiB
 ordering-state limit before allocating the row-index vector or sorting; the
 complete filtered state is required even when `LIMIT`, including `LIMIT 0`,

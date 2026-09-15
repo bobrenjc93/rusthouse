@@ -167,6 +167,191 @@ fn ordered_row_number_supports_both_directions_stable_ties_filtering_and_limit()
 }
 
 #[test]
+fn ordered_row_number_float64_preserves_signed_zero_ties_and_finite_extrema() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, rank_key Float64, keep Bool); \
+             INSERT INTO events VALUES \
+                 (40, 0.0, true), (10, 1.7976931348623157e308, true), \
+                 (30, -0.0, true), (20, -1.7976931348623157e308, true), \
+                 (60, 0.0, true), (50, -0.0, true), \
+                 (70, -1.25, true), (80, 1.25, true), \
+                 (90, -1.7976931348623157e308, false), \
+                 (100, 1.7976931348623157e308, false);",
+        )
+        .expect("Float64 fixture succeeds");
+
+    for (direction, expected) in [
+        (
+            "ASC",
+            [
+                (20, f64::MIN),
+                (70, -1.25),
+                (40, 0.0),
+                (30, -0.0),
+                (60, 0.0),
+                (50, -0.0),
+                (80, 1.25),
+                (10, f64::MAX),
+            ],
+        ),
+        (
+            "DESC",
+            [
+                (10, f64::MAX),
+                (80, 1.25),
+                (40, 0.0),
+                (30, -0.0),
+                (60, 0.0),
+                (50, -0.0),
+                (70, -1.25),
+                (20, f64::MIN),
+            ],
+        ),
+    ] {
+        // LIMIT 4 cuts through the signed-zero ties; equal and oversized limits
+        // also agree with the full result.
+        for limit in [None, Some(0), Some(1), Some(4), Some(8), Some(10)] {
+            let limit_clause = limit.map_or(String::new(), |limit| format!(" LIMIT {limit}"));
+            let results = database
+                .execute(&format!(
+                    "SELECT id, rank_key, \
+                            ROW_NUMBER() OVER (ORDER BY rank_key {direction}) AS n \
+                     FROM events WHERE keep = true{limit_clause}"
+                ))
+                .expect("Float64 ordered ROW_NUMBER succeeds");
+            let result = query(&results[0]);
+            assert_eq!(result.columns[1].data_type, DataType::Float64);
+            assert_eq!(result.columns[2].data_type, DataType::Int64);
+            assert_eq!(result.rows.len(), limit.unwrap_or(8).min(8));
+            for (index, (row, (id, key))) in result.rows.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    row,
+                    &vec![
+                        Value::Int64(id),
+                        Value::Float64(key),
+                        Value::Int64(i64::try_from(index + 1).unwrap()),
+                    ],
+                    "{direction}{limit_clause} row {index}"
+                );
+                let Value::Float64(actual_key) = row[1] else {
+                    panic!("expected Float64 key");
+                };
+                assert_eq!(
+                    actual_key.to_bits(),
+                    key.to_bits(),
+                    "signed zero is retained"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_row_number_float64_preflights_exact_filtered_state_before_limit() {
+    let setup = "CREATE TABLE events (id Int64, rank_key Float64, keep Bool); \
+                 INSERT INTO events VALUES \
+                     (30, 0.0, true), (10, -0.0, true), \
+                     (20, 0.0, true), (40, -1.5, false);";
+    let filtered_state_bytes = 3 * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES;
+    for max in [filtered_state_bytes, filtered_state_bytes - 1] {
+        let mut database = Database::with_query_result_limits(QueryResultLimits {
+            max_ordering_state_bytes: max,
+            ..QueryResultLimits::default()
+        });
+        database.execute(setup).expect("Float64 fixture succeeds");
+
+        for direction in ["ASC", "DESC"] {
+            for limit in [0, 1, 2, 3] {
+                let results = database.execute(&format!(
+                    "SELECT id, ROW_NUMBER() OVER (ORDER BY rank_key {direction}) AS n \
+                     FROM events WHERE keep = true LIMIT {limit}"
+                ));
+                if max == filtered_state_bytes {
+                    let results = results.expect("the exact filtered-state boundary succeeds");
+                    assert_eq!(
+                        query(&results[0]).rows,
+                        [
+                            vec![Value::Int64(30), Value::Int64(1)],
+                            vec![Value::Int64(10), Value::Int64(2)],
+                            vec![Value::Int64(20), Value::Int64(3)],
+                        ][..limit],
+                        "{direction} LIMIT {limit}"
+                    );
+                } else {
+                    assert_eq!(
+                        results,
+                        Err(Error::ResourceLimitExceeded {
+                            resource: "SELECT ordering state bytes",
+                            actual: filtered_state_bytes,
+                            max,
+                        }),
+                        "{direction} LIMIT {limit}"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            database
+                .execute("SELECT ROW_NUMBER() OVER (ORDER BY rank_key ASC) FROM events LIMIT 1"),
+            Err(Error::ResourceLimitExceeded {
+                resource: "SELECT ordering state bytes",
+                actual: 4 * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES,
+                max,
+            })
+        );
+    }
+}
+
+#[test]
+fn ordered_row_number_float64_empty_inputs_fit_zero_ordering_state() {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_ordering_state_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE empty (rank_key Float64); \
+             CREATE TABLE events (rank_key Float64); \
+             INSERT INTO events VALUES (-0.0), (1.5);",
+        )
+        .expect("Float64 fixture succeeds");
+    for direction in ["ASC", "DESC"] {
+        for source in ["empty", "events WHERE rank_key < 0.0"] {
+            for limit in ["", " LIMIT 0", " LIMIT 1"] {
+                let results = database
+                    .execute(&format!(
+                        "SELECT ROW_NUMBER() OVER (ORDER BY rank_key {direction}) AS n \
+                         FROM {source}{limit}"
+                    ))
+                    .expect("empty Float64 ordering state fits a zero-byte limit");
+                assert!(query(&results[0]).rows.is_empty());
+                assert_eq!(
+                    query(&results[0]).columns,
+                    [ResultColumn {
+                        name: "n".to_owned(),
+                        data_type: DataType::Int64,
+                    }]
+                );
+            }
+        }
+        assert_eq!(
+            database.execute(&format!(
+                "SELECT ROW_NUMBER() OVER (ORDER BY rank_key {direction}) \
+                 FROM events LIMIT 0"
+            )),
+            Err(Error::ResourceLimitExceeded {
+                resource: "SELECT ordering state bytes",
+                actual: 2 * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES,
+                max: 0,
+            })
+        );
+    }
+}
+
+#[test]
 fn ordered_row_number_accepts_sql_created_nullable_keys_with_ordinary_null_placement() {
     let filtered_rows = 6;
     let filtered_state_bytes = filtered_rows * ROW_NUMBER_ORDERING_STATE_ENTRY_BYTES;
@@ -460,15 +645,15 @@ fn ordered_row_number_limits_rows_before_checked_cast_projection() {
 }
 
 #[test]
-fn ordered_row_number_rejects_missing_and_non_int64_columns() {
+fn ordered_row_number_rejects_missing_and_non_numeric_columns() {
     let mut database = Database::with_query_result_limits(QueryResultLimits {
         max_ordering_state_bytes: 0,
         ..QueryResultLimits::default()
     });
     database
         .execute(
-            "CREATE TABLE events (id Int64, label String); \
-             INSERT INTO events VALUES (1, 'one');",
+            "CREATE TABLE events (id Int64, label String, enabled Bool); \
+             INSERT INTO events VALUES (1, 'one', true);",
         )
         .expect("fixture succeeds");
 
@@ -481,16 +666,20 @@ fn ordered_row_number_rejects_missing_and_non_int64_columns() {
             column: "missing".to_owned(),
         }
     );
-    assert_eq!(
-        database
-            .execute("SELECT ROW_NUMBER() OVER (ORDER BY label DESC) FROM events")
-            .expect_err("non-Int64 ordering column is rejected"),
-        Error::TypeMismatch {
-            context: "ROW_NUMBER ORDER BY column 'label'".to_owned(),
-            expected: "Int64".to_owned(),
-            actual: "String".to_owned(),
-        }
-    );
+    for (column, actual) in [("label", "String"), ("enabled", "Bool")] {
+        assert_eq!(
+            database
+                .execute(&format!(
+                    "SELECT ROW_NUMBER() OVER (ORDER BY {column} DESC) FROM events"
+                ))
+                .expect_err("non-numeric ordering column is rejected"),
+            Error::TypeMismatch {
+                context: format!("ROW_NUMBER ORDER BY column '{column}'"),
+                expected: "Int64 or Float64".to_owned(),
+                actual: actual.to_owned(),
+            }
+        );
+    }
 }
 
 #[test]
