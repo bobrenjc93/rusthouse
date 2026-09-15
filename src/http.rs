@@ -32,7 +32,8 @@ pub const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 pub const DEFAULT_MAX_HTTP_HEADER_COUNT: usize = 64;
 
 /// Maximum number of entries accepted by
-/// [`handle_http_query_with_clickhouse_principal_set`].
+/// [`handle_http_query_with_clickhouse_principal_set`] and
+/// [`handle_http_query_with_clickhouse_principal_set_and_limits`].
 pub const MAX_HTTP_NAMED_PRINCIPALS: usize = 64;
 
 /// Default maximum size of the decoded SQL request.
@@ -1748,10 +1749,11 @@ pub fn handle_http_query_read_only_with_clickhouse_principal_and_limits(
 /// the same `401 Unauthorized` response before a request body is read or the
 /// database is accessed.
 ///
-/// The exchange uses [`HttpQueryLimits::default`] and includes `Cache-Control:
-/// private, no-store` on every response. This API neither stores credentials
-/// nor provides transport security; the embedding application must provide
-/// TLS on untrusted networks.
+/// The exchange uses [`HttpQueryLimits::default`]; use
+/// [`handle_http_query_with_clickhouse_principal_set_and_limits`] to supply
+/// explicit resource limits. Every response includes `Cache-Control: private,
+/// no-store`. This API neither stores credentials nor provides transport
+/// security; the embedding application must provide TLS on untrusted networks.
 ///
 /// # Errors
 ///
@@ -1762,9 +1764,41 @@ pub fn handle_http_query_with_clickhouse_principal_set(
     database: &SharedDatabase,
     principals: &[ClickHousePrincipal<'_>],
     input: impl Read,
-    mut output: impl Write,
+    output: impl Write,
 ) -> Result<(), HttpQueryError> {
-    let limits = HttpQueryLimits::default();
+    handle_http_query_with_clickhouse_principal_set_and_limits(
+        database,
+        principals,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one ClickHouse principal-set HTTP exchange with explicit resource
+/// limits.
+///
+/// See [`handle_http_query_with_clickhouse_principal_set`] for authentication,
+/// configuration validation, and role-based access behavior. The supplied
+/// [`HttpQueryLimits`] apply to request headers, SQL and body bytes, CSV and TSV
+/// ingestion, and the complete response, including authentication and
+/// configuration-error responses. See [`handle_http_query_with_limits`] for
+/// resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`]. Invalid principal-set configurations are rejected
+/// before request input is read with a bounded `500 Internal Server Error`
+/// response. If the response cap cannot hold the fixed limit-error response,
+/// returns [`HttpQueryError::ResponseLimitExceeded`] without writing output.
+pub fn handle_http_query_with_clickhouse_principal_set_and_limits(
+    database: &SharedDatabase,
+    principals: &[ClickHousePrincipal<'_>],
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
     if let Err(message) = validate_clickhouse_principal_set_configuration(principals) {
         return write_error_response(
             &mut output,

@@ -1566,9 +1566,17 @@ authentication attempt compares both supplied values against every configured
 pair without stopping on a match. One exact match enters the same read-only or
 read-write boundary used by the single-principal handlers, while all missing,
 duplicate, partial, and unknown credentials produce the same bounded `401`
-response. The handler uses the default HTTP, CSV, TSV, and response bounds and
-does not retain credentials. The existing bearer, key-only, and
-single-principal APIs retain their documented behavior.
+response. The handler does not retain credentials and delegates to
+`handle_http_query_with_clickhouse_principal_set_and_limits` with
+`HttpQueryLimits::default()`. Call the explicit-limits variant with
+`(database, principals, input, output, limits)` to bound request header bytes
+and count, SQL and body bytes, CSV and TSV ingestion, and complete response
+bytes. The caller's response cap also applies to authentication and
+configuration-error responses; if even the fixed limit-error response cannot
+fit, the handler returns `HttpQueryError::ResponseLimitExceeded` without
+writing output. Explicit limits preserve each principal's read-only or
+read-write permissions. The existing bearer, key-only, and single-principal
+APIs retain their documented behavior.
 
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before
