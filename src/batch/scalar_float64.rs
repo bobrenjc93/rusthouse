@@ -11,7 +11,7 @@ pub(super) fn abs_cmp(left: f64, right: f64) -> Ordering {
 
 pub(super) fn round(value: f64) -> f64 {
     debug_assert!(value.is_finite(), "Float64 scalar input is finite");
-    value.round()
+    value.round_ties_even()
 }
 
 pub(super) fn round_cmp(left: f64, right: f64) -> Ordering {
@@ -65,15 +65,33 @@ mod tests {
     }
 
     #[test]
-    fn round_covers_halfway_subnormal_and_signed_zero_boundaries() {
+    fn round_uses_ties_to_even_and_preserves_finite_boundaries() {
         let smallest = f64::from_bits(1);
+        let below_half = f64::from_bits(0.5_f64.to_bits() - 1);
+        let above_half = f64::from_bits(0.5_f64.to_bits() + 1);
 
-        assert_eq!(round(-2.5), -3.0);
-        assert_eq!(round(2.5), 3.0);
-        assert_eq!(round(-smallest).to_bits(), (-0.0_f64).to_bits());
-        assert_eq!(round(smallest).to_bits(), 0.0_f64.to_bits());
-        assert_eq!(round(-0.0).to_bits(), (-0.0_f64).to_bits());
-        assert_eq!(round(f64::MAX), f64::MAX);
+        for (input, expected) in [
+            (-3.5, -4.0_f64),
+            (-2.5, -2.0),
+            (-1.5, -2.0),
+            (-above_half, -1.0),
+            (-0.5, -0.0),
+            (-below_half, -0.0),
+            (-smallest, -0.0),
+            (-0.0, -0.0),
+            (0.0, 0.0),
+            (smallest, 0.0),
+            (below_half, 0.0),
+            (0.5, 0.0),
+            (above_half, 1.0),
+            (1.5, 2.0),
+            (2.5, 2.0),
+            (3.5, 4.0),
+            (-f64::MAX, -f64::MAX),
+            (f64::MAX, f64::MAX),
+        ] {
+            assert_eq!(round(input).to_bits(), expected.to_bits(), "{input}");
+        }
     }
 
     #[test]
@@ -96,12 +114,16 @@ mod tests {
         let cases = [
             -f64::MAX,
             -2.5,
+            -1.5,
             -1.1,
+            -0.5,
             -f64::from_bits(1),
             -0.0,
             0.0,
             f64::from_bits(1),
+            0.5,
             1.1,
+            1.5,
             2.5,
             f64::MAX,
         ];
@@ -125,6 +147,9 @@ mod tests {
 
         assert_eq!(abs_cmp(-7.0, 7.0), Ordering::Equal);
         assert_eq!(round_cmp(-0.49, 0.49), Ordering::Equal);
+        assert_eq!(round_cmp(-0.5, 0.5), Ordering::Equal);
+        assert_eq!(round_cmp(-2.5, -1.5), Ordering::Equal);
+        assert_eq!(round_cmp(1.5, 2.5), Ordering::Equal);
         assert_eq!(floor_cmp(1.1, 1.9), Ordering::Equal);
         assert_eq!(ceil_cmp(-1.9, -1.1), Ordering::Equal);
     }

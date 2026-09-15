@@ -746,10 +746,15 @@ signed zero produces positive zero. `ABS` supports an optional `AS alias`,
 ordering by the unaliased expression or alias, `WHERE`, and `LIMIT`/`OFFSET`;
 non-numeric arguments are rejected with a typed error.
 `ROUND(float64_column)` is an ungrouped scalar projection that returns a
-`Float64` rounded to an integral value. Values exactly halfway between two
-integers are rounded away from zero. It supports an optional `AS alias`,
-ordering by the unaliased expression or alias, `WHERE`, and `LIMIT`; non-
-`Float64` arguments are rejected with a typed error.
+`Float64` rounded to the nearest integral value. Values exactly halfway between
+two integers round to the even integer, matching ClickHouse `Float64` rounding:
+`1.5` and `2.5` both produce `2.0`, while `-1.5` and `-2.5` both produce `-2.0`.
+Rounding preserves signed zero (`-0.5` produces `-0.0`, `0.5` produces `0.0`)
+and finite extrema. Projection and ordering use the same rounding semantics.
+When the rounded value is the only ordering key, equal results, including
+signed zeros, retain source order in either sorting direction. It supports an
+optional `AS alias`, ordering by the unaliased expression or alias, `WHERE`,
+and `LIMIT`; non-`Float64` arguments are rejected with a typed error.
 `FLOOR(float64_column)` has the same ungrouped projection shape and returns the
 greatest integral `Float64` less than or equal to each finite input. It supports
 an optional `AS alias`, ordering by the unaliased expression or alias, `WHERE`,
