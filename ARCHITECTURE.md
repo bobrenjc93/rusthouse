@@ -51,6 +51,16 @@ allocation. Focused module tests cover signed zero, subnormal values, extrema, h
 and comparison ties; the existing SQL-boundary differential and resource-limit tests continue to
 cover complete query behavior.
 
+The private, Unix-gated `batch::snapshot_save_errors` module owns only
+`DatabaseSnapshotSaveError`, `DatabaseRleSnapshotSaveError`, and their error contracts: variants,
+display messages, source chains, conversions, and destination-replacement status. The types remain
+public through `batch::engine`, `batch`, and the crate root. The engine retains table validation and
+save orchestration; the snapshot layer retains encoding, atomic replacement, and filesystem
+durability. Restore and WAL errors remain in their existing modules, as do the shared-database
+wrappers and lock handling. Contract tests cover typed error chains and distinguish failures before
+rename from post-rename directory-sync uncertainty; existing snapshot-save regressions cover the
+persistence operations.
+
 The private `batch::aggregate_scheduler` module owns process-wide aggregate-worker admission and
 deterministic contiguous partitioning. Its generic grouped-aggregate driver additionally owns
 scoped worker spawning, ordered partial collection, admission release, and complete-input fallback

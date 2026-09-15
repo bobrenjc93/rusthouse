@@ -12,6 +12,8 @@ mod scalar_float64;
 mod scalar_nullable_int64;
 mod scalar_string;
 mod scalar_text;
+#[cfg(unix)]
+mod snapshot_save_errors;
 
 pub mod catalog;
 pub mod csv;
