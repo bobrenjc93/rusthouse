@@ -5316,10 +5316,10 @@ fn resolve_row_number_ordering(
     };
     let source = table.column_index(&order.name)?;
     let actual = table.schema()[source].data_type;
-    if actual != DataType::Int64 {
+    if !matches!(actual, DataType::Int64 | DataType::Float64) {
         return Err(Error::TypeMismatch {
             context: format!("ROW_NUMBER ORDER BY column '{}'", order.name),
-            expected: DataType::Int64.to_string(),
+            expected: "Int64 or Float64".to_owned(),
             actual: actual.to_string(),
         });
     }

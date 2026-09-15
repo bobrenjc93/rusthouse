@@ -2440,7 +2440,7 @@ impl<'a> Parser<'a> {
                 } else {
                     self.expect_keyword("ORDER")?;
                     self.expect_keyword("BY")?;
-                    let name = self.expect_identifier("Int64 column in ROW_NUMBER ORDER BY")?;
+                    let name = self.expect_identifier("column in ROW_NUMBER ORDER BY")?;
                     let descending = if self.eat_keyword("ASC") {
                         false
                     } else if self.eat_keyword("DESC") {
