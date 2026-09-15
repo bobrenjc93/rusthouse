@@ -15,6 +15,7 @@ use rusthouse::{
     handle_http_query_with_clickhouse_principal,
     handle_http_query_with_clickhouse_principal_and_limits,
     handle_http_query_with_clickhouse_principal_set,
+    handle_http_query_with_clickhouse_principal_set_and_limits,
 };
 
 const USER: &str = "reporting";
@@ -491,13 +492,21 @@ fn named_principal_configuration_is_validated_before_input() {
 }
 
 #[test]
-fn principal_set_reader_rejects_writes_while_writer_ingests() {
+fn principal_set_reader_rejects_writes_while_writer_ingests_with_explicit_limits() {
     let database = SharedDatabase::default();
     database.execute("CREATE TABLE events (id Int64);").unwrap();
     let principals = [
         ClickHousePrincipal::new("reader", "reader-key", ClickHousePrincipalRole::ReadOnly),
         ClickHousePrincipal::new("writer", "writer-key", ClickHousePrincipalRole::ReadWrite),
     ];
+    let limits = HttpQueryLimits {
+        max_header_bytes: 256,
+        max_header_count: 4,
+        max_sql_bytes: 64,
+        csv_ingest_limits: CsvIngestLimits::new(5, 1, 1),
+        tsv_ingest_limits: TsvIngestLimits::new(2, 1, 1),
+        max_response_bytes: 512,
+    };
 
     let (reader_request, reader_body_offset) = request(
         "/insert/events",
@@ -506,11 +515,12 @@ fn principal_set_reader_rejects_writes_while_writer_ingests() {
     );
     let mut reader_input = Cursor::new(reader_request);
     let mut reader_response = Vec::new();
-    handle_http_query_with_clickhouse_principal_set(
+    handle_http_query_with_clickhouse_principal_set_and_limits(
         &database,
         &principals,
         &mut reader_input,
         &mut reader_response,
+        limits,
     )
     .unwrap();
     assert_eq!(reader_input.position(), reader_body_offset);
@@ -523,11 +533,12 @@ fn principal_set_reader_rejects_writes_while_writer_ingests() {
         "X-ClickHouse-User: writer\r\nX-ClickHouse-Key: writer-key\r\n",
     );
     let mut writer_response = Vec::new();
-    handle_http_query_with_clickhouse_principal_set(
+    handle_http_query_with_clickhouse_principal_set_and_limits(
         &database,
         &principals,
         Cursor::new(writer_request),
         &mut writer_response,
+        limits,
     )
     .unwrap();
     assert_status(&writer_response, "HTTP/1.1 200 OK");
@@ -535,13 +546,14 @@ fn principal_set_reader_rejects_writes_while_writer_ingests() {
     assert_private(&writer_response);
 
     let mut query_response = Vec::new();
-    handle_http_query_with_clickhouse_principal_set(
+    handle_http_query_with_clickhouse_principal_set_and_limits(
         &database,
         &principals,
         Cursor::new(
             b"GET /?query=SELECT+id+FROM+events%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-User: reader\r\nX-ClickHouse-Key: reader-key\r\n\r\n",
         ),
         &mut query_response,
+        limits,
     )
     .unwrap();
     assert_status(&query_response, "HTTP/1.1 200 OK");
@@ -549,6 +561,201 @@ fn principal_set_reader_rejects_writes_while_writer_ingests() {
         body(&query_response),
         br#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[2]]}"#
     );
+}
+
+#[test]
+fn principal_set_enforces_request_limits_without_reading_rejected_bodies() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let principals = [ClickHousePrincipal::new(
+        USER,
+        KEY,
+        ClickHousePrincipalRole::ReadWrite,
+    )];
+    let sql = b"INSERT INTO events VALUES (1);";
+    let (sql_request, sql_body_offset) = request("/insert", sql, principal_headers());
+    let (csv_request, csv_body_offset) = request("/insert/events", b"id\n2\n", principal_headers());
+    let (tsv_request, tsv_body_offset) = request(
+        "/?query=INSERT+INTO+events+FORMAT+TabSeparated",
+        b"3\n",
+        principal_headers(),
+    );
+    let cases = [
+        (
+            &sql_request,
+            HttpQueryLimits {
+                max_header_bytes: sql_body_offset as usize - 1,
+                ..HttpQueryLimits::default()
+            },
+            sql_body_offset - 1,
+            "HTTP/1.1 431 Request Header Fields Too Large",
+        ),
+        (
+            &sql_request,
+            HttpQueryLimits {
+                max_header_count: 3,
+                ..HttpQueryLimits::default()
+            },
+            sql_body_offset,
+            "HTTP/1.1 431 Request Header Fields Too Large",
+        ),
+        (
+            &sql_request,
+            HttpQueryLimits {
+                max_sql_bytes: sql.len() - 1,
+                ..HttpQueryLimits::default()
+            },
+            sql_body_offset,
+            "HTTP/1.1 413 Payload Too Large",
+        ),
+        (
+            &csv_request,
+            HttpQueryLimits {
+                csv_ingest_limits: CsvIngestLimits::new(4, 1, 1),
+                ..HttpQueryLimits::default()
+            },
+            csv_body_offset,
+            "HTTP/1.1 400 Bad Request",
+        ),
+        (
+            &tsv_request,
+            HttpQueryLimits {
+                tsv_ingest_limits: TsvIngestLimits::new(1, 1, 1),
+                ..HttpQueryLimits::default()
+            },
+            tsv_body_offset,
+            "HTTP/1.1 400 Bad Request",
+        ),
+    ];
+
+    for (request, limits, consumed, status) in cases {
+        let mut input = Cursor::new(request);
+        let mut response = Vec::new();
+        handle_http_query_with_clickhouse_principal_set_and_limits(
+            &database,
+            &principals,
+            &mut input,
+            &mut response,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(input.position(), consumed);
+        assert_status(&response, status);
+        assert_private(&response);
+    }
+    assert!(
+        database
+            .query("SELECT id FROM events;")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+
+    let mut response = Vec::new();
+    handle_http_query_with_clickhouse_principal_set_and_limits(
+        &database,
+        &principals,
+        Cursor::new(sql_request),
+        &mut response,
+        HttpQueryLimits {
+            max_header_bytes: sql_body_offset as usize,
+            max_header_count: 4,
+            max_sql_bytes: sql.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert_eq!(
+        database.query("SELECT id FROM events;").unwrap().rows,
+        vec![vec![Value::Int64(1)]]
+    );
+}
+
+#[test]
+fn principal_set_response_limits_preserve_default_wrapper_behavior() {
+    let database = SharedDatabase::default();
+    let principals = [ClickHousePrincipal::new(
+        USER,
+        KEY,
+        ClickHousePrincipalRole::ReadOnly,
+    )];
+    let sql = format!("SELECT '{}' AS value;", "x".repeat(128));
+    let (query, _) = request("/query", sql.as_bytes(), principal_headers());
+    let (unauthorized, _) = request("/query", sql.as_bytes(), "");
+
+    for (request, status) in [
+        (query, "HTTP/1.1 200 OK"),
+        (unauthorized, "HTTP/1.1 401 Unauthorized"),
+    ] {
+        let mut expected = Vec::new();
+        handle_http_query_with_clickhouse_principal_set(
+            &database,
+            &principals,
+            Cursor::new(&request),
+            &mut expected,
+        )
+        .unwrap();
+        assert_status(&expected, status);
+
+        for max_response_bytes in [
+            HttpQueryLimits::default().max_response_bytes,
+            expected.len(),
+        ] {
+            let mut response = Vec::new();
+            handle_http_query_with_clickhouse_principal_set_and_limits(
+                &database,
+                &principals,
+                Cursor::new(&request),
+                &mut response,
+                HttpQueryLimits {
+                    max_response_bytes,
+                    ..HttpQueryLimits::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(response, expected);
+        }
+
+        let max_response_bytes = expected.len() - 1;
+        let mut response = Vec::new();
+        handle_http_query_with_clickhouse_principal_set_and_limits(
+            &database,
+            &principals,
+            Cursor::new(&request),
+            &mut response,
+            HttpQueryLimits {
+                max_response_bytes,
+                ..HttpQueryLimits::default()
+            },
+        )
+        .unwrap();
+        assert_status(&response, "HTTP/1.1 500 Internal Server Error");
+        assert_eq!(
+            body(&response),
+            br#"{"error":"response exceeds configured byte limit"}"#
+        );
+        assert_private(&response);
+        assert!(response.len() <= max_response_bytes);
+
+        let mut response = Vec::new();
+        let error = handle_http_query_with_clickhouse_principal_set_and_limits(
+            &database,
+            &principals,
+            Cursor::new(&request),
+            &mut response,
+            HttpQueryLimits {
+                max_response_bytes: 0,
+                ..HttpQueryLimits::default()
+            },
+        )
+        .expect_err("the fixed response-limit error cannot fit");
+        assert!(matches!(
+            error,
+            HttpQueryError::ResponseLimitExceeded { max_bytes: 0, .. }
+        ));
+        assert!(response.is_empty());
+    }
 }
 
 #[test]
@@ -619,6 +826,64 @@ fn principal_set_rejects_duplicate_configuration_before_input() {
         br#"{"error":"configured ClickHouse principal set contains a duplicate user/key pair"}"#
     );
     assert_private(&response);
+
+    for max_response_bytes in [
+        HttpQueryLimits::default().max_response_bytes,
+        response.len(),
+    ] {
+        let mut bounded = Vec::new();
+        handle_http_query_with_clickhouse_principal_set_and_limits(
+            &database,
+            &principals,
+            FailingReader,
+            &mut bounded,
+            HttpQueryLimits {
+                max_response_bytes,
+                ..HttpQueryLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bounded, response);
+    }
+
+    let max_response_bytes = response.len() - 1;
+    let mut bounded = Vec::new();
+    handle_http_query_with_clickhouse_principal_set_and_limits(
+        &database,
+        &principals,
+        FailingReader,
+        &mut bounded,
+        HttpQueryLimits {
+            max_response_bytes,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_status(&bounded, "HTTP/1.1 500 Internal Server Error");
+    assert_eq!(
+        body(&bounded),
+        br#"{"error":"response exceeds configured byte limit"}"#
+    );
+    assert_private(&bounded);
+    assert!(bounded.len() <= max_response_bytes);
+
+    let mut bounded = Vec::new();
+    let error = handle_http_query_with_clickhouse_principal_set_and_limits(
+        &database,
+        &principals,
+        FailingReader,
+        &mut bounded,
+        HttpQueryLimits {
+            max_response_bytes: 0,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("the fixed response-limit error cannot fit");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes: 0, .. }
+    ));
+    assert!(bounded.is_empty());
 }
 
 #[test]
